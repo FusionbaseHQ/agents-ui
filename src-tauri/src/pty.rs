@@ -179,19 +179,26 @@ fn ensure_nu_config(window: &WebviewWindow) -> Option<(String, String, String)> 
     fs::create_dir_all(&nu_cache_dir).ok()?;
 
     let config_path = nu_config_dir.join("config.nu");
-    if !config_path.exists() {
-        let config = r#"let-env config = ($env.config | upsert show_banner false)
+    let config = r#"# Agents UI managed Nushell config
 
-let-env PROMPT_COMMAND = {||
+$env.config = ($env.config | upsert show_banner false)
+
+$env.PROMPT_COMMAND = {||
   let cwd = $env.PWD
   let osc = (char esc) + "]1337;CurrentDir=" + $cwd + (char bel)
   let dir = ($cwd | path basename)
   $osc + (ansi cyan) + $dir + (ansi reset) + " "
 }
 
-let-env PROMPT_INDICATOR = {|| "❯ " }
-let-env PROMPT_MULTILINE_INDICATOR = {|| "… " }
+$env.PROMPT_INDICATOR = {|| "❯ " }
+$env.PROMPT_MULTILINE_INDICATOR = {|| "… " }
 "#;
+
+    let needs_write = match fs::read_to_string(&config_path) {
+        Ok(existing) => existing.contains("let-env "),
+        Err(_) => true,
+    };
+    if needs_write {
         fs::write(&config_path, config).ok()?;
     }
 
