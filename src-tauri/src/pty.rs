@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tauri::{Emitter, State, WebviewWindow};
+use tauri::{Emitter, Manager, State, WebviewWindow};
 
 #[derive(Default)]
 struct AppStateInner {
@@ -130,6 +130,78 @@ __agents_ui_emit_cwd
     Ok(())
 }
 
+#[cfg(target_family = "unix")]
+fn sidecar_path(name: &str) -> Option<PathBuf> {
+    std::env::current_exe().ok()?.parent().map(|p| p.join(name))
+}
+
+#[cfg(all(target_family = "unix", debug_assertions))]
+fn dev_sidecar_path(name: &str) -> Option<PathBuf> {
+    let triple = if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        "aarch64-apple-darwin"
+    } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
+        "x86_64-apple-darwin"
+    } else {
+        return None;
+    };
+    Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin").join(format!("{name}-{triple}")))
+}
+
+#[cfg(target_family = "unix")]
+fn find_bundled_nu() -> Option<PathBuf> {
+    let sidecar = sidecar_path("nu").filter(|p| p.is_file());
+    if sidecar.is_some() {
+        return sidecar;
+    }
+    #[cfg(debug_assertions)]
+    {
+        let dev = dev_sidecar_path("nu").filter(|p| p.is_file());
+        if dev.is_some() {
+            return dev;
+        }
+    }
+    None
+}
+
+#[cfg(target_family = "unix")]
+fn ensure_nu_config(window: &WebviewWindow) -> Option<(String, String, String)> {
+    let app_data = window.app_handle().path().app_data_dir().ok()?;
+    let config_home = app_data.join("shell").join("xdg-config");
+    let data_home = app_data.join("shell").join("xdg-data");
+    let cache_home = app_data.join("shell").join("xdg-cache");
+
+    let nu_config_dir = config_home.join("nushell");
+    let nu_data_dir = data_home.join("nushell");
+    let nu_cache_dir = cache_home.join("nushell");
+
+    fs::create_dir_all(&nu_config_dir).ok()?;
+    fs::create_dir_all(&nu_data_dir).ok()?;
+    fs::create_dir_all(&nu_cache_dir).ok()?;
+
+    let config_path = nu_config_dir.join("config.nu");
+    if !config_path.exists() {
+        let config = r#"let-env config = ($env.config | upsert show_banner false)
+
+let-env PROMPT_COMMAND = {||
+  let cwd = $env.PWD
+  let osc = (char esc) + "]1337;CurrentDir=" + $cwd + (char bel)
+  let dir = ($cwd | path basename)
+  $osc + (ansi cyan) + $dir + (ansi reset) + " "
+}
+
+let-env PROMPT_INDICATOR = {|| "❯ " }
+let-env PROMPT_MULTILINE_INDICATOR = {|| "… " }
+"#;
+        fs::write(&config_path, config).ok()?;
+    }
+
+    Some((
+        config_home.to_string_lossy().to_string(),
+        data_home.to_string_lossy().to_string(),
+        cache_home.to_string_lossy().to_string(),
+    ))
+}
+
 #[tauri::command]
 pub fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionInfo>, String> {
     let sessions = state
@@ -182,13 +254,23 @@ pub fn create_session(
         });
 
     #[cfg(target_family = "unix")]
-    let (program, args, shown_command) = if is_shell {
-        (shell.clone(), vec!["-l".to_string()], format!("{shell} -l"))
+    let (program, args, shown_command, use_nu) = if is_shell {
+        if let Some(nu) = find_bundled_nu() {
+            (
+                nu.to_string_lossy().to_string(),
+                Vec::new(),
+                "nu".to_string(),
+                true,
+            )
+        } else {
+            (shell.clone(), vec!["-l".to_string()], format!("{shell} -l"), false)
+        }
     } else {
         (
             shell.clone(),
             vec!["-lc".to_string(), command.clone()],
             format!("{shell} -lc {command}"),
+            false,
         )
     };
 
@@ -202,6 +284,9 @@ pub fn create_session(
             format!("{shell} /C {command}"),
         )
     };
+
+    #[cfg(not(target_family = "unix"))]
+    let use_nu = false;
 
     let size = PtySize {
         rows: rows.unwrap_or(24),
@@ -221,6 +306,40 @@ pub fn create_session(
     cmd.args(args);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut path_entries: Vec<String> = std::env::var("PATH")
+            .unwrap_or_default()
+            .split(':')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
+        for candidate in [
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+        ] {
+            if Path::new(candidate).is_dir() && !path_entries.iter().any(|p| p == candidate) {
+                path_entries.insert(0, candidate.to_string());
+            }
+        }
+
+        if !path_entries.is_empty() {
+            cmd.env("PATH", path_entries.join(":"));
+        }
+    }
+
+    #[cfg(target_family = "unix")]
+    if use_nu {
+        if let Some((xdg_config_home, xdg_data_home, xdg_cache_home)) = ensure_nu_config(&window) {
+            cmd.env("XDG_CONFIG_HOME", xdg_config_home);
+            cmd.env("XDG_DATA_HOME", xdg_data_home);
+            cmd.env("XDG_CACHE_HOME", xdg_cache_home);
+        }
+    }
     if let Some(ref cwd) = cwd {
         cmd.cwd(cwd);
     }
