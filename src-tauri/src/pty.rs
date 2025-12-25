@@ -62,6 +62,46 @@ fn unique_name(existing: &HashMap<String, PtySession>, base: &str) -> String {
     }
 }
 
+fn decode_utf8_stream(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
+    if chunk.is_empty() {
+        return String::new();
+    }
+    carry.extend_from_slice(chunk);
+
+    let mut out = String::new();
+    let mut idx = 0usize;
+    while idx < carry.len() {
+        match std::str::from_utf8(&carry[idx..]) {
+            Ok(s) => {
+                out.push_str(s);
+                idx = carry.len();
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                if valid > 0 {
+                    let end = idx + valid;
+                    out.push_str(unsafe { std::str::from_utf8_unchecked(&carry[idx..end]) });
+                    idx = end;
+                }
+
+                match e.error_len() {
+                    None => break,
+                    Some(len) => {
+                        out.push('�');
+                        idx = (idx + len).min(carry.len());
+                    }
+                }
+            }
+        }
+    }
+
+    if idx > 0 {
+        carry.drain(..idx);
+    }
+    out
+}
+
 #[cfg(target_family = "unix")]
 fn sh_single_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -185,7 +225,7 @@ $env.config = ($env.config | upsert show_banner false)
 
 $env.PROMPT_COMMAND = {||
   let cwd = $env.PWD
-  let osc = (char esc) + "]1337;CurrentDir=" + $cwd + (char bel)
+  let osc = (char --integer 27) + "]1337;CurrentDir=" + $cwd + (char --integer 7)
   let dir = ($cwd | path basename)
   $osc + (ansi cyan) + $dir + (ansi reset) + " "
 }
@@ -195,7 +235,7 @@ $env.PROMPT_MULTILINE_INDICATOR = {|| "… " }
 "#;
 
     let needs_write = match fs::read_to_string(&config_path) {
-        Ok(existing) => existing.contains("let-env "),
+        Ok(existing) => existing != config,
         Err(_) => true,
     };
     if needs_write {
@@ -432,14 +472,36 @@ pub fn create_session(
     let state_for_thread = state.inner().clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
+        let mut utf8_carry: Vec<u8> = Vec::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let _ = window.emit("pty-output", PtyOutput { id: id_for_thread.clone(), data });
+                    let data = decode_utf8_stream(&mut utf8_carry, &buf[..n]);
+                    if !data.is_empty() {
+                        let _ = window.emit(
+                            "pty-output",
+                            PtyOutput {
+                                id: id_for_thread.clone(),
+                                data,
+                            },
+                        );
+                    }
                 }
                 Err(_) => break,
+            }
+        }
+
+        if !utf8_carry.is_empty() {
+            let data = String::from_utf8_lossy(&utf8_carry).to_string();
+            if !data.is_empty() {
+                let _ = window.emit(
+                    "pty-output",
+                    PtyOutput {
+                        id: id_for_thread.clone(),
+                        data,
+                    },
+                );
             }
         }
 
