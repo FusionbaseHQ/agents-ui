@@ -1,0 +1,22 @@
+# Node / frontend
+node_modules/
+dist/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# TypeScript build artifacts
+*.tsbuildinfo
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/.tauri/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
