@@ -231,8 +231,8 @@ fn ensure_nu_config(window: &WebviewWindow) -> Option<(String, String, String)> 
 $env.config = ($env.config | upsert show_banner false)
 
 $env.config = ($env.config | upsert hooks.pre_execution [
-  { |command|
-    let cleaned = ($command | into string | str trim)
+  {||
+    let cleaned = (commandline | str trim | str replace --all (char newline) " ")
     let osc = (char --integer 27) + "]1337;Command=" + $cleaned + (char --integer 7)
     print --no-newline $osc
   }
