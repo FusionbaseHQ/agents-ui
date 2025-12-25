@@ -160,9 +160,16 @@ fn write_zsh_startup_files(temp_dir: &Path, orig_dir: &Path) -> Result<(), Strin
     let mut zshrc_contents = wrap_source(&orig_zshrc, false);
     zshrc_contents.push_str(
         r#"
-__agents_ui_emit_cwd() { printf '\033]1337;CurrentDir=%s\007' "$PWD"; }
-typeset -ga precmd_functions
+__agents_ui_emit_cwd() {
+  printf '\033]1337;CurrentDir=%s\007' "$PWD"
+  printf '\033]1337;Command=\007'
+}
+
+__agents_ui_emit_command() { printf '\033]1337;Command=%s\007' "$1"; }
+
+typeset -ga precmd_functions preexec_functions
 precmd_functions+=__agents_ui_emit_cwd
+preexec_functions+=__agents_ui_emit_command
 __agents_ui_emit_cwd
 "#,
     );
@@ -222,6 +229,21 @@ fn ensure_nu_config(window: &WebviewWindow) -> Option<(String, String, String)> 
     let config = r#"# Agents UI managed Nushell config
 
 $env.config = ($env.config | upsert show_banner false)
+
+$env.config = ($env.config | upsert hooks.pre_execution [
+  { |command|
+    let cleaned = ($command | into string | str trim)
+    let osc = (char --integer 27) + "]1337;Command=" + $cleaned + (char --integer 7)
+    print --no-newline $osc
+  }
+])
+
+$env.config = ($env.config | upsert hooks.pre_prompt [
+  {||
+    let osc = (char --integer 27) + "]1337;Command=" + (char --integer 7)
+    print --no-newline $osc
+  }
+])
 
 $env.PROMPT_COMMAND = {||
   let cwd = $env.PWD

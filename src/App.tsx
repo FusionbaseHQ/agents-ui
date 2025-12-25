@@ -462,6 +462,20 @@ export default function App() {
     );
   }
 
+  function onCommandChange(id: string, commandLine: string) {
+    const trimmed = commandLine.trim();
+    const effect = trimmed ? detectProcessEffect({ command: trimmed, name: null }) : null;
+    const nextEffectId = effect?.id ?? null;
+
+    setSessions((prev) =>
+      prev.map((s) => {
+        if (s.id !== id) return s;
+        if (s.effectId === nextEffectId) return s;
+        return { ...s, effectId: nextEffectId, processTag: null };
+      }),
+    );
+  }
+
   function pickActiveSessionId(projectId: string): string | null {
     const sessions = sessionsRef.current;
     const last = lastActiveByProject.current.get(projectId);
@@ -1051,6 +1065,7 @@ export default function App() {
                 active={s.id === activeId}
                 readOnly={Boolean(s.exited || s.closing)}
                 onCwdChange={onCwdChange}
+                onCommandChange={onCommandChange}
                 registry={registry}
                 pendingData={pendingData}
               />

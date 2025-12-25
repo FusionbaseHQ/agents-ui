@@ -11,6 +11,7 @@ export default function SessionTerminal(props: {
   active: boolean;
   readOnly: boolean;
   onCwdChange?: (id: string, cwd: string) => void;
+  onCommandChange?: (id: string, commandLine: string) => void;
   registry: React.MutableRefObject<TerminalRegistry>;
   pendingData: React.MutableRefObject<PendingDataBuffer>;
 }) {
@@ -57,6 +58,9 @@ export default function SessionTerminal(props: {
       if (!trimmed) return;
       props.onCwdChange?.(props.id, trimmed);
     };
+    const reportCommand = (commandLine: string) => {
+      props.onCommandChange?.(props.id, commandLine);
+    };
 
     const parseFileUrlPath = (data: string): string | null => {
       if (!data.startsWith("file://")) return null;
@@ -81,11 +85,21 @@ export default function SessionTerminal(props: {
       );
       oscDisposables.push(
         term.parser.registerOscHandler(1337, (data) => {
-          const prefix = "CurrentDir=";
-          if (!data.startsWith(prefix)) return false;
-          const cwd = data.slice(prefix.length);
-          reportCwd(cwd);
-          return true;
+          const cwdPrefix = "CurrentDir=";
+          if (data.startsWith(cwdPrefix)) {
+            const cwd = data.slice(cwdPrefix.length);
+            reportCwd(cwd);
+            return true;
+          }
+
+          const cmdPrefix = "Command=";
+          if (data.startsWith(cmdPrefix)) {
+            const cmd = data.slice(cmdPrefix.length);
+            reportCommand(cmd);
+            return true;
+          }
+
+          return false;
         }),
       );
     }
