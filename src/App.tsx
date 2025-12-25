@@ -24,6 +24,7 @@ type Session = SessionInfo & {
   persistId: string;
   createdAt: number;
   launchCommand: string | null;
+  restoreCommand?: string | null;
   cwd: string | null;
   effectId?: string | null;
   processTag?: string | null;
@@ -68,6 +69,7 @@ type PersistedSession = {
   projectId: string;
   name: string;
   launchCommand: string | null;
+  restoreCommand?: string | null;
   cwd: string | null;
   createdAt: number;
 };
@@ -107,6 +109,7 @@ function loadLegacyPersistedSessions(): PersistedSession[] {
         projectId: s.projectId,
         name: s.name,
         launchCommand: s.launchCommand,
+        restoreCommand: null,
         cwd: s.cwd ?? null,
         createdAt: s.createdAt,
       }));
@@ -172,6 +175,7 @@ async function createSession(input: {
   projectId: string;
   name?: string;
   launchCommand?: string | null;
+  restoreCommand?: string | null;
   cwd?: string | null;
   persistId?: string;
   createdAt?: number;
@@ -194,6 +198,7 @@ async function createSession(input: {
     persistId: input.persistId ?? makeId(),
     createdAt: input.createdAt ?? Date.now(),
     launchCommand,
+    restoreCommand: input.restoreCommand ?? null,
     cwd: info.cwd ?? input.cwd ?? null,
     effectId: effect?.id ?? null,
     processTag,
@@ -317,6 +322,7 @@ export default function App() {
         projectId: s.projectId,
         name: s.name,
         launchCommand: s.launchCommand,
+        restoreCommand: s.restoreCommand ?? null,
         cwd: s.cwd,
         createdAt: s.createdAt,
       }))
@@ -466,12 +472,20 @@ export default function App() {
     const trimmed = commandLine.trim();
     const effect = trimmed ? detectProcessEffect({ command: trimmed, name: null }) : null;
     const nextEffectId = effect?.id ?? null;
+    const nextRestoreCommand = effect ? trimmed : null;
 
     setSessions((prev) =>
       prev.map((s) => {
         if (s.id !== id) return s;
-        if (s.effectId === nextEffectId) return s;
-        return { ...s, effectId: nextEffectId, processTag: null };
+        if (s.effectId === nextEffectId && (s.restoreCommand ?? null) === nextRestoreCommand) {
+          return s;
+        }
+        return {
+          ...s,
+          effectId: nextEffectId,
+          restoreCommand: nextRestoreCommand,
+          processTag: null,
+        };
       }),
     );
   }
@@ -758,11 +772,21 @@ export default function App() {
             projectId: s.projectId,
             name: s.name,
             launchCommand: s.launchCommand,
+            restoreCommand: s.restoreCommand ?? null,
             cwd: s.cwd ?? projectById.get(s.projectId)?.basePath ?? resolvedHome ?? null,
             persistId: s.persistId,
             createdAt: s.createdAt,
           });
           restored.push(created);
+
+          const restoreCmd =
+            (s.launchCommand ? null : (s.restoreCommand ?? null))?.trim() ?? null;
+          if (restoreCmd) {
+            const singleLine = restoreCmd.replace(/\r?\n/g, " ");
+            void invoke("write_to_session", { id: created.id, data: `${singleLine}\n` }).catch(
+              () => {},
+            );
+          }
         } catch (err) {
           if (!cancelled) reportError("Failed to restore session", err);
         }

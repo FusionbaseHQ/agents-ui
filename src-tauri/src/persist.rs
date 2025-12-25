@@ -20,6 +20,7 @@ pub struct PersistedSessionV1 {
     pub project_id: String,
     pub name: String,
     pub launch_command: Option<String>,
+    pub restore_command: Option<String>,
     pub cwd: Option<String>,
     pub created_at: u64,
 }
