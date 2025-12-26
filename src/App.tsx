@@ -1713,8 +1713,12 @@ export default function App() {
                     <div className="sessionName">
                       <span className="sessionNameText">{s.name}</span>
                       {chipLabel && (
-                        <span className={chipClass}>
-                          <span className="chipLabel">{chipLabel}</span>
+                        <span className={chipClass} title={chipLabel}>
+                          {effect?.iconSrc ? (
+                            <img className="chipIcon" src={effect.iconSrc} alt={chipLabel} />
+                          ) : (
+                            <span className="chipLabel">{chipLabel}</span>
+                          )}
                           {isWorking && <span className="chipActivity" aria-label="Working" />}
                         </span>
                       )}

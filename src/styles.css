@@ -258,6 +258,13 @@ body {
   white-space: nowrap;
 }
 
+.chipIcon {
+  width: 16px;
+  height: 16px;
+  border-radius: 5px;
+  display: block;
+}
+
 .chipActivity {
   width: 6px;
   height: 6px;

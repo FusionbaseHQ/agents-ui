@@ -1,13 +1,17 @@
+import claudeIcon from "./assets/claude-code-icon.png";
+import codexIcon from "./assets/openai-codex-icon.png";
+
 export type ProcessEffect = {
   id: string;
   label: string;
   matchCommands: string[];
   idleAfterMs?: number;
+  iconSrc?: string;
 };
 
 export const PROCESS_EFFECTS: ProcessEffect[] = [
-  { id: "codex", label: "codex", matchCommands: ["codex"], idleAfterMs: 2000 },
-  { id: "claude", label: "claude", matchCommands: ["claude"], idleAfterMs: 2000 },
+  { id: "codex", label: "codex", matchCommands: ["codex"], idleAfterMs: 2000, iconSrc: codexIcon },
+  { id: "claude", label: "claude", matchCommands: ["claude"], idleAfterMs: 2000, iconSrc: claudeIcon },
 ];
 
 function normalizeCommandToken(token: string): string {
