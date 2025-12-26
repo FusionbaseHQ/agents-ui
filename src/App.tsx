@@ -63,6 +63,10 @@ function makeId(): string {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+function normalizeSmartQuotes(input: string): string {
+  return input.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+}
+
 function isValidEnvKey(key: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(key.trim());
 }
@@ -78,7 +82,8 @@ function unescapeDoubleQuotedEnvValue(input: string): string {
 
 function parseEnvContentToVars(content: string): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const rawLine of content.split(/\r?\n/)) {
+  const normalized = normalizeSmartQuotes(content);
+  for (const rawLine of normalized.split(/\r?\n/)) {
     let line = rawLine.trim();
     if (!line) continue;
     if (line.startsWith("#")) continue;
@@ -2493,7 +2498,7 @@ export default function App() {
                     <textarea
                       className="textarea"
                       value={environmentEditorContent}
-                      onChange={(e) => setEnvironmentEditorContent(e.target.value)}
+                      onChange={(e) => setEnvironmentEditorContent(normalizeSmartQuotes(e.target.value))}
                       placeholder={"KEY=value\n# Comments supported"}
                     />
                     <div className="hint" style={{ marginTop: 0 }}>

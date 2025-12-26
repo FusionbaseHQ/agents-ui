@@ -366,7 +366,7 @@ fn find_bundled_nu() -> Option<PathBuf> {
 }
 
 #[cfg(target_family = "unix")]
-fn ensure_nu_config(window: &WebviewWindow) -> Option<(String, String, String)> {
+fn ensure_nu_config(window: &WebviewWindow, env_keys: &[String]) -> Option<(String, String, String)> {
     let app_data = window.app_handle().path().app_data_dir().ok()?;
     let config_home = app_data.join("shell").join("xdg-config");
     let data_home = app_data.join("shell").join("xdg-data");
@@ -381,11 +381,11 @@ fn ensure_nu_config(window: &WebviewWindow) -> Option<(String, String, String)> 
     fs::create_dir_all(&nu_cache_dir).ok()?;
 
     let config_path = nu_config_dir.join("config.nu");
-    let config = r#"# Agents UI managed Nushell config
-
-$env.config = ($env.config | upsert show_banner false)
-
-$env.config = ($env.config | upsert hooks.pre_execution [
+    let mut config = String::new();
+    config.push_str("# Agents UI managed Nushell config\n\n");
+    config.push_str("$env.config = ($env.config | upsert show_banner false)\n\n");
+    config.push_str(
+        r#"$env.config = ($env.config | upsert hooks.pre_execution [
   {||
     let cleaned = (commandline | str trim | str replace --all (char newline) " ")
     let osc = (char --integer 27) + "]1337;Command=" + $cleaned + (char --integer 7)
@@ -409,7 +409,25 @@ $env.PROMPT_COMMAND = {||
 
 $env.PROMPT_INDICATOR = {|| "❯ " }
 $env.PROMPT_MULTILINE_INDICATOR = {|| "… " }
-"#;
+"#,
+    );
+
+    let mut keys: Vec<String> = env_keys
+        .iter()
+        .map(|k| k.trim().to_string())
+        .filter(|k| valid_env_key(k))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    if !keys.is_empty() {
+        config.push_str("\n# Agents UI injected env vars as variables\n");
+        for key in keys {
+            config.push_str(&format!(
+                "let {key} = ($env.{key}? | default \"\")\n",
+                key = key
+            ));
+        }
+    }
 
     let needs_write = match fs::read_to_string(&config_path) {
         Ok(existing) => existing != config,
@@ -529,6 +547,11 @@ pub fn create_session(
 
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
+    let env_keys: Vec<String> = env_vars
+        .as_ref()
+        .map(|vars| vars.keys().map(|k| k.trim().to_string()).collect())
+        .unwrap_or_default();
+
     if let Some(vars) = env_vars {
         for (k, v) in vars {
             let key = k.trim();
@@ -568,7 +591,8 @@ pub fn create_session(
 
     #[cfg(target_family = "unix")]
     if use_nu {
-        if let Some((xdg_config_home, xdg_data_home, xdg_cache_home)) = ensure_nu_config(&window) {
+        if let Some((xdg_config_home, xdg_data_home, xdg_cache_home)) = ensure_nu_config(&window, &env_keys)
+        {
             cmd.env("XDG_CONFIG_HOME", xdg_config_home);
             cmd.env("XDG_DATA_HOME", xdg_data_home);
             cmd.env("XDG_CACHE_HOME", xdg_cache_home);
