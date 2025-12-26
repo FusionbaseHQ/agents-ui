@@ -12,9 +12,8 @@ tauri-build = { version = "2", features = [] }
 portable-pty = "0.8.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
-

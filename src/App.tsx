@@ -346,6 +346,20 @@ export default function App() {
     }, 400);
   }, [projects, activeProjectId, activeSessionByProject, sessions, hydrated]);
 
+  const activeAgentCount = useMemo(() => {
+    return sessions.filter(
+      (s) => s.projectId === activeProjectId && Boolean(s.effectId) && !s.exited && !s.closing,
+    ).length;
+  }, [sessions, activeProjectId]);
+
+  const lastTrayCountRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!hydrated) return;
+    if (lastTrayCountRef.current === activeAgentCount) return;
+    lastTrayCountRef.current = activeAgentCount;
+    void invoke("set_tray_agent_count", { count: activeAgentCount }).catch(() => {});
+  }, [activeAgentCount, hydrated]);
+
   useEffect(() => {
     if (!newOpen) return;
     const base = activeProject?.basePath ?? homeDirRef.current ?? "";
