@@ -1697,6 +1697,7 @@ export default function App() {
               const isClosing = Boolean(s.closing);
               const effect = getProcessEffectById(s.effectId);
               const chipLabel = effect?.label ?? s.processTag ?? null;
+              const hasAgentIcon = Boolean(effect?.iconSrc);
               const isWorking = Boolean(effect && s.agentWorking && !isExited && !isClosing);
               const isRecording = Boolean(s.recordingActive && !isExited && !isClosing);
               const chipClass = effect ? `chip chip-${effect.id}` : "chip";
@@ -1711,14 +1712,19 @@ export default function App() {
                   <div className={`dot ${isActive ? "dotActive" : ""}`} />
                   <div className="sessionMeta">
                     <div className="sessionName">
+                      {hasAgentIcon && chipLabel && effect?.iconSrc && (
+                        <span
+                          className={`agentBadge chip-${effect.id} ${isWorking ? "agentBadgeWorking" : ""}`}
+                          title={chipLabel}
+                        >
+                          <img className="agentIcon" src={effect.iconSrc} alt={chipLabel} />
+                          <span className="chipActivity" aria-label="Working" />
+                        </span>
+                      )}
                       <span className="sessionNameText">{s.name}</span>
-                      {chipLabel && (
+                      {chipLabel && !hasAgentIcon && (
                         <span className={chipClass} title={chipLabel}>
-                          {effect?.iconSrc ? (
-                            <img className="chipIcon" src={effect.iconSrc} alt={chipLabel} />
-                          ) : (
-                            <span className="chipLabel">{chipLabel}</span>
-                          )}
+                          <span className="chipLabel">{chipLabel}</span>
                           {isWorking && <span className="chipActivity" aria-label="Working" />}
                         </span>
                       )}

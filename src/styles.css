@@ -258,11 +258,40 @@ body {
   white-space: nowrap;
 }
 
-.chipIcon {
-  width: 16px;
-  height: 16px;
-  border-radius: 5px;
+.agentBadge {
+  position: relative;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.agentBadge.chip-codex,
+.agentBadge.chip-claude {
+  border: none;
+  background: transparent;
+  padding: 0;
+}
+
+.agentIcon {
+  width: 18px;
+  height: 18px;
   display: block;
+}
+
+.agentBadge .chipActivity {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  opacity: 0;
+  box-shadow: 0 0 0 2px rgba(11, 15, 20, 0.9);
+  pointer-events: none;
+}
+
+.agentBadgeWorking .chipActivity {
+  opacity: 1;
 }
 
 .chipActivity {
