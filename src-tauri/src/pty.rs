@@ -35,6 +35,7 @@ struct SessionRecording {
     started_at: Instant,
     last_flush: Instant,
     unflushed_bytes: usize,
+    input_buffer: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -64,8 +65,7 @@ fn now_epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn record_user_input(rec: &mut SessionRecording, data: &str) -> Result<(), String> {
-    let t = rec.started_at.elapsed().as_millis() as u64;
+fn write_recording_event(rec: &mut SessionRecording, t: u64, data: &str) -> Result<(), String> {
     let line = crate::recording::RecordingLineV1::Input(crate::recording::RecordingEventV1 {
         t,
         data: data.to_string(),
@@ -74,11 +74,106 @@ fn record_user_input(rec: &mut SessionRecording, data: &str) -> Result<(), Strin
     rec.writer
         .write_all(json.as_bytes())
         .map_err(|e| format!("write failed: {e}"))?;
-    rec.writer.write_all(b"\n").map_err(|e| format!("write failed: {e}"))?;
+    rec.writer
+        .write_all(b"\n")
+        .map_err(|e| format!("write failed: {e}"))?;
     rec.unflushed_bytes += json.len() + 1;
+    Ok(())
+}
 
-    let should_flush = data.contains('\n')
-        || data.contains('\r')
+fn skip_csi(iter: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(ch) = iter.next() {
+        // CSI sequence terminator is any byte in 0x40..=0x7E.
+        if ('@'..='~').contains(&ch) {
+            break;
+        }
+    }
+}
+
+fn skip_until_st(iter: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(ch) = iter.next() {
+        if ch == '\u{1b}' {
+            if let Some('\\') = iter.peek().copied() {
+                iter.next();
+                break;
+            }
+        }
+    }
+}
+
+fn skip_osc(iter: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(ch) = iter.next() {
+        if ch == '\u{7}' {
+            break;
+        }
+        if ch == '\u{1b}' {
+            if let Some('\\') = iter.peek().copied() {
+                iter.next();
+                break;
+            }
+        }
+    }
+}
+
+fn skip_escape_sequence(iter: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match iter.peek().copied() {
+        Some('[') => {
+            iter.next();
+            skip_csi(iter);
+        }
+        Some(']') => {
+            iter.next();
+            skip_osc(iter);
+        }
+        Some('P') | Some('^') | Some('_') => {
+            iter.next();
+            skip_until_st(iter);
+        }
+        Some(_) => {
+            // Unknown single-char escape sequence.
+            iter.next();
+        }
+        None => {}
+    }
+}
+
+fn record_user_input(rec: &mut SessionRecording, data: &str) -> Result<(), String> {
+    let t = rec.started_at.elapsed().as_millis() as u64;
+    let mut wrote_any = false;
+
+    let mut iter = data.chars().peekable();
+    while let Some(ch) = iter.next() {
+        match ch {
+            '\r' => {
+                // Treat CRLF as a single enter.
+                if iter.peek().copied() == Some('\n') {
+                    iter.next();
+                }
+                let mut line = std::mem::take(&mut rec.input_buffer);
+                line.push('\r');
+                write_recording_event(rec, t, &line)?;
+                wrote_any = true;
+            }
+            '\n' => {
+                let mut line = std::mem::take(&mut rec.input_buffer);
+                line.push('\n');
+                write_recording_event(rec, t, &line)?;
+                wrote_any = true;
+            }
+            '\u{7f}' | '\u{8}' => {
+                rec.input_buffer.pop();
+            }
+            '\u{15}' => {
+                rec.input_buffer.clear();
+            }
+            '\t' => {}
+            '\u{1b}' => skip_escape_sequence(&mut iter),
+            c if c.is_control() => {}
+            c => rec.input_buffer.push(c),
+        }
+    }
+
+    let should_flush = wrote_any
         || rec.unflushed_bytes >= 16 * 1024
         || rec.last_flush.elapsed().as_millis() >= 1500;
     if should_flush {
@@ -601,9 +696,12 @@ pub fn start_session_recording(
     state: State<'_, AppState>,
     id: String,
     recording_id: String,
+    recording_name: Option<String>,
     project_id: String,
     session_persist_id: String,
     cwd: Option<String>,
+    effect_id: Option<String>,
+    bootstrap_command: Option<String>,
 ) -> Result<String, String> {
     let safe_id = crate::recording::sanitize_recording_id(&recording_id);
 
@@ -630,12 +728,25 @@ pub fn start_session_recording(
         .map_err(|e| format!("open failed: {e}"))?;
 
     let mut writer = BufWriter::new(file);
+    let recording_name = recording_name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(120).collect());
+    let effect_id = effect_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let bootstrap_command = bootstrap_command
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let meta = crate::recording::RecordingMetaV1 {
         schema_version: 1,
         created_at: now_epoch_ms(),
+        name: recording_name,
         project_id,
         session_persist_id,
         cwd,
+        effect_id,
+        bootstrap_command,
     };
     let line = crate::recording::RecordingLineV1::Meta(meta);
     let json = serde_json::to_string(&line).map_err(|e| format!("serialize failed: {e}"))?;
@@ -651,6 +762,7 @@ pub fn start_session_recording(
         started_at: Instant::now(),
         last_flush: Instant::now(),
         unflushed_bytes: 0,
+        input_buffer: String::new(),
     });
 
     Ok(safe_id)

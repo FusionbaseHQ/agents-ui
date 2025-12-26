@@ -8,7 +8,7 @@ use pty::{
     stop_session_recording, write_to_session, AppState,
 };
 use persist::{list_directories, load_persisted_state, save_persisted_state, validate_directory};
-use recording::load_recording;
+use recording::{delete_recording, list_recordings, load_recording};
 use tray::{build_status_tray, set_tray_agent_count};
 use tauri::Manager;
 
@@ -36,6 +36,8 @@ fn main() {
             validate_directory,
             list_directories,
             load_recording,
+            list_recordings,
+            delete_recording,
             set_tray_agent_count
         ])
         .run(tauri::generate_context!())

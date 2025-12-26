@@ -92,9 +92,12 @@ type DirectoryListing = { path: string; parent: string | null; entries: Director
 type RecordingMeta = {
   schemaVersion: number;
   createdAt: number;
+  name?: string | null;
   projectId: string;
   sessionPersistId: string;
   cwd: string | null;
+  effectId?: string | null;
+  bootstrapCommand?: string | null;
 };
 
 type RecordingEvent = { t: number; data: string };
@@ -103,6 +106,11 @@ type LoadedRecording = {
   recordingId: string;
   meta: RecordingMeta | null;
   events: RecordingEvent[];
+};
+
+type RecordingIndexEntry = {
+  recordingId: string;
+  meta: RecordingMeta | null;
 };
 
 function loadLegacyPersistedSessions(): PersistedSession[] {
@@ -264,6 +272,13 @@ export default function App() {
   const [replaySteps, setReplaySteps] = useState<string[]>([]);
   const [replayIndex, setReplayIndex] = useState(0);
   const [replayTargetSessionId, setReplayTargetSessionId] = useState<string | null>(null);
+  const [recordPromptOpen, setRecordPromptOpen] = useState(false);
+  const [recordPromptName, setRecordPromptName] = useState("");
+  const [recordPromptSessionId, setRecordPromptSessionId] = useState<string | null>(null);
+  const [recordingsOpen, setRecordingsOpen] = useState(false);
+  const [recordingsLoading, setRecordingsLoading] = useState(false);
+  const [recordingsError, setRecordingsError] = useState<string | null>(null);
+  const [recordings, setRecordings] = useState<RecordingIndexEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const registry = useRef<TerminalRegistry>(new Map());
@@ -275,6 +290,7 @@ export default function App() {
   const activeProjectIdRef = useRef<string>(activeProjectId);
   const lastActiveByProject = useRef<Map<string, string>>(new Map());
   const newNameRef = useRef<HTMLInputElement | null>(null);
+  const recordNameRef = useRef<HTMLInputElement | null>(null);
   const projectTitleRef = useRef<HTMLInputElement | null>(null);
   const homeDirRef = useRef<string | null>(null);
   const saveTimerRef = useRef<number | null>(null);
@@ -450,18 +466,36 @@ export default function App() {
     }, 0);
   }, [projectOpen]);
 
+  useEffect(() => {
+    if (!hydrated) return;
+    void refreshRecordings();
+  }, [hydrated]);
+
 	  useEffect(() => {
 	    const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
 	    const onKeyDown = (e: KeyboardEvent) => {
-	      if (e.key === "Escape" && (newOpen || projectOpen || pathPickerOpen || confirmDeleteProjectOpen || replayOpen)) {
+        const modalOpen =
+          newOpen ||
+          projectOpen ||
+          pathPickerOpen ||
+          confirmDeleteProjectOpen ||
+          replayOpen ||
+          recordPromptOpen ||
+          recordingsOpen;
+
+	      if (e.key === "Escape" && modalOpen) {
 	        e.preventDefault();
 	        setNewOpen(false);
 	        setProjectOpen(false);
 	        setPathPickerOpen(false);
 	        setConfirmDeleteProjectOpen(false);
+          closeRecordPrompt();
+          setRecordingsOpen(false);
 	        closeReplayModal();
 	        return;
 	      }
+
+        if (modalOpen) return;
 
       const activeProjectId = activeProjectIdRef.current;
       const sessions = sessionsRef.current.filter((s) => s.projectId === activeProjectId);
@@ -515,7 +549,15 @@ export default function App() {
 
 	    window.addEventListener("keydown", onKeyDown);
 	    return () => window.removeEventListener("keydown", onKeyDown);
-	  }, [newOpen, projectOpen, pathPickerOpen, confirmDeleteProjectOpen, replayOpen]);
+	  }, [
+      newOpen,
+      projectOpen,
+      pathPickerOpen,
+      confirmDeleteProjectOpen,
+      replayOpen,
+      recordPromptOpen,
+      recordingsOpen,
+    ]);
 
   function formatError(err: unknown): string {
     if (err instanceof Error) return err.message;
@@ -531,11 +573,21 @@ export default function App() {
     setError(`${prefix}: ${formatError(err)}`);
   }
 
+  function sanitizeRecordedInputForReplay(input: string): string {
+    // Remove common ANSI/terminal control sequences; recordings should be replayable as plain input.
+    let out = input;
+    out = out.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+    out = out.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, "");
+    out = out.replace(/\x1bP[\s\S]*?\x1b\\/g, "");
+    out = out.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+    return out;
+  }
+
   function splitRecordingIntoSteps(events: RecordingEvent[]): string[] {
     const steps: string[] = [];
     let buffer = "";
     for (const ev of events) {
-      buffer += ev.data;
+      buffer += sanitizeRecordedInputForReplay(ev.data);
       while (true) {
         const r = buffer.indexOf("\r");
         const n = buffer.indexOf("\n");
@@ -549,19 +601,62 @@ export default function App() {
     return steps;
   }
 
-  async function startRecording(sessionId: string) {
+  async function refreshRecordings() {
+    setRecordingsLoading(true);
+    setRecordingsError(null);
+    try {
+      const list = await invoke<RecordingIndexEntry[]>("list_recordings");
+      setRecordings(list);
+    } catch (err) {
+      setRecordingsError(formatError(err));
+    } finally {
+      setRecordingsLoading(false);
+    }
+  }
+
+  function defaultRecordingName(s: Session): string {
+    const effect = getProcessEffectById(s.effectId);
+    const base = effect?.label ?? s.name ?? "recording";
+    const when = new Date().toISOString().slice(0, 16).replace("T", " ");
+    return `${base} ${when}`;
+  }
+
+  function openRecordPrompt(sessionId: string) {
+    const s = sessionsRef.current.find((s) => s.id === sessionId);
+    if (!s) return;
+    setRecordPromptSessionId(sessionId);
+    setRecordPromptName(defaultRecordingName(s));
+    setRecordPromptOpen(true);
+    window.setTimeout(() => recordNameRef.current?.focus(), 0);
+  }
+
+  function closeRecordPrompt() {
+    setRecordPromptOpen(false);
+    setRecordPromptSessionId(null);
+    setRecordPromptName("");
+  }
+
+  async function startRecording(sessionId: string, name: string) {
     const s = sessionsRef.current.find((s) => s.id === sessionId);
     if (!s) return;
     if (s.recordingActive) return;
 
     try {
       const recordingId = makeId();
+      const effect = getProcessEffectById(s.effectId);
+      const bootstrapCommand =
+        (s.launchCommand ?? null) ||
+        (s.restoreCommand?.trim() ? s.restoreCommand.trim() : null) ||
+        (effect?.matchCommands?.[0] ?? null);
       const safeId = await invoke<string>("start_session_recording", {
         id: s.id,
         recordingId,
+        recordingName: name,
         projectId: s.projectId,
         sessionPersistId: s.persistId,
         cwd: s.cwd,
+        effectId: s.effectId ?? null,
+        bootstrapCommand,
       });
       setSessions((prev) =>
         prev.map((x) =>
@@ -570,6 +665,7 @@ export default function App() {
             : x,
         ),
       );
+      void refreshRecordings();
     } catch (err) {
       reportError("Failed to start recording", err);
     }
@@ -601,8 +697,7 @@ export default function App() {
     setReplayTargetSessionId(null);
   }
 
-  async function openReplayForActive() {
-    if (!active?.lastRecordingId) return;
+  async function openReplay(recordingId: string) {
     setReplayOpen(true);
     setReplayLoading(true);
     setReplayError(null);
@@ -613,7 +708,7 @@ export default function App() {
 
     try {
       const rec = await invoke<LoadedRecording>("load_recording", {
-        recordingId: active.lastRecordingId,
+        recordingId,
       });
       setReplayRecording(rec);
       setReplaySteps(splitRecordingIntoSteps(rec.events));
@@ -621,6 +716,29 @@ export default function App() {
       setReplayError(formatError(err));
     } finally {
       setReplayLoading(false);
+    }
+  }
+
+  async function openReplayForActive() {
+    if (!active?.lastRecordingId) return;
+    await openReplay(active.lastRecordingId);
+  }
+
+  async function deleteRecording(recordingId: string) {
+    if (!window.confirm("Delete this recording?")) return;
+    try {
+      await invoke("delete_recording", { recordingId });
+      setRecordings((prev) => prev.filter((r) => r.recordingId !== recordingId));
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.lastRecordingId === recordingId ? { ...s, lastRecordingId: null } : s,
+        ),
+      );
+      if (replayRecording?.recordingId === recordingId) {
+        closeReplayModal();
+      }
+    } catch (err) {
+      reportError("Failed to delete recording", err);
     }
   }
 
@@ -633,11 +751,23 @@ export default function App() {
       (rec?.meta?.projectId && projects.some((p) => p.id === rec.meta?.projectId)
         ? rec.meta.projectId
         : null) ?? activeProjectId;
+    const bootstrapCommand = (() => {
+      const fromMeta = rec?.meta?.bootstrapCommand?.trim() ?? "";
+      if (fromMeta) return fromMeta;
+      const effect = getProcessEffectById(rec?.meta?.effectId ?? null);
+      return effect?.matchCommands?.[0] ?? null;
+    })();
+    const name = rec?.meta?.name?.trim()
+      ? `replay: ${rec.meta.name.trim()}`
+      : bootstrapCommand
+        ? `replay ${bootstrapCommand}`
+        : "replay";
 
     try {
       const created = await createSession({
         projectId,
-        name: "replay",
+        name,
+        launchCommand: bootstrapCommand,
         cwd,
       });
       setSessions((prev) => [...prev, created]);
@@ -1349,12 +1479,22 @@ export default function App() {
                 <button
                   className={`btnSmall ${active.recordingActive ? "btnRecording" : ""}`}
                   onClick={() =>
-                    active.recordingActive ? void stopRecording(active.id) : void startRecording(active.id)
+                    active.recordingActive ? void stopRecording(active.id) : openRecordPrompt(active.id)
                   }
                   disabled={Boolean(active.exited || active.closing)}
                   title={active.recordingActive ? "Stop recording" : "Start recording"}
                 >
                   {active.recordingActive ? "Stop" : "Record"}
+                </button>
+                <button
+                  className="btnSmall"
+                  onClick={() => {
+                    setRecordingsOpen(true);
+                    void refreshRecordings();
+                  }}
+                  title="Browse recordings"
+                >
+                  Recordings
                 </button>
                 <button
                   className="btnSmall"
@@ -1681,6 +1821,130 @@ export default function App() {
             </div>
           )}
 
+          {recordPromptOpen && (
+            <div className="modalBackdrop" onClick={closeRecordPrompt}>
+              <div className="modal" onClick={(e) => e.stopPropagation()}>
+                <h3 className="modalTitle">Start recording</h3>
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const name = recordPromptName.trim();
+                    if (!recordPromptSessionId || !name) return;
+                    void startRecording(recordPromptSessionId, name);
+                    closeRecordPrompt();
+                  }}
+                >
+                  <div className="formRow">
+                    <div className="label">Name</div>
+                    <input
+                      ref={recordNameRef}
+                      className="input"
+                      value={recordPromptName}
+                      onChange={(e) => setRecordPromptName(e.target.value)}
+                      placeholder="e.g. Fix failing tests"
+                    />
+                    <div className="hint" style={{ marginTop: 0 }}>
+                      Records only your input. Replay is manual step-by-step.
+                    </div>
+                  </div>
+                  <div className="modalActions">
+                    <button type="button" className="btn" onClick={closeRecordPrompt}>
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      className="btn"
+                      disabled={!recordPromptSessionId || !recordPromptName.trim()}
+                    >
+                      Start
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {recordingsOpen && (
+            <div className="modalBackdrop" onClick={() => setRecordingsOpen(false)}>
+              <div className="modal recordingsModal" onClick={(e) => e.stopPropagation()}>
+                <h3 className="modalTitle">Recordings</h3>
+
+                {recordingsError && (
+                  <div className="pathPickerError" role="alert">
+                    {recordingsError}
+                  </div>
+                )}
+
+                <div className="recordingsList">
+                  {recordingsLoading ? (
+                    <div className="empty">Loading…</div>
+                  ) : recordings.length === 0 ? (
+                    <div className="empty">No recordings yet.</div>
+                  ) : (
+                    recordings.map((r) => {
+                      const meta = r.meta;
+                      const displayName = meta?.name?.trim() || r.recordingId;
+                      const projectTitle =
+                        (meta?.projectId
+                          ? projects.find((p) => p.id === meta.projectId)?.title
+                          : null) ?? "Unknown project";
+                      const effectLabel = getProcessEffectById(meta?.effectId)?.label ?? null;
+                      const when = meta?.createdAt ? new Date(meta.createdAt).toLocaleString() : null;
+                      const cwd = meta?.cwd ? shortenPathSmart(meta.cwd, 52) : null;
+                      return (
+                        <div key={r.recordingId} className="recordingItem">
+                          <div className="recordingMain">
+                            <div className="recordingName" title={displayName}>
+                              {displayName}
+                            </div>
+                            <div className="recordingMeta">
+                              {[when, projectTitle, effectLabel, cwd].filter(Boolean).join(" • ")}
+                            </div>
+                          </div>
+                          <div className="recordingActions">
+                            <button
+                              type="button"
+                              className="btnSmall"
+                              onClick={() => {
+                                setRecordingsOpen(false);
+                                void openReplay(r.recordingId);
+                              }}
+                              title="View / replay"
+                            >
+                              Open
+                            </button>
+                            <button
+                              type="button"
+                              className="btnSmall"
+                              onClick={() => void deleteRecording(r.recordingId)}
+                              title="Delete recording"
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+
+                <div className="modalActions">
+                  <button type="button" className="btn" onClick={() => setRecordingsOpen(false)}>
+                    Close
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => void refreshRecordings()}
+                    disabled={recordingsLoading}
+                  >
+                    Refresh
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
           {replayOpen && (
             <div className="modalBackdrop" onClick={closeReplayModal}>
               <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -1697,11 +1961,24 @@ export default function App() {
                 ) : replayRecording ? (
                   <>
                     <div className="hint" style={{ marginTop: 0 }}>
-                      {replayRecording.meta?.cwd
-                        ? `CWD: ${shortenPathSmart(replayRecording.meta.cwd, 64)}`
-                        : "CWD: —"}
-                      {" • "}
-                      {replayIndex}/{replaySteps.length} steps sent
+                      {(() => {
+                        const parts: string[] = [];
+                        parts.push(
+                          replayRecording.meta?.cwd
+                            ? `CWD: ${shortenPathSmart(replayRecording.meta.cwd, 64)}`
+                            : "CWD: —",
+                        );
+                        if (replayRecording.meta?.name?.trim()) {
+                          parts.push(`Name: ${replayRecording.meta.name.trim()}`);
+                        }
+                        const boot =
+                          replayRecording.meta?.bootstrapCommand?.trim() ||
+                          getProcessEffectById(replayRecording.meta?.effectId)?.matchCommands?.[0] ||
+                          null;
+                        if (boot) parts.push(`Boot: ${boot}`);
+                        parts.push(`${replayIndex}/${replaySteps.length} steps sent`);
+                        return parts.join(" • ");
+                      })()}
                     </div>
 
                     <div className="formRow" style={{ marginBottom: 0 }}>
