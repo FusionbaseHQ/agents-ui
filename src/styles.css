@@ -624,6 +624,32 @@ body {
   border-color: rgba(122, 162, 247, 0.5);
 }
 
+.textarea {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+  padding: 10px 12px;
+  border-radius: 12px;
+  outline: none;
+  resize: vertical;
+  min-height: 180px;
+  font-family:
+    ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Monaco,
+    Consolas,
+    "Liberation Mono",
+    "Courier New",
+    monospace;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.textarea:focus {
+  border-color: rgba(122, 162, 247, 0.5);
+}
+
 .modalActions {
   display: flex;
   justify-content: flex-end;

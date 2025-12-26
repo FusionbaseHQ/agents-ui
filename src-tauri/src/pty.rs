@@ -65,6 +65,24 @@ fn now_epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn valid_env_key(key: &str) -> bool {
+    let trimmed = key.trim();
+    let mut chars = trimmed.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    for c in chars {
+        if !(c == '_' || c.is_ascii_alphanumeric()) {
+            return false;
+        }
+    }
+    true
+}
+
 fn write_recording_event(rec: &mut SessionRecording, t: u64, data: &str) -> Result<(), String> {
     let line = crate::recording::RecordingLineV1::Input(crate::recording::RecordingEventV1 {
         t,
@@ -435,6 +453,7 @@ pub fn create_session(
     cwd: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
+    env_vars: Option<HashMap<String, String>>,
 ) -> Result<SessionInfo, String> {
     #[cfg(target_family = "unix")]
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -510,6 +529,15 @@ pub fn create_session(
 
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
+    if let Some(vars) = env_vars {
+        for (k, v) in vars {
+            let key = k.trim();
+            if !valid_env_key(key) {
+                continue;
+            }
+            cmd.env(key, v);
+        }
+    }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
 

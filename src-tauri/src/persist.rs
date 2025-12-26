@@ -11,6 +11,7 @@ pub struct PersistedProjectV1 {
     pub id: String,
     pub title: String,
     pub base_path: Option<String>,
+    pub environment_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -28,12 +29,34 @@ pub struct PersistedSessionV1 {
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct PersistedPromptV1 {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub created_at: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedEnvironmentV1 {
+    pub id: String,
+    pub name: String,
+    pub content: String,
+    pub created_at: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct PersistedStateV1 {
     pub schema_version: u32,
     pub projects: Vec<PersistedProjectV1>,
     pub active_project_id: String,
     pub sessions: Vec<PersistedSessionV1>,
     pub active_session_by_project: HashMap<String, String>,
+    #[serde(default)]
+    pub prompts: Vec<PersistedPromptV1>,
+    #[serde(default)]
+    pub environments: Vec<PersistedEnvironmentV1>,
 }
 
 fn state_file_path(window: &WebviewWindow) -> Result<PathBuf, String> {

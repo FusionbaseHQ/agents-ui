@@ -10,6 +10,7 @@ type Project = {
   id: string;
   title: string;
   basePath: string | null;
+  environmentId: string | null;
 };
 
 type SessionInfo = {
@@ -62,9 +63,82 @@ function makeId(): string {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+function isValidEnvKey(key: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(key.trim());
+}
+
+function unescapeDoubleQuotedEnvValue(input: string): string {
+  return input
+    .replace(/\\\\/g, "\\")
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\r")
+    .replace(/\\t/g, "\t")
+    .replace(/\\"/g, '"');
+}
+
+function parseEnvContentToVars(content: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const rawLine of content.split(/\r?\n/)) {
+    let line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith("#")) continue;
+    if (line.startsWith("export ")) line = line.slice("export ".length).trim();
+
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    if (!isValidEnvKey(key)) continue;
+
+    let value = line.slice(eq + 1).trim();
+    if (!value) {
+      out[key] = "";
+      continue;
+    }
+
+    const first = value[0];
+    const last = value[value.length - 1];
+    const isDouble = first === '"' && last === '"';
+    const isSingle = first === "'" && last === "'";
+    if (isDouble || isSingle) {
+      value = value.slice(1, -1);
+      if (isDouble) value = unescapeDoubleQuotedEnvValue(value);
+      out[key] = value;
+      continue;
+    }
+
+    // Strip trailing comments for unquoted values when preceded by whitespace.
+    for (let i = 0; i < value.length; i++) {
+      if (value[i] !== "#") continue;
+      if (i === 0 || /\s/.test(value[i - 1])) {
+        value = value.slice(0, i).trimEnd();
+        break;
+      }
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+function envVarsForProjectId(
+  projectId: string,
+  projects: Project[],
+  environments: EnvironmentConfig[],
+): Record<string, string> | null {
+  const project = projects.find((p) => p.id === projectId) ?? null;
+  const envId = project?.environmentId ?? null;
+  if (!envId) return null;
+  const env = environments.find((e) => e.id === envId) ?? null;
+  if (!env) return null;
+  const vars = parseEnvContentToVars(env.content);
+  return Object.keys(vars).length ? vars : null;
+}
+
 function defaultProjectState(): { projects: Project[]; activeProjectId: string } {
   const id = makeId();
-  return { projects: [{ id, title: "Default", basePath: null }], activeProjectId: id };
+  return {
+    projects: [{ id, title: "Default", basePath: null, environmentId: null }],
+    activeProjectId: id,
+  };
 }
 
 type PersistedSession = {
@@ -84,10 +158,26 @@ type PersistedStateV1 = {
   activeProjectId: string;
   sessions: PersistedSession[];
   activeSessionByProject: Record<string, string>;
+  prompts?: Prompt[];
+  environments?: EnvironmentConfig[];
 };
 
 type DirectoryEntry = { name: string; path: string };
 type DirectoryListing = { path: string; parent: string | null; entries: DirectoryEntry[] };
+
+type Prompt = {
+  id: string;
+  title: string;
+  content: string;
+  createdAt: number;
+};
+
+type EnvironmentConfig = {
+  id: string;
+  name: string;
+  content: string;
+  createdAt: number;
+};
 
 type RecordingMeta = {
   schemaVersion: number;
@@ -177,7 +267,7 @@ function loadLegacyProjectState(): { projects: Project[]; activeProjectId: strin
               typeof (p as { id?: unknown }).id === "string" &&
               typeof (p as { title?: unknown }).title === "string",
           )
-          .map((p) => ({ id: p.id, title: p.title, basePath: null }));
+          .map((p) => ({ id: p.id, title: p.title, basePath: null, environmentId: null }));
       }
     }
   } catch {
@@ -207,6 +297,7 @@ async function createSession(input: {
   restoreCommand?: string | null;
   lastRecordingId?: string | null;
   cwd?: string | null;
+  envVars?: Record<string, string> | null;
   persistId?: string;
   createdAt?: number;
 }): Promise<Session> {
@@ -221,6 +312,7 @@ async function createSession(input: {
     name: input.name ?? null,
     command: launchCommand,
     cwd: input.cwd ?? null,
+    envVars: input.envVars ?? null,
   });
   return {
     ...info,
@@ -248,6 +340,8 @@ export default function App() {
   const [activeSessionByProject, setActiveSessionByProject] = useState<Record<string, string>>({});
 
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [prompts, setPrompts] = useState<Prompt[]>([]);
+  const [environments, setEnvironments] = useState<EnvironmentConfig[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
   const [newOpen, setNewOpen] = useState(false);
@@ -258,6 +352,7 @@ export default function App() {
   const [projectMode, setProjectMode] = useState<"new" | "rename">("new");
   const [projectTitle, setProjectTitle] = useState("");
   const [projectBasePath, setProjectBasePath] = useState("");
+  const [projectEnvironmentId, setProjectEnvironmentId] = useState<string>("");
   const [confirmDeleteProjectOpen, setConfirmDeleteProjectOpen] = useState(false);
   const [pathPickerOpen, setPathPickerOpen] = useState(false);
   const [pathPickerTarget, setPathPickerTarget] = useState<"project" | "session" | null>(null);
@@ -272,6 +367,7 @@ export default function App() {
   const [replaySteps, setReplaySteps] = useState<string[]>([]);
   const [replayIndex, setReplayIndex] = useState(0);
   const [replayTargetSessionId, setReplayTargetSessionId] = useState<string | null>(null);
+  const [replayShowAll, setReplayShowAll] = useState(false);
   const [recordPromptOpen, setRecordPromptOpen] = useState(false);
   const [recordPromptName, setRecordPromptName] = useState("");
   const [recordPromptSessionId, setRecordPromptSessionId] = useState<string | null>(null);
@@ -279,6 +375,16 @@ export default function App() {
   const [recordingsLoading, setRecordingsLoading] = useState(false);
   const [recordingsError, setRecordingsError] = useState<string | null>(null);
   const [recordings, setRecordings] = useState<RecordingIndexEntry[]>([]);
+  const [promptsOpen, setPromptsOpen] = useState(false);
+  const [promptEditorOpen, setPromptEditorOpen] = useState(false);
+  const [promptEditorId, setPromptEditorId] = useState<string | null>(null);
+  const [promptEditorTitle, setPromptEditorTitle] = useState("");
+  const [promptEditorContent, setPromptEditorContent] = useState("");
+  const [environmentsOpen, setEnvironmentsOpen] = useState(false);
+  const [environmentEditorOpen, setEnvironmentEditorOpen] = useState(false);
+  const [environmentEditorId, setEnvironmentEditorId] = useState<string | null>(null);
+  const [environmentEditorName, setEnvironmentEditorName] = useState("");
+  const [environmentEditorContent, setEnvironmentEditorContent] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const registry = useRef<TerminalRegistry>(new Map());
@@ -291,6 +397,8 @@ export default function App() {
   const lastActiveByProject = useRef<Map<string, string>>(new Map());
   const newNameRef = useRef<HTMLInputElement | null>(null);
   const recordNameRef = useRef<HTMLInputElement | null>(null);
+  const promptTitleRef = useRef<HTMLInputElement | null>(null);
+  const envNameRef = useRef<HTMLInputElement | null>(null);
   const projectTitleRef = useRef<HTMLInputElement | null>(null);
   const homeDirRef = useRef<string | null>(null);
   const saveTimerRef = useRef<number | null>(null);
@@ -424,6 +532,8 @@ export default function App() {
       activeProjectId,
       sessions: persistedSessions,
       activeSessionByProject,
+      prompts,
+      environments,
     };
 
     saveTimerRef.current = window.setTimeout(() => {
@@ -434,7 +544,7 @@ export default function App() {
         reportError("Failed to save state", err);
       });
     }, 400);
-  }, [projects, activeProjectId, activeSessionByProject, sessions, hydrated]);
+  }, [projects, activeProjectId, activeSessionByProject, sessions, prompts, environments, hydrated]);
 
   const activeAgentCount = useMemo(() => {
     return sessions.filter(
@@ -481,18 +591,60 @@ export default function App() {
           confirmDeleteProjectOpen ||
           replayOpen ||
           recordPromptOpen ||
-          recordingsOpen;
+          recordingsOpen ||
+          promptsOpen ||
+          promptEditorOpen ||
+          environmentsOpen ||
+          environmentEditorOpen;
 
 	      if (e.key === "Escape" && modalOpen) {
 	        e.preventDefault();
-	        setNewOpen(false);
-	        setProjectOpen(false);
-	        setPathPickerOpen(false);
-	        setConfirmDeleteProjectOpen(false);
-          closeRecordPrompt();
-          setRecordingsOpen(false);
-	        closeReplayModal();
-	        return;
+          if (environmentEditorOpen) {
+            setEnvironmentEditorOpen(false);
+            return;
+          }
+          if (environmentsOpen) {
+            setEnvironmentsOpen(false);
+            return;
+          }
+          if (promptEditorOpen) {
+            setPromptEditorOpen(false);
+            return;
+          }
+          if (promptsOpen) {
+            setPromptsOpen(false);
+            return;
+          }
+          if (recordingsOpen) {
+            setRecordingsOpen(false);
+            return;
+          }
+          if (recordPromptOpen) {
+            closeRecordPrompt();
+            return;
+          }
+          if (replayOpen) {
+            closeReplayModal();
+            return;
+          }
+          if (pathPickerOpen) {
+            setPathPickerOpen(false);
+            setPathPickerTarget(null);
+            return;
+          }
+          if (confirmDeleteProjectOpen) {
+            setConfirmDeleteProjectOpen(false);
+            return;
+          }
+          if (projectOpen) {
+            setProjectOpen(false);
+            return;
+          }
+          if (newOpen) {
+            setNewOpen(false);
+            return;
+          }
+          return;
 	      }
 
         if (modalOpen) return;
@@ -557,6 +709,10 @@ export default function App() {
       replayOpen,
       recordPromptOpen,
       recordingsOpen,
+      promptsOpen,
+      promptEditorOpen,
+      environmentsOpen,
+      environmentEditorOpen,
     ]);
 
   function formatError(err: unknown): string {
@@ -695,9 +851,10 @@ export default function App() {
     setReplaySteps([]);
     setReplayIndex(0);
     setReplayTargetSessionId(null);
+    setReplayShowAll(false);
   }
 
-  async function openReplay(recordingId: string) {
+  async function openReplay(recordingId: string, mode: "step" | "all" = "step") {
     setReplayOpen(true);
     setReplayLoading(true);
     setReplayError(null);
@@ -705,6 +862,7 @@ export default function App() {
     setReplaySteps([]);
     setReplayIndex(0);
     setReplayTargetSessionId(null);
+    setReplayShowAll(mode === "all");
 
     try {
       const rec = await invoke<LoadedRecording>("load_recording", {
@@ -742,6 +900,102 @@ export default function App() {
     }
   }
 
+  function openPromptEditor(prompt?: Prompt) {
+    setPromptsOpen(false);
+    setPromptEditorId(prompt?.id ?? null);
+    setPromptEditorTitle(prompt?.title ?? "");
+    setPromptEditorContent(prompt?.content ?? "");
+    setPromptEditorOpen(true);
+    window.setTimeout(() => promptTitleRef.current?.focus(), 0);
+  }
+
+  function closePromptEditor() {
+    setPromptEditorOpen(false);
+    setPromptEditorId(null);
+    setPromptEditorTitle("");
+    setPromptEditorContent("");
+  }
+
+  function savePromptFromEditor() {
+    const title = promptEditorTitle.trim();
+    if (!title) return;
+    const content = promptEditorContent;
+    const now = Date.now();
+    const id = promptEditorId ?? makeId();
+    const next: Prompt = { id, title, content, createdAt: now };
+
+    setPrompts((prev) => {
+      if (!promptEditorId) return [...prev, next].sort((a, b) => b.createdAt - a.createdAt);
+      return prev
+        .map((p) => (p.id === promptEditorId ? { ...p, title, content } : p))
+        .sort((a, b) => b.createdAt - a.createdAt);
+    });
+    closePromptEditor();
+  }
+
+  function deletePrompt(id: string) {
+    if (!window.confirm("Delete this prompt?")) return;
+    setPrompts((prev) => prev.filter((p) => p.id !== id));
+  }
+
+  async function sendPromptToActive(prompt: Prompt, mode: "paste" | "send") {
+    const sessionId = activeIdRef.current;
+    if (!sessionId) return;
+    const data = (() => {
+      if (mode === "paste") return prompt.content;
+      const text = prompt.content;
+      if (text.endsWith("\n") || text.endsWith("\r")) return text;
+      return `${text}\n`;
+    })();
+    try {
+      await invoke("write_to_session", { id: sessionId, data, source: "user" });
+    } catch (err) {
+      reportError("Failed to send prompt", err);
+    }
+  }
+
+  function openEnvironmentEditor(env?: EnvironmentConfig) {
+    setEnvironmentsOpen(false);
+    setEnvironmentEditorId(env?.id ?? null);
+    setEnvironmentEditorName(env?.name ?? "");
+    setEnvironmentEditorContent(env?.content ?? "");
+    setEnvironmentEditorOpen(true);
+    window.setTimeout(() => envNameRef.current?.focus(), 0);
+  }
+
+  function closeEnvironmentEditor() {
+    setEnvironmentEditorOpen(false);
+    setEnvironmentEditorId(null);
+    setEnvironmentEditorName("");
+    setEnvironmentEditorContent("");
+  }
+
+  function saveEnvironmentFromEditor() {
+    const name = environmentEditorName.trim();
+    if (!name) return;
+    const content = environmentEditorContent;
+    const now = Date.now();
+    const id = environmentEditorId ?? makeId();
+    const next: EnvironmentConfig = { id, name, content, createdAt: now };
+
+    setEnvironments((prev) => {
+      if (!environmentEditorId) return [...prev, next].sort((a, b) => b.createdAt - a.createdAt);
+      return prev
+        .map((e) => (e.id === environmentEditorId ? { ...e, name, content } : e))
+        .sort((a, b) => b.createdAt - a.createdAt);
+    });
+    closeEnvironmentEditor();
+  }
+
+  function deleteEnvironment(id: string) {
+    if (!window.confirm("Delete this environment?")) return;
+    setEnvironments((prev) => prev.filter((e) => e.id !== id));
+    setProjects((prev) =>
+      prev.map((p) => (p.environmentId === id ? { ...p, environmentId: null } : p)),
+    );
+    if (projectEnvironmentId === id) setProjectEnvironmentId("");
+  }
+
   async function ensureReplayTargetSession(): Promise<string | null> {
     if (replayTargetSessionId) return replayTargetSessionId;
 
@@ -769,6 +1023,7 @@ export default function App() {
         name,
         launchCommand: bootstrapCommand,
         cwd,
+        envVars: envVarsForProjectId(projectId, projects, environments),
       });
       setSessions((prev) => [...prev, created]);
       setActiveProjectId(projectId);
@@ -872,6 +1127,7 @@ export default function App() {
     setProjectMode("new");
     setProjectTitle("");
     setProjectBasePath(active?.cwd ?? activeProject?.basePath ?? homeDirRef.current ?? "");
+    setProjectEnvironmentId(activeProject?.environmentId ?? "");
     setProjectOpen(true);
   }
 
@@ -881,6 +1137,7 @@ export default function App() {
     setProjectMode("rename");
     setProjectTitle(activeProject.title);
     setProjectBasePath(activeProject.basePath ?? "");
+    setProjectEnvironmentId(activeProject.environmentId ?? "");
     setProjectOpen(true);
   }
 
@@ -899,10 +1156,16 @@ export default function App() {
       return;
     }
 
+    const environmentId = projectEnvironmentId && environments.some((e) => e.id === projectEnvironmentId)
+      ? projectEnvironmentId
+      : null;
+
     if (projectMode === "rename") {
       setProjects((prev) =>
         prev.map((p) =>
-          p.id === activeProjectId ? { ...p, title, basePath: validatedBasePath } : p,
+          p.id === activeProjectId
+            ? { ...p, title, basePath: validatedBasePath, environmentId }
+            : p,
         ),
       );
       setProjectOpen(false);
@@ -910,13 +1173,17 @@ export default function App() {
     }
 
     const id = makeId();
-    const project: Project = { id, title, basePath: validatedBasePath };
+    const project: Project = { id, title, basePath: validatedBasePath, environmentId };
     setProjects((prev) => [...prev, project]);
     setProjectOpen(false);
     setActiveProjectId(id);
 
     try {
-      const s = await createSession({ projectId: id, cwd: validatedBasePath });
+      const s = await createSession({
+        projectId: id,
+        cwd: validatedBasePath,
+        envVars: envVarsForProjectId(id, [...projects, project], environments),
+      });
       setSessions((prev) => [...prev, s]);
       setActiveId(s.id);
     } catch (err) {
@@ -957,11 +1224,20 @@ export default function App() {
 
     const remaining = projects.filter((p) => p.id !== activeProjectId);
     if (remaining.length === 0) {
-      const fallback: Project = { id: makeId(), title: "Default", basePath: homeDirRef.current };
+      const fallback: Project = {
+        id: makeId(),
+        title: "Default",
+        basePath: homeDirRef.current,
+        environmentId: null,
+      };
       setProjects([fallback]);
       setActiveProjectId(fallback.id);
       try {
-        const s = await createSession({ projectId: fallback.id, cwd: fallback.basePath ?? null });
+        const s = await createSession({
+          projectId: fallback.id,
+          cwd: fallback.basePath ?? null,
+          envVars: envVarsForProjectId(fallback.id, [fallback], environments),
+        });
         setSessions([s]);
         setActiveId(s.id);
       } catch (err) {
@@ -1108,6 +1384,12 @@ export default function App() {
 
       if (cancelled) return;
 
+      state.projects = state.projects.map((p) => ({
+        ...p,
+        basePath: p.basePath ?? null,
+        environmentId: (p as { environmentId?: string | null }).environmentId ?? null,
+      }));
+
       const projectById = new Map(state.projects.map((p) => [p.id, p]));
       if (projectById.size === 0) {
         const initial = defaultProjectState();
@@ -1133,6 +1415,12 @@ export default function App() {
       setActiveProjectId(activeProjectId);
       activeProjectIdRef.current = activeProjectId;
       setActiveSessionByProject(activeSessionByProject);
+      setPrompts(state.prompts ?? []);
+      setEnvironments(state.environments ?? []);
+
+      const envVarsForProject = (projectId: string): Record<string, string> | null => {
+        return envVarsForProjectId(projectId, state.projects, state.environments ?? []);
+      };
 
       const persisted = state.sessions
         .filter((s) => projectById.has(s.projectId))
@@ -1149,6 +1437,7 @@ export default function App() {
             restoreCommand: s.restoreCommand ?? null,
             lastRecordingId: s.lastRecordingId ?? null,
             cwd: s.cwd ?? projectById.get(s.projectId)?.basePath ?? resolvedHome ?? null,
+            envVars: envVarsForProject(s.projectId),
             persistId: s.persistId,
             createdAt: s.createdAt,
           });
@@ -1178,7 +1467,11 @@ export default function App() {
         let first: Session;
         try {
           const basePath = projectById.get(activeProjectId)?.basePath ?? resolvedHome ?? null;
-          first = await createSession({ projectId: activeProjectId, cwd: basePath });
+          first = await createSession({
+            projectId: activeProjectId,
+            cwd: basePath,
+            envVars: envVarsForProject(activeProjectId),
+          });
         } catch (err) {
           if (!cancelled) reportError("Failed to create session", err);
           return;
@@ -1250,6 +1543,7 @@ export default function App() {
         name,
         launchCommand,
         cwd: validatedCwd,
+        envVars: envVarsForProjectId(activeProjectId, projects, environments),
       });
       setSessions((prev) => [...prev, s]);
       setActiveId(s.id);
@@ -1319,6 +1613,7 @@ export default function App() {
         name: preset.name,
         launchCommand: preset.command,
         cwd,
+        envVars: envVarsForProjectId(activeProjectId, projects, environments),
       });
       setSessions((prev) => [...prev, s]);
       setActiveId(s.id);
@@ -1495,6 +1790,13 @@ export default function App() {
                   title="Browse recordings"
                 >
                   Recordings
+                </button>
+                <button
+                  className="btnSmall"
+                  onClick={() => setPromptsOpen(true)}
+                  title="Prompt library"
+                >
+                  Prompts
                 </button>
                 <button
                   className="btnSmall"
@@ -1675,6 +1977,30 @@ export default function App() {
                       </button>
                     </div>
                     <div className="hint">New sessions in this project start here.</div>
+                  </div>
+                  <div className="formRow">
+                    <div className="label">Environment (.env)</div>
+                    <div className="pathRow">
+                      <select
+                        className="input"
+                        value={projectEnvironmentId}
+                        onChange={(e) => setProjectEnvironmentId(e.target.value)}
+                      >
+                        <option value="">None</option>
+                        {environments
+                          .slice()
+                          .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()))
+                          .map((env) => (
+                            <option key={env.id} value={env.id}>
+                              {env.name}
+                            </option>
+                          ))}
+                      </select>
+                      <button type="button" className="btn" onClick={() => setEnvironmentsOpen(true)}>
+                        Manage
+                      </button>
+                    </div>
+                    <div className="hint">Applied to new sessions in this project.</div>
                   </div>
                   <div className="modalActions">
                     <button
@@ -1907,11 +2233,22 @@ export default function App() {
                               className="btnSmall"
                               onClick={() => {
                                 setRecordingsOpen(false);
-                                void openReplay(r.recordingId);
+                                void openReplay(r.recordingId, "step");
                               }}
                               title="View / replay"
                             >
                               Open
+                            </button>
+                            <button
+                              type="button"
+                              className="btnSmall"
+                              onClick={() => {
+                                setRecordingsOpen(false);
+                                void openReplay(r.recordingId, "all");
+                              }}
+                              title="View all inputs"
+                            >
+                              View
                             </button>
                             <button
                               type="button"
@@ -1941,6 +2278,237 @@ export default function App() {
                     Refresh
                   </button>
                 </div>
+              </div>
+            </div>
+          )}
+
+          {promptsOpen && (
+            <div className="modalBackdrop" onClick={() => setPromptsOpen(false)}>
+              <div className="modal recordingsModal" onClick={(e) => e.stopPropagation()}>
+                <h3 className="modalTitle">Prompts</h3>
+
+                <div className="recordingsList">
+                  {prompts.length === 0 ? (
+                    <div className="empty">No prompts yet.</div>
+                  ) : (
+                    prompts
+                      .slice()
+                      .sort((a, b) => b.createdAt - a.createdAt)
+                      .map((p) => {
+                        const when = p.createdAt ? new Date(p.createdAt).toLocaleString() : null;
+                        const firstLine =
+                          p.content.trim().split(/\r?\n/)[0]?.slice(0, 80) ?? "";
+                        return (
+                          <div key={p.id} className="recordingItem">
+                            <div className="recordingMain">
+                              <div className="recordingName" title={p.title}>
+                                {p.title}
+                              </div>
+                              <div className="recordingMeta">
+                                {[when, firstLine].filter(Boolean).join(" • ")}
+                              </div>
+                            </div>
+                            <div className="recordingActions">
+                              <button
+                                type="button"
+                                className="btnSmall"
+                                onClick={() => void sendPromptToActive(p, "paste")}
+                                disabled={!active}
+                                title={active ? "Paste into active session" : "No active session"}
+                              >
+                                Paste
+                              </button>
+                              <button
+                                type="button"
+                                className="btnSmall"
+                                onClick={() => void sendPromptToActive(p, "send")}
+                                disabled={!active}
+                                title={active ? "Send (paste + Enter)" : "No active session"}
+                              >
+                                Send
+                              </button>
+                              <button
+                                type="button"
+                                className="btnSmall"
+                                onClick={() => openPromptEditor(p)}
+                                title="Edit prompt"
+                              >
+                                Edit
+                              </button>
+                              <button
+                                type="button"
+                                className="btnSmall"
+                                onClick={() => deletePrompt(p.id)}
+                                title="Delete prompt"
+                              >
+                                Delete
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                  )}
+                </div>
+
+                <div className="modalActions">
+                  <button type="button" className="btn" onClick={() => setPromptsOpen(false)}>
+                    Close
+                  </button>
+                  <button type="button" className="btn" onClick={() => openPromptEditor()}>
+                    New
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {promptEditorOpen && (
+            <div className="modalBackdrop" onClick={closePromptEditor}>
+              <div className="modal recordingsModal" onClick={(e) => e.stopPropagation()}>
+                <h3 className="modalTitle">{promptEditorId ? "Edit prompt" : "New prompt"}</h3>
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    savePromptFromEditor();
+                  }}
+                >
+                  <div className="formRow">
+                    <div className="label">Title</div>
+                    <input
+                      ref={promptTitleRef}
+                      className="input"
+                      value={promptEditorTitle}
+                      onChange={(e) => setPromptEditorTitle(e.target.value)}
+                      placeholder="e.g. Write a test plan"
+                    />
+                  </div>
+                  <div className="formRow">
+                    <div className="label">Prompt</div>
+                    <textarea
+                      className="textarea"
+                      value={promptEditorContent}
+                      onChange={(e) => setPromptEditorContent(e.target.value)}
+                      placeholder="Prompt text…"
+                    />
+                  </div>
+                  <div className="modalActions">
+                    <button type="button" className="btn" onClick={closePromptEditor}>
+                      Cancel
+                    </button>
+                    <button type="submit" className="btn" disabled={!promptEditorTitle.trim()}>
+                      Save
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {environmentsOpen && (
+            <div className="modalBackdrop" onClick={() => setEnvironmentsOpen(false)}>
+              <div className="modal recordingsModal" onClick={(e) => e.stopPropagation()}>
+                <h3 className="modalTitle">Environments</h3>
+
+                <div className="recordingsList">
+                  {environments.length === 0 ? (
+                    <div className="empty">No environments yet.</div>
+                  ) : (
+                    environments
+                      .slice()
+                      .sort((a, b) => b.createdAt - a.createdAt)
+                      .map((env) => {
+                        const when = env.createdAt ? new Date(env.createdAt).toLocaleString() : null;
+                        const vars = parseEnvContentToVars(env.content);
+                        const count = Object.keys(vars).length;
+                        return (
+                          <div key={env.id} className="recordingItem">
+                            <div className="recordingMain">
+                              <div className="recordingName" title={env.name}>
+                                {env.name}
+                              </div>
+                              <div className="recordingMeta">
+                                {[when, `${count} vars`].filter(Boolean).join(" • ")}
+                              </div>
+                            </div>
+                            <div className="recordingActions">
+                              <button
+                                type="button"
+                                className="btnSmall"
+                                onClick={() => openEnvironmentEditor(env)}
+                                title="Edit environment"
+                              >
+                                Edit
+                              </button>
+                              <button
+                                type="button"
+                                className="btnSmall"
+                                onClick={() => deleteEnvironment(env.id)}
+                                title="Delete environment"
+                              >
+                                Delete
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                  )}
+                </div>
+
+                <div className="modalActions">
+                  <button type="button" className="btn" onClick={() => setEnvironmentsOpen(false)}>
+                    Close
+                  </button>
+                  <button type="button" className="btn" onClick={() => openEnvironmentEditor()}>
+                    New
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {environmentEditorOpen && (
+            <div className="modalBackdrop" onClick={closeEnvironmentEditor}>
+              <div className="modal recordingsModal" onClick={(e) => e.stopPropagation()}>
+                <h3 className="modalTitle">
+                  {environmentEditorId ? "Edit environment" : "New environment"}
+                </h3>
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    saveEnvironmentFromEditor();
+                  }}
+                >
+                  <div className="formRow">
+                    <div className="label">Name</div>
+                    <input
+                      ref={envNameRef}
+                      className="input"
+                      value={environmentEditorName}
+                      onChange={(e) => setEnvironmentEditorName(e.target.value)}
+                      placeholder="e.g. staging"
+                    />
+                  </div>
+                  <div className="formRow">
+                    <div className="label">.env</div>
+                    <textarea
+                      className="textarea"
+                      value={environmentEditorContent}
+                      onChange={(e) => setEnvironmentEditorContent(e.target.value)}
+                      placeholder={"KEY=value\n# Comments supported"}
+                    />
+                    <div className="hint" style={{ marginTop: 0 }}>
+                      Parsed like an <code>.env</code> file. Applied to new sessions in a project.
+                    </div>
+                  </div>
+                  <div className="modalActions">
+                    <button type="button" className="btn" onClick={closeEnvironmentEditor}>
+                      Cancel
+                    </button>
+                    <button type="submit" className="btn" disabled={!environmentEditorName.trim()}>
+                      Save
+                    </button>
+                  </div>
+                </form>
               </div>
             </div>
           )}
@@ -1982,11 +2550,13 @@ export default function App() {
                     </div>
 
                     <div className="formRow" style={{ marginBottom: 0 }}>
-                      <div className="label">Next input</div>
+                      <div className="label">{replayShowAll ? "All inputs" : "Next input"}</div>
                       <div className="replayPreview">
-                        {replaySteps[replayIndex]
-                          ? replaySteps[replayIndex]
-                          : "Done."}
+                        {replayShowAll
+                          ? replaySteps.join("")
+                          : replaySteps[replayIndex]
+                            ? replaySteps[replayIndex]
+                            : "Done."}
                       </div>
                     </div>
                   </>
@@ -1997,6 +2567,14 @@ export default function App() {
                 <div className="modalActions">
                   <button type="button" className="btn" onClick={closeReplayModal}>
                     Close
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => setReplayShowAll((v) => !v)}
+                    disabled={replayLoading || Boolean(replayError) || !replayRecording}
+                  >
+                    {replayShowAll ? "View step" : "View all"}
                   </button>
                   <button
                     type="button"
