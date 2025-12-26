@@ -27,6 +27,7 @@ type Session = SessionInfo & {
   restoreCommand?: string | null;
   cwd: string | null;
   effectId?: string | null;
+  agentWorking?: boolean;
   processTag?: string | null;
   exited?: boolean;
   closing?: boolean;
@@ -248,6 +249,48 @@ export default function App() {
   const homeDirRef = useRef<string | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const pendingSaveRef = useRef<PersistedStateV1 | null>(null);
+  const agentIdleTimersRef = useRef<Map<string, number>>(new Map());
+
+  function clearAgentIdleTimer(id: string) {
+    const existing = agentIdleTimersRef.current.get(id);
+    if (existing !== undefined) {
+      window.clearTimeout(existing);
+      agentIdleTimersRef.current.delete(id);
+    }
+  }
+
+  function scheduleAgentIdle(id: string, effectId: string | null) {
+    clearAgentIdleTimer(id);
+    if (!effectId) return;
+    const effect = getProcessEffectById(effectId);
+    const idleAfterMs = effect?.idleAfterMs ?? 2000;
+    const timeout = window.setTimeout(() => {
+      agentIdleTimersRef.current.delete(id);
+      setSessions((prev) =>
+        prev.map((s) => {
+          if (s.id !== id) return s;
+          if (!s.agentWorking) return s;
+          return { ...s, agentWorking: false };
+        }),
+      );
+    }, idleAfterMs);
+    agentIdleTimersRef.current.set(id, timeout);
+  }
+
+  function markAgentWorking(id: string) {
+    const s = sessionsRef.current.find((s) => s.id === id);
+    if (!s) return;
+    if (!s.effectId || s.exited || s.closing) return;
+
+    if (!s.agentWorking) {
+      setSessions((prev) =>
+        prev.map((session) =>
+          session.id === id ? { ...session, agentWorking: true } : session,
+        ),
+      );
+    }
+    scheduleAgentIdle(id, s.effectId);
+  }
 
   const active = useMemo(
     () => sessions.find((s) => s.id === activeId) ?? null,
@@ -487,16 +530,25 @@ export default function App() {
     const effect = trimmed ? detectProcessEffect({ command: trimmed, name: null }) : null;
     const nextEffectId = effect?.id ?? null;
     const nextRestoreCommand = effect ? trimmed : null;
+    const nextAgentWorking = Boolean(nextEffectId);
+
+    if (nextEffectId) scheduleAgentIdle(id, nextEffectId);
+    else clearAgentIdleTimer(id);
 
     setSessions((prev) =>
       prev.map((s) => {
         if (s.id !== id) return s;
-        if (s.effectId === nextEffectId && (s.restoreCommand ?? null) === nextRestoreCommand) {
+        if (
+          s.effectId === nextEffectId &&
+          (s.restoreCommand ?? null) === nextRestoreCommand &&
+          Boolean(s.agentWorking) === nextAgentWorking
+        ) {
           return s;
         }
         return {
           ...s,
           effectId: nextEffectId,
+          agentWorking: nextAgentWorking,
           restoreCommand: nextRestoreCommand,
           processTag: null,
         };
@@ -584,6 +636,7 @@ export default function App() {
       .map((s) => s.id);
 
     for (const id of idsToClose) {
+      clearAgentIdleTimer(id);
       if (!closingSessions.current.has(id)) {
         const timeout = window.setTimeout(() => {
           closingSessions.current.delete(id);
@@ -648,6 +701,8 @@ export default function App() {
         // Ignore events for sessions being closed
         if (closingSessions.current.has(id)) return;
 
+        markAgentWorking(id);
+
         const entry = registry.current.get(id);
         if (entry) {
           entry.term.write(data);
@@ -675,6 +730,7 @@ export default function App() {
         const { id, exit_code } = event.payload;
 
         pendingData.current.delete(id);
+        clearAgentIdleTimer(id);
 
         const timeout = closingSessions.current.get(id);
         if (timeout !== undefined) {
@@ -686,7 +742,7 @@ export default function App() {
         setSessions((prev) =>
           prev.map((s) =>
             s.id === id
-              ? { ...s, exited: true, exitCode: exit_code ?? null }
+              ? { ...s, exited: true, exitCode: exit_code ?? null, agentWorking: false }
               : s,
           ),
         );
@@ -858,6 +914,10 @@ export default function App() {
     return () => {
       cancelled = true;
       unlisteners.forEach(fn => fn());
+      for (const timeout of agentIdleTimersRef.current.values()) {
+        window.clearTimeout(timeout);
+      }
+      agentIdleTimersRef.current.clear();
       for (const id of sessionIdsRef.current) {
         void closeSession(id).catch(() => {});
       }
@@ -896,6 +956,7 @@ export default function App() {
   }
 
   async function onClose(id: string) {
+    clearAgentIdleTimer(id);
     setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, closing: true } : s)));
 
     if (!closingSessions.current.has(id)) {
@@ -1021,6 +1082,7 @@ export default function App() {
               const isClosing = Boolean(s.closing);
               const effect = getProcessEffectById(s.effectId);
               const chipLabel = effect?.label ?? s.processTag ?? null;
+              const isWorking = Boolean(effect && s.agentWorking && !isExited && !isClosing);
               const chipClass = effect ? `chip chip-${effect.id}` : "chip";
               return (
                 <div
@@ -1034,7 +1096,12 @@ export default function App() {
                   <div className="sessionMeta">
                     <div className="sessionName">
                       <span className="sessionNameText">{s.name}</span>
-                      {chipLabel && <span className={chipClass}>{chipLabel}</span>}
+                      {chipLabel && (
+                        <span className={chipClass}>
+                          <span className="chipLabel">{chipLabel}</span>
+                          {isWorking && <span className="chipActivity" aria-label="Working" />}
+                        </span>
+                      )}
                       {isClosing ? (
                         <span className="sessionStatus">closing…</span>
                       ) : isExited ? (
@@ -1104,6 +1171,7 @@ export default function App() {
                 readOnly={Boolean(s.exited || s.closing)}
                 onCwdChange={onCwdChange}
                 onCommandChange={onCommandChange}
+                onUserEnter={() => markAgentWorking(s.id)}
                 registry={registry}
                 pendingData={pendingData}
               />

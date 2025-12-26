@@ -12,6 +12,7 @@ export default function SessionTerminal(props: {
   readOnly: boolean;
   onCwdChange?: (id: string, cwd: string) => void;
   onCommandChange?: (id: string, commandLine: string) => void;
+  onUserEnter?: (id: string) => void;
   registry: React.MutableRefObject<TerminalRegistry>;
   pendingData: React.MutableRefObject<PendingDataBuffer>;
 }) {
@@ -47,6 +48,9 @@ export default function SessionTerminal(props: {
 
     term.onData((data) => {
       void invoke("write_to_session", { id: props.id, data }).catch(() => {});
+      if (data.includes("\r") || data.includes("\n")) {
+        props.onUserEnter?.(props.id);
+      }
     });
 
     termRef.current = term;

@@ -2,11 +2,12 @@ export type ProcessEffect = {
   id: string;
   label: string;
   matchCommands: string[];
+  idleAfterMs?: number;
 };
 
 export const PROCESS_EFFECTS: ProcessEffect[] = [
-  { id: "codex", label: "codex", matchCommands: ["codex"] },
-  { id: "claude", label: "claude", matchCommands: ["claude"] },
+  { id: "codex", label: "codex", matchCommands: ["codex"], idleAfterMs: 2000 },
+  { id: "claude", label: "claude", matchCommands: ["claude"], idleAfterMs: 2000 },
 ];
 
 function normalizeCommandToken(token: string): string {
