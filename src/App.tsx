@@ -558,9 +558,9 @@ export default function App() {
       const recordingId = makeId();
       const safeId = await invoke<string>("start_session_recording", {
         id: s.id,
-        recording_id: recordingId,
-        project_id: s.projectId,
-        session_persist_id: s.persistId,
+        recordingId,
+        projectId: s.projectId,
+        sessionPersistId: s.persistId,
         cwd: s.cwd,
       });
       setSessions((prev) =>
@@ -613,7 +613,7 @@ export default function App() {
 
     try {
       const rec = await invoke<LoadedRecording>("load_recording", {
-        recording_id: active.lastRecordingId,
+        recordingId: active.lastRecordingId,
       });
       setReplayRecording(rec);
       setReplaySteps(splitRecordingIntoSteps(rec.events));
