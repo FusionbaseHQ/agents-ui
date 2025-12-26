@@ -281,17 +281,12 @@ body {
   display: block;
 }
 
-.agentBadge .chipActivity {
+.agentBadgeDot {
   position: absolute;
   right: -1px;
   bottom: -1px;
-  opacity: 0;
   box-shadow: 0 0 0 2px rgba(11, 15, 20, 0.9);
   pointer-events: none;
-}
-
-.agentBadgeWorking .chipActivity {
-  opacity: 1;
 }
 
 .chipActivity {

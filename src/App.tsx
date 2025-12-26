@@ -1714,11 +1714,13 @@ export default function App() {
                     <div className="sessionName">
                       {hasAgentIcon && chipLabel && effect?.iconSrc && (
                         <span
-                          className={`agentBadge chip-${effect.id} ${isWorking ? "agentBadgeWorking" : ""}`}
+                          className={`agentBadge chip-${effect.id}`}
                           title={chipLabel}
                         >
                           <img className="agentIcon" src={effect.iconSrc} alt={chipLabel} />
-                          <span className="chipActivity" aria-label="Working" />
+                          {isWorking && (
+                            <span className="chipActivity agentBadgeDot" aria-label="Working" />
+                          )}
                         </span>
                       )}
                       <span className="sessionNameText">{s.name}</span>
