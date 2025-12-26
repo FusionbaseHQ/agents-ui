@@ -1,10 +1,12 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { homeDir } from "@tauri-apps/api/path";
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import SessionTerminal, { TerminalRegistry } from "./SessionTerminal";
 import { commandTagFromCommandLine, detectProcessEffect, getProcessEffectById } from "./processEffects";
 import { shortenPathSmart } from "./pathDisplay";
+import { SlidePanel } from "./SlidePanel";
+import { CommandPalette } from "./CommandPalette";
 
 type Project = {
   id: string;
@@ -78,6 +80,10 @@ function unescapeDoubleQuotedEnvValue(input: string): string {
     .replace(/\\r/g, "\r")
     .replace(/\\t/g, "\t")
     .replace(/\\"/g, '"');
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function parseEnvContentToVars(content: string): Record<string, string> {
@@ -175,6 +181,8 @@ type Prompt = {
   title: string;
   content: string;
   createdAt: number;
+  pinned?: boolean;
+  pinOrder?: number;
 };
 
 type EnvironmentConfig = {
@@ -392,6 +400,26 @@ export default function App() {
   const [environmentEditorContent, setEnvironmentEditorContent] = useState("");
   const [error, setError] = useState<string | null>(null);
 
+  // New UI state for SlidePanel and CommandPalette
+  const [slidePanelOpen, setSlidePanelOpen] = useState(false);
+  const [slidePanelTab, setSlidePanelTab] = useState<"prompts" | "recordings">("prompts");
+  const [slidePanelWidth, setSlidePanelWidth] = useState(360);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [promptSearch, setPromptSearch] = useState("");
+  const [recordingSearch, setRecordingSearch] = useState("");
+  const [recordingStartTime, setRecordingStartTime] = useState<number | null>(null);
+  const [recordingElapsed, setRecordingElapsed] = useState(0);
+
+  const quickStarts = useMemo(() => {
+    const codex = getProcessEffectById("codex");
+    const claude = getProcessEffectById("claude");
+    return [
+      { id: "shell", title: "shell", command: null as string | null, iconSrc: null as string | null },
+      { id: "codex", title: "codex", command: "codex", iconSrc: codex?.iconSrc ?? null },
+      { id: "claude", title: "claude", command: "claude", iconSrc: claude?.iconSrc ?? null },
+    ];
+  }, []);
+
   const registry = useRef<TerminalRegistry>(new Map());
   const pendingData = useRef<PendingDataBuffer>(new Map());
   const closingSessions = useRef<Map<string, number>>(new Map());
@@ -602,6 +630,28 @@ export default function App() {
           environmentsOpen ||
           environmentEditorOpen;
 
+        // Command palette takes priority - Cmd+K or Ctrl+K
+        const modKey = isMac ? e.metaKey : e.ctrlKey;
+        if (modKey && e.key.toLowerCase() === "k" && !commandPaletteOpen) {
+          e.preventDefault();
+          setCommandPaletteOpen(true);
+          return;
+        }
+
+        // Close command palette with Escape
+        if (e.key === "Escape" && commandPaletteOpen) {
+          e.preventDefault();
+          setCommandPaletteOpen(false);
+          return;
+        }
+
+        // Close slide panel with Escape
+        if (e.key === "Escape" && slidePanelOpen && !modalOpen) {
+          e.preventDefault();
+          setSlidePanelOpen(false);
+          return;
+        }
+
 	      if (e.key === "Escape" && modalOpen) {
 	        e.preventDefault();
           if (environmentEditorOpen) {
@@ -652,7 +702,7 @@ export default function App() {
           return;
 	      }
 
-        if (modalOpen) return;
+        if (commandPaletteOpen || modalOpen) return;
 
       const activeProjectId = activeProjectIdRef.current;
       const sessions = sessionsRef.current.filter((s) => s.projectId === activeProjectId);
@@ -671,6 +721,47 @@ export default function App() {
           void onClose(activeId);
           return;
         }
+        // Cmd+Shift+P - Toggle Prompts Panel
+        if (e.metaKey && e.shiftKey && e.key.toLowerCase() === "p") {
+          e.preventDefault();
+          setSlidePanelOpen(prev => {
+            if (!prev) {
+              setSlidePanelTab("prompts");
+              return true;
+            }
+            if (slidePanelTab === "prompts") return false;
+            setSlidePanelTab("prompts");
+            return true;
+          });
+          return;
+        }
+        // Cmd+Shift+R - Toggle Recordings Panel
+        if (e.metaKey && e.shiftKey && e.key.toLowerCase() === "r") {
+          e.preventDefault();
+          void refreshRecordings();
+          setSlidePanelOpen(prev => {
+            if (!prev) {
+              setSlidePanelTab("recordings");
+              return true;
+            }
+            if (slidePanelTab === "recordings") return false;
+            setSlidePanelTab("recordings");
+            return true;
+          });
+          return;
+        }
+        // Cmd+1 through Cmd+5 - Quick prompts
+        if (e.metaKey && /^[1-5]$/.test(e.key)) {
+          const idx = parseInt(e.key) - 1;
+          const pinnedPrompts = prompts
+            .filter(p => p.pinned)
+            .sort((a, b) => (a.pinOrder ?? 0) - (b.pinOrder ?? 0));
+          if (pinnedPrompts[idx] && activeId) {
+            e.preventDefault();
+            void sendPromptToActive(pinnedPrompts[idx], "send");
+          }
+          return;
+        }
 	      } else {
 	        if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "t") {
 	          e.preventDefault();
@@ -682,6 +773,47 @@ export default function App() {
           if (!activeId) return;
           e.preventDefault();
           void onClose(activeId);
+          return;
+        }
+        // Ctrl+Shift+P - Toggle Prompts Panel
+        if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "p") {
+          e.preventDefault();
+          setSlidePanelOpen(prev => {
+            if (!prev) {
+              setSlidePanelTab("prompts");
+              return true;
+            }
+            if (slidePanelTab === "prompts") return false;
+            setSlidePanelTab("prompts");
+            return true;
+          });
+          return;
+        }
+        // Ctrl+Shift+R - Toggle Recordings Panel
+        if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "r") {
+          e.preventDefault();
+          void refreshRecordings();
+          setSlidePanelOpen(prev => {
+            if (!prev) {
+              setSlidePanelTab("recordings");
+              return true;
+            }
+            if (slidePanelTab === "recordings") return false;
+            setSlidePanelTab("recordings");
+            return true;
+          });
+          return;
+        }
+        // Ctrl+1 through Ctrl+5 - Quick prompts
+        if (e.ctrlKey && /^[1-5]$/.test(e.key)) {
+          const idx = parseInt(e.key) - 1;
+          const pinnedPrompts = prompts
+            .filter(p => p.pinned)
+            .sort((a, b) => (a.pinOrder ?? 0) - (b.pinOrder ?? 0));
+          if (pinnedPrompts[idx] && activeId) {
+            e.preventDefault();
+            void sendPromptToActive(pinnedPrompts[idx], "send");
+          }
           return;
         }
       }
@@ -718,6 +850,10 @@ export default function App() {
       promptEditorOpen,
       environmentsOpen,
       environmentEditorOpen,
+      commandPaletteOpen,
+      slidePanelOpen,
+      slidePanelTab,
+      prompts,
     ]);
 
   function formatError(err: unknown): string {
@@ -943,17 +1079,66 @@ export default function App() {
     setPrompts((prev) => prev.filter((p) => p.id !== id));
   }
 
+  function togglePromptPin(id: string) {
+    setPrompts((prev) => {
+      const prompt = prev.find(p => p.id === id);
+      if (!prompt) return prev;
+
+      if (prompt.pinned) {
+        // Unpin: remove pinned status
+        return prev.map(p => p.id === id ? { ...p, pinned: false, pinOrder: undefined } : p);
+      } else {
+        // Pin: add to end of pinned list
+        const maxPinOrder = Math.max(0, ...prev.filter(p => p.pinned).map(p => p.pinOrder ?? 0));
+        return prev.map(p => p.id === id ? { ...p, pinned: true, pinOrder: maxPinOrder + 1 } : p);
+      }
+    });
+  }
+
+  function formatTimeAgo(timestamp: number): string {
+    const now = Date.now();
+    const diff = now - timestamp;
+    const minutes = Math.floor(diff / 60000);
+    const hours = Math.floor(diff / 3600000);
+    const days = Math.floor(diff / 86400000);
+
+    if (minutes < 1) return "just now";
+    if (minutes < 60) return `${minutes}m ago`;
+    if (hours < 24) return `${hours}h ago`;
+    if (days < 7) return `${days}d ago`;
+    return new Date(timestamp).toLocaleDateString();
+  }
+
   async function sendPromptToActive(prompt: Prompt, mode: "paste" | "send") {
     const sessionId = activeIdRef.current;
     if (!sessionId) return;
-    const data = (() => {
-      if (mode === "paste") return prompt.content;
-      const text = prompt.content;
-      if (text.endsWith("\n") || text.endsWith("\r")) return text;
-      return `${text}\n`;
-    })();
+
+    if (mode === "paste") {
+      // Just paste the content as-is
+      try {
+        registry.current.get(sessionId)?.term.focus();
+        await invoke("write_to_session", { id: sessionId, data: prompt.content, source: "user" });
+      } catch (err) {
+        reportError("Failed to send prompt", err);
+      }
+      return;
+    }
+
+    // For "send" mode: send the text first, then send Enter separately
+    // This mimics how a user would type and then press Enter
+    const text = prompt.content.replace(/[\r\n]+$/, ""); // Strip trailing newlines
     try {
-      await invoke("write_to_session", { id: sessionId, data, source: "user" });
+      registry.current.get(sessionId)?.term.focus();
+      // Send the text content
+      if (text) {
+        await invoke("write_to_session", { id: sessionId, data: text, source: "user" });
+      }
+      // Give the target app a moment to process the inserted text, so the Enter
+      // arrives as a distinct keystroke (some CLIs treat fast input as "paste"
+      // and won't submit on a trailing newline).
+      if (text) await sleep(30);
+      // Send Enter key (carriage return) separately.
+      await invoke("write_to_session", { id: sessionId, data: "\r", source: "user" });
     } catch (err) {
       reportError("Failed to send prompt", err);
     }
@@ -1050,7 +1235,28 @@ export default function App() {
 
     const chunk = replaySteps[replayIndex];
     try {
-      await invoke("write_to_session", { id: targetId, data: chunk, source: "system" });
+      registry.current.get(targetId)?.term.focus();
+
+      // Similar to prompt sending: avoid delivering the final newline in the
+      // same burst as the pasted text. Some interactive CLIs treat this as a
+      // paste/newline (insert line) rather than an Enter (submit).
+      const newlineMatch = chunk.match(/[\r\n]+$/);
+      const trailing = newlineMatch?.[0] ?? "";
+      const body = trailing ? chunk.slice(0, -trailing.length) : chunk;
+
+      if (body) {
+        await invoke("write_to_session", { id: targetId, data: body, source: "system" });
+      }
+
+      if (trailing) {
+        if (body) await sleep(30);
+        const enterCount = trailing.replace(/[^\r\n]/g, "").length;
+        for (let i = 0; i < enterCount; i++) {
+          await invoke("write_to_session", { id: targetId, data: "\r", source: "system" });
+          if (i < enterCount - 1) await sleep(10);
+        }
+      }
+
       setReplayIndex((i) => i + 1);
     } catch (err) {
       reportError("Failed to replay input", err);
@@ -1136,14 +1342,22 @@ export default function App() {
     setProjectOpen(true);
   }
 
-  function openRenameProject() {
-    if (!activeProject) return;
+  function openProjectSettings(projectId: string) {
+    const project = projects.find((p) => p.id === projectId);
+    if (!project) return;
+
     setNewOpen(false);
     setProjectMode("rename");
-    setProjectTitle(activeProject.title);
-    setProjectBasePath(activeProject.basePath ?? "");
-    setProjectEnvironmentId(activeProject.environmentId ?? "");
+    setProjectTitle(project.title);
+    setProjectBasePath(project.basePath ?? "");
+    setProjectEnvironmentId(project.environmentId ?? "");
     setProjectOpen(true);
+    window.setTimeout(() => projectTitleRef.current?.focus(), 0);
+  }
+
+  function openRenameProject() {
+    if (!activeProject) return;
+    openProjectSettings(activeProject.id);
   }
 
   async function onProjectSubmit(e: React.FormEvent) {
@@ -1452,11 +1666,25 @@ export default function App() {
             (s.launchCommand ? null : (s.restoreCommand ?? null))?.trim() ?? null;
           if (restoreCmd) {
             const singleLine = restoreCmd.replace(/\r?\n/g, " ");
-            void invoke("write_to_session", {
-              id: created.id,
-              data: `${singleLine}\n`,
-              source: "system",
-            }).catch(() => {});
+            void (async () => {
+              try {
+                if (singleLine) {
+                  await invoke("write_to_session", {
+                    id: created.id,
+                    data: singleLine,
+                    source: "system",
+                  });
+                  await sleep(30);
+                }
+                await invoke("write_to_session", {
+                  id: created.id,
+                  data: "\r",
+                  source: "system",
+                });
+              } catch {
+                // Best-effort restore: if this fails, the tab still opens as a shell.
+              }
+            })();
           }
         } catch (err) {
           if (!cancelled) reportError("Failed to restore session", err);
@@ -1610,7 +1838,7 @@ export default function App() {
     });
   }
 
-  async function quickStart(preset: { name: string; command: string }) {
+  async function quickStart(preset: { name: string; command: string | null }) {
     try {
       const cwd = activeProject?.basePath ?? homeDirRef.current ?? null;
       const s = await createSession({
@@ -1632,21 +1860,54 @@ export default function App() {
       <aside className="sidebar">
         <div className="sidebarHeader">
           <div className="title">Projects</div>
-          <button className="btn" onClick={openNewProject}>
-            New
-          </button>
+          <div className="sidebarHeaderActions">
+            <button type="button" className="btn" onClick={openNewProject}>
+              New
+            </button>
+            <button
+              type="button"
+              className="btnSmall"
+              onClick={openRenameProject}
+              disabled={!activeProject}
+              title="Project settings"
+            >
+              Settings
+            </button>
+            <button
+              type="button"
+              className="btnSmall btnDanger"
+              onClick={() => setConfirmDeleteProjectOpen(true)}
+              disabled={!activeProject}
+              title="Delete project"
+            >
+              Delete
+            </button>
+          </div>
         </div>
 
         <div className="projectList">
           {projects.map((p) => {
             const isActive = p.id === activeProjectId;
             const count = sessionCountByProject.get(p.id) ?? 0;
+            const envName =
+              p.environmentId && environments.some((e) => e.id === p.environmentId)
+                ? environments.find((e) => e.id === p.environmentId)?.name?.trim() ?? null
+                : null;
             return (
 	              <button
 	                key={p.id}
 	                className={`projectItem ${isActive ? "projectItemActive" : ""}`}
 	                onClick={() => selectProject(p.id)}
-	                title={p.basePath ? `${p.title} — ${p.basePath}` : p.title}
+                  onDoubleClick={() => openProjectSettings(p.id)}
+	                title={
+                    [
+                      p.title,
+                      p.basePath ? `Base: ${p.basePath}` : null,
+                      envName ? `Env: ${envName}` : null,
+                    ]
+                      .filter(Boolean)
+                      .join("\n")
+                  }
 	              >
                 <span className="projectTitle">{p.title}</span>
                 <span className="projectCount">{count}</span>
@@ -1655,16 +1916,50 @@ export default function App() {
           })}
         </div>
 
-        <div className="projectActions">
-          <button className="btn" onClick={openRenameProject} disabled={!activeProject}>
-            Rename
-          </button>
-          <button className="btn" onClick={() => setConfirmDeleteProjectOpen(true)} disabled={!activeProject}>
-            Delete
-          </button>
-        </div>
-
         <div className="divider" />
+
+        {/* Quick Prompts Section */}
+        {(() => {
+          const pinnedPrompts = prompts
+            .filter(p => p.pinned)
+            .sort((a, b) => (a.pinOrder ?? 0) - (b.pinOrder ?? 0))
+            .slice(0, 5);
+          if (pinnedPrompts.length === 0) return null;
+          return (
+            <>
+              <div className="sidebarHeader">
+                <div className="title">Quick Prompts</div>
+                <button
+                  className="btn"
+                  onClick={() => {
+                    setSlidePanelTab("prompts");
+                    setSlidePanelOpen(true);
+                  }}
+                  title="Manage prompts"
+                >
+                  +
+                </button>
+              </div>
+              <div className="quickPromptsSection">
+                {pinnedPrompts.map((p, idx) => (
+                  <button
+                    key={p.id}
+                    className="quickPromptItem"
+                    onClick={() => void sendPromptToActive(p, "send")}
+                    onDoubleClick={() => openPromptEditor(p)}
+                    disabled={!activeId}
+                    title={`${p.title}\n\nClick to send, double-click to edit`}
+                  >
+                    <span className="quickPromptIcon">{"\u2605"}</span>
+                    <span className="quickPromptTitle">{p.title}</span>
+                    <span className="quickPromptShortcut">{"\u2318"}{idx + 1}</span>
+                  </button>
+                ))}
+              </div>
+              <div className="divider" />
+            </>
+          );
+        })()}
 
         <div className="sidebarHeader">
           <div className="title">Sessions</div>
@@ -1679,12 +1974,33 @@ export default function App() {
           </button>
         </div>
 
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          {PRESETS.map((p) => (
-            <button key={p.name} className="btn" onClick={() => quickStart(p)}>
-              {p.name}
-            </button>
-          ))}
+        <div className="presetGrid">
+          {PRESETS.map((p) => {
+            const effect = getProcessEffectById(p.name);
+            return (
+              <button
+                key={p.name}
+                type="button"
+                className="presetBtn"
+                onClick={() => void quickStart(p)}
+                title={`Start ${p.name}`}
+              >
+                {effect?.iconSrc ? (
+                  <img
+                    className="presetIcon"
+                    src={effect.iconSrc}
+                    alt=""
+                    aria-hidden="true"
+                  />
+                ) : (
+                  <span className="presetIconFallback" aria-hidden="true">
+                    {"\u25B6"}
+                  </span>
+                )}
+                <span className="presetLabel">{p.name}</span>
+              </button>
+            );
+          })}
         </div>
 
         <div className="sessionList">
@@ -1771,8 +2087,7 @@ export default function App() {
         <div className="topbar">
           <div className="activeTitle">
             {activeProject ? `Project: ${activeProject.title}` : "Project: —"}
-            {activeProject?.basePath ? ` • ${shortenPathSmart(activeProject.basePath, 44)}` : ""}
-            {active ? ` • Session: ${active.name}` : " • No active session"}
+            {active ? ` • ${active.name}` : " • No session"}
           </div>
           <div className="topbarRight">
             {error ? (
@@ -1783,45 +2098,57 @@ export default function App() {
                 </button>
               </div>
             ) : (
-              <div className="hint">New: ⌘T / Ctrl+Shift+T • Close: ⌘W / Ctrl+Shift+W</div>
+              <div className="shortcutHint">
+                <kbd>{"\u2318"}K</kbd> Quick Access
+              </div>
+            )}
+
+            {/* Recording Timer */}
+            {active?.recordingActive && (
+              <div className="recordingTimer">
+                <span className="recordingTimerDot" />
+                <span>REC</span>
+              </div>
             )}
 
             {active && (
               <>
+                {/* Record Button */}
                 <button
-                  className={`btnSmall ${active.recordingActive ? "btnRecording" : ""}`}
+                  className={`iconBtn ${active.recordingActive ? "iconBtnRecording" : ""}`}
                   onClick={() =>
                     active.recordingActive ? void stopRecording(active.id) : openRecordPrompt(active.id)
                   }
                   disabled={Boolean(active.exited || active.closing)}
-                  title={active.recordingActive ? "Stop recording" : "Start recording"}
+                  title={active.recordingActive ? "Stop recording (active)" : "Start recording"}
                 >
-                  {active.recordingActive ? "Stop" : "Record"}
+                  {active.recordingActive ? "\u25A0" : "\u25CF"}
                 </button>
+
+                {/* Panels Button */}
                 <button
-                  className="btnSmall"
+                  className={`iconBtn ${slidePanelOpen ? "iconBtnActive" : ""}`}
                   onClick={() => {
-                    setRecordingsOpen(true);
-                    void refreshRecordings();
+                    if (slidePanelOpen) {
+                      setSlidePanelOpen(false);
+                    } else {
+                      void refreshRecordings();
+                      setSlidePanelOpen(true);
+                    }
                   }}
-                  title="Browse recordings"
+                  title={`${slidePanelOpen ? "Close" : "Open"} panels (\u2318\u21E7P / \u2318\u21E7R)`}
                 >
-                  Recordings
+                  {"\u25A1"}
                 </button>
+
+                {/* Replay Button */}
                 <button
-                  className="btnSmall"
-                  onClick={() => setPromptsOpen(true)}
-                  title="Prompt library"
-                >
-                  Prompts
-                </button>
-                <button
-                  className="btnSmall"
+                  className="iconBtn"
                   onClick={() => void openReplayForActive()}
                   disabled={!active.lastRecordingId}
                   title={active.lastRecordingId ? "Replay last recording" : "No recording yet"}
                 >
-                  Replay
+                  {"\u25B6"}
                 </button>
               </>
             )}
@@ -2610,8 +2937,234 @@ export default function App() {
               </div>
             </div>
           )}
+
+          {/* Slide Panel */}
+          <SlidePanel
+            isOpen={slidePanelOpen}
+            onClose={() => setSlidePanelOpen(false)}
+            activeTab={slidePanelTab}
+            onTabChange={(tab) => {
+              setSlidePanelTab(tab);
+              if (tab === "recordings") void refreshRecordings();
+            }}
+            width={slidePanelWidth}
+            onWidthChange={setSlidePanelWidth}
+          >
+            {slidePanelTab === "prompts" ? (
+              <>
+                {/* Prompts Search */}
+                <div className="panelSearch">
+                  <span className="panelSearchIcon">{"\uD83D\uDD0D"}</span>
+                  <input
+                    className="panelSearchInput"
+                    type="text"
+                    placeholder="Search prompts..."
+                    value={promptSearch}
+                    onChange={(e) => setPromptSearch(e.target.value)}
+                  />
+                </div>
+
+                {/* Pinned Prompts */}
+                {(() => {
+                  const pinnedPrompts = prompts
+                    .filter(p => p.pinned)
+                    .filter(p => !promptSearch || p.title.toLowerCase().includes(promptSearch.toLowerCase()))
+                    .sort((a, b) => (a.pinOrder ?? 0) - (b.pinOrder ?? 0));
+                  if (pinnedPrompts.length === 0) return null;
+                  return (
+                    <div className="panelSection">
+                      <div className="panelSectionTitle">Pinned</div>
+                      <div className="panelList">
+                        {pinnedPrompts.map((p) => (
+                          <div key={p.id} className="panelCard">
+                            <div className="panelCardHeader">
+                              <span className="panelCardPin">{"\u2605"}</span>
+                              <span className="panelCardTitle">{p.title}</span>
+                            </div>
+                            <div className="panelCardPreview">{p.content.slice(0, 100)}</div>
+                            <div className="panelCardActions">
+                              <button className="panelCardBtn" onClick={() => void sendPromptToActive(p, "paste")} disabled={!activeId}>Paste</button>
+                              <button className="panelCardBtn" onClick={() => void sendPromptToActive(p, "send")} disabled={!activeId}>Send</button>
+                              <button className="panelCardBtn" onClick={() => openPromptEditor(p)}>Edit</button>
+                              <button className="panelCardBtn" onClick={() => togglePromptPin(p.id)}>Unpin</button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* All Prompts */}
+                <div className="panelSection">
+                  <div className="panelSectionTitle">All Prompts</div>
+                  <div className="panelList">
+                    {prompts
+                      .filter(p => !p.pinned)
+                      .filter(p => !promptSearch || p.title.toLowerCase().includes(promptSearch.toLowerCase()))
+                      .sort((a, b) => b.createdAt - a.createdAt)
+                      .map((p) => (
+                        <div key={p.id} className="panelCard">
+                          <div className="panelCardHeader">
+                            <span className="panelCardTitle">{p.title}</span>
+                          </div>
+                          <div className="panelCardMeta">{formatTimeAgo(p.createdAt)}</div>
+                          <div className="panelCardPreview">{p.content.slice(0, 100)}</div>
+                          <div className="panelCardActions">
+                            <button className="panelCardBtn" onClick={() => void sendPromptToActive(p, "paste")} disabled={!activeId}>Paste</button>
+                            <button className="panelCardBtn" onClick={() => void sendPromptToActive(p, "send")} disabled={!activeId}>Send</button>
+                            <button className="panelCardBtn" onClick={() => openPromptEditor(p)}>Edit</button>
+                            <button className="panelCardBtn" onClick={() => togglePromptPin(p.id)}>Pin</button>
+                          </div>
+                        </div>
+                      ))}
+                    {prompts.filter(p => !p.pinned).length === 0 && (
+                      <div className="panelCardMeta" style={{ textAlign: "center", padding: "16px" }}>
+                        No prompts yet
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* New Prompt Footer */}
+                <div className="panelFooter">
+                  <button className="panelFooterBtn" onClick={() => openPromptEditor()}>
+                    + New Prompt
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                {/* Recordings Search */}
+                <div className="panelSearch">
+                  <span className="panelSearchIcon">{"\uD83D\uDD0D"}</span>
+                  <input
+                    className="panelSearchInput"
+                    type="text"
+                    placeholder="Search recordings..."
+                    value={recordingSearch}
+                    onChange={(e) => setRecordingSearch(e.target.value)}
+                  />
+                </div>
+
+                {/* Recordings List */}
+                <div className="panelList">
+                  {recordingsLoading ? (
+                    <div className="panelCardMeta" style={{ textAlign: "center", padding: "16px" }}>
+                      Loading...
+                    </div>
+                  ) : (
+                    (() => {
+                      const filteredRecordings = recordings.filter(r => {
+                        if (!recordingSearch) return true;
+                        const name = r.meta?.name || r.recordingId;
+                        return name.toLowerCase().includes(recordingSearch.toLowerCase());
+                      });
+
+                      // Group by date
+                      const today = new Date();
+                      const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+                      const yesterdayStart = todayStart - 86400000;
+                      const weekStart = todayStart - 7 * 86400000;
+
+                      const groups: { label: string; items: typeof recordings }[] = [];
+                      const todayItems = filteredRecordings.filter(r => (r.meta?.createdAt ?? 0) >= todayStart);
+                      const yesterdayItems = filteredRecordings.filter(r => {
+                        const t = r.meta?.createdAt ?? 0;
+                        return t >= yesterdayStart && t < todayStart;
+                      });
+                      const weekItems = filteredRecordings.filter(r => {
+                        const t = r.meta?.createdAt ?? 0;
+                        return t >= weekStart && t < yesterdayStart;
+                      });
+                      const olderItems = filteredRecordings.filter(r => (r.meta?.createdAt ?? 0) < weekStart);
+
+                      if (todayItems.length) groups.push({ label: "Today", items: todayItems });
+                      if (yesterdayItems.length) groups.push({ label: "Yesterday", items: yesterdayItems });
+                      if (weekItems.length) groups.push({ label: "This Week", items: weekItems });
+                      if (olderItems.length) groups.push({ label: "Older", items: olderItems });
+
+                      if (groups.length === 0) {
+                        return (
+                          <div className="panelCardMeta" style={{ textAlign: "center", padding: "16px" }}>
+                            No recordings yet
+                          </div>
+                        );
+                      }
+
+                      return groups.map(group => (
+                        <div key={group.label} className="panelSection">
+                          <div className="dateGroupHeader">{group.label}</div>
+                          {group.items.map((r) => {
+                            const meta = r.meta;
+                            const displayName = meta?.name || r.recordingId.slice(0, 12);
+                            const effect = meta?.effectId ? getProcessEffectById(meta.effectId) : null;
+                            return (
+                              <div key={r.recordingId} className="panelCard">
+                                <div className="panelCardHeader">
+                                  <span className="panelCardTitle">{displayName}</span>
+                                </div>
+                                <div className="panelCardMeta">
+                                  {[
+                                    effect?.label,
+                                    meta?.cwd ? shortenPathSmart(meta.cwd, 30) : null,
+                                  ].filter(Boolean).join(" • ")}
+                                </div>
+                                <div className="panelCardActions">
+                                  <button className="panelCardBtn" onClick={() => void openReplay(r.recordingId, "step")}>Replay</button>
+                                  <button className="panelCardBtn" onClick={() => void openReplay(r.recordingId, "all")}>View</button>
+                                  <button className="panelCardBtn" onClick={() => void deleteRecording(r.recordingId)}>Delete</button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ));
+                    })()
+                  )}
+                </div>
+
+                {/* Refresh Button */}
+                <div className="panelFooter">
+                  <button className="panelFooterBtn" onClick={() => void refreshRecordings()}>
+                    Refresh
+                  </button>
+                </div>
+              </>
+            )}
+          </SlidePanel>
         </div>
       </main>
+
+      {/* Command Palette */}
+      <CommandPalette
+        isOpen={commandPaletteOpen}
+        onClose={() => setCommandPaletteOpen(false)}
+        prompts={prompts}
+        recordings={recordings}
+        sessions={projectSessions}
+        activeSessionId={activeId}
+        quickStarts={quickStarts}
+        onQuickStart={(preset) => void quickStart({ name: preset.title, command: preset.command })}
+        onSendPrompt={(prompt, mode) => void sendPromptToActive(prompt, mode)}
+        onEditPrompt={openPromptEditor}
+        onOpenRecording={(id, mode) => void openReplay(id, mode)}
+        onSwitchSession={setActiveId}
+        onNewSession={() => setNewOpen(true)}
+        onNewPrompt={() => openPromptEditor()}
+        onStartRecording={() => activeId && openRecordPrompt(activeId)}
+        onStopRecording={() => activeId && void stopRecording(activeId)}
+        isRecording={Boolean(active?.recordingActive)}
+        onOpenPromptsPanel={() => {
+          setSlidePanelTab("prompts");
+          setSlidePanelOpen(true);
+        }}
+        onOpenRecordingsPanel={() => {
+          void refreshRecordings();
+          setSlidePanelTab("recordings");
+          setSlidePanelOpen(true);
+        }}
+      />
     </div>
   );
 }
