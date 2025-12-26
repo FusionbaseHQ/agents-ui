@@ -1,9 +1,14 @@
 mod pty;
 mod persist;
+mod recording;
 mod tray;
 
-use pty::{close_session, create_session, list_sessions, resize_session, write_to_session, AppState};
+use pty::{
+    close_session, create_session, list_sessions, resize_session, start_session_recording,
+    stop_session_recording, write_to_session, AppState,
+};
 use persist::{list_directories, load_persisted_state, save_persisted_state, validate_directory};
+use recording::load_recording;
 use tray::{build_status_tray, set_tray_agent_count};
 use tauri::Manager;
 
@@ -24,10 +29,13 @@ fn main() {
             resize_session,
             close_session,
             list_sessions,
+            start_session_recording,
+            stop_session_recording,
             load_persisted_state,
             save_persisted_state,
             validate_directory,
             list_directories,
+            load_recording,
             set_tray_agent_count
         ])
         .run(tauri::generate_context!())

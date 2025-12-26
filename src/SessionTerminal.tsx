@@ -47,7 +47,7 @@ export default function SessionTerminal(props: {
     fit.fit();
 
     term.onData((data) => {
-      void invoke("write_to_session", { id: props.id, data }).catch(() => {});
+      void invoke("write_to_session", { id: props.id, data, source: "user" }).catch(() => {});
       if (data.includes("\r") || data.includes("\n")) {
         props.onUserEnter?.(props.id);
       }

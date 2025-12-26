@@ -2,10 +2,11 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State, WebviewWindow};
 
 #[derive(Default)]
@@ -25,6 +26,15 @@ struct PtySession {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn portable_pty::Child + Send>,
+    recording: Option<SessionRecording>,
+}
+
+struct SessionRecording {
+    id: String,
+    writer: BufWriter<std::fs::File>,
+    started_at: Instant,
+    last_flush: Instant,
+    unflushed_bytes: usize,
 }
 
 #[derive(Serialize, Clone)]
@@ -45,6 +55,38 @@ struct PtyOutput {
 struct PtyExit {
     id: String,
     exit_code: Option<u32>,
+}
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn record_user_input(rec: &mut SessionRecording, data: &str) -> Result<(), String> {
+    let t = rec.started_at.elapsed().as_millis() as u64;
+    let line = crate::recording::RecordingLineV1::Input(crate::recording::RecordingEventV1 {
+        t,
+        data: data.to_string(),
+    });
+    let json = serde_json::to_string(&line).map_err(|e| format!("serialize failed: {e}"))?;
+    rec.writer
+        .write_all(json.as_bytes())
+        .map_err(|e| format!("write failed: {e}"))?;
+    rec.writer.write_all(b"\n").map_err(|e| format!("write failed: {e}"))?;
+    rec.unflushed_bytes += json.len() + 1;
+
+    let should_flush = data.contains('\n')
+        || data.contains('\r')
+        || rec.unflushed_bytes >= 16 * 1024
+        || rec.last_flush.elapsed().as_millis() >= 1500;
+    if should_flush {
+        rec.writer.flush().ok();
+        rec.last_flush = Instant::now();
+        rec.unflushed_bytes = 0;
+    }
+    Ok(())
 }
 
 fn unique_name(existing: &HashMap<String, PtySession>, base: &str) -> String {
@@ -486,6 +528,7 @@ pub fn create_session(
             master: pair.master,
             writer,
             child,
+            recording: None,
         },
     );
     drop(sessions);
@@ -553,17 +596,115 @@ pub fn create_session(
 }
 
 #[tauri::command]
-pub fn write_to_session(state: State<'_, AppState>, id: String, data: String) -> Result<(), String> {
+pub fn start_session_recording(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    id: String,
+    recording_id: String,
+    project_id: String,
+    session_persist_id: String,
+    cwd: Option<String>,
+) -> Result<String, String> {
+    let safe_id = crate::recording::sanitize_recording_id(&recording_id);
+
     let mut sessions = state
         .inner
         .sessions
         .lock()
         .map_err(|_| "state poisoned")?;
     let s = sessions.get_mut(&id).ok_or("unknown session")?;
+
+    if s.recording.is_some() {
+        return Err("already recording".to_string());
+    }
+
+    let path = crate::recording::recording_file_path(&window, &safe_id)?;
+    let dir = path.parent().ok_or("invalid recording path")?;
+    fs::create_dir_all(dir).map_err(|e| format!("create dir failed: {e}"))?;
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(|e| format!("open failed: {e}"))?;
+
+    let mut writer = BufWriter::new(file);
+    let meta = crate::recording::RecordingMetaV1 {
+        schema_version: 1,
+        created_at: now_epoch_ms(),
+        project_id,
+        session_persist_id,
+        cwd,
+    };
+    let line = crate::recording::RecordingLineV1::Meta(meta);
+    let json = serde_json::to_string(&line).map_err(|e| format!("serialize failed: {e}"))?;
+    writer
+        .write_all(json.as_bytes())
+        .map_err(|e| format!("write failed: {e}"))?;
+    writer.write_all(b"\n").map_err(|e| format!("write failed: {e}"))?;
+    writer.flush().ok();
+
+    s.recording = Some(SessionRecording {
+        id: safe_id.clone(),
+        writer,
+        started_at: Instant::now(),
+        last_flush: Instant::now(),
+        unflushed_bytes: 0,
+    });
+
+    Ok(safe_id)
+}
+
+#[tauri::command]
+pub fn stop_session_recording(state: State<'_, AppState>, id: String) -> Result<Option<String>, String> {
+    let mut sessions = state
+        .inner
+        .sessions
+        .lock()
+        .map_err(|_| "state poisoned")?;
+    let s = sessions.get_mut(&id).ok_or("unknown session")?;
+
+    let mut rec = match s.recording.take() {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    rec.writer.flush().ok();
+    Ok(Some(rec.id))
+}
+
+#[tauri::command]
+pub fn write_to_session(
+    state: State<'_, AppState>,
+    id: String,
+    data: String,
+    source: Option<String>,
+) -> Result<(), String> {
+    let mut sessions = state
+        .inner
+        .sessions
+        .lock()
+        .map_err(|_| "state poisoned")?;
+    let s = sessions.get_mut(&id).ok_or("unknown session")?;
+
     s.writer
         .write_all(data.as_bytes())
         .map_err(|e| format!("write failed: {e}"))?;
     s.writer.flush().ok();
+
+    let is_user = source.as_deref() == Some("user");
+    if is_user {
+        let mut rec_err: Option<String> = None;
+        if let Some(rec) = s.recording.as_mut() {
+            if let Err(e) = record_user_input(rec, &data) {
+                rec_err = Some(e);
+            }
+        }
+        if let Some(err) = rec_err {
+            eprintln!("Failed to write recording event: {err}");
+            s.recording = None;
+        }
+    }
     Ok(())
 }
 

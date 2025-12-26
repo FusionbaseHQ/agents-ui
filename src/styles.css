@@ -220,6 +220,30 @@ body {
   white-space: nowrap;
 }
 
+.recordingDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 80, 80, 0.95);
+  box-shadow: 0 0 0 2px rgba(255, 80, 80, 0.14);
+  animation: recordingPulse 1.2s ease-in-out infinite;
+}
+
+@keyframes recordingPulse {
+  0% {
+    transform: scale(0.85);
+    opacity: 0.7;
+  }
+  50% {
+    transform: scale(1.15);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(0.85);
+    opacity: 0.7;
+  }
+}
+
 .chip {
   display: inline-flex;
   align-items: center;
@@ -320,6 +344,13 @@ body {
   padding: 0 12px;
   border-bottom: 1px solid var(--border);
   background: rgba(255, 255, 255, 0.02);
+}
+
+.topbarRight {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
 }
 
 .activeTitle {
@@ -435,6 +466,12 @@ body {
   font-size: 12px;
 }
 
+.btnSmall.btnRecording {
+  border-color: rgba(255, 80, 80, 0.35);
+  background: rgba(255, 80, 80, 0.12);
+  color: rgba(255, 255, 255, 0.92);
+}
+
 .btnSmall:hover {
   background: rgba(255, 255, 255, 0.06);
 }
@@ -472,6 +509,27 @@ body {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.replayPreview {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 14px;
+  padding: 10px;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-family:
+    ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Monaco,
+    Consolas,
+    "Liberation Mono",
+    "Courier New",
+    monospace;
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .pathPickerItem {

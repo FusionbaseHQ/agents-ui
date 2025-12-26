@@ -25,6 +25,8 @@ type Session = SessionInfo & {
   createdAt: number;
   launchCommand: string | null;
   restoreCommand?: string | null;
+  lastRecordingId?: string | null;
+  recordingActive?: boolean;
   cwd: string | null;
   effectId?: string | null;
   agentWorking?: boolean;
@@ -71,6 +73,7 @@ type PersistedSession = {
   name: string;
   launchCommand: string | null;
   restoreCommand?: string | null;
+  lastRecordingId?: string | null;
   cwd: string | null;
   createdAt: number;
 };
@@ -85,6 +88,22 @@ type PersistedStateV1 = {
 
 type DirectoryEntry = { name: string; path: string };
 type DirectoryListing = { path: string; parent: string | null; entries: DirectoryEntry[] };
+
+type RecordingMeta = {
+  schemaVersion: number;
+  createdAt: number;
+  projectId: string;
+  sessionPersistId: string;
+  cwd: string | null;
+};
+
+type RecordingEvent = { t: number; data: string };
+
+type LoadedRecording = {
+  recordingId: string;
+  meta: RecordingMeta | null;
+  events: RecordingEvent[];
+};
 
 function loadLegacyPersistedSessions(): PersistedSession[] {
   try {
@@ -111,6 +130,7 @@ function loadLegacyPersistedSessions(): PersistedSession[] {
         name: s.name,
         launchCommand: s.launchCommand,
         restoreCommand: null,
+        lastRecordingId: null,
         cwd: s.cwd ?? null,
         createdAt: s.createdAt,
       }));
@@ -177,6 +197,7 @@ async function createSession(input: {
   name?: string;
   launchCommand?: string | null;
   restoreCommand?: string | null;
+  lastRecordingId?: string | null;
   cwd?: string | null;
   persistId?: string;
   createdAt?: number;
@@ -200,6 +221,8 @@ async function createSession(input: {
     createdAt: input.createdAt ?? Date.now(),
     launchCommand,
     restoreCommand: input.restoreCommand ?? null,
+    lastRecordingId: input.lastRecordingId ?? null,
+    recordingActive: false,
     cwd: info.cwd ?? input.cwd ?? null,
     effectId: effect?.id ?? null,
     processTag,
@@ -234,6 +257,13 @@ export default function App() {
   const [pathPickerInput, setPathPickerInput] = useState("");
   const [pathPickerLoading, setPathPickerLoading] = useState(false);
   const [pathPickerError, setPathPickerError] = useState<string | null>(null);
+  const [replayOpen, setReplayOpen] = useState(false);
+  const [replayLoading, setReplayLoading] = useState(false);
+  const [replayError, setReplayError] = useState<string | null>(null);
+  const [replayRecording, setReplayRecording] = useState<LoadedRecording | null>(null);
+  const [replaySteps, setReplaySteps] = useState<string[]>([]);
+  const [replayIndex, setReplayIndex] = useState(0);
+  const [replayTargetSessionId, setReplayTargetSessionId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const registry = useRef<TerminalRegistry>(new Map());
@@ -366,6 +396,7 @@ export default function App() {
         name: s.name,
         launchCommand: s.launchCommand,
         restoreCommand: s.restoreCommand ?? null,
+        lastRecordingId: s.lastRecordingId ?? null,
         cwd: s.cwd,
         createdAt: s.createdAt,
       }))
@@ -422,12 +453,13 @@ export default function App() {
 	  useEffect(() => {
 	    const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
 	    const onKeyDown = (e: KeyboardEvent) => {
-	      if (e.key === "Escape" && (newOpen || projectOpen || pathPickerOpen || confirmDeleteProjectOpen)) {
+	      if (e.key === "Escape" && (newOpen || projectOpen || pathPickerOpen || confirmDeleteProjectOpen || replayOpen)) {
 	        e.preventDefault();
 	        setNewOpen(false);
 	        setProjectOpen(false);
 	        setPathPickerOpen(false);
 	        setConfirmDeleteProjectOpen(false);
+	        closeReplayModal();
 	        return;
 	      }
 
@@ -483,7 +515,7 @@ export default function App() {
 
 	    window.addEventListener("keydown", onKeyDown);
 	    return () => window.removeEventListener("keydown", onKeyDown);
-	  }, [newOpen, projectOpen, pathPickerOpen, confirmDeleteProjectOpen]);
+	  }, [newOpen, projectOpen, pathPickerOpen, confirmDeleteProjectOpen, replayOpen]);
 
   function formatError(err: unknown): string {
     if (err instanceof Error) return err.message;
@@ -497,6 +529,142 @@ export default function App() {
 
   function reportError(prefix: string, err: unknown) {
     setError(`${prefix}: ${formatError(err)}`);
+  }
+
+  function splitRecordingIntoSteps(events: RecordingEvent[]): string[] {
+    const steps: string[] = [];
+    let buffer = "";
+    for (const ev of events) {
+      buffer += ev.data;
+      while (true) {
+        const r = buffer.indexOf("\r");
+        const n = buffer.indexOf("\n");
+        const idx = r === -1 ? n : n === -1 ? r : Math.min(r, n);
+        if (idx === -1) break;
+        steps.push(buffer.slice(0, idx + 1));
+        buffer = buffer.slice(idx + 1);
+      }
+    }
+    if (buffer) steps.push(buffer);
+    return steps;
+  }
+
+  async function startRecording(sessionId: string) {
+    const s = sessionsRef.current.find((s) => s.id === sessionId);
+    if (!s) return;
+    if (s.recordingActive) return;
+
+    try {
+      const recordingId = makeId();
+      const safeId = await invoke<string>("start_session_recording", {
+        id: s.id,
+        recording_id: recordingId,
+        project_id: s.projectId,
+        session_persist_id: s.persistId,
+        cwd: s.cwd,
+      });
+      setSessions((prev) =>
+        prev.map((x) =>
+          x.id === sessionId
+            ? { ...x, recordingActive: true, lastRecordingId: safeId }
+            : x,
+        ),
+      );
+    } catch (err) {
+      reportError("Failed to start recording", err);
+    }
+  }
+
+  async function stopRecording(sessionId: string) {
+    const s = sessionsRef.current.find((s) => s.id === sessionId);
+    if (!s) return;
+    if (!s.recordingActive) return;
+
+    try {
+      await invoke("stop_session_recording", { id: s.id });
+    } catch (err) {
+      reportError("Failed to stop recording", err);
+    } finally {
+      setSessions((prev) =>
+        prev.map((x) => (x.id === sessionId ? { ...x, recordingActive: false } : x)),
+      );
+    }
+  }
+
+  function closeReplayModal() {
+    setReplayOpen(false);
+    setReplayLoading(false);
+    setReplayError(null);
+    setReplayRecording(null);
+    setReplaySteps([]);
+    setReplayIndex(0);
+    setReplayTargetSessionId(null);
+  }
+
+  async function openReplayForActive() {
+    if (!active?.lastRecordingId) return;
+    setReplayOpen(true);
+    setReplayLoading(true);
+    setReplayError(null);
+    setReplayRecording(null);
+    setReplaySteps([]);
+    setReplayIndex(0);
+    setReplayTargetSessionId(null);
+
+    try {
+      const rec = await invoke<LoadedRecording>("load_recording", {
+        recording_id: active.lastRecordingId,
+      });
+      setReplayRecording(rec);
+      setReplaySteps(splitRecordingIntoSteps(rec.events));
+    } catch (err) {
+      setReplayError(formatError(err));
+    } finally {
+      setReplayLoading(false);
+    }
+  }
+
+  async function ensureReplayTargetSession(): Promise<string | null> {
+    if (replayTargetSessionId) return replayTargetSessionId;
+
+    const rec = replayRecording;
+    const cwd = rec?.meta?.cwd ?? active?.cwd ?? activeProject?.basePath ?? homeDirRef.current ?? null;
+    const projectId =
+      (rec?.meta?.projectId && projects.some((p) => p.id === rec.meta?.projectId)
+        ? rec.meta.projectId
+        : null) ?? activeProjectId;
+
+    try {
+      const created = await createSession({
+        projectId,
+        name: "replay",
+        cwd,
+      });
+      setSessions((prev) => [...prev, created]);
+      setActiveProjectId(projectId);
+      setActiveId(created.id);
+      setReplayTargetSessionId(created.id);
+      return created.id;
+    } catch (err) {
+      reportError("Failed to create replay session", err);
+      return null;
+    }
+  }
+
+  async function sendNextReplayStep() {
+    if (!replaySteps.length) return;
+    if (replayIndex >= replaySteps.length) return;
+
+    const targetId = (await ensureReplayTargetSession()) ?? null;
+    if (!targetId) return;
+
+    const chunk = replaySteps[replayIndex];
+    try {
+      await invoke("write_to_session", { id: targetId, data: chunk, source: "system" });
+      setReplayIndex((i) => i + 1);
+    } catch (err) {
+      reportError("Failed to replay input", err);
+    }
   }
 
   async function loadPathPicker(path: string | null) {
@@ -742,7 +910,13 @@ export default function App() {
         setSessions((prev) =>
           prev.map((s) =>
             s.id === id
-              ? { ...s, exited: true, exitCode: exit_code ?? null, agentWorking: false }
+              ? {
+                  ...s,
+                  exited: true,
+                  exitCode: exit_code ?? null,
+                  agentWorking: false,
+                  recordingActive: false,
+                }
               : s,
           ),
         );
@@ -843,6 +1017,7 @@ export default function App() {
             name: s.name,
             launchCommand: s.launchCommand,
             restoreCommand: s.restoreCommand ?? null,
+            lastRecordingId: s.lastRecordingId ?? null,
             cwd: s.cwd ?? projectById.get(s.projectId)?.basePath ?? resolvedHome ?? null,
             persistId: s.persistId,
             createdAt: s.createdAt,
@@ -853,9 +1028,11 @@ export default function App() {
             (s.launchCommand ? null : (s.restoreCommand ?? null))?.trim() ?? null;
           if (restoreCmd) {
             const singleLine = restoreCmd.replace(/\r?\n/g, " ");
-            void invoke("write_to_session", { id: created.id, data: `${singleLine}\n` }).catch(
-              () => {},
-            );
+            void invoke("write_to_session", {
+              id: created.id,
+              data: `${singleLine}\n`,
+              source: "system",
+            }).catch(() => {});
           }
         } catch (err) {
           if (!cancelled) reportError("Failed to restore session", err);
@@ -957,6 +1134,14 @@ export default function App() {
 
   async function onClose(id: string) {
     clearAgentIdleTimer(id);
+    const session = sessionsRef.current.find((s) => s.id === id) ?? null;
+    if (session?.recordingActive) {
+      try {
+        await invoke("stop_session_recording", { id });
+      } catch {
+        // ignore
+      }
+    }
     setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, closing: true } : s)));
 
     if (!closingSessions.current.has(id)) {
@@ -1083,6 +1268,7 @@ export default function App() {
               const effect = getProcessEffectById(s.effectId);
               const chipLabel = effect?.label ?? s.processTag ?? null;
               const isWorking = Boolean(effect && s.agentWorking && !isExited && !isClosing);
+              const isRecording = Boolean(s.recordingActive && !isExited && !isClosing);
               const chipClass = effect ? `chip chip-${effect.id}` : "chip";
               return (
                 <div
@@ -1102,6 +1288,7 @@ export default function App() {
                           {isWorking && <span className="chipActivity" aria-label="Working" />}
                         </span>
                       )}
+                      {isRecording && <span className="recordingDot" title="Recording" />}
                       {isClosing ? (
                         <span className="sessionStatus">closing…</span>
                       ) : isExited ? (
@@ -1145,16 +1332,41 @@ export default function App() {
             {activeProject?.basePath ? ` • ${shortenPathSmart(activeProject.basePath, 44)}` : ""}
             {active ? ` • Session: ${active.name}` : " • No active session"}
           </div>
-          {error ? (
-            <div className="errorBanner" role="alert">
-              <div className="errorText">{error}</div>
-              <button className="errorClose" onClick={() => setError(null)} title="Dismiss">
-                ×
-              </button>
-            </div>
-          ) : (
-            <div className="hint">New: ⌘T / Ctrl+Shift+T • Close: ⌘W / Ctrl+Shift+W</div>
-          )}
+          <div className="topbarRight">
+            {error ? (
+              <div className="errorBanner" role="alert">
+                <div className="errorText">{error}</div>
+                <button className="errorClose" onClick={() => setError(null)} title="Dismiss">
+                  ×
+                </button>
+              </div>
+            ) : (
+              <div className="hint">New: ⌘T / Ctrl+Shift+T • Close: ⌘W / Ctrl+Shift+W</div>
+            )}
+
+            {active && (
+              <>
+                <button
+                  className={`btnSmall ${active.recordingActive ? "btnRecording" : ""}`}
+                  onClick={() =>
+                    active.recordingActive ? void stopRecording(active.id) : void startRecording(active.id)
+                  }
+                  disabled={Boolean(active.exited || active.closing)}
+                  title={active.recordingActive ? "Stop recording" : "Start recording"}
+                >
+                  {active.recordingActive ? "Stop" : "Record"}
+                </button>
+                <button
+                  className="btnSmall"
+                  onClick={() => void openReplayForActive()}
+                  disabled={!active.lastRecordingId}
+                  title={active.lastRecordingId ? "Replay last recording" : "No recording yet"}
+                >
+                  Replay
+                </button>
+              </>
+            )}
+          </div>
         </div>
 
         <div className="terminalArea">
@@ -1463,6 +1675,64 @@ export default function App() {
                     }}
                   >
                     Select
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {replayOpen && (
+            <div className="modalBackdrop" onClick={closeReplayModal}>
+              <div className="modal" onClick={(e) => e.stopPropagation()}>
+                <h3 className="modalTitle">Replay recording</h3>
+
+                {replayError && (
+                  <div className="pathPickerError" role="alert">
+                    {replayError}
+                  </div>
+                )}
+
+                {replayLoading ? (
+                  <div className="empty">Loading…</div>
+                ) : replayRecording ? (
+                  <>
+                    <div className="hint" style={{ marginTop: 0 }}>
+                      {replayRecording.meta?.cwd
+                        ? `CWD: ${shortenPathSmart(replayRecording.meta.cwd, 64)}`
+                        : "CWD: —"}
+                      {" • "}
+                      {replayIndex}/{replaySteps.length} steps sent
+                    </div>
+
+                    <div className="formRow" style={{ marginBottom: 0 }}>
+                      <div className="label">Next input</div>
+                      <div className="replayPreview">
+                        {replaySteps[replayIndex]
+                          ? replaySteps[replayIndex]
+                          : "Done."}
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <div className="empty">No recording loaded.</div>
+                )}
+
+                <div className="modalActions">
+                  <button type="button" className="btn" onClick={closeReplayModal}>
+                    Close
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => void sendNextReplayStep()}
+                    disabled={
+                      replayLoading ||
+                      Boolean(replayError) ||
+                      replayIndex >= replaySteps.length
+                    }
+                    title="Creates a new replay tab if needed"
+                  >
+                    Send next
                   </button>
                 </div>
               </div>
