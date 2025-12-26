@@ -3,8 +3,8 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, Tray
 use tauri::{AppHandle, Manager, State};
 
 pub struct StatusTrayState {
-    tray: TrayIcon,
-    count_item: MenuItem<tauri::Wry>,
+    tray: Option<TrayIcon>,
+    count_item: Option<MenuItem<tauri::Wry>>,
 }
 
 fn show_main_window(app: &AppHandle) {
@@ -44,13 +44,24 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
 }
 
 impl StatusTrayState {
+    pub fn disabled() -> Self {
+        Self {
+            tray: None,
+            count_item: None,
+        }
+    }
+
     fn set_agent_count(&self, count: u32) -> Result<(), String> {
-        self.count_item
+        let Some(count_item) = &self.count_item else {
+            return Ok(());
+        };
+        count_item
             .set_text(format!("Active agents: {count}"))
             .map_err(|e| e.to_string())?;
 
-        let tooltip = format!("Agents UI — {count} active");
-        let _ = self.tray.set_tooltip(Some(tooltip));
+        let Some(tray) = &self.tray else {
+            return Ok(());
+        };
 
         #[cfg(not(windows))]
         {
@@ -59,8 +70,11 @@ impl StatusTrayState {
             } else {
                 Some(count.to_string())
             };
-            let _ = self.tray.set_title(title);
+            let _ = tray.set_title(title);
         }
+
+        let tooltip = format!("Agents UI — {count} active");
+        let _ = tray.set_tooltip(Some(tooltip));
 
         Ok(())
     }
@@ -105,7 +119,10 @@ pub fn build_status_tray(app: &AppHandle) -> Result<StatusTrayState, String> {
 
     let tray = tray_builder.build(app).map_err(|e| e.to_string())?;
 
-    Ok(StatusTrayState { tray, count_item })
+    Ok(StatusTrayState {
+        tray: Some(tray),
+        count_item: Some(count_item),
+    })
 }
 
 #[tauri::command]

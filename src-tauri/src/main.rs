@@ -11,7 +11,10 @@ fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
         .setup(|app| {
-            let tray = build_status_tray(&app.handle())?;
+            let tray = build_status_tray(&app.handle()).unwrap_or_else(|e| {
+                eprintln!("Failed to create tray icon: {e}");
+                tray::StatusTrayState::disabled()
+            });
             app.manage(tray);
             Ok(())
         })
