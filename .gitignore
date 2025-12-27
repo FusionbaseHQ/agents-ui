@@ -20,3 +20,6 @@ src-tauri/.tauri/
 .DS_Store
 .vscode/
 .idea/
+
+# Local agent configs
+.claude/

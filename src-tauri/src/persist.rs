@@ -12,6 +12,7 @@ pub struct PersistedProjectV1 {
     pub title: String,
     pub base_path: Option<String>,
     pub environment_id: Option<String>,
+    pub assets_enabled: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -47,6 +48,23 @@ pub struct PersistedEnvironmentV1 {
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct PersistedAssetV1 {
+    pub id: String,
+    pub name: String,
+    pub relative_path: String,
+    pub content: String,
+    pub created_at: u64,
+    pub auto_apply: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedAssetSettingsV1 {
+    pub auto_apply_enabled: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct PersistedStateV1 {
     pub schema_version: u32,
     pub projects: Vec<PersistedProjectV1>,
@@ -57,6 +75,11 @@ pub struct PersistedStateV1 {
     pub prompts: Vec<PersistedPromptV1>,
     #[serde(default)]
     pub environments: Vec<PersistedEnvironmentV1>,
+    #[serde(default)]
+    pub assets: Vec<PersistedAssetV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_shortcut_ids: Option<Vec<String>>,
+    pub asset_settings: Option<PersistedAssetSettingsV1>,
 }
 
 fn state_file_path(window: &WebviewWindow) -> Result<PathBuf, String> {

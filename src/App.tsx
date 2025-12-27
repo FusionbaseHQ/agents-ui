@@ -3,16 +3,30 @@ import { invoke } from "@tauri-apps/api/core";
 import { homeDir } from "@tauri-apps/api/path";
 import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import SessionTerminal, { TerminalRegistry } from "./SessionTerminal";
-import { commandTagFromCommandLine, detectProcessEffect, getProcessEffectById } from "./processEffects";
+import {
+  commandTagFromCommandLine,
+  detectProcessEffect,
+  getProcessEffectById,
+  PROCESS_EFFECTS,
+} from "./processEffects";
 import { shortenPathSmart } from "./pathDisplay";
 import { SlidePanel } from "./SlidePanel";
 import { CommandPalette } from "./CommandPalette";
+import { ProjectsSection } from "./components/ProjectsSection";
+import { QuickPromptsSection } from "./components/QuickPromptsSection";
+import { SessionsSection } from "./components/SessionsSection";
+import { AgentShortcutsModal } from "./components/AgentShortcutsModal";
+import { NewSessionModal } from "./components/modals/NewSessionModal";
+import { ProjectModal } from "./components/modals/ProjectModal";
+import { ConfirmDeleteProjectModal } from "./components/modals/ConfirmDeleteProjectModal";
+import { PathPickerModal } from "./components/modals/PathPickerModal";
 
 type Project = {
   id: string;
   title: string;
   basePath: string | null;
   environmentId: string | null;
+  assetsEnabled?: boolean;
 };
 
 type SessionInfo = {
@@ -53,10 +67,7 @@ const STORAGE_ACTIVE_SESSION_BY_PROJECT_KEY = "agents-ui-active-session-by-proje
 const MAX_PENDING_SESSIONS = 32;
 const MAX_PENDING_CHUNKS_PER_SESSION = 200;
 
-const PRESETS: Array<{ name: string; command: string }> = [
-  { name: "codex", command: "codex" },
-  { name: "claude", command: "claude" }
-];
+const DEFAULT_AGENT_SHORTCUT_IDS = ["codex", "claude", "gemini"];
 
 function makeId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -147,7 +158,7 @@ function envVarsForProjectId(
 function defaultProjectState(): { projects: Project[]; activeProjectId: string } {
   const id = makeId();
   return {
-    projects: [{ id, title: "Default", basePath: null, environmentId: null }],
+    projects: [{ id, title: "Default", basePath: null, environmentId: null, assetsEnabled: true }],
     activeProjectId: id,
   };
 }
@@ -171,6 +182,9 @@ type PersistedStateV1 = {
   activeSessionByProject: Record<string, string>;
   prompts?: Prompt[];
   environments?: EnvironmentConfig[];
+  assets?: AssetTemplate[];
+  assetSettings?: AssetSettings;
+  agentShortcutIds?: string[];
 };
 
 type DirectoryEntry = { name: string; path: string };
@@ -190,6 +204,19 @@ type EnvironmentConfig = {
   name: string;
   content: string;
   createdAt: number;
+};
+
+type AssetTemplate = {
+  id: string;
+  name: string;
+  relativePath: string;
+  content: string;
+  createdAt: number;
+  autoApply?: boolean;
+};
+
+type AssetSettings = {
+  autoApplyEnabled: boolean;
 };
 
 type RecordingMeta = {
@@ -280,7 +307,13 @@ function loadLegacyProjectState(): { projects: Project[]; activeProjectId: strin
               typeof (p as { id?: unknown }).id === "string" &&
               typeof (p as { title?: unknown }).title === "string",
           )
-          .map((p) => ({ id: p.id, title: p.title, basePath: null, environmentId: null }));
+          .map((p) => ({
+            id: p.id,
+            title: p.title,
+            basePath: null,
+            environmentId: null,
+            assetsEnabled: true,
+          }));
       }
     }
   } catch {
@@ -355,6 +388,10 @@ export default function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [prompts, setPrompts] = useState<Prompt[]>([]);
   const [environments, setEnvironments] = useState<EnvironmentConfig[]>([]);
+  const [assets, setAssets] = useState<AssetTemplate[]>([]);
+  const [assetSettings, setAssetSettings] = useState<AssetSettings>({ autoApplyEnabled: true });
+  const [agentShortcutIds, setAgentShortcutIds] = useState<string[]>(DEFAULT_AGENT_SHORTCUT_IDS);
+  const [agentShortcutsOpen, setAgentShortcutsOpen] = useState(false);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
   const [newOpen, setNewOpen] = useState(false);
@@ -366,6 +403,7 @@ export default function App() {
   const [projectTitle, setProjectTitle] = useState("");
   const [projectBasePath, setProjectBasePath] = useState("");
   const [projectEnvironmentId, setProjectEnvironmentId] = useState<string>("");
+  const [projectAssetsEnabled, setProjectAssetsEnabled] = useState(true);
   const [confirmDeleteProjectOpen, setConfirmDeleteProjectOpen] = useState(false);
   const [pathPickerOpen, setPathPickerOpen] = useState(false);
   const [pathPickerTarget, setPathPickerTarget] = useState<"project" | "session" | null>(null);
@@ -398,27 +436,72 @@ export default function App() {
   const [environmentEditorId, setEnvironmentEditorId] = useState<string | null>(null);
   const [environmentEditorName, setEnvironmentEditorName] = useState("");
   const [environmentEditorContent, setEnvironmentEditorContent] = useState("");
+  const [assetEditorOpen, setAssetEditorOpen] = useState(false);
+  const [assetEditorId, setAssetEditorId] = useState<string | null>(null);
+  const [assetEditorName, setAssetEditorName] = useState("");
+  const [assetEditorPath, setAssetEditorPath] = useState("");
+  const [assetEditorAutoApply, setAssetEditorAutoApply] = useState(true);
+  const [assetEditorContent, setAssetEditorContent] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   // New UI state for SlidePanel and CommandPalette
   const [slidePanelOpen, setSlidePanelOpen] = useState(false);
-  const [slidePanelTab, setSlidePanelTab] = useState<"prompts" | "recordings">("prompts");
+  const [slidePanelTab, setSlidePanelTab] = useState<"prompts" | "recordings" | "assets">("prompts");
   const [slidePanelWidth, setSlidePanelWidth] = useState(360);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [promptSearch, setPromptSearch] = useState("");
   const [recordingSearch, setRecordingSearch] = useState("");
+  const [assetSearch, setAssetSearch] = useState("");
   const [recordingStartTime, setRecordingStartTime] = useState<number | null>(null);
   const [recordingElapsed, setRecordingElapsed] = useState(0);
 
   const quickStarts = useMemo(() => {
-    const codex = getProcessEffectById("codex");
-    const claude = getProcessEffectById("claude");
+    const presets: Array<{ id: string; title: string; command: string | null; iconSrc: string | null }> = [];
+
+    const seen = new Set<string>();
+    for (const id of agentShortcutIds) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const effect = getProcessEffectById(id);
+      if (!effect) continue;
+      presets.push({
+        id: effect.id,
+        title: effect.label,
+        command: effect.matchCommands[0] ?? effect.label,
+        iconSrc: effect.iconSrc ?? null,
+      });
+    }
+
+    const pinned = new Set(presets.map((p) => p.id));
+    const rest = PROCESS_EFFECTS
+      .filter((e) => !pinned.has(e.id))
+      .slice()
+      .sort((a, b) => a.label.toLowerCase().localeCompare(b.label.toLowerCase()))
+      .map((effect) => ({
+        id: effect.id,
+        title: effect.label,
+        command: effect.matchCommands[0] ?? effect.label,
+        iconSrc: effect.iconSrc ?? null,
+      }));
+
     return [
+      ...presets,
+      ...rest,
       { id: "shell", title: "shell", command: null as string | null, iconSrc: null as string | null },
-      { id: "codex", title: "codex", command: "codex", iconSrc: codex?.iconSrc ?? null },
-      { id: "claude", title: "claude", command: "claude", iconSrc: claude?.iconSrc ?? null },
     ];
-  }, []);
+  }, [agentShortcutIds]);
+
+  const agentShortcuts = useMemo(() => {
+    const seen = new Set<string>();
+    return agentShortcutIds
+      .filter((id) => {
+        if (seen.has(id)) return false;
+        seen.add(id);
+        return true;
+      })
+      .map((id) => getProcessEffectById(id))
+      .filter((effect): effect is NonNullable<ReturnType<typeof getProcessEffectById>> => Boolean(effect));
+  }, [agentShortcutIds]);
 
   const registry = useRef<TerminalRegistry>(new Map());
   const pendingData = useRef<PendingDataBuffer>(new Map());
@@ -432,6 +515,7 @@ export default function App() {
   const recordNameRef = useRef<HTMLInputElement | null>(null);
   const promptTitleRef = useRef<HTMLInputElement | null>(null);
   const envNameRef = useRef<HTMLInputElement | null>(null);
+  const assetNameRef = useRef<HTMLInputElement | null>(null);
   const projectTitleRef = useRef<HTMLInputElement | null>(null);
   const homeDirRef = useRef<string | null>(null);
   const saveTimerRef = useRef<number | null>(null);
@@ -502,6 +586,17 @@ export default function App() {
     return counts;
   }, [sessions]);
 
+  const workingAgentCountByProject = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const s of sessions) {
+      if (!s.effectId) continue;
+      if (s.exited || s.closing) continue;
+      if (!s.agentWorking) continue;
+      counts.set(s.projectId, (counts.get(s.projectId) ?? 0) + 1);
+    }
+    return counts;
+  }, [sessions]);
+
   useEffect(() => {
     sessionIdsRef.current = sessions.map((s) => s.id);
     sessionsRef.current = sessions;
@@ -567,6 +662,9 @@ export default function App() {
       activeSessionByProject,
       prompts,
       environments,
+      assets,
+      assetSettings,
+      agentShortcutIds,
     };
 
     saveTimerRef.current = window.setTimeout(() => {
@@ -577,7 +675,7 @@ export default function App() {
         reportError("Failed to save state", err);
       });
     }, 400);
-  }, [projects, activeProjectId, activeSessionByProject, sessions, prompts, environments, hydrated]);
+  }, [projects, activeProjectId, activeSessionByProject, sessions, prompts, environments, assets, assetSettings, agentShortcutIds, hydrated]);
 
   const activeAgentCount = useMemo(() => {
     return sessions.filter(
@@ -619,6 +717,7 @@ export default function App() {
 	    const onKeyDown = (e: KeyboardEvent) => {
         const modalOpen =
           newOpen ||
+          agentShortcutsOpen ||
           projectOpen ||
           pathPickerOpen ||
           confirmDeleteProjectOpen ||
@@ -628,7 +727,8 @@ export default function App() {
           promptsOpen ||
           promptEditorOpen ||
           environmentsOpen ||
-          environmentEditorOpen;
+          environmentEditorOpen ||
+          assetEditorOpen;
 
         // Command palette takes priority - Cmd+K or Ctrl+K
         const modKey = isMac ? e.metaKey : e.ctrlKey;
@@ -654,12 +754,20 @@ export default function App() {
 
 	      if (e.key === "Escape" && modalOpen) {
 	        e.preventDefault();
+          if (agentShortcutsOpen) {
+            setAgentShortcutsOpen(false);
+            return;
+          }
           if (environmentEditorOpen) {
             setEnvironmentEditorOpen(false);
             return;
           }
           if (environmentsOpen) {
             setEnvironmentsOpen(false);
+            return;
+          }
+          if (assetEditorOpen) {
+            closeAssetEditor();
             return;
           }
           if (promptEditorOpen) {
@@ -750,6 +858,20 @@ export default function App() {
           });
           return;
         }
+        // Cmd+Shift+A - Toggle Assets Panel
+        if (e.metaKey && e.shiftKey && e.key.toLowerCase() === "a") {
+          e.preventDefault();
+          setSlidePanelOpen(prev => {
+            if (!prev) {
+              setSlidePanelTab("assets");
+              return true;
+            }
+            if (slidePanelTab === "assets") return false;
+            setSlidePanelTab("assets");
+            return true;
+          });
+          return;
+        }
         // Cmd+1 through Cmd+5 - Quick prompts
         if (e.metaKey && /^[1-5]$/.test(e.key)) {
           const idx = parseInt(e.key) - 1;
@@ -800,6 +922,20 @@ export default function App() {
             }
             if (slidePanelTab === "recordings") return false;
             setSlidePanelTab("recordings");
+            return true;
+          });
+          return;
+        }
+        // Ctrl+Shift+A - Toggle Assets Panel
+        if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "a") {
+          e.preventDefault();
+          setSlidePanelOpen(prev => {
+            if (!prev) {
+              setSlidePanelTab("assets");
+              return true;
+            }
+            if (slidePanelTab === "assets") return false;
+            setSlidePanelTab("assets");
             return true;
           });
           return;
@@ -1186,6 +1322,93 @@ export default function App() {
     if (projectEnvironmentId === id) setProjectEnvironmentId("");
   }
 
+  function openAssetEditor(asset?: AssetTemplate) {
+    setAssetEditorId(asset?.id ?? null);
+    setAssetEditorName(asset?.name ?? "");
+    setAssetEditorPath(asset?.relativePath ?? "");
+    setAssetEditorContent(asset?.content ?? "");
+    setAssetEditorAutoApply(asset?.autoApply ?? true);
+    setAssetEditorOpen(true);
+    window.setTimeout(() => assetNameRef.current?.focus(), 0);
+  }
+
+  function closeAssetEditor() {
+    setAssetEditorOpen(false);
+    setAssetEditorId(null);
+    setAssetEditorName("");
+    setAssetEditorPath("");
+    setAssetEditorContent("");
+    setAssetEditorAutoApply(true);
+  }
+
+  function saveAssetFromEditor() {
+    const name = assetEditorName.trim();
+    const relativePath = assetEditorPath.trim();
+    if (!name || !relativePath) return;
+    const now = Date.now();
+    const id = assetEditorId ?? makeId();
+    const next: AssetTemplate = {
+      id,
+      name,
+      relativePath,
+      content: assetEditorContent,
+      createdAt: assetEditorId ? (assets.find((a) => a.id === assetEditorId)?.createdAt ?? now) : now,
+      autoApply: assetEditorAutoApply,
+    };
+    setAssets((prev) => {
+      if (!assetEditorId) return [...prev, next].sort((a, b) => b.createdAt - a.createdAt);
+      return prev
+        .map((a) => (a.id === assetEditorId ? next : a))
+        .sort((a, b) => b.createdAt - a.createdAt);
+    });
+    closeAssetEditor();
+  }
+
+  function deleteAsset(id: string) {
+    const asset = assets.find((a) => a.id === id);
+    const label = asset?.name?.trim() ? asset.name.trim() : "this asset";
+    if (!window.confirm(`Delete ${label}?`)) return;
+    setAssets((prev) => prev.filter((a) => a.id !== id));
+  }
+
+  function toggleAssetAutoApply(id: string) {
+    setAssets((prev) =>
+      prev.map((a) => (a.id === id ? { ...a, autoApply: !(a.autoApply ?? true) } : a)),
+    );
+  }
+
+  async function applyTextAssets(baseDir: string, templates: AssetTemplate[], overwrite: boolean) {
+    const dir = baseDir.trim();
+    if (!dir) return;
+    const payload = templates
+      .map((t) => ({
+        relativePath: t.relativePath,
+        content: t.content,
+      }))
+      .filter((t) => t.relativePath.trim());
+    if (payload.length === 0) return;
+    try {
+      await invoke("apply_text_assets", { baseDir: dir, assets: payload, overwrite });
+    } catch (err) {
+      reportError("Failed to apply assets", err);
+    }
+  }
+
+  async function ensureAutoAssets(baseDir: string, projectId: string, assetsEnabledOverride?: boolean) {
+    const enabledGlobal = assetSettings.autoApplyEnabled;
+    if (!enabledGlobal) return;
+
+    const enabledProject =
+      assetsEnabledOverride ??
+      (projects.find((p) => p.id === projectId)?.assetsEnabled ?? true);
+    if (!enabledProject) return;
+
+    const templates = assets.filter((a) => a.autoApply ?? true);
+    if (templates.length === 0) return;
+
+    await applyTextAssets(baseDir, templates, false);
+  }
+
   async function ensureReplayTargetSession(): Promise<string | null> {
     if (replayTargetSessionId) return replayTargetSessionId;
 
@@ -1339,6 +1562,7 @@ export default function App() {
     setProjectTitle("");
     setProjectBasePath(active?.cwd ?? activeProject?.basePath ?? homeDirRef.current ?? "");
     setProjectEnvironmentId(activeProject?.environmentId ?? "");
+    setProjectAssetsEnabled(activeProject?.assetsEnabled ?? true);
     setProjectOpen(true);
   }
 
@@ -1351,6 +1575,7 @@ export default function App() {
     setProjectTitle(project.title);
     setProjectBasePath(project.basePath ?? "");
     setProjectEnvironmentId(project.environmentId ?? "");
+    setProjectAssetsEnabled(project.assetsEnabled ?? true);
     setProjectOpen(true);
     window.setTimeout(() => projectTitleRef.current?.focus(), 0);
   }
@@ -1383,7 +1608,13 @@ export default function App() {
       setProjects((prev) =>
         prev.map((p) =>
           p.id === activeProjectId
-            ? { ...p, title, basePath: validatedBasePath, environmentId }
+            ? {
+                ...p,
+                title,
+                basePath: validatedBasePath,
+                environmentId,
+                assetsEnabled: projectAssetsEnabled,
+              }
             : p,
         ),
       );
@@ -1392,12 +1623,19 @@ export default function App() {
     }
 
     const id = makeId();
-    const project: Project = { id, title, basePath: validatedBasePath, environmentId };
+    const project: Project = {
+      id,
+      title,
+      basePath: validatedBasePath,
+      environmentId,
+      assetsEnabled: projectAssetsEnabled,
+    };
     setProjects((prev) => [...prev, project]);
     setProjectOpen(false);
     setActiveProjectId(id);
 
     try {
+      await ensureAutoAssets(validatedBasePath, id, projectAssetsEnabled);
       const s = await createSession({
         projectId: id,
         cwd: validatedBasePath,
@@ -1607,6 +1845,7 @@ export default function App() {
         ...p,
         basePath: p.basePath ?? null,
         environmentId: (p as { environmentId?: string | null }).environmentId ?? null,
+        assetsEnabled: (p as { assetsEnabled?: boolean }).assetsEnabled ?? true,
       }));
 
       const projectById = new Map(state.projects.map((p) => [p.id, p]));
@@ -1636,6 +1875,37 @@ export default function App() {
       setActiveSessionByProject(activeSessionByProject);
       setPrompts(state.prompts ?? []);
       setEnvironments(state.environments ?? []);
+      setAssetSettings(state.assetSettings ?? { autoApplyEnabled: true });
+      setAgentShortcutIds(() => {
+        const loaded = state.agentShortcutIds ?? null;
+        if (!loaded) return cleanAgentShortcutIds(DEFAULT_AGENT_SHORTCUT_IDS);
+        const cleaned = cleanAgentShortcutIds(loaded);
+        if (loaded.length > 0 && cleaned.length === 0) {
+          return cleanAgentShortcutIds(DEFAULT_AGENT_SHORTCUT_IDS);
+        }
+        return cleaned;
+      });
+      setAssets(() => {
+        const loaded = (state.assets ?? [])
+          .map((a) => ({
+            ...a,
+            name: a.name?.trim?.() ? a.name.trim() : a.name,
+            relativePath: a.relativePath?.trim?.() ? a.relativePath.trim() : a.relativePath,
+            autoApply: a.autoApply ?? true,
+          }))
+          .filter((a) => a && a.id && a.relativePath && a.name);
+        if (loaded.length) return loaded;
+        return [
+          {
+            id: makeId(),
+            name: "AGENTS.md",
+            relativePath: "AGENTS.md",
+            content: "# AGENTS.md\n\n<INSTRUCTIONS>\n- Add project-specific agent instructions here.\n</INSTRUCTIONS>\n",
+            createdAt: Date.now(),
+            autoApply: true,
+          },
+        ];
+      });
 
       const envVarsForProject = (projectId: string): Record<string, string> | null => {
         return envVarsForProjectId(projectId, state.projects, state.environments ?? []);
@@ -1771,6 +2041,7 @@ export default function App() {
         setError("Working directory must be an existing folder.");
         return;
       }
+      await ensureAutoAssets(validatedCwd, activeProjectId);
       const s = await createSession({
         projectId: activeProjectId,
         name,
@@ -1838,12 +2109,48 @@ export default function App() {
     });
   }
 
-  async function quickStart(preset: { name: string; command: string | null }) {
+  function cleanAgentShortcutIds(input: string[]): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const raw of input) {
+      const id = raw.trim();
+      if (!id || seen.has(id)) continue;
+      if (!getProcessEffectById(id)) continue;
+      seen.add(id);
+      out.push(id);
+    }
+    return out;
+  }
+
+  function addAgentShortcut(id: string) {
+    setAgentShortcutIds((prev) => cleanAgentShortcutIds([...prev, id]));
+  }
+
+  function removeAgentShortcut(id: string) {
+    setAgentShortcutIds((prev) => cleanAgentShortcutIds(prev.filter((x) => x !== id)));
+  }
+
+  function moveAgentShortcut(id: string, direction: -1 | 1) {
+    setAgentShortcutIds((prev) => {
+      const cleaned = cleanAgentShortcutIds(prev);
+      const index = cleaned.indexOf(id);
+      const nextIndex = index + direction;
+      if (index < 0) return cleaned;
+      if (nextIndex < 0 || nextIndex >= cleaned.length) return cleaned;
+      const next = cleaned.slice();
+      const [item] = next.splice(index, 1);
+      next.splice(nextIndex, 0, item);
+      return next;
+    });
+  }
+
+  async function quickStart(preset: { id: string; title: string; command: string | null }) {
     try {
       const cwd = activeProject?.basePath ?? homeDirRef.current ?? null;
+      if (cwd) await ensureAutoAssets(cwd, activeProjectId);
       const s = await createSession({
         projectId: activeProjectId,
-        name: preset.name,
+        name: preset.title,
         launchCommand: preset.command,
         cwd,
         envVars: envVarsForProjectId(activeProjectId, projects, environments),
@@ -1851,236 +2158,59 @@ export default function App() {
       setSessions((prev) => [...prev, s]);
       setActiveId(s.id);
     } catch (err) {
-      reportError(`Failed to start ${preset.name}`, err);
+      reportError(`Failed to start ${preset.title}`, err);
     }
   }
 
   return (
     <div className="app">
       <aside className="sidebar">
-        <div className="sidebarHeader">
-          <div className="title">Projects</div>
-          <div className="sidebarHeaderActions">
-            <button type="button" className="btn" onClick={openNewProject}>
-              New
-            </button>
-            <button
-              type="button"
-              className="btnSmall"
-              onClick={openRenameProject}
-              disabled={!activeProject}
-              title="Project settings"
-            >
-              Settings
-            </button>
-            <button
-              type="button"
-              className="btnSmall btnDanger"
-              onClick={() => setConfirmDeleteProjectOpen(true)}
-              disabled={!activeProject}
-              title="Delete project"
-            >
-              Delete
-            </button>
-          </div>
-        </div>
-
-        <div className="projectList">
-          {projects.map((p) => {
-            const isActive = p.id === activeProjectId;
-            const count = sessionCountByProject.get(p.id) ?? 0;
-            const envName =
-              p.environmentId && environments.some((e) => e.id === p.environmentId)
-                ? environments.find((e) => e.id === p.environmentId)?.name?.trim() ?? null
-                : null;
-            return (
-	              <button
-	                key={p.id}
-	                className={`projectItem ${isActive ? "projectItemActive" : ""}`}
-	                onClick={() => selectProject(p.id)}
-                  onDoubleClick={() => openProjectSettings(p.id)}
-	                title={
-                    [
-                      p.title,
-                      p.basePath ? `Base: ${p.basePath}` : null,
-                      envName ? `Env: ${envName}` : null,
-                    ]
-                      .filter(Boolean)
-                      .join("\n")
-                  }
-	              >
-                <span className="projectTitle">{p.title}</span>
-                <span className="projectCount">{count}</span>
-              </button>
-            );
-          })}
-        </div>
+        <ProjectsSection
+          projects={projects}
+          activeProjectId={activeProjectId}
+          activeProject={activeProject}
+          environments={environments}
+          sessionCountByProject={sessionCountByProject}
+          workingAgentCountByProject={workingAgentCountByProject}
+          onNewProject={openNewProject}
+          onProjectSettings={openRenameProject}
+          onDeleteProject={() => setConfirmDeleteProjectOpen(true)}
+          onSelectProject={selectProject}
+          onOpenProjectSettings={openProjectSettings}
+        />
 
         <div className="divider" />
 
-        {/* Quick Prompts Section */}
-        {(() => {
-          const pinnedPrompts = prompts
-            .filter(p => p.pinned)
-            .sort((a, b) => (a.pinOrder ?? 0) - (b.pinOrder ?? 0))
-            .slice(0, 5);
-          if (pinnedPrompts.length === 0) return null;
-          return (
-            <>
-              <div className="sidebarHeader">
-                <div className="title">Quick Prompts</div>
-                <button
-                  className="btn"
-                  onClick={() => {
-                    setSlidePanelTab("prompts");
-                    setSlidePanelOpen(true);
-                  }}
-                  title="Manage prompts"
-                >
-                  +
-                </button>
-              </div>
-              <div className="quickPromptsSection">
-                {pinnedPrompts.map((p, idx) => (
-                  <button
-                    key={p.id}
-                    className="quickPromptItem"
-                    onClick={() => void sendPromptToActive(p, "send")}
-                    onDoubleClick={() => openPromptEditor(p)}
-                    disabled={!activeId}
-                    title={`${p.title}\n\nClick to send, double-click to edit`}
-                  >
-                    <span className="quickPromptIcon">{"\u2605"}</span>
-                    <span className="quickPromptTitle">{p.title}</span>
-                    <span className="quickPromptShortcut">{"\u2318"}{idx + 1}</span>
-                  </button>
-                ))}
-              </div>
-              <div className="divider" />
-            </>
-          );
-        })()}
+        <QuickPromptsSection
+          prompts={prompts}
+          activeSessionId={activeId}
+          onSendPrompt={(prompt) => void sendPromptToActive(prompt, "send")}
+          onEditPrompt={openPromptEditor}
+          onOpenPromptsPanel={() => {
+            setSlidePanelTab("prompts");
+            setSlidePanelOpen(true);
+          }}
+        />
 
-        <div className="sidebarHeader">
-          <div className="title">Sessions</div>
-          <button
-            className="btn"
-            onClick={() => {
-              setProjectOpen(false);
-              setNewOpen(true);
-            }}
-          >
-            New
-          </button>
-        </div>
-
-        <div className="presetGrid">
-          {PRESETS.map((p) => {
-            const effect = getProcessEffectById(p.name);
-            return (
-              <button
-                key={p.name}
-                type="button"
-                className="presetBtn"
-                onClick={() => void quickStart(p)}
-                title={`Start ${p.name}`}
-              >
-                {effect?.iconSrc ? (
-                  <img
-                    className="presetIcon"
-                    src={effect.iconSrc}
-                    alt=""
-                    aria-hidden="true"
-                  />
-                ) : (
-                  <span className="presetIconFallback" aria-hidden="true">
-                    {"\u25B6"}
-                  </span>
-                )}
-                <span className="presetLabel">{p.name}</span>
-              </button>
-            );
-          })}
-        </div>
-
-        <div className="sessionList">
-          {projectSessions.length === 0 ? (
-            <div className="empty">No sessions in this project.</div>
-          ) : (
-            projectSessions.map((s) => {
-              const isActive = s.id === activeId;
-              const isExited = Boolean(s.exited);
-              const isClosing = Boolean(s.closing);
-              const effect = getProcessEffectById(s.effectId);
-              const chipLabel = effect?.label ?? s.processTag ?? null;
-              const hasAgentIcon = Boolean(effect?.iconSrc);
-              const isWorking = Boolean(effect && s.agentWorking && !isExited && !isClosing);
-              const isRecording = Boolean(s.recordingActive && !isExited && !isClosing);
-              const chipClass = effect ? `chip chip-${effect.id}` : "chip";
-              return (
-                <div
-                  key={s.id}
-                  className={`sessionItem ${isActive ? "sessionItemActive" : ""} ${
-                    isExited ? "sessionItemExited" : ""
-                  } ${isClosing ? "sessionItemClosing" : ""}`}
-                  onClick={() => setActiveId(s.id)}
-                >
-                  <div className={`dot ${isActive ? "dotActive" : ""}`} />
-                  <div className="sessionMeta">
-                    <div className="sessionName">
-                      {hasAgentIcon && chipLabel && effect?.iconSrc && (
-                        <span
-                          className={`agentBadge chip-${effect.id}`}
-                          title={chipLabel}
-                        >
-                          <img className="agentIcon" src={effect.iconSrc} alt={chipLabel} />
-                          {isWorking && (
-                            <span className="chipActivity agentBadgeDot" aria-label="Working" />
-                          )}
-                        </span>
-                      )}
-                      <span className="sessionNameText">{s.name}</span>
-                      {chipLabel && !hasAgentIcon && (
-                        <span className={chipClass} title={chipLabel}>
-                          <span className="chipLabel">{chipLabel}</span>
-                          {isWorking && <span className="chipActivity" aria-label="Working" />}
-                        </span>
-                      )}
-                      {isRecording && <span className="recordingDot" title="Recording" />}
-                      {isClosing ? (
-                        <span className="sessionStatus">closing…</span>
-                      ) : isExited ? (
-                        <span className="sessionStatus">
-                          exited{s.exitCode != null ? ` ${s.exitCode}` : ""}
-                        </span>
-                      ) : null}
-                    </div>
-                    <div className="sessionCmd">
-                      {(() => {
-                        const parts: string[] = [];
-                        if (s.cwd) parts.push(shortenPathSmart(s.cwd, 44));
-                        if (s.launchCommand) parts.push(s.launchCommand);
-                        if (!parts.length) parts.push(s.command);
-                        return parts.join(" • ");
-                      })()}
-                    </div>
-                  </div>
-                  <button
-                    className="closeBtn"
-                    disabled={isClosing}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void onClose(s.id);
-                    }}
-                    title="Close session"
-                  >
-                    ×
-                  </button>
-                </div>
-              );
+        <SessionsSection
+          agentShortcuts={agentShortcuts}
+          sessions={projectSessions}
+          activeSessionId={activeId}
+          onSelectSession={setActiveId}
+          onCloseSession={(id) => void onClose(id)}
+          onQuickStart={(effect) =>
+            void quickStart({
+              id: effect.id,
+              title: effect.label,
+              command: effect.matchCommands[0] ?? effect.label,
             })
-          )}
-        </div>
+          }
+          onOpenNewSession={() => {
+            setProjectOpen(false);
+            setNewOpen(true);
+          }}
+          onOpenAgentShortcuts={() => setAgentShortcutsOpen(true)}
+        />
       </aside>
 
       <main className="main">
@@ -2131,12 +2261,12 @@ export default function App() {
                   onClick={() => {
                     if (slidePanelOpen) {
                       setSlidePanelOpen(false);
-                    } else {
+                  } else {
                       void refreshRecordings();
                       setSlidePanelOpen(true);
                     }
                   }}
-                  title={`${slidePanelOpen ? "Close" : "Open"} panels (\u2318\u21E7P / \u2318\u21E7R)`}
+                  title={`${slidePanelOpen ? "Close" : "Open"} panels (\u2318\u21E7P / \u2318\u21E7R / \u2318\u21E7A)`}
                 >
                   {"\u25A1"}
                 </button>
@@ -2176,320 +2306,99 @@ export default function App() {
             </div>
           ))}
 
-          {newOpen && (
-            <div className="modalBackdrop" onClick={() => setNewOpen(false)}>
-              <div className="modal" onClick={(e) => e.stopPropagation()}>
-                <h3 className="modalTitle">
-                  New session{activeProject ? ` — ${activeProject.title}` : ""}
-                </h3>
-                <form onSubmit={onNewSubmit}>
-                  <div className="formRow">
-                    <div className="label">Name (optional)</div>
-                    <input
-                      className="input"
-                      ref={newNameRef}
-                      value={newName}
-                      onChange={(e) => setNewName(e.target.value)}
-                      placeholder="e.g. codex"
-                    />
-                  </div>
-                  <div className="formRow">
-                    <div className="label">Command (optional)</div>
-                    <input
-                      className="input"
-                      value={newCommand}
-                      onChange={(e) => setNewCommand(e.target.value)}
-                      placeholder="e.g. codex  (leave blank for a shell)"
-                    />
-                    <div className="hint">
-                      Uses your $SHELL by default; commands run as "$SHELL -lc".
-                    </div>
-                  </div>
-                  <div className="formRow">
-                    <div className="label">Working directory</div>
-                    <div className="pathRow">
-                      <input
-                        className="input"
-                        value={newCwd}
-                        onChange={(e) => setNewCwd(e.target.value)}
-                        placeholder={activeProject?.basePath ?? "~"}
-                      />
-                      <button
-                        type="button"
-                        className="btn"
-                        onClick={() =>
-                          openPathPicker(
-                            "session",
-                            newCwd.trim() || activeProject?.basePath || null,
-                          )
-                        }
-                      >
-                        Browse
-                      </button>
-                    </div>
-                    <div className="pathActions">
-                      <button
-                        type="button"
-                        className="btnSmall"
-                        onClick={() => setNewCwd(activeProject?.basePath ?? "")}
-                        disabled={!activeProject?.basePath}
-                      >
-                        Use project base
-                      </button>
-                      <button
-                        type="button"
-                        className="btnSmall"
-                        onClick={() => setNewCwd(active?.cwd ?? "")}
-                        disabled={!active?.cwd}
-                      >
-                        Use current tab
-                      </button>
-                    </div>
-                  </div>
-                  <div className="modalActions">
-                    <button
-                      type="button"
-                      className="btn"
-                      onClick={() => setNewOpen(false)}
-                    >
-                      Cancel
-                    </button>
-                    <button type="submit" className="btn">
-                      Create
-                    </button>
-                  </div>
-                </form>
-              </div>
-            </div>
-          )}
+          <NewSessionModal
+            isOpen={newOpen}
+            projectTitle={activeProject?.title ?? null}
+            name={newName}
+            nameInputRef={newNameRef}
+            onChangeName={setNewName}
+            command={newCommand}
+            onChangeCommand={setNewCommand}
+            cwd={newCwd}
+            onChangeCwd={setNewCwd}
+            cwdPlaceholder={activeProject?.basePath ?? "~"}
+            onBrowseCwd={() =>
+              openPathPicker("session", newCwd.trim() || activeProject?.basePath || null)
+            }
+            canUseProjectBase={Boolean(activeProject?.basePath)}
+            onUseProjectBase={() => setNewCwd(activeProject?.basePath ?? "")}
+            canUseCurrentTab={Boolean(active?.cwd)}
+            onUseCurrentTab={() => setNewCwd(active?.cwd ?? "")}
+            onClose={() => setNewOpen(false)}
+            onSubmit={onNewSubmit}
+          />
 
-          {projectOpen && (
-            <div className="modalBackdrop" onClick={() => setProjectOpen(false)}>
-              <div className="modal" onClick={(e) => e.stopPropagation()}>
-                <h3 className="modalTitle">
-                  {projectMode === "new" ? "New project" : "Project settings"}
-                </h3>
-                <form onSubmit={onProjectSubmit}>
-                  <div className="formRow">
-                    <div className="label">Title</div>
-                    <input
-                      className="input"
-                      ref={projectTitleRef}
-                      value={projectTitle}
-                      onChange={(e) => setProjectTitle(e.target.value)}
-                      placeholder="e.g. my-repo"
-                    />
-                  </div>
-                  <div className="formRow">
-                    <div className="label">Base path</div>
-                    <div className="pathRow">
-                      <input
-                        className="input"
-                        value={projectBasePath}
-                        onChange={(e) => setProjectBasePath(e.target.value)}
-                        placeholder={homeDirRef.current ?? "~"}
-                      />
-                      <button
-                        type="button"
-                        className="btn"
-                        onClick={() =>
-                          openPathPicker(
-                            "project",
-                            projectBasePath.trim() || activeProject?.basePath || null,
-                          )
-                        }
-                      >
-                        Browse
-                      </button>
-                    </div>
-                    <div className="pathActions">
-                      <button
-                        type="button"
-                        className="btnSmall"
-                        onClick={() => setProjectBasePath(active?.cwd ?? "")}
-                        disabled={!active?.cwd}
-                      >
-                        Use current tab
-                      </button>
-                      <button
-                        type="button"
-                        className="btnSmall"
-                        onClick={() => setProjectBasePath(homeDirRef.current ?? "")}
-                        disabled={!homeDirRef.current}
-                      >
-                        Home
-                      </button>
-                    </div>
-                    <div className="hint">New sessions in this project start here.</div>
-                  </div>
-                  <div className="formRow">
-                    <div className="label">Environment (.env)</div>
-                    <div className="pathRow">
-                      <select
-                        className="input"
-                        value={projectEnvironmentId}
-                        onChange={(e) => setProjectEnvironmentId(e.target.value)}
-                      >
-                        <option value="">None</option>
-                        {environments
-                          .slice()
-                          .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()))
-                          .map((env) => (
-                            <option key={env.id} value={env.id}>
-                              {env.name}
-                            </option>
-                          ))}
-                      </select>
-                      <button type="button" className="btn" onClick={() => setEnvironmentsOpen(true)}>
-                        Manage
-                      </button>
-                    </div>
-                    <div className="hint">Applied to new sessions in this project.</div>
-                  </div>
-                  <div className="modalActions">
-                    <button
-                      type="button"
-                      className="btn"
-                      onClick={() => setProjectOpen(false)}
-                    >
-                      Cancel
-                    </button>
-                    <button type="submit" className="btn">
-                      {projectMode === "new" ? "Create" : "Save"}
-                    </button>
-                  </div>
-                </form>
-              </div>
-            </div>
-          )}
+          <AgentShortcutsModal
+            isOpen={agentShortcutsOpen}
+            agentShortcuts={agentShortcuts}
+            onClose={() => setAgentShortcutsOpen(false)}
+            onMoveUp={(id) => moveAgentShortcut(id, -1)}
+            onMoveDown={(id) => moveAgentShortcut(id, 1)}
+            onRemove={removeAgentShortcut}
+            onAdd={addAgentShortcut}
+            onResetDefaults={() =>
+              setAgentShortcutIds(cleanAgentShortcutIds(DEFAULT_AGENT_SHORTCUT_IDS))
+            }
+          />
 
-          {confirmDeleteProjectOpen && activeProject && (
-            <div
-              className="modalBackdrop"
-              onClick={() => setConfirmDeleteProjectOpen(false)}
-            >
-              <div className="modal" onClick={(e) => e.stopPropagation()}>
-                <h3 className="modalTitle">Delete project</h3>
-                <div className="hint" style={{ marginTop: 0 }}>
-                  Delete "{activeProject.title}"? All sessions in this project will be closed.
-                </div>
-                <div className="modalActions">
-                  <button
-                    type="button"
-                    className="btn"
-                    onClick={() => setConfirmDeleteProjectOpen(false)}
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    className="btn"
-                    onClick={() => {
-                      setConfirmDeleteProjectOpen(false);
-                      void deleteActiveProject();
-                    }}
-                  >
-                    Delete
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
+          <ProjectModal
+            isOpen={projectOpen}
+            mode={projectMode}
+            title={projectTitle}
+            titleInputRef={projectTitleRef}
+            onChangeTitle={setProjectTitle}
+            basePath={projectBasePath}
+            onChangeBasePath={setProjectBasePath}
+            basePathPlaceholder={homeDirRef.current ?? "~"}
+            onBrowseBasePath={() =>
+              openPathPicker("project", projectBasePath.trim() || activeProject?.basePath || null)
+            }
+            canUseCurrentTab={Boolean(active?.cwd)}
+            onUseCurrentTab={() => setProjectBasePath(active?.cwd ?? "")}
+            canUseHome={Boolean(homeDirRef.current)}
+            onUseHome={() => setProjectBasePath(homeDirRef.current ?? "")}
+            environments={environments}
+            selectedEnvironmentId={projectEnvironmentId}
+            onChangeEnvironmentId={setProjectEnvironmentId}
+            onOpenEnvironments={() => setEnvironmentsOpen(true)}
+            assetsEnabled={projectAssetsEnabled}
+            onChangeAssetsEnabled={setProjectAssetsEnabled}
+            onClose={() => setProjectOpen(false)}
+            onSubmit={onProjectSubmit}
+          />
 
-          {pathPickerOpen && (
-            <div
-              className="modalBackdrop"
-              onClick={() => {
-                setPathPickerOpen(false);
-                setPathPickerTarget(null);
-              }}
-            >
-              <div className="modal" onClick={(e) => e.stopPropagation()}>
-                <h3 className="modalTitle">Select folder</h3>
-                <form
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    void loadPathPicker(pathPickerInput.trim() || null);
-                  }}
-                >
-                  <div className="pathPickerHeader">
-                    <button
-                      type="button"
-                      className="btn"
-                      disabled={!pathPickerListing?.parent || pathPickerLoading}
-                      onClick={() => void loadPathPicker(pathPickerListing?.parent ?? null)}
-                      title="Up"
-                    >
-                      Up
-                    </button>
-                    <input
-                      className="input"
-                      value={pathPickerInput}
-                      onChange={(e) => setPathPickerInput(e.target.value)}
-                      placeholder={homeDirRef.current ?? "~"}
-                    />
-                    <button type="submit" className="btn" disabled={pathPickerLoading}>
-                      Go
-                    </button>
-                  </div>
-                </form>
+          <ConfirmDeleteProjectModal
+            isOpen={confirmDeleteProjectOpen && Boolean(activeProject)}
+            projectTitle={activeProject?.title ?? ""}
+            onClose={() => setConfirmDeleteProjectOpen(false)}
+            onConfirmDelete={() => {
+              setConfirmDeleteProjectOpen(false);
+              void deleteActiveProject();
+            }}
+          />
 
-                {pathPickerError && (
-                  <div className="pathPickerError" role="alert">
-                    {pathPickerError}
-                  </div>
-                )}
-
-                <div className="pathPickerList">
-                  {pathPickerLoading ? (
-                    <div className="empty">Loading…</div>
-                  ) : pathPickerListing && pathPickerListing.entries.length === 0 ? (
-                    <div className="empty">No subfolders.</div>
-                  ) : (
-                    pathPickerListing?.entries.map((e) => (
-                      <button
-                        key={e.path}
-                        type="button"
-                        className="pathPickerItem"
-                        onClick={() => void loadPathPicker(e.path)}
-                        title={e.path}
-                      >
-                        {e.name}
-                      </button>
-                    ))
-                  )}
-                </div>
-
-                <div className="modalActions">
-                  <button
-                    type="button"
-                    className="btn"
-                    onClick={() => {
-                      setPathPickerOpen(false);
-                      setPathPickerTarget(null);
-                    }}
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={!pathPickerListing}
-                    onClick={() => {
-                      const selected = pathPickerListing?.path;
-                      if (!selected) return;
-                      if (pathPickerTarget === "project") setProjectBasePath(selected);
-                      if (pathPickerTarget === "session") setNewCwd(selected);
-                      setPathPickerOpen(false);
-                      setPathPickerTarget(null);
-                    }}
-                  >
-                    Select
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
+          <PathPickerModal
+            isOpen={pathPickerOpen}
+            listing={pathPickerListing}
+            input={pathPickerInput}
+            placeholder={homeDirRef.current ?? "~"}
+            loading={pathPickerLoading}
+            error={pathPickerError}
+            onInputChange={setPathPickerInput}
+            onLoad={(path) => void loadPathPicker(path)}
+            onClose={() => {
+              setPathPickerOpen(false);
+              setPathPickerTarget(null);
+            }}
+            onSelect={() => {
+              const selected = pathPickerListing?.path;
+              if (!selected) return;
+              if (pathPickerTarget === "project") setProjectBasePath(selected);
+              if (pathPickerTarget === "session") setNewCwd(selected);
+              setPathPickerOpen(false);
+              setPathPickerTarget(null);
+            }}
+          />
 
           {recordPromptOpen && (
             <div className="modalBackdrop" onClick={closeRecordPrompt}>
@@ -2857,6 +2766,75 @@ export default function App() {
             </div>
           )}
 
+          {assetEditorOpen && (
+            <div className="modalBackdrop" onClick={closeAssetEditor}>
+              <div className="modal recordingsModal" onClick={(e) => e.stopPropagation()}>
+                <h3 className="modalTitle">{assetEditorId ? "Edit asset" : "New asset"}</h3>
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    saveAssetFromEditor();
+                  }}
+                >
+                  <div className="formRow">
+                    <div className="label">Name</div>
+                    <input
+                      ref={assetNameRef}
+                      className="input"
+                      value={assetEditorName}
+                      onChange={(e) => setAssetEditorName(e.target.value)}
+                      placeholder="e.g. AGENTS.md"
+                    />
+                  </div>
+                  <div className="formRow">
+                    <div className="label">Relative path</div>
+                    <input
+                      className="input"
+                      value={assetEditorPath}
+                      onChange={(e) => setAssetEditorPath(e.target.value)}
+                      placeholder="e.g. AGENTS.md or .github/ISSUE_TEMPLATE.md"
+                    />
+                    <div className="hint" style={{ marginTop: 0 }}>
+                      Written relative to the session/project directory.
+                    </div>
+                  </div>
+                  <div className="formRow" style={{ marginBottom: 0 }}>
+                    <div className="label">Auto-create</div>
+                    <label className="checkRow">
+                      <input
+                        type="checkbox"
+                        checked={assetEditorAutoApply}
+                        onChange={(e) => setAssetEditorAutoApply(e.target.checked)}
+                      />
+                      Create on new sessions
+                    </label>
+                  </div>
+                  <div className="formRow">
+                    <div className="label">Content</div>
+                    <textarea
+                      className="textarea"
+                      value={assetEditorContent}
+                      onChange={(e) => setAssetEditorContent(e.target.value)}
+                      placeholder="File contents…"
+                    />
+                  </div>
+                  <div className="modalActions">
+                    <button type="button" className="btn" onClick={closeAssetEditor}>
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      className="btn"
+                      disabled={!assetEditorName.trim() || !assetEditorPath.trim()}
+                    >
+                      Save
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
           {replayOpen && (
             <div className="modalBackdrop" onClick={closeReplayModal}>
               <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -3033,7 +3011,7 @@ export default function App() {
                   </button>
                 </div>
               </>
-            ) : (
+            ) : slidePanelTab === "recordings" ? (
               <>
                 {/* Recordings Search */}
                 <div className="panelSearch">
@@ -3131,6 +3109,131 @@ export default function App() {
                   </button>
                 </div>
               </>
+            ) : (
+              <>
+                {/* Assets Search */}
+                <div className="panelSearch">
+                  <span className="panelSearchIcon">{"\uD83D\uDD0D"}</span>
+                  <input
+                    className="panelSearchInput"
+                    type="text"
+                    placeholder="Search assets..."
+                    value={assetSearch}
+                    onChange={(e) => setAssetSearch(e.target.value)}
+                  />
+                </div>
+
+                {/* Auto-create Settings */}
+                <div className="panelSection">
+                  <div className="panelSectionTitle">Auto-create</div>
+                  <div className="panelCard">
+                    <div className="panelCardHeader">
+                      <span className="panelCardTitle">Create missing files on new sessions</span>
+                    </div>
+                    <label className="checkRow">
+                      <input
+                        type="checkbox"
+                        checked={assetSettings.autoApplyEnabled}
+                        onChange={(e) =>
+                          setAssetSettings((prev) => ({ ...prev, autoApplyEnabled: e.target.checked }))
+                        }
+                      />
+                      Enabled
+                    </label>
+                    <div className="panelCardMeta">
+                      Applies enabled templates to the session working directory (only if missing).
+                    </div>
+                    {activeProject?.assetsEnabled === false && (
+                      <div className="panelCardMeta">
+                        Disabled for this project in Project settings.
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Templates */}
+                <div className="panelSection">
+                  <div className="panelSectionTitle">Templates</div>
+                  <div className="panelList">
+                    {(() => {
+                      const q = assetSearch.trim().toLowerCase();
+                      const filtered = assets
+                        .filter((a) => {
+                          if (!q) return true;
+                          return (
+                            a.name.toLowerCase().includes(q) ||
+                            a.relativePath.toLowerCase().includes(q)
+                          );
+                        })
+                        .sort((a, b) => b.createdAt - a.createdAt);
+
+                      if (filtered.length === 0) {
+                        return (
+                          <div className="panelCardMeta" style={{ textAlign: "center", padding: "16px" }}>
+                            No assets yet
+                          </div>
+                        );
+                      }
+
+                      return filtered.map((a) => (
+                        <div key={a.id} className="panelCard">
+                          <div className="panelCardHeader">
+                            <span className="panelCardTitle">{a.name}</span>
+                          </div>
+                          <div className="panelCardMeta">
+                            {[a.relativePath, a.autoApply ?? true ? "Auto" : "Manual"].join(" • ")}
+                          </div>
+                          <div className="panelCardPreview">{a.content.slice(0, 140)}</div>
+                          <div className="panelCardActions">
+                            <button
+                              className="panelCardBtn"
+                              onClick={() => {
+                                const dir = activeProject?.basePath ?? null;
+                                if (!dir) return;
+                                const overwrite = window.confirm("Overwrite existing file if present?");
+                                void applyTextAssets(dir, [a], overwrite);
+                              }}
+                              disabled={!activeProject?.basePath}
+                              title={activeProject?.basePath ? "Apply to project base path" : "Project has no base path"}
+                            >
+                              To project
+                            </button>
+                            <button
+                              className="panelCardBtn"
+                              onClick={() => {
+                                const dir = active?.cwd ?? null;
+                                if (!dir) return;
+                                const overwrite = window.confirm("Overwrite existing file if present?");
+                                void applyTextAssets(dir, [a], overwrite);
+                              }}
+                              disabled={!active?.cwd}
+                              title={active?.cwd ? "Apply to current tab working directory" : "No active tab cwd"}
+                            >
+                              To tab
+                            </button>
+                            <button className="panelCardBtn" onClick={() => openAssetEditor(a)}>
+                              Edit
+                            </button>
+                            <button className="panelCardBtn" onClick={() => toggleAssetAutoApply(a.id)}>
+                              {a.autoApply ?? true ? "Disable auto" : "Enable auto"}
+                            </button>
+                            <button className="panelCardBtn" onClick={() => deleteAsset(a.id)}>
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+                      ));
+                    })()}
+                  </div>
+                </div>
+
+                {/* New Asset Footer */}
+                <div className="panelFooter">
+                  <button className="panelFooterBtn" onClick={() => openAssetEditor()}>
+                    + New Asset
+                  </button>
+                </div>
+              </>
             )}
           </SlidePanel>
         </div>
@@ -3145,7 +3248,7 @@ export default function App() {
         sessions={projectSessions}
         activeSessionId={activeId}
         quickStarts={quickStarts}
-        onQuickStart={(preset) => void quickStart({ name: preset.title, command: preset.command })}
+        onQuickStart={(preset) => void quickStart(preset)}
         onSendPrompt={(prompt, mode) => void sendPromptToActive(prompt, mode)}
         onEditPrompt={openPromptEditor}
         onOpenRecording={(id, mode) => void openReplay(id, mode)}
@@ -3162,6 +3265,10 @@ export default function App() {
         onOpenRecordingsPanel={() => {
           void refreshRecordings();
           setSlidePanelTab("recordings");
+          setSlidePanelOpen(true);
+        }}
+        onOpenAssetsPanel={() => {
+          setSlidePanelTab("assets");
           setSlidePanelOpen(true);
         }}
       />

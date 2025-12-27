@@ -8,6 +8,7 @@
   --muted: rgba(255, 255, 255, 0.65);
   --accent: #7aa2f7;
   --accent-2: #2ac3de;
+  --accent-3: #c084fc;
 }
 
 * {
@@ -108,6 +109,33 @@ body {
   font-size: 13px;
 }
 
+.projectBadges {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.projectAgentsBadge {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: linear-gradient(180deg, rgba(122, 162, 247, 0.22), rgba(42, 195, 222, 0.14));
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.projectAgentsDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: linear-gradient(180deg, var(--accent), var(--accent-2));
+  animation: chipPulse 1.1s ease-in-out infinite;
+}
+
 .projectCount {
   font-size: 11px;
   color: var(--muted);
@@ -118,54 +146,59 @@ body {
   white-space: nowrap;
 }
 
-.presetGrid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
+.agentShortcutRow {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+  scrollbar-width: none;
 }
 
-.presetBtn {
+.agentShortcutRow::-webkit-scrollbar {
+  display: none;
+}
+
+.agentShortcutBtn {
   border: 1px solid var(--border);
   background: rgba(255, 255, 255, 0.03);
   color: var(--text);
-  padding: 8px 10px;
-  border-radius: 12px;
+  padding: 6px 8px;
+  border-radius: 999px;
   cursor: pointer;
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   justify-content: flex-start;
+  white-space: nowrap;
+  font-size: 12px;
 }
 
-.presetBtn:hover {
+.agentShortcutBtn:hover {
   background: rgba(255, 255, 255, 0.06);
   border-color: rgba(255, 255, 255, 0.14);
 }
 
-.presetIcon {
-  width: 16px;
-  height: 16px;
+.agentShortcutIcon {
+  width: 14px;
+  height: 14px;
   flex-shrink: 0;
   display: block;
 }
 
-.presetIconFallback {
-  width: 16px;
-  height: 16px;
+.agentShortcutIconFallback {
+  width: 14px;
+  height: 14px;
   flex-shrink: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
 }
 
-.presetLabel {
-  font-size: 13px;
+.agentShortcutLabel {
   line-height: 1;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  font-size: 12px;
 }
 
 .divider {
@@ -211,7 +244,7 @@ body {
 
 .btn:focus-visible,
 .btnSmall:focus-visible,
-.presetBtn:focus-visible,
+.agentShortcutBtn:focus-visible,
 .projectItem:focus-visible,
 .sessionItem:focus-visible,
 .iconBtn:focus-visible {
@@ -335,7 +368,8 @@ body {
 }
 
 .agentBadge.chip-codex,
-.agentBadge.chip-claude {
+.agentBadge.chip-claude,
+.agentBadge.chip-gemini {
   border: none;
   background: transparent;
   padding: 0;
@@ -371,6 +405,10 @@ body {
   background: var(--accent-2);
 }
 
+.chip-gemini .chipActivity {
+  background: var(--accent-3);
+}
+
 @keyframes chipPulse {
   0% {
     transform: scale(0.75);
@@ -395,6 +433,12 @@ body {
 .chip-claude {
   border-color: rgba(42, 195, 222, 0.45);
   background: rgba(42, 195, 222, 0.12);
+  color: rgba(255, 255, 255, 0.88);
+}
+
+.chip-gemini {
+  border-color: rgba(192, 132, 252, 0.45);
+  background: rgba(192, 132, 252, 0.12);
   color: rgba(255, 255, 255, 0.88);
 }
 
@@ -528,11 +572,139 @@ body {
   margin: 0 0 10px 0;
 }
 
+.agentShortcutEditorSection {
+  margin-top: 12px;
+}
+
+.agentShortcutEditorTitle {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 6px;
+}
+
+.agentShortcutEditorList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agentShortcutEditorItem {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 12px;
+  padding: 8px 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.agentShortcutEditorMain {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.agentShortcutEditorIcon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  display: block;
+}
+
+.agentShortcutEditorIconFallback {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.agentShortcutEditorName {
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agentShortcutEditorActions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.agentShortcutAddRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.agentShortcutAddBtn {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+  padding: 6px 8px;
+  border-radius: 999px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.agentShortcutAddBtn:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
+.agentShortcutAddIcon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  display: block;
+}
+
+.agentShortcutAddIconFallback {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.agentShortcutAddLabel {
+  line-height: 1;
+}
+
 .formRow {
   display: flex;
   flex-direction: column;
   gap: 6px;
   margin-bottom: 10px;
+}
+
+.checkRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text);
+  user-select: none;
+}
+
+.checkRow input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
 }
 
 .pathRow {
@@ -561,6 +733,17 @@ body {
   border-radius: 10px;
   cursor: pointer;
   font-size: 12px;
+}
+
+.btnSmall.btnIcon {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  line-height: 1;
 }
 
 .btnSmall.btnRecording {

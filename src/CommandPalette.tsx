@@ -73,6 +73,7 @@ type CommandPaletteProps = {
   isRecording: boolean;
   onOpenPromptsPanel: () => void;
   onOpenRecordingsPanel: () => void;
+  onOpenAssetsPanel: () => void;
 };
 
 function fuzzyMatch(text: string, query: string): { match: boolean; score: number } {
@@ -146,6 +147,7 @@ export function CommandPalette({
   isRecording,
   onOpenPromptsPanel,
   onOpenRecordingsPanel,
+  onOpenAssetsPanel,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -267,6 +269,14 @@ export function CommandPalette({
       shortcut: "Shift+R",
     });
 
+    items.push({
+      id: "action-open-assets",
+      type: "action",
+      title: "Open Assets Panel",
+      icon: "panel",
+      shortcut: "Shift+A",
+    });
+
     return items;
   }, [prompts, recordings, sessions, activeSessionId, isRecording, quickStarts]);
 
@@ -370,11 +380,14 @@ export function CommandPalette({
           case "action-open-recordings":
             onOpenRecordingsPanel();
             break;
+          case "action-open-assets":
+            onOpenAssetsPanel();
+            break;
         }
         break;
       }
     }
-  }, [onClose, onSendPrompt, onOpenRecording, onSwitchSession, onNewSession, onNewPrompt, onStartRecording, onStopRecording, onOpenPromptsPanel, onOpenRecordingsPanel, onQuickStart]);
+  }, [onClose, onSendPrompt, onOpenRecording, onSwitchSession, onNewSession, onNewPrompt, onStartRecording, onStopRecording, onOpenPromptsPanel, onOpenRecordingsPanel, onOpenAssetsPanel, onQuickStart]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     switch (e.key) {

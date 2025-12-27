@@ -1,8 +1,10 @@
+mod assets;
 mod pty;
 mod persist;
 mod recording;
 mod tray;
 
+use assets::apply_text_assets;
 use pty::{
     close_session, create_session, list_sessions, resize_session, start_session_recording,
     stop_session_recording, write_to_session, AppState,
@@ -38,6 +40,7 @@ fn main() {
             load_recording,
             list_recordings,
             delete_recording,
+            apply_text_assets,
             set_tray_agent_count
         ])
         .run(tauri::generate_context!())

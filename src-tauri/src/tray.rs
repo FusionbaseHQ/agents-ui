@@ -1,11 +1,13 @@
 use tauri::menu::{MenuBuilder, MenuEvent, MenuItem, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, State};
+use tauri::{include_image, AppHandle, Manager, State};
 
 pub struct StatusTrayState {
     tray: Option<TrayIcon>,
     count_item: Option<MenuItem<tauri::Wry>>,
 }
+
+const TRAY_ICON: tauri::image::Image<'_> = include_image!("./icons/tray.png");
 
 fn show_main_window(app: &AppHandle) {
     #[cfg(target_os = "macos")]
@@ -102,15 +104,12 @@ pub fn build_status_tray(app: &AppHandle) -> Result<StatusTrayState, String> {
         .map_err(|e| e.to_string())?;
 
     let mut tray_builder = TrayIconBuilder::with_id("agents-ui-tray")
+        .icon(TRAY_ICON)
         .tooltip("Agents UI")
         .menu(&menu)
         .on_menu_event(on_menu_event)
         .on_tray_icon_event(|tray, event| on_tray_click(tray, event))
         .show_menu_on_left_click(false);
-
-    if let Some(icon) = app.default_window_icon().cloned() {
-        tray_builder = tray_builder.icon(icon);
-    }
 
     #[cfg(target_os = "macos")]
     {
