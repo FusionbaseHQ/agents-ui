@@ -110,14 +110,34 @@ def write_png_rgba(path: str, width: int, height: int, pixel_fn) -> None:
 
 
 def build_app_icon(path: str, size: int = 1024) -> None:
-    bg_a = Color(0x0F, 0x16, 0x20)  # #0f1620
-    bg_b = Color(0x0B, 0x0F, 0x14)  # #0b0f14
+    # Slightly brighter base so the icon pops in a crowded dock/taskbar.
+    bg_a = Color(0x14, 0x1D, 0x2A)  # #141d2a
+    bg_b = Color(0x0B, 0x12, 0x1A)  # #0b121a
     accent = Color(0x7A, 0xA2, 0xF7)  # #7aa2f7
     accent_2 = Color(0x2A, 0xC3, 0xDE)  # #2ac3de
     white = Color(255, 255, 255)
     black = Color(0, 0, 0)
 
     inv = 1.0 / float(size)
+
+    def diamond_alpha(u: float, v: float, cx: float, cy: float, r: float, aa: float) -> float:
+        d = abs(u - cx) + abs(v - cy)
+        return 1.0 - smoothstep(r - aa, r + aa, d)
+
+    def sparkle_alpha(
+        u: float,
+        v: float,
+        cx: float,
+        cy: float,
+        size: float,
+        thickness: float,
+        aa: float,
+    ) -> float:
+        half = thickness / 2.0
+        h = stroke_alpha(dist_to_segment(u, v, cx - size, cy, cx + size, cy), half, aa)
+        vert = stroke_alpha(dist_to_segment(u, v, cx, cy - size, cx, cy + size), half, aa)
+        diamond = diamond_alpha(u, v, cx, cy, r=size * 0.55, aa=aa) * 0.9
+        return max(h, vert, diamond)
 
     def pixel(x: int, y: int):
         u = (x + 0.5) * inv
@@ -135,29 +155,61 @@ def build_app_icon(path: str, size: int = 1024) -> None:
             g = 1.0 / (1.0 + d2 / 0.025)
             return base.mix(col, clamp01(g * strength))
 
-        base = glow(0.24, 0.22, 0.33, accent)
-        base = glow(0.78, 0.80, 0.22, accent_2)
+        base = glow(0.24, 0.22, 0.50, accent)
+        base = glow(0.78, 0.80, 0.38, accent_2)
 
         # Gentle vignette.
         dx = u - 0.5
         dy = v - 0.5
         vignette = clamp01((dx * dx + dy * dy) / 0.35)
-        base = base.mix(black, vignette * 0.22)
+        base = base.mix(black, vignette * 0.14)
+
+        # Subtle edge highlight to improve recognizability at small sizes.
+        edge = min(u, v, 1.0 - u, 1.0 - v)
+        edge_glow = 1.0 - smoothstep(0.0, 0.028, edge)
+        base = base.mix(accent.mix(accent_2, 0.5), edge_glow * 0.08)
 
         # Prompt glyph with subtle shadow.
         aa = 1.2 * inv
-        shadow = prompt_mark_alpha(u + 0.010, v + 0.012, thickness=0.075, dot_radius=0.030, aa=aa)
-        glyph = prompt_mark_alpha(u, v, thickness=0.070, dot_radius=0.028, aa=aa)
+        shadow = prompt_mark_alpha(u + 0.010, v + 0.012, thickness=0.084, dot_radius=0.033, aa=aa)
+        glyph = prompt_mark_alpha(u, v, thickness=0.078, dot_radius=0.031, aa=aa)
+
+        # Small "spark" to hint at AI.
+        spark_shadow = sparkle_alpha(
+            u + 0.010,
+            v + 0.012,
+            cx=0.84,
+            cy=0.34,
+            size=0.050,
+            thickness=0.018,
+            aa=aa,
+        )
+        spark = sparkle_alpha(
+            u,
+            v,
+            cx=0.84,
+            cy=0.34,
+            size=0.048,
+            thickness=0.016,
+            aa=aa,
+        )
 
         out = base
         if shadow > 0.0:
             out = out.mix(black, clamp01(shadow * 0.28))
 
+        if spark_shadow > 0.0:
+            out = out.mix(black, clamp01(spark_shadow * 0.24))
+
         if glyph > 0.0:
             # Gradient glyph (subtle) from accent to accent_2.
             gt = clamp01((u - 0.30) / 0.55)
-            fg = accent.mix(accent_2, gt).mix(white, 0.12)
+            fg = accent.mix(accent_2, gt).mix(white, 0.26)
             out = out.mix(fg, glyph)
+
+        if spark > 0.0:
+            spark_col = accent_2.mix(accent, 0.25).mix(white, 0.70)
+            out = out.mix(spark_col, spark)
 
         return (int(out.r + 0.5), int(out.g + 0.5), int(out.b + 0.5), 255)
 
@@ -167,18 +219,40 @@ def build_app_icon(path: str, size: int = 1024) -> None:
 def build_tray_icon(path: str, size: int = 32) -> None:
     accent = Color(0x7A, 0xA2, 0xF7)
     accent_2 = Color(0x2A, 0xC3, 0xDE)
+    white = Color(255, 255, 255)
     inv = 1.0 / float(size)
+
+    def diamond_alpha(u: float, v: float, cx: float, cy: float, r: float, aa: float) -> float:
+        d = abs(u - cx) + abs(v - cy)
+        return 1.0 - smoothstep(r - aa, r + aa, d)
+
+    def sparkle_alpha(
+        u: float,
+        v: float,
+        cx: float,
+        cy: float,
+        size: float,
+        thickness: float,
+        aa: float,
+    ) -> float:
+        half = thickness / 2.0
+        h = stroke_alpha(dist_to_segment(u, v, cx - size, cy, cx + size, cy), half, aa)
+        vert = stroke_alpha(dist_to_segment(u, v, cx, cy - size, cx, cy + size), half, aa)
+        diamond = diamond_alpha(u, v, cx, cy, r=size * 0.55, aa=aa) * 0.9
+        return max(h, vert, diamond)
 
     def pixel(x: int, y: int):
         u = (x + 0.5) * inv
         v = (y + 0.5) * inv
         aa = 1.0 * inv
-        glyph = prompt_mark_alpha(u, v, thickness=0.185, dot_radius=0.070, aa=aa)
-        if glyph <= 0.0:
+        glyph = prompt_mark_alpha(u, v, thickness=0.205, dot_radius=0.076, aa=aa)
+        spark = sparkle_alpha(u, v, cx=0.88, cy=0.32, size=0.11, thickness=0.045, aa=aa)
+        mask = max(glyph, spark)
+        if mask <= 0.0:
             return (0, 0, 0, 0)
         gt = clamp01((u - 0.28) / 0.62)
-        fg = accent.mix(accent_2, gt)
-        return (int(fg.r + 0.5), int(fg.g + 0.5), int(fg.b + 0.5), int(255 * glyph + 0.5))
+        fg = accent.mix(accent_2, gt).mix(white, 0.28)
+        return (int(fg.r + 0.5), int(fg.g + 0.5), int(fg.b + 0.5), int(255 * mask + 0.5))
 
     write_png_rgba(path, size, size, pixel)
 
@@ -197,4 +271,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
