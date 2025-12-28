@@ -8,6 +8,7 @@ type Session = {
   command: string;
   cwd: string | null;
   launchCommand: string | null;
+  persistent?: boolean;
   effectId?: string | null;
   processTag?: string | null;
   agentWorking?: boolean;
@@ -26,6 +27,7 @@ type SessionsSectionProps = {
   onQuickStart: (effect: ProcessEffect) => void;
   onOpenNewSession: () => void;
   onOpenAgentShortcuts: () => void;
+  onOpenPersistentSessions: () => void;
 };
 
 export function SessionsSection({
@@ -37,6 +39,7 @@ export function SessionsSection({
   onQuickStart,
   onOpenNewSession,
   onOpenAgentShortcuts,
+  onOpenPersistentSessions,
 }: SessionsSectionProps) {
   return (
     <>
@@ -51,6 +54,15 @@ export function SessionsSection({
             aria-label="New session"
           >
             <span aria-hidden="true">+</span>
+          </button>
+          <button
+            type="button"
+            className="btnSmall btnIcon"
+            onClick={onOpenPersistentSessions}
+            title="Persistent sessions"
+            aria-label="Persistent sessions"
+          >
+            <span aria-hidden="true">{"\u221E"}</span>
           </button>
           <button
             type="button"
@@ -121,6 +133,11 @@ export function SessionsSection({
                       </span>
                     )}
                     <span className="sessionNameText">{s.name}</span>
+                    {s.persistent ? (
+                      <span className="chip" title="Persistent (zellij)">
+                        <span className="chipLabel">persist</span>
+                      </span>
+                    ) : null}
                     {chipLabel && !hasAgentIcon && (
                       <span className={chipClass} title={chipLabel}>
                         <span className="chipLabel">{chipLabel}</span>
@@ -165,4 +182,3 @@ export function SessionsSection({
     </>
   );
 }
-

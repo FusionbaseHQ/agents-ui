@@ -17,9 +17,17 @@ import { QuickPromptsSection } from "./components/QuickPromptsSection";
 import { SessionsSection } from "./components/SessionsSection";
 import { AgentShortcutsModal } from "./components/AgentShortcutsModal";
 import { NewSessionModal } from "./components/modals/NewSessionModal";
+import {
+  PersistentSessionsModal,
+  type PersistentSessionsModalItem,
+} from "./components/modals/PersistentSessionsModal";
 import { ProjectModal } from "./components/modals/ProjectModal";
 import { ConfirmDeleteProjectModal } from "./components/modals/ConfirmDeleteProjectModal";
+import { ConfirmDeleteRecordingModal } from "./components/modals/ConfirmDeleteRecordingModal";
+import { ApplyAssetModal } from "./components/modals/ApplyAssetModal";
+import { ConfirmActionModal } from "./components/modals/ConfirmActionModal";
 import { PathPickerModal } from "./components/modals/PathPickerModal";
+import { UpdateModal, UpdateCheckState } from "./components/modals/UpdateModal";
 
 type Project = {
   id: string;
@@ -39,6 +47,7 @@ type SessionInfo = {
 type Session = SessionInfo & {
   projectId: string;
   persistId: string;
+  persistent: boolean;
   createdAt: number;
   launchCommand: string | null;
   restoreCommand?: string | null;
@@ -55,6 +64,8 @@ type Session = SessionInfo & {
 
 type PtyOutput = { id: string; data: string };
 type PtyExit = { id: string; exit_code?: number | null };
+type AppInfo = { name: string; version: string; homepage?: string | null };
+type AppMenuEventPayload = { id: string };
 
 // Buffer for data that arrives before terminal is ready
 export type PendingDataBuffer = Map<string, string[]>;
@@ -78,6 +89,50 @@ function makeId(): string {
 
 function normalizeSmartQuotes(input: string): string {
   return input.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+}
+
+function parseGithubRepo(value: string | null | undefined): { owner: string; repo: string } | null {
+  const raw = value?.trim() ?? "";
+  if (!raw) return null;
+
+  const direct = raw.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(?:\.git)?\/?$/);
+  if (direct) {
+    return { owner: direct[1], repo: direct[2] };
+  }
+
+  try {
+    const url = new URL(raw);
+    if (url.hostname !== "github.com") return null;
+    const parts = url.pathname.split("/").filter(Boolean);
+    if (parts.length < 2) return null;
+    let repo = parts[1];
+    if (repo.endsWith(".git")) repo = repo.slice(0, -4);
+    return { owner: parts[0], repo };
+  } catch {
+    return null;
+  }
+}
+
+function parseSemver(input: string): number[] | null {
+  const match = input.trim().match(/\d+(?:\.\d+)+/);
+  if (!match) return null;
+  const parts = match[0].split(".").filter(Boolean);
+  const nums = parts.map((p) => Number.parseInt(p, 10));
+  if (nums.some((n) => Number.isNaN(n))) return null;
+  return nums;
+}
+
+function compareSemver(a: string, b: string): number | null {
+  const pa = parseSemver(a);
+  const pb = parseSemver(b);
+  if (!pa || !pb) return null;
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const av = pa[i] ?? 0;
+    const bv = pb[i] ?? 0;
+    if (av !== bv) return av > bv ? 1 : -1;
+  }
+  return 0;
 }
 
 function isValidEnvKey(key: string): boolean {
@@ -171,6 +226,7 @@ type PersistedSession = {
   restoreCommand?: string | null;
   lastRecordingId?: string | null;
   cwd: string | null;
+  persistent?: boolean;
   createdAt: number;
 };
 
@@ -189,6 +245,8 @@ type PersistedStateV1 = {
 
 type DirectoryEntry = { name: string; path: string };
 type DirectoryListing = { path: string; parent: string | null; entries: DirectoryEntry[] };
+
+type PersistentSessionInfo = { persistId: string; sessionName: string };
 
 type Prompt = {
   id: string;
@@ -217,6 +275,14 @@ type AssetTemplate = {
 
 type AssetSettings = {
   autoApplyEnabled: boolean;
+};
+
+type ApplyAssetTarget = "project" | "tab";
+
+type ApplyAssetRequest = {
+  assetId: string;
+  target: ApplyAssetTarget;
+  dir: string;
 };
 
 type RecordingMeta = {
@@ -344,11 +410,15 @@ async function createSession(input: {
   lastRecordingId?: string | null;
   cwd?: string | null;
   envVars?: Record<string, string> | null;
+  persistent?: boolean;
   persistId?: string;
   createdAt?: number;
 }): Promise<Session> {
+  const persistent = Boolean(input.persistent);
+  const persistId = input.persistId ?? makeId();
+
   const trimmedCommand = (input.launchCommand ?? "").trim();
-  const launchCommand = trimmedCommand ? trimmedCommand : null;
+  const launchCommand = persistent ? null : trimmedCommand ? trimmedCommand : null;
   const processTag = launchCommand ? commandTagFromCommandLine(launchCommand) : null;
   const effect = detectProcessEffect({
     command: launchCommand,
@@ -359,11 +429,14 @@ async function createSession(input: {
     command: launchCommand,
     cwd: input.cwd ?? null,
     envVars: input.envVars ?? null,
+    persistent,
+    persistId,
   });
   return {
     ...info,
     projectId: input.projectId,
-    persistId: input.persistId ?? makeId(),
+    persistId,
+    persistent,
     createdAt: input.createdAt ?? Date.now(),
     launchCommand,
     restoreCommand: input.restoreCommand ?? null,
@@ -377,6 +450,10 @@ async function createSession(input: {
 
 async function closeSession(id: string): Promise<void> {
   await invoke("close_session", { id });
+}
+
+async function detachSession(id: string): Promise<void> {
+  await invoke("detach_session", { id });
 }
 
 export default function App() {
@@ -397,6 +474,7 @@ export default function App() {
   const [newOpen, setNewOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [newCommand, setNewCommand] = useState("");
+  const [newPersistent, setNewPersistent] = useState(false);
   const [newCwd, setNewCwd] = useState("");
   const [projectOpen, setProjectOpen] = useState(false);
   const [projectMode, setProjectMode] = useState<"new" | "rename">("new");
@@ -405,6 +483,10 @@ export default function App() {
   const [projectEnvironmentId, setProjectEnvironmentId] = useState<string>("");
   const [projectAssetsEnabled, setProjectAssetsEnabled] = useState(true);
   const [confirmDeleteProjectOpen, setConfirmDeleteProjectOpen] = useState(false);
+  const [confirmDeleteRecordingId, setConfirmDeleteRecordingId] = useState<string | null>(null);
+  const [confirmDeletePromptId, setConfirmDeletePromptId] = useState<string | null>(null);
+  const [confirmDeleteEnvironmentId, setConfirmDeleteEnvironmentId] = useState<string | null>(null);
+  const [confirmDeleteAssetId, setConfirmDeleteAssetId] = useState<string | null>(null);
   const [pathPickerOpen, setPathPickerOpen] = useState(false);
   const [pathPickerTarget, setPathPickerTarget] = useState<"project" | "session" | null>(null);
   const [pathPickerListing, setPathPickerListing] = useState<DirectoryListing | null>(null);
@@ -442,7 +524,22 @@ export default function App() {
   const [assetEditorPath, setAssetEditorPath] = useState("");
   const [assetEditorAutoApply, setAssetEditorAutoApply] = useState(true);
   const [assetEditorContent, setAssetEditorContent] = useState("");
+  const [applyAssetRequest, setApplyAssetRequest] = useState<ApplyAssetRequest | null>(null);
+  const [applyAssetApplying, setApplyAssetApplying] = useState(false);
+  const [applyAssetError, setApplyAssetError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimerRef = useRef<number | null>(null);
+  const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
+  const [updatesOpen, setUpdatesOpen] = useState(false);
+  const [updateCheckState, setUpdateCheckState] = useState<UpdateCheckState>({ status: "idle" });
+
+  const [persistentSessionsOpen, setPersistentSessionsOpen] = useState(false);
+  const [persistentSessionsLoading, setPersistentSessionsLoading] = useState(false);
+  const [persistentSessionsError, setPersistentSessionsError] = useState<string | null>(null);
+  const [persistentSessions, setPersistentSessions] = useState<PersistentSessionInfo[]>([]);
+  const [confirmKillPersistentId, setConfirmKillPersistentId] = useState<string | null>(null);
+  const [confirmKillPersistentBusy, setConfirmKillPersistentBusy] = useState(false);
 
   // New UI state for SlidePanel and CommandPalette
   const [slidePanelOpen, setSlidePanelOpen] = useState(false);
@@ -454,6 +551,19 @@ export default function App() {
   const [assetSearch, setAssetSearch] = useState("");
   const [recordingStartTime, setRecordingStartTime] = useState<number | null>(null);
   const [recordingElapsed, setRecordingElapsed] = useState(0);
+
+  const updateSourceLabel = useMemo(() => {
+    const repo = parseGithubRepo(appInfo?.homepage);
+    if (repo) return `${repo.owner}/${repo.repo}`;
+    const homepage = appInfo?.homepage?.trim();
+    return homepage ? homepage : null;
+  }, [appInfo]);
+
+  const fallbackReleaseUrl = useMemo(() => {
+    const repo = parseGithubRepo(appInfo?.homepage);
+    if (!repo) return null;
+    return `https://github.com/${repo.owner}/${repo.repo}/releases/latest`;
+  }, [appInfo]);
 
   const quickStarts = useMemo(() => {
     const presets: Array<{ id: string; title: string; command: string | null; iconSrc: string | null }> = [];
@@ -505,6 +615,7 @@ export default function App() {
 
   const registry = useRef<TerminalRegistry>(new Map());
   const pendingData = useRef<PendingDataBuffer>(new Map());
+  const pendingExitCodes = useRef<Map<string, number | null>>(new Map());
   const closingSessions = useRef<Map<string, number>>(new Map());
   const sessionIdsRef = useRef<string[]>([]);
   const sessionsRef = useRef<Session[]>([]);
@@ -521,6 +632,20 @@ export default function App() {
   const saveTimerRef = useRef<number | null>(null);
   const pendingSaveRef = useRef<PersistedStateV1 | null>(null);
   const agentIdleTimersRef = useRef<Map<string, number>>(new Map());
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<AppInfo>("get_app_info")
+      .then((info) => {
+        if (cancelled) return;
+        setAppInfo(info);
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   function clearAgentIdleTimer(id: string) {
     const existing = agentIdleTimersRef.current.get(id);
@@ -597,6 +722,49 @@ export default function App() {
     return counts;
   }, [sessions]);
 
+  const persistentSessionItems = useMemo<PersistentSessionsModalItem[]>(() => {
+    if (!persistentSessions.length) return [];
+    const projectTitleById = new Map(projects.map((p) => [p.id, p.title]));
+    const out: PersistentSessionsModalItem[] = [];
+
+    for (const ps of persistentSessions) {
+      const activeSession =
+        sessions.find((s) => s.persistId === ps.persistId && !s.exited && !s.closing) ?? null;
+      const openInUi = Boolean(activeSession);
+      const projectTitle = activeSession ? projectTitleById.get(activeSession.projectId) ?? null : null;
+      const label = activeSession
+        ? projectTitle
+          ? `${activeSession.name} — ${projectTitle}`
+          : activeSession.name
+        : ps.sessionName;
+      out.push({
+        persistId: ps.persistId,
+        sessionName: ps.sessionName,
+        label,
+        openInUi,
+      });
+    }
+
+    out.sort((a, b) => {
+      if (a.openInUi !== b.openInUi) return a.openInUi ? -1 : 1;
+      return a.persistId.localeCompare(b.persistId);
+    });
+    return out;
+  }, [persistentSessions, projects, sessions]);
+
+  const applyPendingExit = useCallback((session: Session): Session => {
+    const pending = pendingExitCodes.current.get(session.id);
+    if (pending === undefined) return session;
+    pendingExitCodes.current.delete(session.id);
+    return {
+      ...session,
+      exited: true,
+      exitCode: pending,
+      agentWorking: false,
+      recordingActive: false,
+    };
+  }, []);
+
   useEffect(() => {
     sessionIdsRef.current = sessions.map((s) => s.id);
     sessionsRef.current = sessions;
@@ -650,6 +818,7 @@ export default function App() {
         restoreCommand: s.restoreCommand ?? null,
         lastRecordingId: s.lastRecordingId ?? null,
         cwd: s.cwd,
+        persistent: s.persistent,
         createdAt: s.createdAt,
       }))
       .sort((a, b) => a.createdAt - b.createdAt);
@@ -695,6 +864,7 @@ export default function App() {
     if (!newOpen) return;
     const base = activeProject?.basePath ?? homeDirRef.current ?? "";
     setNewCwd(base);
+    setNewPersistent(false);
     window.setTimeout(() => {
       newNameRef.current?.focus();
     }, 0);
@@ -712,23 +882,28 @@ export default function App() {
     void refreshRecordings();
   }, [hydrated]);
 
-	  useEffect(() => {
-	    const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
-	    const onKeyDown = (e: KeyboardEvent) => {
-        const modalOpen =
-          newOpen ||
-          agentShortcutsOpen ||
-          projectOpen ||
-          pathPickerOpen ||
-          confirmDeleteProjectOpen ||
-          replayOpen ||
-          recordPromptOpen ||
-          recordingsOpen ||
-          promptsOpen ||
-          promptEditorOpen ||
-          environmentsOpen ||
-          environmentEditorOpen ||
-          assetEditorOpen;
+  useEffect(() => {
+    const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+    const onKeyDown = (e: KeyboardEvent) => {
+      const modalOpen =
+        newOpen ||
+        agentShortcutsOpen ||
+        projectOpen ||
+        pathPickerOpen ||
+        confirmDeleteProjectOpen ||
+        Boolean(confirmDeleteRecordingId) ||
+        Boolean(confirmDeletePromptId) ||
+        Boolean(confirmDeleteEnvironmentId) ||
+        Boolean(confirmDeleteAssetId) ||
+        Boolean(applyAssetRequest) ||
+        replayOpen ||
+        recordPromptOpen ||
+        recordingsOpen ||
+        promptsOpen ||
+        promptEditorOpen ||
+        environmentsOpen ||
+        environmentEditorOpen ||
+        assetEditorOpen;
 
         // Command palette takes priority - Cmd+K or Ctrl+K
         const modKey = isMac ? e.metaKey : e.ctrlKey;
@@ -752,12 +927,33 @@ export default function App() {
           return;
         }
 
-	      if (e.key === "Escape" && modalOpen) {
-	        e.preventDefault();
-          if (agentShortcutsOpen) {
-            setAgentShortcutsOpen(false);
-            return;
-          }
+      if (e.key === "Escape" && modalOpen) {
+        e.preventDefault();
+        if (applyAssetRequest) {
+          if (applyAssetApplying) return;
+          closeApplyAssetModal();
+          return;
+        }
+        if (confirmDeleteAssetId) {
+          setConfirmDeleteAssetId(null);
+          return;
+        }
+        if (confirmDeleteEnvironmentId) {
+          setConfirmDeleteEnvironmentId(null);
+          return;
+        }
+        if (confirmDeletePromptId) {
+          setConfirmDeletePromptId(null);
+          return;
+        }
+        if (confirmDeleteRecordingId) {
+          setConfirmDeleteRecordingId(null);
+          return;
+        }
+        if (agentShortcutsOpen) {
+          setAgentShortcutsOpen(false);
+          return;
+        }
           if (environmentEditorOpen) {
             setEnvironmentEditorOpen(false);
             return;
@@ -972,25 +1168,42 @@ export default function App() {
       }
     };
 
-	    window.addEventListener("keydown", onKeyDown);
-	    return () => window.removeEventListener("keydown", onKeyDown);
-	  }, [
-      newOpen,
-      projectOpen,
-      pathPickerOpen,
-      confirmDeleteProjectOpen,
-      replayOpen,
-      recordPromptOpen,
-      recordingsOpen,
-      promptsOpen,
-      promptEditorOpen,
-      environmentsOpen,
-      environmentEditorOpen,
-      commandPaletteOpen,
-      slidePanelOpen,
-      slidePanelTab,
-      prompts,
-    ]);
+		    window.addEventListener("keydown", onKeyDown);
+		    return () => window.removeEventListener("keydown", onKeyDown);
+        }, [
+          newOpen,
+          agentShortcutsOpen,
+          projectOpen,
+          pathPickerOpen,
+          confirmDeleteProjectOpen,
+          confirmDeleteRecordingId,
+          confirmDeletePromptId,
+          confirmDeleteEnvironmentId,
+          confirmDeleteAssetId,
+          applyAssetRequest,
+          applyAssetApplying,
+          replayOpen,
+          recordPromptOpen,
+          recordingsOpen,
+          promptsOpen,
+          promptEditorOpen,
+          environmentsOpen,
+          environmentEditorOpen,
+          assetEditorOpen,
+          commandPaletteOpen,
+          slidePanelOpen,
+          slidePanelTab,
+          prompts,
+        ]);
+
+  useEffect(() => {
+    return () => {
+      if (noticeTimerRef.current !== null) {
+        window.clearTimeout(noticeTimerRef.current);
+        noticeTimerRef.current = null;
+      }
+    };
+  }, []);
 
   function formatError(err: unknown): string {
     if (err instanceof Error) return err.message;
@@ -1005,6 +1218,109 @@ export default function App() {
   function reportError(prefix: string, err: unknown) {
     setError(`${prefix}: ${formatError(err)}`);
   }
+
+  function dismissNotice() {
+    setNotice(null);
+    if (noticeTimerRef.current !== null) {
+      window.clearTimeout(noticeTimerRef.current);
+      noticeTimerRef.current = null;
+    }
+  }
+
+  function showNotice(message: string, timeoutMs = 4500) {
+    setNotice(message);
+    if (noticeTimerRef.current !== null) {
+      window.clearTimeout(noticeTimerRef.current);
+    }
+    noticeTimerRef.current = window.setTimeout(() => {
+      noticeTimerRef.current = null;
+      setNotice(null);
+    }, timeoutMs);
+  }
+
+  const openExternal = useCallback(
+    async (url: string) => {
+      try {
+        await invoke("plugin:shell|open", { path: url });
+      } catch (err) {
+        reportError("Failed to open link", err);
+      }
+    },
+    [reportError],
+  );
+
+  const checkForUpdates = useCallback(async () => {
+    setUpdateCheckState({ status: "checking" });
+
+    let info: AppInfo | null = null;
+    try {
+      info = await invoke<AppInfo>("get_app_info");
+      setAppInfo(info);
+    } catch {
+      info = null;
+    }
+
+    if (!info) {
+      setUpdateCheckState({ status: "error", message: "Unable to read app info." });
+      return;
+    }
+
+    const repo = parseGithubRepo(info.homepage);
+    if (!repo) {
+      setUpdateCheckState({
+        status: "error",
+        message: "Update source not configured. Set bundle.homepage to your GitHub repo URL.",
+      });
+      return;
+    }
+
+    const fallbackReleaseUrl = `https://github.com/${repo.owner}/${repo.repo}/releases/latest`;
+    const apiUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/releases/latest`;
+
+    try {
+      const response = await fetch(apiUrl, {
+        headers: { Accept: "application/vnd.github+json" },
+      });
+      if (!response.ok) {
+        throw new Error(`GitHub API returned ${response.status}`);
+      }
+      const data = (await response.json()) as { tag_name?: string; html_url?: string };
+      const tag = data.tag_name?.trim();
+      if (!tag) {
+        setUpdateCheckState({ status: "error", message: "Latest release has no tag name." });
+        return;
+      }
+
+      const current = info.version;
+      const cmp = compareSemver(tag, current);
+
+      const releaseUrl = data.html_url ?? fallbackReleaseUrl;
+      const isNewer =
+        cmp === null
+          ? tag.trim().replace(/^v/i, "") !== current.trim().replace(/^v/i, "")
+          : cmp > 0;
+
+      if (isNewer) {
+        setUpdateCheckState({
+          status: "updateAvailable",
+          latestVersion: tag,
+          releaseUrl,
+        });
+        return;
+      }
+
+      setUpdateCheckState({
+        status: "upToDate",
+        latestVersion: tag,
+        releaseUrl,
+      });
+    } catch (err) {
+      setUpdateCheckState({
+        status: "error",
+        message: `Update check failed: ${formatError(err)}`,
+      });
+    }
+  }, []);
 
   function sanitizeRecordedInputForReplay(input: string): string {
     // Remove common ANSI/terminal control sequences; recordings should be replayable as plain input.
@@ -1044,6 +1360,19 @@ export default function App() {
       setRecordingsError(formatError(err));
     } finally {
       setRecordingsLoading(false);
+    }
+  }
+
+  async function refreshPersistentSessions() {
+    setPersistentSessionsLoading(true);
+    setPersistentSessionsError(null);
+    try {
+      const list = await invoke<PersistentSessionInfo[]>("list_persistent_sessions");
+      setPersistentSessions(list);
+    } catch (err) {
+      setPersistentSessionsError(formatError(err));
+    } finally {
+      setPersistentSessionsLoading(false);
     }
   }
 
@@ -1159,8 +1488,14 @@ export default function App() {
     await openReplay(active.lastRecordingId);
   }
 
+  function requestDeleteRecording(recordingId: string) {
+    setRecordingsOpen(false);
+    setConfirmDeleteRecordingId(recordingId);
+  }
+
   async function deleteRecording(recordingId: string) {
-    if (!window.confirm("Delete this recording?")) return;
+    const label =
+      recordings.find((r) => r.recordingId === recordingId)?.meta?.name?.trim() || recordingId;
     try {
       await invoke("delete_recording", { recordingId });
       setRecordings((prev) => prev.filter((r) => r.recordingId !== recordingId));
@@ -1172,6 +1507,7 @@ export default function App() {
       if (replayRecording?.recordingId === recordingId) {
         closeReplayModal();
       }
+      showNotice(`Deleted recording "${label}"`);
     } catch (err) {
       reportError("Failed to delete recording", err);
     }
@@ -1210,9 +1546,21 @@ export default function App() {
     closePromptEditor();
   }
 
-  function deletePrompt(id: string) {
-    if (!window.confirm("Delete this prompt?")) return;
+  function requestDeletePrompt(id: string) {
+    setConfirmDeletePromptId(id);
+  }
+
+  function confirmDeletePrompt() {
+    const id = confirmDeletePromptId;
+    setConfirmDeletePromptId(null);
+    if (!id) return;
+
+    const prompt = prompts.find((p) => p.id === id);
+    const label = prompt?.title?.trim() ? prompt.title.trim() : "prompt";
+
+    if (promptEditorId === id) closePromptEditor();
     setPrompts((prev) => prev.filter((p) => p.id !== id));
+    showNotice(`Deleted prompt "${label}"`);
   }
 
   function togglePromptPin(id: string) {
@@ -1313,13 +1661,25 @@ export default function App() {
     closeEnvironmentEditor();
   }
 
-  function deleteEnvironment(id: string) {
-    if (!window.confirm("Delete this environment?")) return;
+  function requestDeleteEnvironment(id: string) {
+    setConfirmDeleteEnvironmentId(id);
+  }
+
+  function confirmDeleteEnvironment() {
+    const id = confirmDeleteEnvironmentId;
+    setConfirmDeleteEnvironmentId(null);
+    if (!id) return;
+
+    const env = environments.find((e) => e.id === id);
+    const label = env?.name?.trim() ? env.name.trim() : "environment";
+
+    if (environmentEditorId === id) closeEnvironmentEditor();
     setEnvironments((prev) => prev.filter((e) => e.id !== id));
     setProjects((prev) =>
       prev.map((p) => (p.environmentId === id ? { ...p, environmentId: null } : p)),
     );
     if (projectEnvironmentId === id) setProjectEnvironmentId("");
+    showNotice(`Deleted environment "${label}"`);
   }
 
   function openAssetEditor(asset?: AssetTemplate) {
@@ -1364,11 +1724,26 @@ export default function App() {
     closeAssetEditor();
   }
 
-  function deleteAsset(id: string) {
+  function requestDeleteAsset(id: string) {
+    setConfirmDeleteAssetId(id);
+  }
+
+  function confirmDeleteAsset() {
+    const id = confirmDeleteAssetId;
+    setConfirmDeleteAssetId(null);
+    if (!id) return;
+
     const asset = assets.find((a) => a.id === id);
-    const label = asset?.name?.trim() ? asset.name.trim() : "this asset";
-    if (!window.confirm(`Delete ${label}?`)) return;
+    const label = asset?.name?.trim() ? asset.name.trim() : "template";
+
+    if (assetEditorId === id) closeAssetEditor();
+    if (applyAssetRequest?.assetId === id) {
+      setApplyAssetRequest(null);
+      setApplyAssetError(null);
+      setApplyAssetApplying(false);
+    }
     setAssets((prev) => prev.filter((a) => a.id !== id));
+    showNotice(`Deleted template "${label}"`);
   }
 
   function toggleAssetAutoApply(id: string) {
@@ -1377,20 +1752,33 @@ export default function App() {
     );
   }
 
-  async function applyTextAssets(baseDir: string, templates: AssetTemplate[], overwrite: boolean) {
+  async function applyTextAssetsRaw(
+    baseDir: string,
+    templates: AssetTemplate[],
+    overwrite: boolean,
+  ): Promise<string[]> {
     const dir = baseDir.trim();
-    if (!dir) return;
+    if (!dir) return [];
     const payload = templates
       .map((t) => ({
         relativePath: t.relativePath,
         content: t.content,
       }))
       .filter((t) => t.relativePath.trim());
-    if (payload.length === 0) return;
+    if (payload.length === 0) return [];
+    return invoke<string[]>("apply_text_assets", { baseDir: dir, assets: payload, overwrite });
+  }
+
+  async function applyTextAssets(
+    baseDir: string,
+    templates: AssetTemplate[],
+    overwrite: boolean,
+  ): Promise<string[]> {
     try {
-      await invoke("apply_text_assets", { baseDir: dir, assets: payload, overwrite });
+      return await applyTextAssetsRaw(baseDir, templates, overwrite);
     } catch (err) {
       reportError("Failed to apply assets", err);
+      return [];
     }
   }
 
@@ -1407,6 +1795,60 @@ export default function App() {
     if (templates.length === 0) return;
 
     await applyTextAssets(baseDir, templates, false);
+  }
+
+  function joinPathDisplay(baseDir: string, relativePath: string): string {
+    const base = baseDir.replace(/[\\/]+$/, "");
+    const rel = relativePath.replace(/^[\\/]+/, "");
+    if (!base) return rel;
+    if (!rel) return base;
+    return `${base}/${rel}`;
+  }
+
+  function openApplyAssetModal(target: ApplyAssetTarget, dir: string, assetId: string) {
+    setApplyAssetError(null);
+    setApplyAssetApplying(false);
+    setApplyAssetRequest({ target, dir, assetId });
+  }
+
+  function closeApplyAssetModal() {
+    if (applyAssetApplying) return;
+    setApplyAssetRequest(null);
+    setApplyAssetError(null);
+  }
+
+  async function confirmApplyAsset(overwrite: boolean) {
+    const req = applyAssetRequest;
+    if (!req) return;
+    const asset = assets.find((a) => a.id === req.assetId);
+    if (!asset) {
+      setApplyAssetRequest(null);
+      return;
+    }
+
+	    setApplyAssetApplying(true);
+	    setApplyAssetError(null);
+	    try {
+	      const written = await applyTextAssetsRaw(req.dir, [asset], overwrite);
+	      setApplyAssetRequest(null);
+
+	      const templateLabel = asset.name.trim() || "template";
+	      const targetLabel = req.target === "project" ? "project" : "tab";
+	      const targetPath = shortenPathSmart(joinPathDisplay(req.dir, asset.relativePath), 72);
+	      if (written.length === 0) {
+	        showNotice(`Skipped "${templateLabel}" (${targetLabel}): ${targetPath}`);
+	        return;
+	      }
+	      const verb = overwrite ? "Applied (overwrite)" : "Applied";
+	      showNotice(
+	        `${verb} "${templateLabel}" (${targetLabel}): ${shortenPathSmart(written[0] ?? targetPath, 72)}`,
+	      );
+	    } catch (err) {
+	      setApplyAssetError(formatError(err));
+	      reportError("Failed to apply asset", err);
+	    } finally {
+	      setApplyAssetApplying(false);
+    }
   }
 
   async function ensureReplayTargetSession(): Promise<string | null> {
@@ -1431,13 +1873,14 @@ export default function App() {
         : "replay";
 
     try {
-      const created = await createSession({
+      const createdRaw = await createSession({
         projectId,
         name,
         launchCommand: bootstrapCommand,
         cwd,
         envVars: envVarsForProjectId(projectId, projects, environments),
       });
+      const created = applyPendingExit(createdRaw);
       setSessions((prev) => [...prev, created]);
       setActiveProjectId(projectId);
       setActiveId(created.id);
@@ -1636,11 +2079,12 @@ export default function App() {
 
     try {
       await ensureAutoAssets(validatedBasePath, id, projectAssetsEnabled);
-      const s = await createSession({
+      const createdRaw = await createSession({
         projectId: id,
         cwd: validatedBasePath,
         envVars: envVarsForProjectId(id, [...projects, project], environments),
       });
+      const s = applyPendingExit(createdRaw);
       setSessions((prev) => [...prev, s]);
       setActiveId(s.id);
     } catch (err) {
@@ -1690,11 +2134,12 @@ export default function App() {
       setProjects([fallback]);
       setActiveProjectId(fallback.id);
       try {
-        const s = await createSession({
+        const createdRaw = await createSession({
           projectId: fallback.id,
           cwd: fallback.basePath ?? null,
           envVars: envVarsForProjectId(fallback.id, [fallback], environments),
         });
+        const s = applyPendingExit(createdRaw);
         setSessions([s]);
         setActiveId(s.id);
       } catch (err) {
@@ -1760,7 +2205,6 @@ export default function App() {
         if (cancelled) return;
         const { id, exit_code } = event.payload;
 
-        pendingData.current.delete(id);
         clearAgentIdleTimer(id);
 
         const timeout = closingSessions.current.get(id);
@@ -1770,21 +2214,33 @@ export default function App() {
           return;
         }
 
-        setSessions((prev) =>
-          prev.map((s) =>
-            s.id === id
-              ? {
-                  ...s,
-                  exited: true,
-                  exitCode: exit_code ?? null,
-                  agentWorking: false,
-                  recordingActive: false,
-                }
-              : s,
-          ),
-        );
+        setSessions((prev) => {
+          let found = false;
+          const next = prev.map((s) => {
+            if (s.id !== id) return s;
+            found = true;
+            return {
+              ...s,
+              exited: true,
+              exitCode: exit_code ?? null,
+              agentWorking: false,
+              recordingActive: false,
+            };
+          });
+          if (!found) pendingExitCodes.current.set(id, exit_code ?? null);
+          return next;
+        });
       });
       unlisteners.push(unlistenExit);
+
+      const unlistenMenu = await listen<AppMenuEventPayload>("app-menu", (event) => {
+        if (cancelled) return;
+        if (event.payload.id === "help-check-updates") {
+          setUpdatesOpen(true);
+          void checkForUpdates();
+        }
+      });
+      unlisteners.push(unlistenMenu);
 
       // Check if we were cancelled during async setup
       if (cancelled) {
@@ -1919,7 +2375,7 @@ export default function App() {
       for (const s of persisted) {
         if (cancelled) break;
         try {
-          const created = await createSession({
+          const createdRaw = await createSession({
             projectId: s.projectId,
             name: s.name,
             launchCommand: s.launchCommand,
@@ -1927,9 +2383,11 @@ export default function App() {
             lastRecordingId: s.lastRecordingId ?? null,
             cwd: s.cwd ?? projectById.get(s.projectId)?.basePath ?? resolvedHome ?? null,
             envVars: envVarsForProject(s.projectId),
+            persistent: s.persistent ?? false,
             persistId: s.persistId,
             createdAt: s.createdAt,
           });
+          const created = applyPendingExit(createdRaw);
           restored.push(created);
 
           const restoreCmd =
@@ -1970,11 +2428,12 @@ export default function App() {
         let first: Session;
         try {
           const basePath = projectById.get(activeProjectId)?.basePath ?? resolvedHome ?? null;
-          first = await createSession({
+          const createdRaw = await createSession({
             projectId: activeProjectId,
             cwd: basePath,
             envVars: envVarsForProject(activeProjectId),
           });
+          first = applyPendingExit(createdRaw);
         } catch (err) {
           if (!cancelled) reportError("Failed to create session", err);
           return;
@@ -2022,7 +2481,9 @@ export default function App() {
       }
       agentIdleTimersRef.current.clear();
       for (const id of sessionIdsRef.current) {
-        void closeSession(id).catch(() => {});
+        const s = sessionsRef.current.find((x) => x.id === id) ?? null;
+        if (s?.persistent && !s.exited) void detachSession(id).catch(() => {});
+        else void closeSession(id).catch(() => {});
       }
     };
   }, []);
@@ -2032,6 +2493,10 @@ export default function App() {
     const name = newName.trim() || undefined;
     try {
       const launchCommand = newCommand.trim() || null;
+      if (newPersistent && launchCommand) {
+        setError("Persistent sessions require an empty command (run commands inside the session).");
+        return;
+      }
       const desiredCwd =
         newCwd.trim() || activeProject?.basePath || homeDirRef.current || "";
       const validatedCwd = await invoke<string | null>("validate_directory", {
@@ -2042,27 +2507,31 @@ export default function App() {
         return;
       }
       await ensureAutoAssets(validatedCwd, activeProjectId);
-      const s = await createSession({
+      const createdRaw = await createSession({
         projectId: activeProjectId,
         name,
         launchCommand,
+        persistent: newPersistent,
         cwd: validatedCwd,
         envVars: envVarsForProjectId(activeProjectId, projects, environments),
       });
+      const s = applyPendingExit(createdRaw);
       setSessions((prev) => [...prev, s]);
       setActiveId(s.id);
       setNewOpen(false);
       setNewName("");
       setNewCommand("");
+      setNewPersistent(false);
       setNewCwd("");
     } catch (err) {
       reportError("Failed to create session", err);
     }
   }
 
-  async function onClose(id: string) {
-    clearAgentIdleTimer(id);
-    const session = sessionsRef.current.find((s) => s.id === id) ?? null;
+	  async function onClose(id: string) {
+	    clearAgentIdleTimer(id);
+	    const session = sessionsRef.current.find((s) => s.id === id) ?? null;
+	    const wasPersistent = Boolean(session?.persistent && !session?.exited);
     if (session?.recordingActive) {
       try {
         await invoke("stop_session_recording", { id });
@@ -2080,21 +2549,43 @@ export default function App() {
       closingSessions.current.set(id, timeout);
     }
 
-    // Clean up pending buffer
-    pendingData.current.delete(id);
+	    // Clean up pending buffer
+	    pendingData.current.delete(id);
 
-    try {
-      await closeSession(id);
-    } catch (err) {
-      const timeout = closingSessions.current.get(id);
-      if (timeout !== undefined) window.clearTimeout(timeout);
-      closingSessions.current.delete(id);
+	    let killErr: string | null = null;
+	    let killedPersistent = false;
+	    try {
+	      if (wasPersistent && session?.persistId) {
+	        try {
+	          await invoke("kill_persistent_session", { persistId: session.persistId });
+	          killedPersistent = true;
+	        } catch (err) {
+	          killErr = formatError(err);
+	        } finally {
+	          void refreshPersistentSessions();
+	        }
+	      }
+	      await closeSession(id);
+	    } catch (err) {
+	      const timeout = closingSessions.current.get(id);
+	      if (timeout !== undefined) window.clearTimeout(timeout);
+	      closingSessions.current.delete(id);
       setSessions((prev) =>
         prev.map((s) => (s.id === id ? { ...s, closing: false } : s)),
       );
       reportError("Failed to close session", err);
-      return;
-    }
+	      return;
+	    }
+
+	    if (wasPersistent && session) {
+	      if (killedPersistent) {
+	        showNotice(`Closed "${session.name}" and killed persistent session.`);
+	      } else if (killErr) {
+	        showNotice(`Closed "${session.name}" but failed to kill persistent session. Manage via Persistent sessions (∞).`);
+	      } else {
+	        showNotice(`Closed "${session.name}".`);
+	      }
+	    }
 
     setSessions((prev) => {
       const closing = prev.find((s) => s.id === id);
@@ -2107,6 +2598,61 @@ export default function App() {
       });
       return next;
     });
+  }
+
+  async function attachPersistentSession(persistId: string) {
+    const existing = sessionsRef.current.find((s) => s.persistId === persistId) ?? null;
+    if (existing && !existing.exited && !existing.closing) {
+      setActiveProjectId(existing.projectId);
+      setActiveId(existing.id);
+      return;
+    }
+
+    const cwd = activeProject?.basePath ?? homeDirRef.current ?? null;
+    try {
+      if (cwd) await ensureAutoAssets(cwd, activeProjectId);
+      const createdRaw = await createSession({
+        projectId: activeProjectId,
+        name: `persist ${persistId.slice(0, 8)}`,
+        persistent: true,
+        persistId,
+        cwd,
+        envVars: envVarsForProjectId(activeProjectId, projects, environments),
+      });
+      const created = applyPendingExit(createdRaw);
+      setSessions((prev) => [...prev, created]);
+      setActiveId(created.id);
+    } catch (err) {
+      reportError("Failed to attach persistent session", err);
+    }
+  }
+
+  async function confirmKillPersistentSession() {
+    const persistId = confirmKillPersistentId;
+    if (!persistId) return;
+    setConfirmKillPersistentBusy(true);
+    try {
+      const toClose = sessionsRef.current.filter((s) => s.persistId === persistId).map((s) => s.id);
+      await Promise.all(toClose.map((id) => closeSession(id).catch(() => {})));
+      await invoke("kill_persistent_session", { persistId });
+
+      setSessions((prev) => prev.filter((s) => s.persistId !== persistId));
+      setActiveId((prevActive) => {
+        if (!prevActive) return prevActive;
+        const stillExists = sessionsRef.current.some(
+          (s) => s.id === prevActive && s.persistId !== persistId,
+        );
+        return stillExists ? prevActive : null;
+      });
+
+      showNotice(`Killed persistent session ${persistId.slice(0, 8)}`);
+      void refreshPersistentSessions();
+    } catch (err) {
+      reportError("Failed to kill persistent session", err);
+    } finally {
+      setConfirmKillPersistentBusy(false);
+      setConfirmKillPersistentId(null);
+    }
   }
 
   function cleanAgentShortcutIds(input: string[]): string[] {
@@ -2148,19 +2694,34 @@ export default function App() {
     try {
       const cwd = activeProject?.basePath ?? homeDirRef.current ?? null;
       if (cwd) await ensureAutoAssets(cwd, activeProjectId);
-      const s = await createSession({
+      const createdRaw = await createSession({
         projectId: activeProjectId,
         name: preset.title,
         launchCommand: preset.command,
         cwd,
         envVars: envVarsForProjectId(activeProjectId, projects, environments),
       });
+      const s = applyPendingExit(createdRaw);
       setSessions((prev) => [...prev, s]);
       setActiveId(s.id);
     } catch (err) {
       reportError(`Failed to start ${preset.title}`, err);
     }
   }
+
+  const pendingApplyAsset = applyAssetRequest
+    ? assets.find((a) => a.id === applyAssetRequest.assetId) ?? null
+    : null;
+
+  const pendingDeletePrompt = confirmDeletePromptId
+    ? prompts.find((p) => p.id === confirmDeletePromptId) ?? null
+    : null;
+  const pendingDeleteEnvironment = confirmDeleteEnvironmentId
+    ? environments.find((e) => e.id === confirmDeleteEnvironmentId) ?? null
+    : null;
+  const pendingDeleteAsset = confirmDeleteAssetId
+    ? assets.find((a) => a.id === confirmDeleteAssetId) ?? null
+    : null;
 
   return (
     <div className="app">
@@ -2209,6 +2770,10 @@ export default function App() {
             setProjectOpen(false);
             setNewOpen(true);
           }}
+          onOpenPersistentSessions={() => {
+            setPersistentSessionsOpen(true);
+            void refreshPersistentSessions();
+          }}
           onOpenAgentShortcuts={() => setAgentShortcutsOpen(true)}
         />
       </aside>
@@ -2219,19 +2784,30 @@ export default function App() {
             {activeProject ? `Project: ${activeProject.title}` : "Project: —"}
             {active ? ` • ${active.name}` : " • No session"}
           </div>
-          <div className="topbarRight">
-            {error ? (
-              <div className="errorBanner" role="alert">
-                <div className="errorText">{error}</div>
-                <button className="errorClose" onClick={() => setError(null)} title="Dismiss">
-                  ×
-                </button>
-              </div>
-            ) : (
-              <div className="shortcutHint">
-                <kbd>{"\u2318"}K</kbd> Quick Access
-              </div>
-            )}
+	          <div className="topbarRight">
+	            {error && (
+	              <div className="errorBanner" role="alert">
+	                <div className="errorText">{error}</div>
+	                <button className="errorClose" onClick={() => setError(null)} title="Dismiss">
+	                  ×
+	                </button>
+	              </div>
+	            )}
+
+	            {notice && (
+	              <div className="noticeBanner" role="status" aria-live="polite">
+	                <div className="noticeText">{notice}</div>
+	                <button className="errorClose" onClick={dismissNotice} title="Dismiss">
+	                  ×
+	                </button>
+	              </div>
+	            )}
+
+	            {!error && !notice && (
+	              <div className="shortcutHint">
+	                <kbd>{"\u2318"}K</kbd> Quick Access
+	              </div>
+	            )}
 
             {/* Recording Timer */}
             {active?.recordingActive && (
@@ -2297,6 +2873,7 @@ export default function App() {
                 id={s.id}
                 active={s.id === activeId}
                 readOnly={Boolean(s.exited || s.closing)}
+                persistent={s.persistent}
                 onCwdChange={onCwdChange}
                 onCommandChange={onCommandChange}
                 onUserEnter={() => markAgentWorking(s.id)}
@@ -2314,6 +2891,8 @@ export default function App() {
             onChangeName={setNewName}
             command={newCommand}
             onChangeCommand={setNewCommand}
+            persistent={newPersistent}
+            onChangePersistent={setNewPersistent}
             cwd={newCwd}
             onChangeCwd={setNewCwd}
             cwdPlaceholder={activeProject?.basePath ?? "~"}
@@ -2324,8 +2903,26 @@ export default function App() {
             onUseProjectBase={() => setNewCwd(activeProject?.basePath ?? "")}
             canUseCurrentTab={Boolean(active?.cwd)}
             onUseCurrentTab={() => setNewCwd(active?.cwd ?? "")}
-            onClose={() => setNewOpen(false)}
+            onClose={() => {
+              setNewOpen(false);
+              setNewPersistent(false);
+            }}
             onSubmit={onNewSubmit}
+          />
+
+          <PersistentSessionsModal
+            isOpen={persistentSessionsOpen}
+            loading={persistentSessionsLoading}
+            error={persistentSessionsError}
+            sessions={persistentSessionItems}
+            onClose={() => {
+              if (confirmKillPersistentBusy) return;
+              setPersistentSessionsOpen(false);
+              setPersistentSessionsError(null);
+            }}
+            onRefresh={() => void refreshPersistentSessions()}
+            onAttach={(persistId) => void attachPersistentSession(persistId)}
+            onRequestKill={(persistId) => setConfirmKillPersistentId(persistId)}
           />
 
           <AgentShortcutsModal
@@ -2339,6 +2936,26 @@ export default function App() {
             onResetDefaults={() =>
               setAgentShortcutIds(cleanAgentShortcutIds(DEFAULT_AGENT_SHORTCUT_IDS))
             }
+          />
+
+          <ConfirmActionModal
+            isOpen={Boolean(confirmKillPersistentId)}
+            title="Kill persistent session"
+            message={
+              <>
+                Kill{" "}
+                {confirmKillPersistentId ? `agents-ui-${confirmKillPersistentId.slice(0, 8)}…` : "this"}
+                ? This will terminate any running shells/ssh inside the session.
+              </>
+            }
+            confirmLabel="Kill"
+            confirmDanger
+            busy={confirmKillPersistentBusy}
+            onClose={() => {
+              if (confirmKillPersistentBusy) return;
+              setConfirmKillPersistentId(null);
+            }}
+            onConfirm={() => void confirmKillPersistentSession()}
           />
 
           <ProjectModal
@@ -2377,6 +2994,85 @@ export default function App() {
             }}
           />
 
+          <ConfirmDeleteRecordingModal
+            isOpen={Boolean(confirmDeleteRecordingId)}
+            recordingLabel={
+              confirmDeleteRecordingId
+                ? recordings.find((r) => r.recordingId === confirmDeleteRecordingId)?.meta?.name?.trim() ||
+                  confirmDeleteRecordingId
+                : ""
+            }
+            onClose={() => setConfirmDeleteRecordingId(null)}
+            onConfirmDelete={() => {
+              const id = confirmDeleteRecordingId;
+              setConfirmDeleteRecordingId(null);
+              if (id) void deleteRecording(id);
+            }}
+          />
+
+          <ConfirmActionModal
+            isOpen={Boolean(confirmDeletePromptId)}
+            title="Delete prompt"
+            message={
+              <>
+                Delete{" "}
+                {pendingDeletePrompt?.title?.trim() ? `"${pendingDeletePrompt.title.trim()}"` : "this prompt"}?
+                {" "}This cannot be undone.
+              </>
+            }
+            confirmLabel="Delete"
+            confirmDanger
+            onClose={() => setConfirmDeletePromptId(null)}
+            onConfirm={confirmDeletePrompt}
+          />
+
+          <ConfirmActionModal
+            isOpen={Boolean(confirmDeleteEnvironmentId)}
+            title="Delete environment"
+            message={
+              <>
+                Delete{" "}
+                {pendingDeleteEnvironment?.name?.trim()
+                  ? `"${pendingDeleteEnvironment.name.trim()}"`
+                  : "this environment"}
+                ? Projects using it will fall back to no environment.
+              </>
+            }
+            confirmLabel="Delete"
+            confirmDanger
+            onClose={() => setConfirmDeleteEnvironmentId(null)}
+            onConfirm={confirmDeleteEnvironment}
+          />
+
+          <ConfirmActionModal
+            isOpen={Boolean(confirmDeleteAssetId)}
+            title="Delete template"
+            message={
+              <>
+                Delete{" "}
+                {pendingDeleteAsset?.name?.trim() ? `"${pendingDeleteAsset.name.trim()}"` : "this template"}?
+                <br />
+                Relative path: {pendingDeleteAsset?.relativePath ?? "—"}
+              </>
+            }
+            confirmLabel="Delete"
+            confirmDanger
+            onClose={() => setConfirmDeleteAssetId(null)}
+            onConfirm={confirmDeleteAsset}
+          />
+
+          <ApplyAssetModal
+            isOpen={Boolean(applyAssetRequest && pendingApplyAsset)}
+            templateName={pendingApplyAsset?.name ?? ""}
+            relativePath={pendingApplyAsset?.relativePath ?? ""}
+            targetLabel={applyAssetRequest?.target === "project" ? "project base path" : "tab working directory"}
+            targetDir={applyAssetRequest?.dir ?? ""}
+            applying={applyAssetApplying}
+            error={applyAssetError}
+            onClose={closeApplyAssetModal}
+            onApply={(overwrite) => void confirmApplyAsset(overwrite)}
+          />
+
           <PathPickerModal
             isOpen={pathPickerOpen}
             listing={pathPickerListing}
@@ -2398,6 +3094,18 @@ export default function App() {
               setPathPickerOpen(false);
               setPathPickerTarget(null);
             }}
+          />
+
+          <UpdateModal
+            isOpen={updatesOpen}
+            appName={appInfo?.name ?? "Agents UI"}
+            currentVersion={appInfo?.version ?? null}
+            updateSourceLabel={updateSourceLabel}
+            fallbackReleaseUrl={fallbackReleaseUrl}
+            state={updateCheckState}
+            onClose={() => setUpdatesOpen(false)}
+            onCheck={() => void checkForUpdates()}
+            onOpenRelease={(url) => void openExternal(url)}
           />
 
           {recordPromptOpen && (
@@ -2503,14 +3211,14 @@ export default function App() {
                             >
                               View
                             </button>
-                            <button
-                              type="button"
-                              className="btnSmall"
-                              onClick={() => void deleteRecording(r.recordingId)}
-                              title="Delete recording"
-                            >
-                              Delete
-                            </button>
+	                            <button
+	                              type="button"
+	                              className="btnSmall btnDanger"
+	                              onClick={() => requestDeleteRecording(r.recordingId)}
+	                              title="Delete recording"
+	                            >
+	                              Delete
+	                            </button>
                           </div>
                         </div>
                       );
@@ -2588,14 +3296,14 @@ export default function App() {
                               >
                                 Edit
                               </button>
-                              <button
-                                type="button"
-                                className="btnSmall"
-                                onClick={() => deletePrompt(p.id)}
-                                title="Delete prompt"
-                              >
-                                Delete
-                              </button>
+	                              <button
+	                                type="button"
+	                                className="btnSmall btnDanger"
+	                                onClick={() => requestDeletePrompt(p.id)}
+	                                title="Delete prompt"
+	                              >
+	                                Delete
+	                              </button>
                             </div>
                           </div>
                         );
@@ -2692,14 +3400,14 @@ export default function App() {
                               >
                                 Edit
                               </button>
-                              <button
-                                type="button"
-                                className="btnSmall"
-                                onClick={() => deleteEnvironment(env.id)}
-                                title="Delete environment"
-                              >
-                                Delete
-                              </button>
+	                              <button
+	                                type="button"
+	                                className="btnSmall btnDanger"
+	                                onClick={() => requestDeleteEnvironment(env.id)}
+	                                title="Delete environment"
+	                              >
+	                                Delete
+	                              </button>
                             </div>
                           </div>
                         );
@@ -3091,11 +3799,11 @@ export default function App() {
                                 <div className="panelCardActions">
                                   <button className="panelCardBtn" onClick={() => void openReplay(r.recordingId, "step")}>Replay</button>
                                   <button className="panelCardBtn" onClick={() => void openReplay(r.recordingId, "all")}>View</button>
-                                  <button className="panelCardBtn" onClick={() => void deleteRecording(r.recordingId)}>Delete</button>
-                                </div>
-                              </div>
-                            );
-                          })}
+	                                  <button className="panelCardBtn panelCardBtnDanger" onClick={() => requestDeleteRecording(r.recordingId)}>Delete</button>
+	                                </div>
+	                              </div>
+	                            );
+	                          })}
                         </div>
                       ));
                     })()
@@ -3185,31 +3893,29 @@ export default function App() {
                           </div>
                           <div className="panelCardPreview">{a.content.slice(0, 140)}</div>
                           <div className="panelCardActions">
-                            <button
-                              className="panelCardBtn"
-                              onClick={() => {
-                                const dir = activeProject?.basePath ?? null;
-                                if (!dir) return;
-                                const overwrite = window.confirm("Overwrite existing file if present?");
-                                void applyTextAssets(dir, [a], overwrite);
-                              }}
-                              disabled={!activeProject?.basePath}
-                              title={activeProject?.basePath ? "Apply to project base path" : "Project has no base path"}
-                            >
-                              To project
+	                            <button
+	                              className="panelCardBtn"
+	                              onClick={() => {
+	                                const dir = activeProject?.basePath ?? null;
+	                                if (!dir) return;
+	                                openApplyAssetModal("project", dir, a.id);
+	                              }}
+	                              disabled={!activeProject?.basePath}
+	                              title={activeProject?.basePath ? "Apply to project base path" : "Project has no base path"}
+	                            >
+	                              To project
                             </button>
-                            <button
-                              className="panelCardBtn"
-                              onClick={() => {
-                                const dir = active?.cwd ?? null;
-                                if (!dir) return;
-                                const overwrite = window.confirm("Overwrite existing file if present?");
-                                void applyTextAssets(dir, [a], overwrite);
-                              }}
-                              disabled={!active?.cwd}
-                              title={active?.cwd ? "Apply to current tab working directory" : "No active tab cwd"}
-                            >
-                              To tab
+	                            <button
+	                              className="panelCardBtn"
+	                              onClick={() => {
+	                                const dir = active?.cwd ?? null;
+	                                if (!dir) return;
+	                                openApplyAssetModal("tab", dir, a.id);
+	                              }}
+	                              disabled={!active?.cwd}
+	                              title={active?.cwd ? "Apply to current tab working directory" : "No active tab cwd"}
+	                            >
+	                              To tab
                             </button>
                             <button className="panelCardBtn" onClick={() => openAssetEditor(a)}>
                               Edit
@@ -3217,9 +3923,9 @@ export default function App() {
                             <button className="panelCardBtn" onClick={() => toggleAssetAutoApply(a.id)}>
                               {a.autoApply ?? true ? "Disable auto" : "Enable auto"}
                             </button>
-                            <button className="panelCardBtn" onClick={() => deleteAsset(a.id)}>
-                              Delete
-                            </button>
+	                            <button className="panelCardBtn panelCardBtnDanger" onClick={() => requestDeleteAsset(a.id)}>
+	                              Delete
+	                            </button>
                           </div>
                         </div>
                       ));

@@ -10,6 +10,7 @@
     "core:event:allow-listen",
     "core:webview:default",
     "core:webview:allow-webview-close",
-    "core:window:default"
+    "core:window:default",
+    "shell:default"
   ]
 }

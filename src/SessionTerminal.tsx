@@ -10,6 +10,7 @@ export default function SessionTerminal(props: {
   id: string;
   active: boolean;
   readOnly: boolean;
+  persistent?: boolean;
   onCwdChange?: (id: string, cwd: string) => void;
   onCommandChange?: (id: string, commandLine: string) => void;
   onUserEnter?: (id: string) => void;
@@ -21,6 +22,10 @@ export default function SessionTerminal(props: {
   const fitRef = useRef<FitAddon | null>(null);
   const resizeRafRef = useRef<number | null>(null);
   const lastSizeRef = useRef<{ cols: number; rows: number } | null>(null);
+  const zellijAutoScrollRef = useRef<{
+    active: boolean;
+    wheelRemainder: number;
+  }>({ active: false, wheelRemainder: 0 });
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -46,12 +51,88 @@ export default function SessionTerminal(props: {
     term.open(containerRef.current);
     fit.fit();
 
-    term.onData((data) => {
-      void invoke("write_to_session", { id: props.id, data, source: "user" }).catch(() => {});
-      if (data.includes("\r") || data.includes("\n")) {
-        props.onUserEnter?.(props.id);
-      }
-    });
+    if (props.persistent) {
+      const sendZellij = (data: string) =>
+        invoke("write_to_session", { id: props.id, data, source: "ui" }).catch(() => {});
+
+      const ensureZellijScrollModePrefix = () => {
+        const state = zellijAutoScrollRef.current;
+        if (state.active) return "";
+        state.active = true;
+        return "\x13"; // Ctrl+s => zellij scroll mode
+      };
+
+      const scrollZellijLines = (lines: number) => {
+        const count = Math.min(Math.abs(lines), 120);
+        if (count === 0) return;
+        if (lines > 0 && !zellijAutoScrollRef.current.active) return;
+        const prefix = ensureZellijScrollModePrefix();
+        const step = lines < 0 ? "k" : "j";
+        void sendZellij(`${prefix}${step.repeat(count)}`);
+      };
+
+      term.attachCustomKeyEventHandler((event) => {
+        if (event.type !== "keydown") return true;
+        const key = event.key;
+        const isPageUp = key === "PageUp";
+        const isPageDown = key === "PageDown";
+        const isHome = key === "Home";
+        const isEnd = key === "End";
+        const isUp = key === "ArrowUp";
+        const isDown = key === "ArrowDown";
+
+        if (event.shiftKey && isPageUp) {
+          scrollZellijLines(-term.rows);
+          return false;
+        }
+        if (event.shiftKey && isPageDown) {
+          scrollZellijLines(term.rows);
+          return false;
+        }
+        if (event.metaKey && isUp) {
+          scrollZellijLines(-term.rows);
+          return false;
+        }
+        if (event.metaKey && isDown) {
+          scrollZellijLines(term.rows);
+          return false;
+        }
+
+        if ((event.shiftKey || event.metaKey) && (isHome || isEnd)) {
+          // Not supported in zellij defaults; keep default behavior.
+          return true;
+        }
+
+        return true;
+      });
+      term.onData((data) => {
+        const state = zellijAutoScrollRef.current;
+        if (state.active) {
+          state.active = false;
+          if (data === "\x1b") {
+            void invoke("write_to_session", { id: props.id, data: "\x1b", source: "ui" }).catch(() => {});
+          } else {
+            void invoke("write_to_session", { id: props.id, data: "\x1b", source: "ui" })
+              .catch(() => {})
+              .then(() =>
+                invoke("write_to_session", { id: props.id, data, source: "user" }).catch(() => {}),
+              );
+          }
+        } else {
+          void invoke("write_to_session", { id: props.id, data, source: "user" }).catch(() => {});
+        }
+        if (data.includes("\r") || data.includes("\n")) {
+          props.onUserEnter?.(props.id);
+        }
+      });
+    } else {
+      term.onData((data) => {
+        void invoke("write_to_session", { id: props.id, data, source: "user" }).catch(() => {});
+        if (data.includes("\r") || data.includes("\n")) {
+          props.onUserEnter?.(props.id);
+        }
+      });
+    }
 
     termRef.current = term;
     fitRef.current = fit;
@@ -106,6 +187,8 @@ export default function SessionTerminal(props: {
           return false;
         }),
       );
+
+      // keep zellij's alternate screen behavior intact
     }
 
     const sendResize = () => {
@@ -146,6 +229,57 @@ export default function SessionTerminal(props: {
     resizeObserver.observe(containerRef.current);
     sendResize();
 
+    let wheelCleanup: (() => void) | null = null;
+    if (props.persistent) {
+      const PIXELS_PER_LINE = 40;
+
+      const wheelListener = (event: WheelEvent) => {
+        const term = termRef.current;
+        if (!term) return;
+        if (event.ctrlKey) return;
+        if (event.deltaY === 0) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        let lines = 0;
+        if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+          lines = Math.trunc(event.deltaY);
+        } else if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+          lines = Math.trunc(event.deltaY * term.rows);
+        } else {
+          const state = zellijAutoScrollRef.current;
+          state.wheelRemainder += event.deltaY;
+          lines = Math.trunc(state.wheelRemainder / PIXELS_PER_LINE);
+          if (lines !== 0) {
+            const state = zellijAutoScrollRef.current;
+            state.wheelRemainder -= lines * PIXELS_PER_LINE;
+          }
+        }
+        if (lines !== 0) {
+          const state = zellijAutoScrollRef.current;
+          if (lines > 0 && !state.active) return;
+          const prefix = state.active ? "" : "\x13";
+          state.active = true;
+          const count = Math.min(Math.abs(lines), 120);
+          const step = lines < 0 ? "k" : "j";
+          void invoke("write_to_session", {
+            id: props.id,
+            data: `${prefix}${step.repeat(count)}`,
+            source: "ui",
+          }).catch(() => {});
+        }
+      };
+
+      containerRef.current.addEventListener("wheel", wheelListener, {
+        passive: false,
+        capture: true,
+      });
+      wheelCleanup = () => {
+        containerRef.current?.removeEventListener("wheel", wheelListener, true);
+      };
+    }
+
     return () => {
       resizeObserver.disconnect();
       if (resizeRafRef.current !== null) {
@@ -154,6 +288,7 @@ export default function SessionTerminal(props: {
       for (const d of oscDisposables) d.dispose();
       props.registry.current.delete(props.id);
       props.pendingData.current.delete(props.id);
+      wheelCleanup?.();
       term.dispose();
       termRef.current = null;
       fitRef.current = null;

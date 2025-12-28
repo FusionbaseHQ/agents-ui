@@ -38,6 +38,6 @@
       "icons/icon.ico"
     ],
     "targets": "all",
-    "externalBin": ["bin/nu"]
+    "externalBin": ["bin/nu", "bin/zellij"]
   }
 }

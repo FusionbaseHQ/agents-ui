@@ -221,11 +221,34 @@ body {
   padding: 8px 10px;
   border-radius: 10px;
   cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.05s ease;
 }
 
 .btn:hover {
   background: rgba(255, 255, 255, 0.06);
+}
+
+.btn:active {
+  transform: translateY(1px);
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.btn.btnDanger {
+  border-color: rgba(255, 80, 80, 0.35);
+  background: rgba(255, 80, 80, 0.1);
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.btn.btnDanger:hover {
+  background: rgba(255, 80, 80, 0.14);
+}
+
+.btn.btnDanger:disabled {
+  opacity: 0.55;
 }
 
 .sessionList {
@@ -511,7 +534,28 @@ body {
   max-width: 60%;
 }
 
+.noticeBanner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgba(122, 162, 247, 0.35);
+  background: rgba(122, 162, 247, 0.12);
+  padding: 6px 8px;
+  border-radius: 12px;
+  min-width: 0;
+  max-width: 60%;
+}
+
 .errorText {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.9);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.noticeText {
   font-size: 12px;
   color: rgba(255, 255, 255, 0.9);
   white-space: nowrap;
@@ -557,6 +601,11 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
+  z-index: 500;
+}
+
+.modalBackdropTop {
+  z-index: 650;
 }
 
 .modal {
@@ -733,6 +782,7 @@ body {
   border-radius: 10px;
   cursor: pointer;
   font-size: 12px;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.05s ease;
 }
 
 .btnSmall.btnIcon {
@@ -764,6 +814,10 @@ body {
 
 .btnSmall:hover {
   background: rgba(255, 255, 255, 0.06);
+}
+
+.btnSmall:active {
+  transform: translateY(1px);
 }
 
 .btnSmall:disabled {
@@ -1194,16 +1248,30 @@ body {
   border-radius: 6px;
   cursor: pointer;
   font-size: 11px;
-  transition: background 0.15s ease, border-color 0.15s ease;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.05s ease;
 }
 
 .panelCardBtn:hover {
   background: rgba(255, 255, 255, 0.08);
 }
 
+.panelCardBtn:active {
+  transform: translateY(1px);
+}
+
 .panelCardBtn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.panelCardBtn.panelCardBtnDanger {
+  border-color: rgba(255, 80, 80, 0.35);
+  background: rgba(255, 80, 80, 0.1);
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.panelCardBtn.panelCardBtnDanger:hover {
+  background: rgba(255, 80, 80, 0.14);
 }
 
 /* Panel Footer */

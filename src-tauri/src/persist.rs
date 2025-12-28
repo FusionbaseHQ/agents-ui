@@ -25,6 +25,7 @@ pub struct PersistedSessionV1 {
     pub restore_command: Option<String>,
     pub last_recording_id: Option<String>,
     pub cwd: Option<String>,
+    pub persistent: Option<bool>,
     pub created_at: u64,
 }
 

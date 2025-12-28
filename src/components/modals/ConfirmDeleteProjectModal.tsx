@@ -26,7 +26,7 @@ export function ConfirmDeleteProjectModal({
           <button type="button" className="btn" onClick={onClose}>
             Cancel
           </button>
-          <button type="button" className="btn" onClick={onConfirmDelete}>
+          <button type="button" className="btn btnDanger" onClick={onConfirmDelete}>
             Delete
           </button>
         </div>
@@ -34,4 +34,3 @@ export function ConfirmDeleteProjectModal({
     </div>
   );
 }
-

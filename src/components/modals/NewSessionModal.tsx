@@ -8,6 +8,8 @@ type NewSessionModalProps = {
   onChangeName: (value: string) => void;
   command: string;
   onChangeCommand: (value: string) => void;
+  persistent: boolean;
+  onChangePersistent: (value: boolean) => void;
   cwd: string;
   onChangeCwd: (value: string) => void;
   cwdPlaceholder: string;
@@ -28,6 +30,8 @@ export function NewSessionModal({
   onChangeName,
   command,
   onChangeCommand,
+  persistent,
+  onChangePersistent,
   cwd,
   onChangeCwd,
   cwdPlaceholder,
@@ -65,6 +69,20 @@ export function NewSessionModal({
               placeholder="e.g. codex  (leave blank for a shell)"
             />
             <div className="hint">Uses your $SHELL by default; commands run as "$SHELL -lc".</div>
+          </div>
+          <div className="formRow">
+            <label className="checkRow">
+              <input
+                type="checkbox"
+                checked={persistent}
+                onChange={(e) => onChangePersistent(e.target.checked)}
+              />
+              Persistent session (zellij)
+            </label>
+            <div className="hint">
+              Keeps the shell running after you close the app so you can resume later (uses a bundled{" "}
+              <code>zellij</code>).
+            </div>
           </div>
           <div className="formRow">
             <div className="label">Working directory</div>

@@ -189,6 +189,15 @@ npm run tauri dev
 
 This starts the Vite dev server and Tauri development window with hot reload.
 
+### Bundled Tools (macOS)
+
+Agents UI bundles `nu` (Nushell) and `zellij` as Tauri sidecars under `src-tauri/bin` so the app runs without system dependencies.
+
+```bash
+./scripts/fetch-nu-macos.sh <nu-version>
+./scripts/fetch-zellij-macos.sh <zellij-version-or-latest>
+```
+
 ### Production Build
 
 ```bash
