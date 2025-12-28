@@ -1959,7 +1959,8 @@ export default function App() {
     const trimmed = commandLine.trim();
     const effect = trimmed ? detectProcessEffect({ command: trimmed, name: null }) : null;
     const nextEffectId = effect?.id ?? null;
-    const nextRestoreCommand = effect ? trimmed : null;
+    const session = sessionsRef.current.find((s) => s.id === id) ?? null;
+    const nextRestoreCommand = effect && !session?.persistent ? trimmed : null;
     const nextAgentWorking = Boolean(nextEffectId);
 
     if (nextEffectId) scheduleAgentIdle(id, nextEffectId);
@@ -1975,13 +1976,13 @@ export default function App() {
         ) {
           return s;
         }
-        return {
-          ...s,
-          effectId: nextEffectId,
-          agentWorking: nextAgentWorking,
-          restoreCommand: nextRestoreCommand,
-          processTag: null,
-        };
+          return {
+            ...s,
+            effectId: nextEffectId,
+            agentWorking: nextAgentWorking,
+            restoreCommand: nextRestoreCommand,
+            processTag: null,
+          };
       }),
     );
   }
@@ -2391,7 +2392,9 @@ export default function App() {
           restored.push(created);
 
           const restoreCmd =
-            (s.launchCommand ? null : (s.restoreCommand ?? null))?.trim() ?? null;
+            (s.persistent
+              ? null
+              : (s.launchCommand ? null : (s.restoreCommand ?? null))?.trim()) ?? null;
           if (restoreCmd) {
             const singleLine = restoreCmd.replace(/\r?\n/g, " ");
             void (async () => {
@@ -2528,10 +2531,10 @@ export default function App() {
     }
   }
 
-	  async function onClose(id: string) {
-	    clearAgentIdleTimer(id);
-	    const session = sessionsRef.current.find((s) => s.id === id) ?? null;
-	    const wasPersistent = Boolean(session?.persistent && !session?.exited);
+  async function onClose(id: string) {
+    clearAgentIdleTimer(id);
+    const session = sessionsRef.current.find((s) => s.id === id) ?? null;
+    const wasPersistent = Boolean(session?.persistent && !session?.exited);
     if (session?.recordingActive) {
       try {
         await invoke("stop_session_recording", { id });
@@ -2549,43 +2552,54 @@ export default function App() {
       closingSessions.current.set(id, timeout);
     }
 
-	    // Clean up pending buffer
-	    pendingData.current.delete(id);
+    // Clean up pending buffer
+    pendingData.current.delete(id);
 
-	    let killErr: string | null = null;
-	    let killedPersistent = false;
-	    try {
-	      if (wasPersistent && session?.persistId) {
-	        try {
-	          await invoke("kill_persistent_session", { persistId: session.persistId });
-	          killedPersistent = true;
-	        } catch (err) {
-	          killErr = formatError(err);
-	        } finally {
-	          void refreshPersistentSessions();
-	        }
-	      }
-	      await closeSession(id);
-	    } catch (err) {
-	      const timeout = closingSessions.current.get(id);
-	      if (timeout !== undefined) window.clearTimeout(timeout);
-	      closingSessions.current.delete(id);
+    let killErr: string | null = null;
+    let killedPersistent = false;
+    let closeErr: unknown | null = null;
+    try {
+      try {
+        // Close the attached client first so zellij is no longer "in use" when we kill the session.
+        await closeSession(id);
+      } catch (err) {
+        closeErr = err;
+      }
+
+      if (wasPersistent && session?.persistId) {
+        try {
+          await invoke("kill_persistent_session", { persistId: session.persistId });
+          killedPersistent = true;
+        } catch (err) {
+          killErr = formatError(err);
+        } finally {
+          void refreshPersistentSessions();
+        }
+      }
+
+      if (closeErr) throw closeErr;
+    } catch (err) {
+      const timeout = closingSessions.current.get(id);
+      if (timeout !== undefined) window.clearTimeout(timeout);
+      closingSessions.current.delete(id);
       setSessions((prev) =>
         prev.map((s) => (s.id === id ? { ...s, closing: false } : s)),
       );
       reportError("Failed to close session", err);
-	      return;
-	    }
+      return;
+    }
 
-	    if (wasPersistent && session) {
-	      if (killedPersistent) {
-	        showNotice(`Closed "${session.name}" and killed persistent session.`);
-	      } else if (killErr) {
-	        showNotice(`Closed "${session.name}" but failed to kill persistent session. Manage via Persistent sessions (∞).`);
-	      } else {
-	        showNotice(`Closed "${session.name}".`);
-	      }
-	    }
+    if (wasPersistent && session) {
+      if (killedPersistent) {
+        showNotice(`Closed "${session.name}" and killed persistent session.`);
+      } else if (killErr) {
+        showNotice(
+          `Closed "${session.name}" but failed to kill persistent session. Manage via Persistent sessions (∞).`,
+        );
+      } else {
+        showNotice(`Closed "${session.name}".`);
+      }
+    }
 
     setSessions((prev) => {
       const closing = prev.find((s) => s.id === id);

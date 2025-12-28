@@ -3,6 +3,7 @@ import React, { useEffect, useRef } from "react";
 import { Terminal } from "xterm";
 import { FitAddon } from "xterm-addon-fit";
 import type { PendingDataBuffer } from "./App";
+import { detectProcessEffect } from "./processEffects";
 
 export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon }>;
 
@@ -26,6 +27,7 @@ export default function SessionTerminal(props: {
     active: boolean;
     wheelRemainder: number;
   }>({ active: false, wheelRemainder: 0 });
+  const commandBufferRef = useRef<string>("");
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -54,6 +56,91 @@ export default function SessionTerminal(props: {
     if (props.persistent) {
       const sendZellij = (data: string) =>
         invoke("write_to_session", { id: props.id, data, source: "ui" }).catch(() => {});
+
+      const skipEscapeSequence = (data: string, start: number): number => {
+        const next = data[start];
+        if (!next) return start;
+        if (next === "[") {
+          let i = start + 1;
+          while (i < data.length) {
+            const ch = data[i];
+            if (ch >= "@" && ch <= "~") return i + 1;
+            i += 1;
+          }
+          return i;
+        }
+        if (next === "]") {
+          let i = start + 1;
+          while (i < data.length) {
+            const ch = data[i];
+            if (ch === "\u0007") return i + 1;
+            if (ch === "\u001b" && data[i + 1] === "\\") return i + 2;
+            i += 1;
+          }
+          return i;
+        }
+        if (next === "P" || next === "^" || next === "_") {
+          let i = start + 1;
+          while (i < data.length) {
+            if (data[i] === "\u001b" && data[i + 1] === "\\") return i + 2;
+            i += 1;
+          }
+          return i;
+        }
+        return start + 1;
+      };
+
+      const ingestUserInputForCommandDetection = (data: string) => {
+        let buffer = commandBufferRef.current;
+        const submitted: string[] = [];
+
+        let i = 0;
+        while (i < data.length) {
+          const ch = data[i];
+          if (ch === "\r") {
+            if (data[i + 1] === "\n") i += 1;
+            submitted.push(buffer);
+            buffer = "";
+            i += 1;
+            continue;
+          }
+          if (ch === "\n") {
+            submitted.push(buffer);
+            buffer = "";
+            i += 1;
+            continue;
+          }
+          if (ch === "\u007f" || ch === "\b") {
+            buffer = buffer.slice(0, -1);
+            i += 1;
+            continue;
+          }
+          if (ch === "\u0015") {
+            buffer = "";
+            i += 1;
+            continue;
+          }
+          if (ch === "\u001b") {
+            i = skipEscapeSequence(data, i + 1);
+            continue;
+          }
+          if (ch < " " || ch === "\u007f") {
+            i += 1;
+            continue;
+          }
+          buffer += ch;
+          i += 1;
+        }
+
+        commandBufferRef.current = buffer;
+
+        for (const line of submitted) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          const effect = detectProcessEffect({ command: trimmed, name: null });
+          if (effect) props.onCommandChange?.(props.id, trimmed);
+        }
+      };
 
       const ensureZellijScrollModePrefix = () => {
         const state = zellijAutoScrollRef.current;
@@ -124,6 +211,7 @@ export default function SessionTerminal(props: {
         if (data.includes("\r") || data.includes("\n")) {
           props.onUserEnter?.(props.id);
         }
+        ingestUserInputForCommandDetection(data);
       });
     } else {
       term.onData((data) => {
