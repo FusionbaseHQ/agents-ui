@@ -16,8 +16,9 @@ use pty::{
     list_sessions, resize_session, start_session_recording, stop_session_recording, write_to_session,
     AppState,
 };
-use persist::{list_directories, load_persisted_state, save_persisted_state, validate_directory};
+use persist::{list_directories, load_persisted_state, load_persisted_state_meta, save_persisted_state, validate_directory};
 use recording::{delete_recording, list_recordings, load_recording};
+use secure::{prepare_secure_storage, reset_secure_storage};
 use ssh::list_ssh_hosts;
 use tray::{build_status_tray, set_tray_agent_count};
 use tauri::Manager;
@@ -48,12 +49,15 @@ fn main() {
             start_session_recording,
             stop_session_recording,
             load_persisted_state,
+            load_persisted_state_meta,
             save_persisted_state,
             validate_directory,
             list_directories,
             load_recording,
             list_recordings,
             delete_recording,
+            prepare_secure_storage,
+            reset_secure_storage,
             list_ssh_hosts,
             apply_text_assets,
             set_tray_agent_count,

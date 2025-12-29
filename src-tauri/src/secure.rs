@@ -3,6 +3,7 @@ use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand_core::{OsRng, RngCore};
+use std::sync::{Mutex, OnceLock};
 use tauri::Manager;
 use tauri::WebviewWindow;
 
@@ -47,13 +48,25 @@ pub fn is_probably_encrypted_value(value: &str) -> bool {
     decoded.len() >= NONCE_LEN + 16
 }
 
+#[derive(Clone)]
+enum MasterKeyCacheState {
+    Uninitialized,
+    Ready([u8; KEY_LEN]),
+    Error(String),
+}
+
+fn master_key_cache() -> &'static Mutex<MasterKeyCacheState> {
+    static CACHE: OnceLock<Mutex<MasterKeyCacheState>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(MasterKeyCacheState::Uninitialized))
+}
+
 fn keychain_service(window: &WebviewWindow) -> String {
     let app = window.app_handle();
     let cfg = app.config();
     cfg.identifier.clone()
 }
 
-pub fn get_or_create_master_key(window: &WebviewWindow) -> Result<[u8; KEY_LEN], String> {
+fn get_or_create_master_key_uncached(window: &WebviewWindow) -> Result<[u8; KEY_LEN], String> {
     let service = keychain_service(window);
     let entry = keyring::Entry::new(&service, KEYCHAIN_ACCOUNT)
         .map_err(|e| format!("keychain init failed: {e}"))?;
@@ -82,6 +95,46 @@ pub fn get_or_create_master_key(window: &WebviewWindow) -> Result<[u8; KEY_LEN],
         .set_password(&encoded)
         .map_err(|e| format!("keychain write failed: {e}"))?;
     Ok(key)
+}
+
+pub fn get_or_create_master_key(window: &WebviewWindow) -> Result<[u8; KEY_LEN], String> {
+    let cache = master_key_cache();
+    let mut state = cache.lock().map_err(|_| "secure storage cache poisoned".to_string())?;
+    match &*state {
+        MasterKeyCacheState::Ready(key) => return Ok(*key),
+        MasterKeyCacheState::Error(err) => return Err(err.clone()),
+        MasterKeyCacheState::Uninitialized => {}
+    }
+
+    match get_or_create_master_key_uncached(window) {
+        Ok(key) => {
+            *state = MasterKeyCacheState::Ready(key);
+            Ok(key)
+        }
+        Err(err) => {
+            // Cache the error to avoid repeated Keychain prompts/spam until the user explicitly retries.
+            *state = MasterKeyCacheState::Error(err.clone());
+            Err(err)
+        }
+    }
+}
+
+pub fn reset_master_key_cache() -> Result<(), String> {
+    let cache = master_key_cache();
+    let mut state = cache.lock().map_err(|_| "secure storage cache poisoned".to_string())?;
+    *state = MasterKeyCacheState::Uninitialized;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn prepare_secure_storage(window: WebviewWindow) -> Result<(), String> {
+    let _ = get_or_create_master_key(&window)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn reset_secure_storage() -> Result<(), String> {
+    reset_master_key_cache()
 }
 
 pub fn encrypt_string_with_key(

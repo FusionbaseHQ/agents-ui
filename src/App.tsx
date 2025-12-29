@@ -344,6 +344,12 @@ type PersistedStateV1 = {
   agentShortcutIds?: string[];
 };
 
+type PersistedStateMetaV1 = {
+  schemaVersion: number;
+  environmentCount: number;
+  encryptedEnvironmentCount: number;
+};
+
 type DirectoryEntry = { name: string; path: string };
 type DirectoryListing = { path: string; parent: string | null; entries: DirectoryEntry[] };
 
@@ -642,6 +648,7 @@ export default function App() {
   const [applyAssetApplying, setApplyAssetApplying] = useState(false);
   const [applyAssetError, setApplyAssetError] = useState<string | null>(null);
   const [persistenceDisabledReason, setPersistenceDisabledReason] = useState<string | null>(null);
+  const [secureStorageRetrying, setSecureStorageRetrying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
@@ -956,14 +963,20 @@ export default function App() {
       agentShortcutIds,
     };
 
-    saveTimerRef.current = window.setTimeout(() => {
-      saveTimerRef.current = null;
-      const state = pendingSaveRef.current;
-      if (!state) return;
-      void invoke("save_persisted_state", { state }).catch((err) => {
-        reportError("Failed to save state", err);
-      });
-    }, 400);
+      saveTimerRef.current = window.setTimeout(() => {
+        saveTimerRef.current = null;
+        const state = pendingSaveRef.current;
+        if (!state) return;
+        void invoke("save_persisted_state", { state }).catch((err) => {
+          const msg = formatError(err);
+          const lower = msg.toLowerCase();
+          if (lower.includes("keychain") || lower.includes("keyring")) {
+            setPersistenceDisabledReason(`Secure storage is locked (changes won’t be saved): ${msg}`);
+            return;
+          }
+          reportError("Failed to save state", err);
+        });
+      }, 400);
   }, [projects, activeProjectId, activeSessionByProject, sessions, prompts, environments, assets, assetSettings, agentShortcutIds, hydrated, persistenceDisabledReason]);
 
   const activeAgentCount = useMemo(() => {
@@ -1373,6 +1386,32 @@ export default function App() {
       noticeTimerRef.current = null;
       setNotice(null);
     }, timeoutMs);
+  }
+
+  async function retrySecureStorage() {
+    if (secureStorageRetrying) return;
+    setSecureStorageRetrying(true);
+    showNotice(
+      "Secure storage: macOS may prompt you to allow Keychain access to decrypt/encrypt environments and recordings.",
+      20000,
+    );
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+    try {
+      await invoke("reset_secure_storage");
+      await invoke("prepare_secure_storage");
+      setPersistenceDisabledReason(null);
+
+      const refreshed = await invoke<PersistedStateV1 | null>("load_persisted_state").catch(() => null);
+      if (refreshed?.schemaVersion === 1) {
+        setEnvironments(refreshed.environments ?? []);
+      }
+
+      showNotice("Secure storage unlocked.", 7000);
+    } catch (err) {
+      setPersistenceDisabledReason(`Secure storage is locked (changes won’t be saved): ${formatError(err)}`);
+    } finally {
+      setSecureStorageRetrying(false);
+    }
   }
 
   const sshCommandPreview = useMemo(() => {
@@ -2543,6 +2582,29 @@ export default function App() {
         homeDirRef.current = null;
       }
 
+      const stateMeta = await invoke<PersistedStateMetaV1 | null>("load_persisted_state_meta").catch(
+        () => null,
+      );
+      const needsSecureStorage = Boolean(
+        stateMeta &&
+          stateMeta.schemaVersion === 1 &&
+          (stateMeta.environmentCount > 0 || stateMeta.encryptedEnvironmentCount > 0),
+      );
+      if (needsSecureStorage) {
+        showNotice(
+          "Secure storage: environment configs and recording inputs are encrypted using macOS Keychain. macOS may prompt you now — choose “Always Allow” to avoid repeated prompts.",
+          20000,
+        );
+        await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+        try {
+          await invoke("prepare_secure_storage");
+        } catch (err) {
+          if (!cancelled) {
+            setPersistenceDisabledReason(`Secure storage is locked (changes won’t be saved): ${formatError(err)}`);
+          }
+        }
+      }
+
       const legacyProjects = loadLegacyProjectState();
       const legacySessions = loadLegacyPersistedSessions();
       const legacyActiveSessionByProject = loadLegacyActiveSessionByProject();
@@ -3213,12 +3275,23 @@ export default function App() {
               </>
             ) : null}
           </div>
-	          <div className="topbarRight">
-	            {persistenceDisabledReason && (
-	              <div className="errorBanner" role="alert">
-	                <div className="errorText">{persistenceDisabledReason}</div>
-	              </div>
-	            )}
+		          <div className="topbarRight">
+		            {persistenceDisabledReason && (
+		              <div className="errorBanner" role="alert">
+		                <div className="errorText" title={persistenceDisabledReason}>
+		                  {persistenceDisabledReason}
+		                </div>
+		                <button
+		                  type="button"
+		                  className="errorClose"
+		                  onClick={() => void retrySecureStorage()}
+		                  disabled={secureStorageRetrying}
+		                  title="Retry Keychain access"
+		                >
+		                  {secureStorageRetrying ? "Retrying…" : "Retry"}
+		                </button>
+		              </div>
+		            )}
 
 	            {error && (
 	              <div className="errorBanner" role="alert">

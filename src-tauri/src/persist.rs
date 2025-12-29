@@ -85,6 +85,14 @@ pub struct PersistedStateV1 {
     pub asset_settings: Option<PersistedAssetSettingsV1>,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedStateMetaV1 {
+    pub schema_version: u32,
+    pub environment_count: usize,
+    pub encrypted_environment_count: usize,
+}
+
 fn state_file_path(window: &WebviewWindow) -> Result<PathBuf, String> {
     let dir = window
         .app_handle()
@@ -92,6 +100,34 @@ fn state_file_path(window: &WebviewWindow) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|_| "unknown app data dir".to_string())?;
     Ok(dir.join("state-v1.json"))
+}
+
+#[tauri::command]
+pub fn load_persisted_state_meta(window: WebviewWindow) -> Result<Option<PersistedStateMetaV1>, String> {
+    let path = state_file_path(&window)?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read failed: {e}")),
+    };
+
+    let state: PersistedStateV1 = serde_json::from_str(&raw).map_err(|e| format!("parse failed: {e}"))?;
+    if state.schema_version != 1 {
+        return Ok(None);
+    }
+
+    let environment_count = state.environments.len();
+    let encrypted_environment_count = state
+        .environments
+        .iter()
+        .filter(|env| crate::secure::is_probably_encrypted_value(&env.content))
+        .count();
+
+    Ok(Some(PersistedStateMetaV1 {
+        schema_version: state.schema_version,
+        environment_count,
+        encrypted_environment_count,
+    }))
 }
 
 fn expand_home(input: &str) -> String {
