@@ -12,6 +12,7 @@ type UpdateModalProps = {
   appName: string;
   currentVersion: string | null;
   updateSourceLabel: string | null;
+  checkUrl: string | null;
   fallbackReleaseUrl: string | null;
   state: UpdateCheckState;
   onClose: () => void;
@@ -24,6 +25,7 @@ export function UpdateModal({
   appName,
   currentVersion,
   updateSourceLabel,
+  checkUrl,
   fallbackReleaseUrl,
   state,
   onClose,
@@ -45,6 +47,19 @@ export function UpdateModal({
           {appName} {currentVersion ? `v${currentVersion}` : ""}
         </div>
         {updateSourceLabel ? <div className="hint">Source: {updateSourceLabel}</div> : null}
+        <div className="hint">
+          Checking for updates contacts GitHub; opening a release launches your browser to download the installer.
+        </div>
+        {checkUrl ? (
+          <div className="hint" style={{ fontFamily: "ui-monospace, monospace" }}>
+            Checks: {checkUrl}
+          </div>
+        ) : null}
+        {releaseUrl ? (
+          <div className="hint" style={{ fontFamily: "ui-monospace, monospace" }}>
+            Opens: {releaseUrl}
+          </div>
+        ) : null}
 
         {state.status === "idle" ? (
           <div className="hint">Check GitHub Releases for a newer version.</div>

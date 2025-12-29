@@ -687,6 +687,12 @@ export default function App() {
     return `https://github.com/${repo.owner}/${repo.repo}/releases/latest`;
   }, [appInfo]);
 
+  const updateCheckUrl = useMemo(() => {
+    const repo = parseGithubRepo(appInfo?.homepage);
+    if (!repo) return null;
+    return `https://api.github.com/repos/${repo.owner}/${repo.repo}/releases/latest`;
+  }, [appInfo]);
+
   const quickStarts = useMemo(() => {
     const presets: Array<{ id: string; title: string; command: string | null; iconSrc: string | null }> = [];
 
@@ -1392,7 +1398,7 @@ export default function App() {
     if (secureStorageRetrying) return;
     setSecureStorageRetrying(true);
     showNotice(
-      "Secure storage: macOS may prompt you to allow Keychain access to decrypt/encrypt environments and recordings.",
+      "macOS Keychain access is needed to decrypt/encrypt your environments + recordings. Choose “Always Allow” to avoid future prompts.",
       20000,
     );
     await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
@@ -1433,8 +1439,8 @@ export default function App() {
     async (url: string) => {
       try {
         const parsed = new URL(url);
-        if (parsed.protocol !== "https:") {
-          throw new Error(`refusing to open non-https URL (${parsed.protocol})`);
+        if (parsed.protocol !== "https:" || parsed.hostname !== "github.com") {
+          throw new Error("refusing to open untrusted URL");
         }
         await invoke("plugin:shell|open", { path: parsed.toString() });
       } catch (err) {
@@ -1479,7 +1485,7 @@ export default function App() {
       if (!response.ok) {
         throw new Error(`GitHub API returned ${response.status}`);
       }
-      const data = (await response.json()) as { tag_name?: string; html_url?: string };
+      const data = (await response.json()) as { tag_name?: string };
       const tag = data.tag_name?.trim();
       if (!tag) {
         setUpdateCheckState({ status: "error", message: "Latest release has no tag name." });
@@ -1489,7 +1495,7 @@ export default function App() {
       const current = info.version;
       const cmp = compareSemver(tag, current);
 
-      const releaseUrl = data.html_url ?? fallbackReleaseUrl;
+      const releaseUrl = fallbackReleaseUrl;
       const isNewer =
         cmp === null
           ? tag.trim().replace(/^v/i, "") !== current.trim().replace(/^v/i, "")
@@ -2592,12 +2598,16 @@ export default function App() {
       );
       if (needsSecureStorage) {
         showNotice(
-          "Secure storage: environment configs and recording inputs are encrypted using macOS Keychain. macOS may prompt you now — choose “Always Allow” to avoid repeated prompts.",
-          20000,
+          "macOS Keychain access is needed to decrypt/encrypt your environments + recordings. You may see 1–2 prompts (first run can create the encryption key). Choose “Always Allow” to avoid future prompts.",
+          60000,
         );
         await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
         try {
           await invoke("prepare_secure_storage");
+          showNotice(
+            "Secure storage enabled: environments + recording inputs are encrypted at rest (key stored in macOS Keychain).",
+            20000,
+          );
         } catch (err) {
           if (!cancelled) {
             setPersistenceDisabledReason(`Secure storage is locked (changes won’t be saved): ${formatError(err)}`);
@@ -3302,14 +3312,16 @@ export default function App() {
 	              </div>
 	            )}
 
-	            {notice && (
-	              <div className="noticeBanner" role="status" aria-live="polite">
-	                <div className="noticeText">{notice}</div>
-	                <button className="errorClose" onClick={dismissNotice} title="Dismiss">
-	                  ×
-	                </button>
-	              </div>
-	            )}
+		            {notice && (
+		              <div className="noticeBanner" role="status" aria-live="polite">
+		                <div className="noticeText" title={notice}>
+		                  {notice}
+		                </div>
+		                <button className="errorClose" onClick={dismissNotice} title="Dismiss">
+		                  ×
+		                </button>
+		              </div>
+		            )}
 
 	            {!error && !notice && (
 	              <div className="shortcutHint">
@@ -3638,6 +3650,7 @@ export default function App() {
             appName={appInfo?.name ?? "Agents UI"}
             currentVersion={appInfo?.version ?? null}
             updateSourceLabel={updateSourceLabel}
+            checkUrl={updateCheckUrl}
             fallbackReleaseUrl={fallbackReleaseUrl}
             state={updateCheckState}
             onClose={() => setUpdatesOpen(false)}
