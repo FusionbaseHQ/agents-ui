@@ -115,6 +115,7 @@ pub fn load_recording(window: WebviewWindow, recording_id: String) -> Result<Loa
 
     let mut meta: Option<RecordingMetaV1> = None;
     let mut events: Vec<RecordingEventV1> = Vec::new();
+    let mut key: Option<[u8; 32]> = None;
 
     for line in reader.lines() {
         let line = line.map_err(|e| format!("read failed: {e}"))?;
@@ -130,7 +131,21 @@ pub fn load_recording(window: WebviewWindow, recording_id: String) -> Result<Loa
                     meta = Some(m);
                 }
             }
-            RecordingLineV1::Input(ev) => events.push(ev),
+            RecordingLineV1::Input(mut ev) => {
+                if crate::secure::is_encrypted_value(&ev.data) {
+                    if key.is_none() {
+                        key = Some(crate::secure::get_or_create_master_key(&window)?);
+                    }
+                    if let Some(key) = key.as_ref() {
+                        ev.data = crate::secure::decrypt_string_with_key(
+                            key,
+                            crate::secure::SecretContext::Recording,
+                            &ev.data,
+                        )?;
+                    }
+                }
+                events.push(ev);
+            }
         }
     }
 

@@ -61,10 +61,10 @@ fn write_text_file_atomic(path: &Path, content: &str) -> Result<(), String> {
     file.sync_all().ok();
     drop(file);
 
-    if path.exists() {
-        let _ = fs::remove_file(path);
-    }
     fs::rename(&tmp, path).map_err(|e| format!("rename failed: {e}"))?;
+
+    // Best-effort: ensure the directory entry for the rename is durable.
+    let _ = fs::File::open(parent).and_then(|dir_handle| dir_handle.sync_all());
     Ok(())
 }
 
@@ -105,4 +105,3 @@ pub fn apply_text_assets(
 
     Ok(written)
 }
-

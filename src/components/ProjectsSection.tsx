@@ -1,4 +1,5 @@
 import React from "react";
+import { Icon } from "./Icon";
 
 type Project = {
   id: string;
@@ -55,7 +56,7 @@ export function ProjectsSection({
             title="Project settings"
             aria-label="Project settings"
           >
-            <span aria-hidden="true">{"\u2699"}</span>
+            <Icon name="settings" />
           </button>
           <button
             type="button"
@@ -65,7 +66,7 @@ export function ProjectsSection({
             title="Delete project"
             aria-label="Delete project"
           >
-            <span aria-hidden="true">{"\u232B"}</span>
+            <Icon name="trash" />
           </button>
         </div>
       </div>
@@ -116,4 +117,3 @@ export function ProjectsSection({
     </>
   );
 }
-

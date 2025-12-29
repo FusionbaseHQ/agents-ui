@@ -1,4 +1,5 @@
 import React from "react";
+import { Icon } from "./Icon";
 
 type Prompt = {
   id: string;
@@ -36,7 +37,7 @@ export function QuickPromptsSection({
       <div className="sidebarHeader">
         <div className="title">Quick Prompts</div>
         <button className="btn" onClick={onOpenPromptsPanel} title="Manage prompts">
-          +
+          <Icon name="panel" />
         </button>
       </div>
       <div className="quickPromptsSection">
@@ -62,4 +63,3 @@ export function QuickPromptsSection({
     </>
   );
 }
-

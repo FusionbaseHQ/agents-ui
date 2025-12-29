@@ -1,6 +1,15 @@
 import React from "react";
 import { getProcessEffectById, type ProcessEffect } from "../processEffects";
 import { shortenPathSmart } from "../pathDisplay";
+import { Icon } from "./Icon";
+
+function isSshCommand(commandLine: string | null | undefined): boolean {
+  const trimmed = commandLine?.trim() ?? "";
+  if (!trimmed) return false;
+  const token = trimmed.split(/\s+/)[0];
+  const base = token.split(/[\\/]/).pop() ?? token;
+  return base.toLowerCase().replace(/\.exe$/, "") === "ssh";
+}
 
 type Session = {
   id: string;
@@ -8,6 +17,7 @@ type Session = {
   command: string;
   cwd: string | null;
   launchCommand: string | null;
+  restoreCommand?: string | null;
   persistent?: boolean;
   effectId?: string | null;
   processTag?: string | null;
@@ -28,6 +38,7 @@ type SessionsSectionProps = {
   onOpenNewSession: () => void;
   onOpenAgentShortcuts: () => void;
   onOpenPersistentSessions: () => void;
+  onOpenSshManager: () => void;
 };
 
 export function SessionsSection({
@@ -40,6 +51,7 @@ export function SessionsSection({
   onOpenNewSession,
   onOpenAgentShortcuts,
   onOpenPersistentSessions,
+  onOpenSshManager,
 }: SessionsSectionProps) {
   return (
     <>
@@ -53,7 +65,7 @@ export function SessionsSection({
             title="New session"
             aria-label="New session"
           >
-            <span aria-hidden="true">+</span>
+            <Icon name="plus" />
           </button>
           <button
             type="button"
@@ -62,7 +74,16 @@ export function SessionsSection({
             title="Persistent sessions"
             aria-label="Persistent sessions"
           >
-            <span aria-hidden="true">{"\u221E"}</span>
+            <Icon name="layers" />
+          </button>
+          <button
+            type="button"
+            className="btnSmall btnIcon"
+            onClick={onOpenSshManager}
+            title="SSH connect"
+            aria-label="SSH connect"
+          >
+            <Icon name="ssh" />
           </button>
           <button
             type="button"
@@ -71,7 +92,7 @@ export function SessionsSection({
             title="Agent shortcuts"
             aria-label="Agent shortcuts"
           >
-            <span aria-hidden="true">{"\u2699"}</span>
+            <Icon name="bolt" />
           </button>
         </div>
       </div>
@@ -112,13 +133,19 @@ export function SessionsSection({
             const hasAgentIcon = Boolean(effect?.iconSrc);
             const isWorking = Boolean(effect && s.agentWorking && !isExited && !isClosing);
             const isRecording = Boolean(s.recordingActive && !isExited && !isClosing);
-            const chipClass = effect ? `chip chip-${effect.id}` : "chip";
+            const launchOrRestore =
+              s.launchCommand ??
+              (s.restoreCommand?.trim() ? s.restoreCommand.trim() : null) ??
+              null;
+            const isSsh = isSshCommand(launchOrRestore);
+            const chipClass = effect ? `chip chip-${effect.id}` : isSsh ? "chip chip-ssh" : "chip";
+            const showSshChip = isSsh && (!chipLabel || chipLabel.toLowerCase() !== "ssh");
             return (
               <div
                 key={s.id}
                 className={`sessionItem ${isActive ? "sessionItemActive" : ""} ${
                   isExited ? "sessionItemExited" : ""
-                } ${isClosing ? "sessionItemClosing" : ""}`}
+                } ${isClosing ? "sessionItemClosing" : ""} ${isSsh ? "sessionItemSsh" : ""}`}
                 onClick={() => onSelectSession(s.id)}
               >
                 <div className={`dot ${isActive ? "dotActive" : ""}`} />
@@ -133,6 +160,11 @@ export function SessionsSection({
                       </span>
                     )}
                     <span className="sessionNameText">{s.name}</span>
+                    {showSshChip ? (
+                      <span className="chip chip-ssh" title="SSH">
+                        <span className="chipLabel">ssh</span>
+                      </span>
+                    ) : null}
                     {s.persistent ? (
                       <span className="chip" title="Persistent (zellij)">
                         <span className="chipLabel">persist</span>
@@ -157,7 +189,7 @@ export function SessionsSection({
                     {(() => {
                       const parts: string[] = [];
                       if (s.cwd) parts.push(shortenPathSmart(s.cwd, 44));
-                      if (s.launchCommand) parts.push(s.launchCommand);
+                      if (launchOrRestore) parts.push(launchOrRestore);
                       if (!parts.length) parts.push(s.command);
                       return parts.join(" • ");
                     })()}

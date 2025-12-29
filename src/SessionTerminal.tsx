@@ -51,7 +51,6 @@ export default function SessionTerminal(props: {
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(containerRef.current);
-    fit.fit();
 
     if (props.persistent) {
       const sendZellij = (data: string) =>
@@ -282,7 +281,11 @@ export default function SessionTerminal(props: {
     const sendResize = () => {
       const term = termRef.current;
       const fit = fitRef.current;
+      const container = containerRef.current;
       if (!term || !fit) return;
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
       fit.fit();
       const { cols, rows } = term;
       const last = lastSizeRef.current;
@@ -390,14 +393,32 @@ export default function SessionTerminal(props: {
     const fit = fitRef.current;
     const container = containerRef.current;
     if (!term || !fit || !container) return;
-    term.focus();
-    fit.fit();
-    const { cols, rows } = term;
-    const last = lastSizeRef.current;
-    if (!last || last.cols !== cols || last.rows !== rows) {
-      lastSizeRef.current = { cols, rows };
-      void invoke("resize_session", { id: props.id, cols, rows }).catch(() => {});
-    }
+
+    let cancelled = false;
+    const attemptFit = (attemptsLeft: number) => {
+      if (cancelled) return;
+      const rect = container.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) {
+        if (attemptsLeft > 0) {
+          window.requestAnimationFrame(() => attemptFit(attemptsLeft - 1));
+        }
+        return;
+      }
+
+      term.focus();
+      fit.fit();
+      const { cols, rows } = term;
+      const last = lastSizeRef.current;
+      if (!last || last.cols !== cols || last.rows !== rows) {
+        lastSizeRef.current = { cols, rows };
+        void invoke("resize_session", { id: props.id, cols, rows }).catch(() => {});
+      }
+    };
+
+    attemptFit(8);
+    return () => {
+      cancelled = true;
+    };
   }, [props.active, props.id]);
 
   useEffect(() => {

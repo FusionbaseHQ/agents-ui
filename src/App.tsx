@@ -15,6 +15,7 @@ import { CommandPalette } from "./CommandPalette";
 import { ProjectsSection } from "./components/ProjectsSection";
 import { QuickPromptsSection } from "./components/QuickPromptsSection";
 import { SessionsSection } from "./components/SessionsSection";
+import { Icon } from "./components/Icon";
 import { AgentShortcutsModal } from "./components/AgentShortcutsModal";
 import { NewSessionModal } from "./components/modals/NewSessionModal";
 import {
@@ -28,6 +29,12 @@ import { ApplyAssetModal } from "./components/modals/ApplyAssetModal";
 import { ConfirmActionModal } from "./components/modals/ConfirmActionModal";
 import { PathPickerModal } from "./components/modals/PathPickerModal";
 import { UpdateModal, UpdateCheckState } from "./components/modals/UpdateModal";
+import {
+  SshManagerModal,
+  type SshForward,
+  type SshForwardType,
+  type SshHostEntry,
+} from "./components/modals/SshManagerModal";
 
 type Project = {
   id: string;
@@ -150,6 +157,100 @@ function unescapeDoubleQuotedEnvValue(input: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function copyToClipboard(text: string): Promise<boolean> {
+  const value = text ?? "";
+  if (!value) return false;
+
+  try {
+    await navigator.clipboard.writeText(value);
+    return true;
+  } catch {
+    // fall through
+  }
+
+  try {
+    const el = document.createElement("textarea");
+    el.value = value;
+    el.setAttribute("readonly", "true");
+    el.style.position = "fixed";
+    el.style.left = "-9999px";
+    el.style.top = "0";
+    document.body.appendChild(el);
+    el.focus();
+    el.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(el);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+function parsePort(value: string): number | null {
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const num = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(num) || num < 1 || num > 65535) return null;
+  return num;
+}
+
+function sshForwardFlag(type: SshForwardType): "-L" | "-R" | "-D" {
+  if (type === "remote") return "-R";
+  if (type === "dynamic") return "-D";
+  return "-L";
+}
+
+function sshForwardSpec(f: SshForward): string | null {
+  const listenPort = parsePort(f.listenPort);
+  if (!listenPort) return null;
+
+  const bind = f.bindAddress.trim();
+  if (f.type === "dynamic") {
+    return bind ? `${bind}:${listenPort}` : `${listenPort}`;
+  }
+
+  const destHost = f.destinationHost.trim();
+  const destPort = parsePort(f.destinationPort);
+  if (!destHost || !destPort) return null;
+
+  const prefix = bind ? `${bind}:${listenPort}` : `${listenPort}`;
+  return `${prefix}:${destHost}:${destPort}`;
+}
+
+function buildSshCommand(input: {
+  host: string;
+  forwards: SshForward[];
+  exitOnForwardFailure: boolean;
+  forwardOnly: boolean;
+}): string | null {
+  const host = input.host.trim();
+  if (!host) return null;
+
+  const args: string[] = ["ssh"];
+  if (input.exitOnForwardFailure && input.forwards.length > 0) {
+    args.push("-o", "ExitOnForwardFailure=yes");
+  }
+  if (input.forwardOnly) {
+    args.push("-N");
+  }
+  for (const f of input.forwards) {
+    const spec = sshForwardSpec(f);
+    if (!spec) return null;
+    args.push(sshForwardFlag(f.type), spec);
+  }
+  args.push(host);
+
+  return args.join(" ");
+}
+
+function isSshCommandLine(commandLine: string | null | undefined): boolean {
+  const trimmed = commandLine?.trim() ?? "";
+  if (!trimmed) return false;
+  const token = trimmed.split(/\s+/)[0];
+  const base = token.split(/[\\/]/).pop() ?? token;
+  return base.toLowerCase().replace(/\.exe$/, "") === "ssh";
 }
 
 function parseEnvContentToVars(content: string): Record<string, string> {
@@ -476,6 +577,17 @@ export default function App() {
   const [newCommand, setNewCommand] = useState("");
   const [newPersistent, setNewPersistent] = useState(false);
   const [newCwd, setNewCwd] = useState("");
+  const [sshManagerOpen, setSshManagerOpen] = useState(false);
+  const [sshHosts, setSshHosts] = useState<SshHostEntry[]>([]);
+  const [sshHostsLoading, setSshHostsLoading] = useState(false);
+  const [sshHostsError, setSshHostsError] = useState<string | null>(null);
+  const [sshHost, setSshHost] = useState("");
+  const sshHostInputRef = useRef<HTMLInputElement>(null);
+  const [sshPersistent, setSshPersistent] = useState(false);
+  const [sshForwardOnly, setSshForwardOnly] = useState(false);
+  const [sshExitOnForwardFailure, setSshExitOnForwardFailure] = useState(true);
+  const [sshForwards, setSshForwards] = useState<SshForward[]>([]);
+  const [sshError, setSshError] = useState<string | null>(null);
   const [projectOpen, setProjectOpen] = useState(false);
   const [projectMode, setProjectMode] = useState<"new" | "rename">("new");
   const [projectTitle, setProjectTitle] = useState("");
@@ -501,6 +613,8 @@ export default function App() {
   const [replayIndex, setReplayIndex] = useState(0);
   const [replayTargetSessionId, setReplayTargetSessionId] = useState<string | null>(null);
   const [replayShowAll, setReplayShowAll] = useState(false);
+  const [replayFlowExpanded, setReplayFlowExpanded] = useState<Record<string, boolean>>({});
+  const replayNextItemRef = useRef<HTMLDivElement | null>(null);
   const [recordPromptOpen, setRecordPromptOpen] = useState(false);
   const [recordPromptName, setRecordPromptName] = useState("");
   const [recordPromptSessionId, setRecordPromptSessionId] = useState<string | null>(null);
@@ -693,6 +807,11 @@ export default function App() {
     [sessions, activeId],
   );
 
+  const activeIsSsh = useMemo(() => {
+    if (!active) return false;
+    return isSshCommandLine(active.launchCommand ?? active.restoreCommand ?? null);
+  }, [active]);
+
   const activeProject = useMemo(
     () => projects.find((p) => p.id === activeProjectId) ?? null,
     [projects, activeProjectId],
@@ -871,6 +990,15 @@ export default function App() {
   }, [newOpen, activeProject?.basePath]);
 
   useEffect(() => {
+    if (!sshManagerOpen) return;
+    setSshError(null);
+    void refreshSshHosts();
+    window.setTimeout(() => {
+      sshHostInputRef.current?.focus();
+    }, 0);
+  }, [sshManagerOpen]);
+
+  useEffect(() => {
     if (!projectOpen) return;
     window.setTimeout(() => {
       projectTitleRef.current?.focus();
@@ -887,6 +1015,7 @@ export default function App() {
     const onKeyDown = (e: KeyboardEvent) => {
       const modalOpen =
         newOpen ||
+        sshManagerOpen ||
         agentShortcutsOpen ||
         projectOpen ||
         pathPickerOpen ||
@@ -909,6 +1038,8 @@ export default function App() {
         const modKey = isMac ? e.metaKey : e.ctrlKey;
         if (modKey && e.key.toLowerCase() === "k" && !commandPaletteOpen) {
           e.preventDefault();
+          e.stopPropagation();
+          (document.activeElement as HTMLElement | null)?.blur?.();
           setCommandPaletteOpen(true);
           return;
         }
@@ -916,6 +1047,7 @@ export default function App() {
         // Close command palette with Escape
         if (e.key === "Escape" && commandPaletteOpen) {
           e.preventDefault();
+          e.stopPropagation();
           setCommandPaletteOpen(false);
           return;
         }
@@ -997,6 +1129,10 @@ export default function App() {
           }
           if (projectOpen) {
             setProjectOpen(false);
+            return;
+          }
+          if (sshManagerOpen) {
+            setSshManagerOpen(false);
             return;
           }
           if (newOpen) {
@@ -1168,8 +1304,8 @@ export default function App() {
       }
     };
 
-		    window.addEventListener("keydown", onKeyDown);
-		    return () => window.removeEventListener("keydown", onKeyDown);
+		    window.addEventListener("keydown", onKeyDown, true);
+		    return () => window.removeEventListener("keydown", onKeyDown, true);
         }, [
           newOpen,
           agentShortcutsOpen,
@@ -1236,6 +1372,21 @@ export default function App() {
       noticeTimerRef.current = null;
       setNotice(null);
     }, timeoutMs);
+  }
+
+  const sshCommandPreview = useMemo(() => {
+    return buildSshCommand({
+      host: sshHost,
+      forwards: sshForwards,
+      exitOnForwardFailure: sshExitOnForwardFailure,
+      forwardOnly: sshForwardOnly,
+    });
+  }, [sshHost, sshForwards, sshExitOnForwardFailure, sshForwardOnly]);
+
+  async function copySshCommand() {
+    if (!sshCommandPreview) return;
+    const ok = await copyToClipboard(sshCommandPreview);
+    showNotice(ok ? "Copied SSH command" : "Could not copy SSH command");
   }
 
   const openExternal = useCallback(
@@ -1350,6 +1501,89 @@ export default function App() {
     return steps;
   }
 
+  function formatRecordingT(ms: number): string {
+    const safe = Number.isFinite(ms) ? Math.max(0, ms) : 0;
+    if (safe < 1000) return `+${safe}ms`;
+    const totalSeconds = Math.floor(safe / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    if (minutes > 0) return `+${minutes}m${seconds.toString().padStart(2, "0")}s`;
+    const tenths = Math.floor((safe % 1000) / 100);
+    return `+${seconds}.${tenths}s`;
+  }
+
+  const replayFlow = useMemo(() => {
+    const rec = replayRecording;
+    if (!rec) return [];
+    const events = rec.events ?? [];
+    if (!events.length) return [];
+
+    const groups: Array<{
+      key: string;
+      t: number;
+      startIndex: number;
+      endIndex: number;
+      preview: string;
+      items: Array<{ index: number; text: string }>;
+    }> = [];
+
+    let groupIndex = -1;
+    let currentT: number | null = null;
+
+    for (let i = 0; i < events.length; i++) {
+      const ev = events[i];
+      const clean = sanitizeRecordedInputForReplay(ev.data ?? "");
+      const text = clean.replace(/[\r\n]+$/, "");
+
+      if (currentT === null || ev.t !== currentT) {
+        groupIndex += 1;
+        currentT = ev.t;
+        groups.push({
+          key: `${ev.t}-${groupIndex}`,
+          t: ev.t,
+          startIndex: i,
+          endIndex: i,
+          preview: "",
+          items: [{ index: i, text }],
+        });
+      } else {
+        const group = groups[groups.length - 1];
+        group.endIndex = i;
+        group.items.push({ index: i, text });
+      }
+    }
+
+    for (const group of groups) {
+      const firstNonEmpty = group.items.find((it) => it.text.trim())?.text.trim();
+      group.preview = firstNonEmpty ? firstNonEmpty : "⏎";
+    }
+
+    return groups;
+  }, [replayRecording]);
+
+  useEffect(() => {
+    if (!replayShowAll) return;
+    if (!replayFlow.length) return;
+    if (replayIndex >= replaySteps.length) return;
+
+    const nextGroup = replayFlow.find(
+      (g) => replayIndex >= g.startIndex && replayIndex <= g.endIndex,
+    );
+    if (!nextGroup) return;
+    setReplayFlowExpanded((prev) => {
+      if (prev[nextGroup.key]) return prev;
+      return { ...prev, [nextGroup.key]: true };
+    });
+  }, [replayFlow, replayIndex, replayShowAll, replaySteps.length]);
+
+  useEffect(() => {
+    if (!replayShowAll) return;
+    const raf = window.requestAnimationFrame(() => {
+      replayNextItemRef.current?.scrollIntoView({ block: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, [replayShowAll, replayIndex, replayFlowExpanded]);
+
   async function refreshRecordings() {
     setRecordingsLoading(true);
     setRecordingsError(null);
@@ -1373,6 +1607,19 @@ export default function App() {
       setPersistentSessionsError(formatError(err));
     } finally {
       setPersistentSessionsLoading(false);
+    }
+  }
+
+  async function refreshSshHosts() {
+    setSshHostsLoading(true);
+    setSshHostsError(null);
+    try {
+      const list = await invoke<SshHostEntry[]>("list_ssh_hosts");
+      setSshHosts(list);
+    } catch (err) {
+      setSshHostsError(formatError(err));
+    } finally {
+      setSshHostsLoading(false);
     }
   }
 
@@ -1458,6 +1705,7 @@ export default function App() {
     setReplayIndex(0);
     setReplayTargetSessionId(null);
     setReplayShowAll(false);
+    setReplayFlowExpanded({});
   }
 
   async function openReplay(recordingId: string, mode: "step" | "all" = "step") {
@@ -1469,6 +1717,7 @@ export default function App() {
     setReplayIndex(0);
     setReplayTargetSessionId(null);
     setReplayShowAll(mode === "all");
+    setReplayFlowExpanded({});
 
     try {
       const rec = await invoke<LoadedRecording>("load_recording", {
@@ -1593,12 +1842,8 @@ export default function App() {
     return new Date(timestamp).toLocaleDateString();
   }
 
-  async function sendPromptToActive(prompt: Prompt, mode: "paste" | "send") {
-    const sessionId = activeIdRef.current;
-    if (!sessionId) return;
-
+  async function sendPromptToSession(sessionId: string, prompt: Prompt, mode: "paste" | "send") {
     if (mode === "paste") {
-      // Just paste the content as-is
       try {
         registry.current.get(sessionId)?.term.focus();
         await invoke("write_to_session", { id: sessionId, data: prompt.content, source: "user" });
@@ -1608,23 +1853,58 @@ export default function App() {
       return;
     }
 
-    // For "send" mode: send the text first, then send Enter separately
-    // This mimics how a user would type and then press Enter
-    const text = prompt.content.replace(/[\r\n]+$/, ""); // Strip trailing newlines
+    const text = prompt.content.replace(/[\r\n]+$/, "");
     try {
       registry.current.get(sessionId)?.term.focus();
-      // Send the text content
       if (text) {
         await invoke("write_to_session", { id: sessionId, data: text, source: "user" });
       }
-      // Give the target app a moment to process the inserted text, so the Enter
-      // arrives as a distinct keystroke (some CLIs treat fast input as "paste"
-      // and won't submit on a trailing newline).
       if (text) await sleep(30);
-      // Send Enter key (carriage return) separately.
       await invoke("write_to_session", { id: sessionId, data: "\r", source: "user" });
     } catch (err) {
       reportError("Failed to send prompt", err);
+    }
+  }
+
+  async function sendPromptToActive(prompt: Prompt, mode: "paste" | "send") {
+    const sessionId = activeIdRef.current;
+    if (!sessionId) return;
+    await sendPromptToSession(sessionId, prompt, mode);
+  }
+
+  async function sendPromptFromCommandPalette(prompt: Prompt, mode: "paste" | "send") {
+    const projectId = activeProjectId;
+
+    const activeSessionId = activeId;
+    const activeSession = activeSessionId ? sessions.find((s) => s.id === activeSessionId) ?? null : null;
+
+    const defaultAgentId = agentShortcutIds[0] ?? null;
+    const effect =
+      getProcessEffectById(activeSession?.effectId) ?? getProcessEffectById(defaultAgentId);
+
+    if (!effect) {
+      await sendPromptToActive(prompt, mode);
+      return;
+    }
+
+    const cwd =
+      activeSession?.cwd ?? activeProject?.basePath ?? homeDirRef.current ?? null;
+    try {
+      if (cwd) await ensureAutoAssets(cwd, projectId);
+      const createdRaw = await createSession({
+        projectId,
+        name: prompt.title.trim() ? prompt.title.trim() : effect.label,
+        launchCommand: effect.matchCommands[0] ?? effect.label,
+        cwd,
+        envVars: envVarsForProjectId(projectId, projects, environments),
+      });
+      const s = applyPendingExit(createdRaw);
+      setSessions((prev) => [...prev, s]);
+      setActiveId(s.id);
+      await sleep(50);
+      await sendPromptToSession(s.id, prompt, mode);
+    } catch (err) {
+      reportError("Failed to start new session for prompt", err);
     }
   }
 
@@ -2531,6 +2811,105 @@ export default function App() {
     }
   }
 
+  function addSshForward() {
+    setSshForwards((prev) => [
+      ...prev,
+      {
+        id: makeId(),
+        type: "local",
+        bindAddress: "",
+        listenPort: "",
+        destinationHost: "localhost",
+        destinationPort: "",
+      },
+    ]);
+  }
+
+  function removeSshForward(id: string) {
+    setSshForwards((prev) => prev.filter((f) => f.id !== id));
+  }
+
+  function updateSshForward(id: string, patch: Partial<SshForward>) {
+    setSshForwards((prev) => prev.map((f) => (f.id === id ? { ...f, ...patch } : f)));
+  }
+
+  async function onSshConnect() {
+    setSshError(null);
+
+    const target = sshHost.trim();
+    if (!target) {
+      setSshError("Pick an SSH host.");
+      return;
+    }
+
+    for (const [idx, f] of sshForwards.entries()) {
+      const listenPort = parsePort(f.listenPort);
+      if (!listenPort) {
+        setSshError(`Forward #${idx + 1}: invalid listen port.`);
+        return;
+      }
+      if (f.type !== "dynamic") {
+        if (!f.destinationHost.trim()) {
+          setSshError(`Forward #${idx + 1}: destination host is required.`);
+          return;
+        }
+        const destPort = parsePort(f.destinationPort);
+        if (!destPort) {
+          setSshError(`Forward #${idx + 1}: invalid destination port.`);
+          return;
+        }
+      }
+    }
+
+    const command = sshCommandPreview;
+    if (!command) {
+      setSshError("Invalid SSH configuration.");
+      return;
+    }
+
+    try {
+      const desiredCwd = activeProject?.basePath ?? homeDirRef.current ?? "";
+      const validatedCwd = await invoke<string | null>("validate_directory", {
+        path: desiredCwd,
+      }).catch(() => null);
+      if (!validatedCwd) {
+        setSshError("Working directory must be an existing folder.");
+        return;
+      }
+
+      await ensureAutoAssets(validatedCwd, activeProjectId);
+
+      const name = `ssh ${target}`;
+      const createdRaw = await createSession({
+        projectId: activeProjectId,
+        name,
+        launchCommand: sshPersistent ? null : command,
+        restoreCommand: sshPersistent ? command : null,
+        persistent: sshPersistent,
+        cwd: validatedCwd,
+        envVars: envVarsForProjectId(activeProjectId, projects, environments),
+      });
+      const s = applyPendingExit(createdRaw);
+      setSessions((prev) => [...prev, s]);
+      setActiveId(s.id);
+      setSshManagerOpen(false);
+
+      if (sshPersistent) {
+        void (async () => {
+          try {
+            await invoke("write_to_session", { id: s.id, data: command, source: "system" });
+            await sleep(30);
+            await invoke("write_to_session", { id: s.id, data: "\r", source: "system" });
+          } catch (err) {
+            reportError("Failed to start SSH inside persistent session", err);
+          }
+        })();
+      }
+    } catch (err) {
+      setSshError(formatError(err));
+    }
+  }
+
   async function onClose(id: string) {
     clearAgentIdleTimer(id);
     const session = sessionsRef.current.find((s) => s.id === id) ?? null;
@@ -2788,6 +3167,11 @@ export default function App() {
             setPersistentSessionsOpen(true);
             void refreshPersistentSessions();
           }}
+          onOpenSshManager={() => {
+            setProjectOpen(false);
+            setNewOpen(false);
+            setSshManagerOpen(true);
+          }}
           onOpenAgentShortcuts={() => setAgentShortcutsOpen(true)}
         />
       </aside>
@@ -2795,8 +3179,16 @@ export default function App() {
       <main className="main">
         <div className="topbar">
           <div className="activeTitle">
-            {activeProject ? `Project: ${activeProject.title}` : "Project: —"}
-            {active ? ` • ${active.name}` : " • No session"}
+            <span>{activeProject ? `Project: ${activeProject.title}` : "Project: —"}</span>
+            <span>{active ? ` • ${active.name}` : " • No session"}</span>
+            {activeIsSsh ? (
+              <>
+                {" "}
+                <span className="chip chip-ssh" title="SSH">
+                  <span className="chipLabel">ssh</span>
+                </span>
+              </>
+            ) : null}
           </div>
 	          <div className="topbarRight">
 	            {error && (
@@ -2842,7 +3234,7 @@ export default function App() {
                   disabled={Boolean(active.exited || active.closing)}
                   title={active.recordingActive ? "Stop recording (active)" : "Start recording"}
                 >
-                  {active.recordingActive ? "\u25A0" : "\u25CF"}
+                  <Icon name={active.recordingActive ? "stop" : "record"} />
                 </button>
 
                 {/* Panels Button */}
@@ -2858,7 +3250,7 @@ export default function App() {
                   }}
                   title={`${slidePanelOpen ? "Close" : "Open"} panels (\u2318\u21E7P / \u2318\u21E7R / \u2318\u21E7A)`}
                 >
-                  {"\u25A1"}
+                  <Icon name="panel" />
                 </button>
 
                 {/* Replay Button */}
@@ -2868,7 +3260,7 @@ export default function App() {
                   disabled={!active.lastRecordingId}
                   title={active.lastRecordingId ? "Replay last recording" : "No recording yet"}
                 >
-                  {"\u25B6"}
+                  <Icon name="play" />
                 </button>
               </>
             )}
@@ -2922,6 +3314,35 @@ export default function App() {
               setNewPersistent(false);
             }}
             onSubmit={onNewSubmit}
+          />
+
+          <SshManagerModal
+            isOpen={sshManagerOpen}
+            hosts={sshHosts}
+            hostsLoading={sshHostsLoading}
+            hostsError={sshHostsError}
+            onRefreshHosts={() => void refreshSshHosts()}
+            host={sshHost}
+            hostInputRef={sshHostInputRef}
+            onChangeHost={setSshHost}
+            persistent={sshPersistent}
+            onChangePersistent={setSshPersistent}
+            forwardOnly={sshForwardOnly}
+            onChangeForwardOnly={setSshForwardOnly}
+            exitOnForwardFailure={sshExitOnForwardFailure}
+            onChangeExitOnForwardFailure={setSshExitOnForwardFailure}
+            forwards={sshForwards}
+            onAddForward={addSshForward}
+            onRemoveForward={removeSshForward}
+            onUpdateForward={updateSshForward}
+            commandPreview={sshCommandPreview}
+            onCopyCommand={() => void copySshCommand()}
+            error={sshError}
+            onClose={() => {
+              setSshManagerOpen(false);
+              setSshError(null);
+            }}
+            onConnect={() => void onSshConnect()}
           />
 
           <PersistentSessionsModal
@@ -3145,7 +3566,7 @@ export default function App() {
                       placeholder="e.g. Fix failing tests"
                     />
                     <div className="hint" style={{ marginTop: 0 }}>
-                      Records only your input. Replay is manual step-by-step.
+                      Records only your input (may include secrets). Stored encrypted at rest (key in macOS Keychain).
                     </div>
                   </div>
                   <div className="modalActions">
@@ -3472,7 +3893,7 @@ export default function App() {
                       placeholder={"KEY=value\n# Comments supported"}
                     />
                     <div className="hint" style={{ marginTop: 0 }}>
-                      Parsed like an <code>.env</code> file. Applied to new sessions in a project.
+                      Parsed like an <code>.env</code> file. Applied to new sessions in a project. Stored encrypted at rest (key in macOS Keychain).
                     </div>
                   </div>
                   <div className="modalActions">
@@ -3559,7 +3980,7 @@ export default function App() {
 
           {replayOpen && (
             <div className="modalBackdrop" onClick={closeReplayModal}>
-              <div className="modal" onClick={(e) => e.stopPropagation()}>
+              <div className="modal recordingsModal" onClick={(e) => e.stopPropagation()}>
                 <h3 className="modalTitle">Replay recording</h3>
 
                 {replayError && (
@@ -3594,13 +4015,104 @@ export default function App() {
                     </div>
 
                     <div className="formRow" style={{ marginBottom: 0 }}>
-                      <div className="label">{replayShowAll ? "All inputs" : "Next input"}</div>
-                      <div className="replayPreview">
-                        {replayShowAll
-                          ? replaySteps.join("")
-                          : replaySteps[replayIndex]
-                            ? replaySteps[replayIndex]
-                            : "Done."}
+                      <div className="label">{replayShowAll ? "Flow" : "Next input"}</div>
+                      <div className={`replayPreview ${replayShowAll ? "replayPreviewFlow" : ""}`}>
+                        {replayShowAll ? (
+                          <div className="replayFlow">
+                            {replayFlow.length === 0 ? (
+                              <div className="empty">No inputs recorded.</div>
+                            ) : (
+                              replayFlow.map((group) => {
+                                const hasNext =
+                                  replayIndex < replaySteps.length &&
+                                  replayIndex >= group.startIndex &&
+                                  replayIndex <= group.endIndex;
+                                const expanded =
+                                  replayFlowExpanded[group.key] ??
+                                  group.items.length <= 3;
+                                const range =
+                                  group.startIndex === group.endIndex
+                                    ? `#${group.startIndex + 1}`
+                                    : `#${group.startIndex + 1}\u2013${group.endIndex + 1}`;
+                                const headerPreview = (() => {
+                                  if (!hasNext) return group.preview;
+                                  const nextItem = group.items.find((it) => it.index === replayIndex);
+                                  const text = nextItem?.text?.trim() ?? "";
+                                  return text ? text : group.preview;
+                                })();
+                                return (
+                                  <div
+                                    key={group.key}
+                                    className={`replayFlowGroup ${hasNext ? "replayFlowGroupNext" : ""}`}
+                                  >
+                                    <button
+                                      type="button"
+                                      className="replayFlowGroupHeader"
+                                      onClick={() =>
+                                        setReplayFlowExpanded((prev) => ({
+                                          ...prev,
+                                          [group.key]: !expanded,
+                                        }))
+                                      }
+                                      aria-expanded={expanded}
+                                    >
+                                      <span className="replayFlowCaret" aria-hidden="true">
+                                        {expanded ? "\u25BE" : "\u25B8"}
+                                      </span>
+                                      <span className="replayFlowTime">{formatRecordingT(group.t)}</span>
+                                      <span className="replayFlowRange">{range}</span>
+                                      {group.items.length > 1 ? (
+                                        <span className={`replayFlowCount ${hasNext ? "replayFlowCountNext" : ""}`}>
+                                          {hasNext ? "NEXT" : `${group.items.length} lines`}
+                                        </span>
+                                      ) : null}
+                                      <span className="replayFlowPreview" title={headerPreview}>
+                                        {headerPreview}
+                                      </span>
+                                    </button>
+
+                                    {expanded ? (
+                                      <div className="replayFlowItems">
+                                        {group.items.map((it, idx) => {
+                                          const marker =
+                                            idx === group.items.length - 1 ? "\u2514\u2500" : "\u251C\u2500";
+                                          const display = it.text.length ? it.text : "\u23CE";
+                                          const isSent = it.index < replayIndex;
+                                          const isNext = it.index === replayIndex && replayIndex < replaySteps.length;
+                                          return (
+                                            <div
+                                              key={it.index}
+                                              ref={(el) => {
+                                                if (isNext) replayNextItemRef.current = el;
+                                              }}
+                                              className={`replayFlowItem ${isSent ? "replayFlowItemSent" : ""} ${
+                                                isNext ? "replayFlowItemNext" : ""
+                                              }`}
+                                              aria-current={isNext ? "step" : undefined}
+                                            >
+                                              <span className="replayFlowItemMarker" aria-hidden="true">
+                                                {marker}
+                                              </span>
+                                              <span className="replayFlowItemIndex">
+                                                {it.index + 1}
+                                                {isNext ? <span className="replayFlowNextBadge">next</span> : null}
+                                              </span>
+                                              <pre className="replayFlowItemText">{display}</pre>
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                );
+                              })
+                            )}
+                          </div>
+                        ) : replaySteps[replayIndex] ? (
+                          replaySteps[replayIndex]
+                        ) : (
+                          "Done."
+                        )}
                       </div>
                     </div>
                   </>
@@ -3618,7 +4130,7 @@ export default function App() {
                     onClick={() => setReplayShowAll((v) => !v)}
                     disabled={replayLoading || Boolean(replayError) || !replayRecording}
                   >
-                    {replayShowAll ? "View step" : "View all"}
+                    {replayShowAll ? "View next" : "View flow"}
                   </button>
                   <button
                     type="button"
@@ -3654,7 +4166,9 @@ export default function App() {
               <>
                 {/* Prompts Search */}
                 <div className="panelSearch">
-                  <span className="panelSearchIcon">{"\uD83D\uDD0D"}</span>
+                  <span className="panelSearchIcon" aria-hidden="true">
+                    <Icon name="search" size={14} />
+                  </span>
                   <input
                     className="panelSearchInput"
                     type="text"
@@ -3737,7 +4251,9 @@ export default function App() {
               <>
                 {/* Recordings Search */}
                 <div className="panelSearch">
-                  <span className="panelSearchIcon">{"\uD83D\uDD0D"}</span>
+                  <span className="panelSearchIcon" aria-hidden="true">
+                    <Icon name="search" size={14} />
+                  </span>
                   <input
                     className="panelSearchInput"
                     type="text"
@@ -3835,7 +4351,9 @@ export default function App() {
               <>
                 {/* Assets Search */}
                 <div className="panelSearch">
-                  <span className="panelSearchIcon">{"\uD83D\uDD0D"}</span>
+                  <span className="panelSearchIcon" aria-hidden="true">
+                    <Icon name="search" size={14} />
+                  </span>
                   <input
                     className="panelSearchInput"
                     type="text"
@@ -3969,11 +4487,16 @@ export default function App() {
         activeSessionId={activeId}
         quickStarts={quickStarts}
         onQuickStart={(preset) => void quickStart(preset)}
-        onSendPrompt={(prompt, mode) => void sendPromptToActive(prompt, mode)}
+        onSendPrompt={(prompt, mode) => void sendPromptFromCommandPalette(prompt, mode)}
         onEditPrompt={openPromptEditor}
         onOpenRecording={(id, mode) => void openReplay(id, mode)}
         onSwitchSession={setActiveId}
         onNewSession={() => setNewOpen(true)}
+        onOpenSshManager={() => {
+          setProjectOpen(false);
+          setNewOpen(false);
+          setSshManagerOpen(true);
+        }}
         onNewPrompt={() => openPromptEditor()}
         onStartRecording={() => activeId && openRecordPrompt(activeId)}
         onStopRecording={() => activeId && void stopRecording(activeId)}

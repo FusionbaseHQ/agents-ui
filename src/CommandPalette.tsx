@@ -1,4 +1,5 @@
-import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useRef, useEffect, useLayoutEffect, useMemo, useCallback } from "react";
+import { Icon } from "./components/Icon";
 
 type Prompt = {
   id: string;
@@ -67,6 +68,7 @@ type CommandPaletteProps = {
   onOpenRecording: (recordingId: string, mode: "step" | "all") => void;
   onSwitchSession: (sessionId: string) => void;
   onNewSession: () => void;
+  onOpenSshManager: () => void;
   onNewPrompt: () => void;
   onStartRecording: () => void;
   onStopRecording: () => void;
@@ -141,6 +143,7 @@ export function CommandPalette({
   onOpenRecording,
   onSwitchSession,
   onNewSession,
+  onOpenSshManager,
   onNewPrompt,
   onStartRecording,
   onStopRecording,
@@ -240,6 +243,13 @@ export function CommandPalette({
     });
 
     items.push({
+      id: "action-ssh-connect",
+      type: "action",
+      title: "SSH Connect",
+      icon: "ssh",
+    });
+
+    items.push({
       id: "action-new-prompt",
       type: "action",
       title: "New Prompt",
@@ -313,17 +323,19 @@ export function CommandPalette({
     return groups;
   }, [filteredItems]);
 
+  const displayedItems = useMemo(() => groupedItems.flatMap((g) => g.items), [groupedItems]);
+
   // Reset selection when items change
   useEffect(() => {
     setSelectedIndex(0);
-  }, [filteredItems]);
+  }, [displayedItems]);
 
   // Focus input on open
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (isOpen) {
       setQuery("");
       setSelectedIndex(0);
-      setTimeout(() => inputRef.current?.focus(), 0);
+      inputRef.current?.focus();
     }
   }, [isOpen]);
 
@@ -365,6 +377,9 @@ export function CommandPalette({
           case "action-new-session":
             onNewSession();
             break;
+          case "action-ssh-connect":
+            onOpenSshManager();
+            break;
           case "action-new-prompt":
             onNewPrompt();
             break;
@@ -387,13 +402,14 @@ export function CommandPalette({
         break;
       }
     }
-  }, [onClose, onSendPrompt, onOpenRecording, onSwitchSession, onNewSession, onNewPrompt, onStartRecording, onStopRecording, onOpenPromptsPanel, onOpenRecordingsPanel, onOpenAssetsPanel, onQuickStart]);
+  }, [onClose, onSendPrompt, onOpenRecording, onSwitchSession, onNewSession, onOpenSshManager, onNewPrompt, onStartRecording, onStopRecording, onOpenPromptsPanel, onOpenRecordingsPanel, onOpenAssetsPanel, onQuickStart]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    e.stopPropagation();
     switch (e.key) {
       case "ArrowDown":
         e.preventDefault();
-        setSelectedIndex(i => Math.min(i + 1, filteredItems.length - 1));
+        setSelectedIndex(i => Math.min(i + 1, displayedItems.length - 1));
         break;
       case "ArrowUp":
         e.preventDefault();
@@ -401,8 +417,8 @@ export function CommandPalette({
         break;
       case "Enter":
         e.preventDefault();
-        if (filteredItems[selectedIndex]) {
-          executeItem(filteredItems[selectedIndex]);
+        if (displayedItems[selectedIndex]) {
+          executeItem(displayedItems[selectedIndex]);
         }
         break;
       case "Escape":
@@ -425,18 +441,19 @@ export function CommandPalette({
         }
         break;
     }
-  }, [filteredItems, selectedIndex, executeItem, onClose, prompts, onSendPrompt]);
+  }, [displayedItems, selectedIndex, executeItem, onClose, prompts, onSendPrompt]);
 
   if (!isOpen) return null;
 
-  const getIcon = (item: CommandItem) => {
+  const getIcon = (item: CommandItem): React.ReactNode => {
     switch (item.icon) {
       case "star": return "\u2605";
-      case "recording": return "\u25CF";
-      case "plus": return "+";
-      case "panel": return "\u25A1";
+      case "recording": return <Icon name="record" />;
+      case "plus": return <Icon name="plus" />;
+      case "panel": return <Icon name="panel" />;
       case "active": return "\u25CF";
       case "session": return "\u25CB";
+      case "ssh": return <Icon name="ssh" />;
       default: return "\u25CB";
     }
   };

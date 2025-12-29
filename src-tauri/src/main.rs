@@ -4,6 +4,8 @@ mod assets;
 mod pty;
 mod persist;
 mod recording;
+mod secure;
+mod ssh;
 mod tray;
 
 use app_info::get_app_info;
@@ -16,6 +18,7 @@ use pty::{
 };
 use persist::{list_directories, load_persisted_state, save_persisted_state, validate_directory};
 use recording::{delete_recording, list_recordings, load_recording};
+use ssh::list_ssh_hosts;
 use tray::{build_status_tray, set_tray_agent_count};
 use tauri::Manager;
 
@@ -51,6 +54,7 @@ fn main() {
             load_recording,
             list_recordings,
             delete_recording,
+            list_ssh_hosts,
             apply_text_assets,
             set_tray_agent_count,
             get_app_info

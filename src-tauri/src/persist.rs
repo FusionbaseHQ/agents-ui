@@ -5,6 +5,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tauri::{Manager, WebviewWindow};
 
+use crate::secure::{decrypt_string_with_key, encrypt_string_with_key, get_or_create_master_key, SecretContext};
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedProjectV1 {
@@ -125,9 +127,22 @@ pub fn load_persisted_state(window: WebviewWindow) -> Result<Option<PersistedSta
         Err(e) => return Err(format!("read failed: {e}")),
     };
 
-    let state: PersistedStateV1 = serde_json::from_str(&raw).map_err(|e| format!("parse failed: {e}"))?;
+    let mut state: PersistedStateV1 = serde_json::from_str(&raw).map_err(|e| format!("parse failed: {e}"))?;
     if state.schema_version != 1 {
         return Ok(None);
+    }
+
+    let needs_decrypt = state
+        .environments
+        .iter()
+        .any(|env| crate::secure::is_encrypted_value(&env.content));
+    if needs_decrypt {
+        let key = get_or_create_master_key(&window)?;
+        for env in &mut state.environments {
+            if crate::secure::is_encrypted_value(&env.content) {
+                env.content = decrypt_string_with_key(&key, SecretContext::State, &env.content)?;
+            }
+        }
     }
     Ok(Some(state))
 }
@@ -143,6 +158,14 @@ pub fn save_persisted_state(window: WebviewWindow, state: PersistedStateV1) -> R
     fs::create_dir_all(dir).map_err(|e| format!("create dir failed: {e}"))?;
 
     let tmp = path.with_extension("json.tmp");
+    let mut state = state;
+    if !state.environments.is_empty() {
+        let key = get_or_create_master_key(&window)?;
+        for env in &mut state.environments {
+            env.content = encrypt_string_with_key(&key, SecretContext::State, &env.content)?;
+        }
+    }
+
     let json = serde_json::to_string_pretty(&state).map_err(|e| format!("serialize failed: {e}"))?;
 
     let mut file = fs::File::create(&tmp).map_err(|e| format!("write temp failed: {e}"))?;
@@ -153,10 +176,10 @@ pub fn save_persisted_state(window: WebviewWindow, state: PersistedStateV1) -> R
     file.sync_all().ok();
     drop(file);
 
-    if path.exists() {
-        let _ = fs::remove_file(&path);
-    }
     fs::rename(&tmp, &path).map_err(|e| format!("rename failed: {e}"))?;
+
+    // Best-effort: ensure the directory entry for the rename is durable.
+    let _ = fs::File::open(dir).and_then(|dir_handle| dir_handle.sync_all());
     Ok(())
 }
 
