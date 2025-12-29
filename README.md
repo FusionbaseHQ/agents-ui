@@ -18,7 +18,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License">
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" alt="Platform">
+  <img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg" alt="Platform">
   <img src="https://img.shields.io/badge/version-0.1.0-green.svg" alt="Version">
   <img src="https://img.shields.io/badge/tauri-v2-orange.svg" alt="Tauri">
 </p>
@@ -82,14 +82,14 @@ Add your screenshots here:
 
 - [Node.js](https://nodejs.org/) (v18 or later recommended)
 - [Rust](https://rustup.rs/) toolchain
-- [Tauri prerequisites](https://tauri.app/v1/guides/getting-started/prerequisites) for your OS
+- [Tauri prerequisites](https://tauri.app/start/prerequisites/) for macOS
 
 ### Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-username/agents-ui.git
-cd agents-ui/desktop
+# Clone the repository and enter it
+git clone <repo-url>
+cd <repo>
 
 # Install dependencies
 npm install
@@ -273,6 +273,15 @@ export const PROCESS_EFFECTS: ProcessEffect[] = [
 ];
 ```
 
+## Security & Privacy
+
+Agents UI runs local shells and can execute commands with **your user permissions**. Treat agent output as untrusted, and avoid running commands you don’t understand.
+
+- **Encrypted at rest (macOS):** environment configs and recording inputs are stored encrypted in the app data directory; the master key is stored in **macOS Keychain**.
+- **Recordings may include secrets:** recordings can capture what you typed. Use recording sparingly when handling credentials.
+- **SSH host list:** the SSH picker reads `~/.ssh/config` to list host aliases.
+- **No telemetry:** Agents UI doesn’t send session contents anywhere. The only built-in network call is the optional “Check for updates” request to GitHub (agents you run may of course use the network).
+
 ## FAQ
 
 <details>
@@ -295,9 +304,7 @@ Yes! Agents UI works as a regular terminal multiplexer. Create sessions with a b
 <summary><strong>Where is my data stored?</strong></summary>
 
 All data is stored locally on your machine via Tauri's app data directory:
-- **macOS:** `~/Library/Application Support/com.example.agentsui/`
-- **Linux:** `~/.local/share/com.example.agentsui/`
-- **Windows:** `%APPDATA%\com.example.agentsui\`
+- **macOS:** `~/Library/Application Support/<bundle-id>/`
 
 Data includes projects, sessions, prompts, recordings, and settings.
 </details>
@@ -336,27 +343,13 @@ Contributions are welcome! Here's how you can help:
 ### Development Guidelines
 
 - Follow existing code style and patterns
-- Test changes on multiple platforms when possible
+- Test changes on macOS (other platforms are welcome but currently not the focus)
 - Update documentation for new features
 - Keep commits focused and well-described
 
 ## License
 
-```
-Copyright 2024 Agents UI Contributors
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
+Apache-2.0. See `LICENSE`.
 
 ## Acknowledgments
 
