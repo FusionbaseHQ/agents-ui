@@ -135,12 +135,29 @@ pub fn load_persisted_state(window: WebviewWindow) -> Result<Option<PersistedSta
     let needs_decrypt = state
         .environments
         .iter()
-        .any(|env| crate::secure::is_encrypted_value(&env.content));
+        .any(|env| crate::secure::is_probably_encrypted_value(&env.content));
     if needs_decrypt {
-        let key = get_or_create_master_key(&window)?;
+        let key = match get_or_create_master_key(&window) {
+            Ok(key) => Some(key),
+            Err(e) => {
+                eprintln!("Failed to read master key; leaving environments encrypted: {e}");
+                None
+            }
+        };
         for env in &mut state.environments {
-            if crate::secure::is_encrypted_value(&env.content) {
-                env.content = decrypt_string_with_key(&key, SecretContext::State, &env.content)?;
+            if !crate::secure::is_probably_encrypted_value(&env.content) {
+                continue;
+            }
+            let Some(key) = key.as_ref() else {
+                continue;
+            };
+            match decrypt_string_with_key(key, SecretContext::State, &env.content) {
+                Ok(plaintext) => env.content = plaintext,
+                Err(e) => {
+                    // Don't fail the full state load; preserve the encrypted value so the user can
+                    // potentially recover it later if Keychain access is restored.
+                    eprintln!("Failed to decrypt environment {}; leaving encrypted: {e}", env.id);
+                }
             }
         }
     }
@@ -162,6 +179,9 @@ pub fn save_persisted_state(window: WebviewWindow, state: PersistedStateV1) -> R
     if !state.environments.is_empty() {
         let key = get_or_create_master_key(&window)?;
         for env in &mut state.environments {
+            if crate::secure::is_probably_encrypted_value(&env.content) {
+                continue;
+            }
             env.content = encrypt_string_with_key(&key, SecretContext::State, &env.content)?;
         }
     }

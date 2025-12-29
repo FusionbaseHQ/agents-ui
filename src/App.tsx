@@ -641,6 +641,7 @@ export default function App() {
   const [applyAssetRequest, setApplyAssetRequest] = useState<ApplyAssetRequest | null>(null);
   const [applyAssetApplying, setApplyAssetApplying] = useState(false);
   const [applyAssetError, setApplyAssetError] = useState<string | null>(null);
+  const [persistenceDisabledReason, setPersistenceDisabledReason] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
@@ -922,7 +923,7 @@ export default function App() {
   }, [projects]);
 
   useEffect(() => {
-    if (!hydrated) return;
+    if (!hydrated || persistenceDisabledReason) return;
     if (saveTimerRef.current !== null) {
       window.clearTimeout(saveTimerRef.current);
     }
@@ -963,7 +964,7 @@ export default function App() {
         reportError("Failed to save state", err);
       });
     }, 400);
-  }, [projects, activeProjectId, activeSessionByProject, sessions, prompts, environments, assets, assetSettings, agentShortcutIds, hydrated]);
+  }, [projects, activeProjectId, activeSessionByProject, sessions, prompts, environments, assets, assetSettings, agentShortcutIds, hydrated, persistenceDisabledReason]);
 
   const activeAgentCount = useMemo(() => {
     return sessions.filter(
@@ -1392,7 +1393,11 @@ export default function App() {
   const openExternal = useCallback(
     async (url: string) => {
       try {
-        await invoke("plugin:shell|open", { path: url });
+        const parsed = new URL(url);
+        if (parsed.protocol !== "https:") {
+          throw new Error(`refusing to open non-https URL (${parsed.protocol})`);
+        }
+        await invoke("plugin:shell|open", { path: parsed.toString() });
       } catch (err) {
         reportError("Failed to open link", err);
       }
@@ -2542,9 +2547,18 @@ export default function App() {
       const legacySessions = loadLegacyPersistedSessions();
       const legacyActiveSessionByProject = loadLegacyActiveSessionByProject();
 
-      const diskState = await invoke<PersistedStateV1 | null>("load_persisted_state").catch(
-        () => null,
-      );
+      let diskState: PersistedStateV1 | null = null;
+      try {
+        diskState = await invoke<PersistedStateV1 | null>("load_persisted_state");
+      } catch (err) {
+        const msg = formatError(err);
+        if (!cancelled) {
+          setPersistenceDisabledReason(
+            `Failed to load saved state (changes won't be saved until restart): ${msg}`,
+          );
+        }
+        diskState = null;
+      }
 
       let state: PersistedStateV1 | null = diskState;
       if (!state && legacyProjects) {
@@ -2612,6 +2626,15 @@ export default function App() {
       setActiveSessionByProject(activeSessionByProject);
       setPrompts(state.prompts ?? []);
       setEnvironments(state.environments ?? []);
+      const encryptedEnvCount = (state.environments ?? []).filter((e) =>
+        (e.content ?? "").trimStart().startsWith("enc:v1:"),
+      ).length;
+      if (encryptedEnvCount > 0) {
+        showNotice(
+          `Some environments could not be decrypted (${encryptedEnvCount}). Check macOS Keychain access.`,
+          9000,
+        );
+      }
       setAssetSettings(state.assetSettings ?? { autoApplyEnabled: true });
       setAgentShortcutIds(() => {
         const loaded = state.agentShortcutIds ?? null;
@@ -3177,8 +3200,8 @@ export default function App() {
       </aside>
 
       <main className="main">
-        <div className="topbar">
-          <div className="activeTitle">
+	        <div className="topbar">
+	          <div className="activeTitle">
             <span>{activeProject ? `Project: ${activeProject.title}` : "Project: —"}</span>
             <span>{active ? ` • ${active.name}` : " • No session"}</span>
             {activeIsSsh ? (
@@ -3191,6 +3214,12 @@ export default function App() {
             ) : null}
           </div>
 	          <div className="topbarRight">
+	            {persistenceDisabledReason && (
+	              <div className="errorBanner" role="alert">
+	                <div className="errorText">{persistenceDisabledReason}</div>
+	              </div>
+	            )}
+
 	            {error && (
 	              <div className="errorBanner" role="alert">
 	                <div className="errorText">{error}</div>

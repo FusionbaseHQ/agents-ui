@@ -29,6 +29,24 @@ pub fn is_encrypted_value(value: &str) -> bool {
     value.trim_start().starts_with(ENC_PREFIX)
 }
 
+/// Returns true only if the value both has the `enc:v1:` prefix and contains a plausibly-sized
+/// base64-encoded (nonce + ciphertext) blob.
+///
+/// This avoids triggering Keychain reads for plain text that happens to start with the prefix.
+pub fn is_probably_encrypted_value(value: &str) -> bool {
+    if !is_encrypted_value(value) {
+        return false;
+    }
+    let trimmed = value.trim_start();
+    let encoded = trimmed.strip_prefix(ENC_PREFIX).unwrap_or_default();
+    let decoded = match BASE64.decode(encoded) {
+        Ok(decoded) => decoded,
+        Err(_) => return false,
+    };
+    // Nonce (12 bytes) + Poly1305 tag (16 bytes) at minimum.
+    decoded.len() >= NONCE_LEN + 16
+}
+
 fn keychain_service(window: &WebviewWindow) -> String {
     let app = window.app_handle();
     let cfg = app.config();

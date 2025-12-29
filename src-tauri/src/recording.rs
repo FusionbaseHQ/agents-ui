@@ -132,7 +132,7 @@ pub fn load_recording(window: WebviewWindow, recording_id: String) -> Result<Loa
                 }
             }
             RecordingLineV1::Input(mut ev) => {
-                if crate::secure::is_encrypted_value(&ev.data) {
+                if crate::secure::is_probably_encrypted_value(&ev.data) {
                     if key.is_none() {
                         key = Some(crate::secure::get_or_create_master_key(&window)?);
                     }
