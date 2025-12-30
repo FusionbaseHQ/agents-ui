@@ -96,7 +96,7 @@ function makeId(): string {
 }
 
 function normalizeSmartQuotes(input: string): string {
-  return input.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+  return input.replace(/[“”„‟«»]/g, '"').replace(/[‘’‚‛‹›]/g, "'");
 }
 
 function parseGithubRepo(value: string | null | undefined): { owner: string; repo: string } | null {
@@ -3607,14 +3607,14 @@ export default function App() {
             projectTitle={activeProject?.title ?? null}
             name={newName}
             nameInputRef={newNameRef}
-            onChangeName={setNewName}
+            onChangeName={(value) => setNewName(normalizeSmartQuotes(value))}
             command={newCommand}
-            onChangeCommand={setNewCommand}
+            onChangeCommand={(value) => setNewCommand(normalizeSmartQuotes(value))}
             commandSuggestions={commandSuggestions}
             persistent={newPersistent}
             onChangePersistent={setNewPersistent}
             cwd={newCwd}
-            onChangeCwd={setNewCwd}
+            onChangeCwd={(value) => setNewCwd(normalizeSmartQuotes(value))}
             cwdPlaceholder={activeProject?.basePath ?? "~"}
             onBrowseCwd={() =>
               openPathPicker("session", newCwd.trim() || activeProject?.basePath || null)
@@ -3712,9 +3712,9 @@ export default function App() {
             mode={projectMode}
             title={projectTitle}
             titleInputRef={projectTitleRef}
-            onChangeTitle={setProjectTitle}
+            onChangeTitle={(value) => setProjectTitle(normalizeSmartQuotes(value))}
             basePath={projectBasePath}
-            onChangeBasePath={setProjectBasePath}
+            onChangeBasePath={(value) => setProjectBasePath(normalizeSmartQuotes(value))}
             basePathPlaceholder={homeDirRef.current ?? "~"}
             onBrowseBasePath={() =>
               openPathPicker("project", projectBasePath.trim() || activeProject?.basePath || null)
@@ -3958,7 +3958,10 @@ export default function App() {
                       ref={recordNameRef}
                       className="input"
                       value={recordPromptName}
-                      onChange={(e) => setRecordPromptName(e.target.value)}
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      onChange={(e) => setRecordPromptName(normalizeSmartQuotes(e.target.value))}
                       placeholder="e.g. Fix failing tests"
                     />
                     <div className="hint" style={{ marginTop: 0 }}>
@@ -4173,7 +4176,10 @@ export default function App() {
                       ref={promptTitleRef}
                       className="input"
                       value={promptEditorTitle}
-                      onChange={(e) => setPromptEditorTitle(e.target.value)}
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      onChange={(e) => setPromptEditorTitle(normalizeSmartQuotes(e.target.value))}
                       placeholder="e.g. Write a test plan"
                     />
                   </div>
@@ -4182,7 +4188,10 @@ export default function App() {
                     <textarea
                       className="textarea"
                       value={promptEditorContent}
-                      onChange={(e) => setPromptEditorContent(e.target.value)}
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      onChange={(e) => setPromptEditorContent(normalizeSmartQuotes(e.target.value))}
                       placeholder="Prompt text…"
                     />
                   </div>
@@ -4279,7 +4288,12 @@ export default function App() {
                       ref={envNameRef}
                       className="input"
                       value={environmentEditorName}
-                      onChange={(e) => setEnvironmentEditorName(e.target.value)}
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      onChange={(e) =>
+                        setEnvironmentEditorName(normalizeSmartQuotes(e.target.value))
+                      }
                       placeholder="e.g. staging"
                     />
                   </div>
@@ -4289,6 +4303,9 @@ export default function App() {
                       className="textarea"
                       value={environmentEditorContent}
                       disabled={environmentEditorLocked}
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      spellCheck={false}
                       onChange={(e) => setEnvironmentEditorContent(normalizeSmartQuotes(e.target.value))}
                       placeholder={
                         environmentEditorLocked
@@ -4353,7 +4370,10 @@ export default function App() {
                       ref={assetNameRef}
                       className="input"
                       value={assetEditorName}
-                      onChange={(e) => setAssetEditorName(e.target.value)}
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      onChange={(e) => setAssetEditorName(normalizeSmartQuotes(e.target.value))}
                       placeholder="e.g. AGENTS.md"
                     />
                   </div>
@@ -4362,7 +4382,10 @@ export default function App() {
                     <input
                       className="input"
                       value={assetEditorPath}
-                      onChange={(e) => setAssetEditorPath(e.target.value)}
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      onChange={(e) => setAssetEditorPath(normalizeSmartQuotes(e.target.value))}
                       placeholder="e.g. AGENTS.md or .github/ISSUE_TEMPLATE.md"
                     />
                     <div className="hint" style={{ marginTop: 0 }}>
@@ -4385,7 +4408,10 @@ export default function App() {
                     <textarea
                       className="textarea"
                       value={assetEditorContent}
-                      onChange={(e) => setAssetEditorContent(e.target.value)}
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      onChange={(e) => setAssetEditorContent(normalizeSmartQuotes(e.target.value))}
                       placeholder="File contents…"
                     />
                   </div>
