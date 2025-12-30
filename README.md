@@ -195,7 +195,7 @@ To simulate a first launch, run the app with `--clear-data` to remove the saved 
 
 ```bash
 # Pass args through to the app binary (note the `--`)
-npm run tauri dev -- --clear-data
+npm run tauri dev -- -- --clear-data
 
 # Or use the helper script
 npm run tauri:dev:clear
