@@ -6,6 +6,7 @@ mod persist;
 mod recording;
 mod secure;
 mod ssh;
+mod startup;
 mod tray;
 
 use app_info::get_app_info;
@@ -20,16 +21,21 @@ use persist::{list_directories, load_persisted_state, load_persisted_state_meta,
 use recording::{delete_recording, list_recordings, load_recording};
 use secure::{prepare_secure_storage, reset_secure_storage};
 use ssh::list_ssh_hosts;
+use startup::get_startup_flags;
 use tray::{build_status_tray, set_tray_agent_count};
 use tauri::Manager;
 
 fn main() {
+    startup::init_startup_flags();
     tauri::Builder::default()
         .manage(AppState::default())
         .plugin(tauri_plugin_shell::init())
         .menu(|app| build_app_menu(app))
         .on_menu_event(|app, event| handle_app_menu_event(app, event))
         .setup(|app| {
+            if let Err(e) = startup::clear_app_data_if_requested(&app.handle()) {
+                eprintln!("Failed to clear app data: {e}");
+            }
             let tray = build_status_tray(&app.handle()).unwrap_or_else(|e| {
                 eprintln!("Failed to create tray icon: {e}");
                 tray::StatusTrayState::disabled()
@@ -48,6 +54,7 @@ fn main() {
             kill_persistent_session,
             start_session_recording,
             stop_session_recording,
+            get_startup_flags,
             load_persisted_state,
             load_persisted_state_meta,
             save_persisted_state,

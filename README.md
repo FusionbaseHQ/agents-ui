@@ -189,6 +189,18 @@ npm run tauri dev
 
 This starts the Vite dev server and Tauri development window with hot reload.
 
+### Fresh Start (Clear Local Data)
+
+To simulate a first launch, run the app with `--clear-data` to remove the saved state + recordings:
+
+```bash
+# Pass args through to the app binary (note the `--`)
+npm run tauri dev -- --clear-data
+
+# Or use the helper script
+npm run tauri:dev:clear
+```
+
 ### Bundled Tools (macOS)
 
 Agents UI bundles `nu` (Nushell) and `zellij` as Tauri sidecars under `src-tauri/bin` so the app runs without system dependencies.

@@ -7,7 +7,8 @@
     "dev": "vite --port 1420 --strictPort",
     "build": "tsc -b && vite build",
     "preview": "vite preview --port 1420 --strictPort",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:dev:clear": "tauri dev -- --clear-data"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

@@ -73,6 +73,7 @@ type PtyOutput = { id: string; data: string };
 type PtyExit = { id: string; exit_code?: number | null };
 type AppInfo = { name: string; version: string; homepage?: string | null };
 type AppMenuEventPayload = { id: string };
+type StartupFlags = { clearData: boolean };
 
 // Buffer for data that arrives before terminal is ready
 export type PendingDataBuffer = Map<string, string[]>;
@@ -2723,6 +2724,19 @@ export default function App() {
       } catch {
         resolvedHome = null;
         homeDirRef.current = null;
+      }
+
+      const startupFlags = await invoke<StartupFlags>("get_startup_flags").catch(() => null);
+      if (startupFlags?.clearData) {
+        try {
+          localStorage.removeItem(STORAGE_PROJECTS_KEY);
+          localStorage.removeItem(STORAGE_ACTIVE_PROJECT_KEY);
+          localStorage.removeItem(STORAGE_SESSIONS_KEY);
+          localStorage.removeItem(STORAGE_ACTIVE_SESSION_BY_PROJECT_KEY);
+        } catch {
+          // Best-effort: localStorage may be unavailable in some contexts.
+        }
+        showNotice("Cleared saved app data for a fresh start.", 8000);
       }
 
       const stateMeta = await invoke<PersistedStateMetaV1 | null>("load_persisted_state_meta").catch(
