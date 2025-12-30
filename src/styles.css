@@ -715,42 +715,48 @@ body {
 .errorBanner {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   border: 1px solid rgba(255, 80, 80, 0.35);
   background: rgba(255, 80, 80, 0.08);
-  padding: 6px 8px;
+  padding: 8px 10px;
   border-radius: 12px;
   min-width: 0;
-  max-width: 60%;
+  max-width: min(720px, 70vw);
 }
 
 .noticeBanner {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   border: 1px solid rgba(122, 162, 247, 0.35);
   background: rgba(122, 162, 247, 0.12);
-  padding: 6px 8px;
+  padding: 8px 10px;
   border-radius: 12px;
   min-width: 0;
-  max-width: 60%;
+  max-width: min(720px, 70vw);
 }
 
 .errorText {
-  font-size: 12px;
+  font-size: 13px;
   color: rgba(255, 255, 255, 0.9);
-  white-space: nowrap;
+  line-height: 1.35;
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
   min-width: 0;
 }
 
 .noticeText {
-  font-size: 12px;
+  font-size: 13px;
   color: rgba(255, 255, 255, 0.9);
-  white-space: nowrap;
+  line-height: 1.35;
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
   min-width: 0;
 }
 

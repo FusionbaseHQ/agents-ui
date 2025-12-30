@@ -3504,7 +3504,9 @@ export default function App() {
 
 	            {error && (
 	              <div className="errorBanner" role="alert">
-	                <div className="errorText">{error}</div>
+	                <div className="errorText" title={error}>
+	                  {error}
+	                </div>
 	                <button className="errorClose" onClick={() => setError(null)} title="Dismiss">
 	                  ×
 	                </button>
