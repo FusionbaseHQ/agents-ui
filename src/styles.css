@@ -355,6 +355,24 @@ body {
   background: rgba(122, 162, 247, 0.09);
 }
 
+.sessionItemActive.sessionItemSsh {
+  border-color: rgba(42, 195, 222, 0.55);
+  background: rgba(42, 195, 222, 0.085);
+}
+
+.sessionItemActive.sessionItemPersistent {
+  border-color: rgba(192, 132, 252, 0.55);
+  background: rgba(192, 132, 252, 0.085);
+}
+
+.sessionItemActive.sessionItemSsh .dotActive {
+  background: rgba(42, 195, 222, 0.95);
+}
+
+.sessionItemActive.sessionItemPersistent .dotActive {
+  background: rgba(192, 132, 252, 0.95);
+}
+
 .sessionItemExited {
   opacity: 0.75;
 }
