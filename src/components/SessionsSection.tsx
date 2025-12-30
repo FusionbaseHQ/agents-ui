@@ -190,17 +190,22 @@ export function SessionsSection({
               (s.restoreCommand?.trim() ? s.restoreCommand.trim() : null) ??
               null;
             const isSsh = isSshCommand(launchOrRestore);
-            const isPersistent = Boolean(s.persistent) && !isSsh;
-            const chipClass = effect ? `chip chip-${effect.id}` : isSsh ? "chip chip-ssh" : "chip";
-            const showSshChip = isSsh && (!chipLabel || chipLabel.toLowerCase() !== "ssh");
+            const isPersistent = Boolean(s.persistent);
+            const showSshStyle = isSsh && !isPersistent;
+            const chipClass = effect
+              ? `chip chip-${effect.id}`
+              : showSshStyle
+                ? "chip chip-ssh"
+                : "chip";
+            const showSshChip = showSshStyle && (!chipLabel || chipLabel.toLowerCase() !== "ssh");
             return (
               <div
                 key={s.id}
                 className={`sessionItem ${isActive ? "sessionItemActive" : ""} ${
                   isExited ? "sessionItemExited" : ""
-                } ${isClosing ? "sessionItemClosing" : ""} ${isSsh ? "sessionItemSsh" : ""} ${
-                  isPersistent ? "sessionItemPersistent" : ""
-                }`}
+                } ${isClosing ? "sessionItemClosing" : ""} ${
+                  showSshStyle ? "sessionItemSsh" : ""
+                } ${isPersistent ? "sessionItemPersistent" : ""}`}
                 title={isPersistent ? "Persistent (zellij)" : undefined}
                 onClick={() => onSelectSession(s.id)}
               >
