@@ -190,6 +190,7 @@ export function SessionsSection({
               (s.restoreCommand?.trim() ? s.restoreCommand.trim() : null) ??
               null;
             const isSsh = isSshCommand(launchOrRestore);
+            const isPersistent = Boolean(s.persistent) && !isSsh;
             const chipClass = effect ? `chip chip-${effect.id}` : isSsh ? "chip chip-ssh" : "chip";
             const showSshChip = isSsh && (!chipLabel || chipLabel.toLowerCase() !== "ssh");
             return (
@@ -197,7 +198,10 @@ export function SessionsSection({
                 key={s.id}
                 className={`sessionItem ${isActive ? "sessionItemActive" : ""} ${
                   isExited ? "sessionItemExited" : ""
-                } ${isClosing ? "sessionItemClosing" : ""} ${isSsh ? "sessionItemSsh" : ""}`}
+                } ${isClosing ? "sessionItemClosing" : ""} ${isSsh ? "sessionItemSsh" : ""} ${
+                  isPersistent ? "sessionItemPersistent" : ""
+                }`}
+                title={isPersistent ? "Persistent (zellij)" : undefined}
                 onClick={() => onSelectSession(s.id)}
               >
                 <div className={`dot ${isActive ? "dotActive" : ""}`} />
@@ -215,11 +219,6 @@ export function SessionsSection({
                     {showSshChip ? (
                       <span className="chip chip-ssh" title="SSH">
                         <span className="chipLabel">ssh</span>
-                      </span>
-                    ) : null}
-                    {s.persistent ? (
-                      <span className="chip" title="Persistent (zellij)">
-                        <span className="chipLabel">persist</span>
                       </span>
                     ) : null}
                     {chipLabel && !hasAgentIcon && (

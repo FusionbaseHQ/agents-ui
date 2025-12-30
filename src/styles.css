@@ -375,6 +375,18 @@ body {
   background: rgba(42, 195, 222, 0.4);
 }
 
+.sessionItemPersistent {
+  box-shadow: inset 2px 0 0 rgba(192, 132, 252, 0.35);
+}
+
+.sessionItemPersistent:hover {
+  border-color: rgba(192, 132, 252, 0.22);
+}
+
+.sessionItemPersistent .dot:not(.dotActive) {
+  background: rgba(192, 132, 252, 0.4);
+}
+
 .dot {
   width: 8px;
   height: 8px;
