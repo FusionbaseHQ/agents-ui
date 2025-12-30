@@ -320,7 +320,8 @@ body {
 .sessionLegend {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
+  justify-content: center;
+  gap: 18px;
   align-items: center;
   margin: 6px 2px 2px 2px;
   font-size: 10px;
@@ -336,22 +337,43 @@ body {
 }
 
 .sessionLegendSwatch {
-  width: 8px;
-  height: 8px;
+  width: 9px;
+  height: 9px;
   border-radius: 999px;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.18);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.22);
+}
+
+.sessionLegendItemDefault {
+  color: rgba(122, 162, 247, 0.75);
+}
+
+.sessionLegendItemSsh {
+  color: rgba(42, 195, 222, 0.78);
+}
+
+.sessionLegendItemPersistent {
+  color: rgba(192, 132, 252, 0.78);
 }
 
 .sessionLegendSwatchDefault {
   background: var(--accent);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.22),
+    0 0 0 3px rgba(122, 162, 247, 0.14);
 }
 
 .sessionLegendSwatchSsh {
   background: var(--accent-2);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.22),
+    0 0 0 3px rgba(42, 195, 222, 0.14);
 }
 
 .sessionLegendSwatchPersistent {
   background: var(--accent-3);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.22),
+    0 0 0 3px rgba(192, 132, 252, 0.14);
 }
 
 .empty {

@@ -173,18 +173,18 @@ export function SessionsSection({
       )}
 
       <div className="sessionLegend" aria-label="Session types">
-        <div className="sessionLegendItem">
+        <div className="sessionLegendItem sessionLegendItemDefault">
           <span
             className="sessionLegendSwatch sessionLegendSwatchDefault"
             aria-hidden="true"
           />
           <span>default</span>
         </div>
-        <div className="sessionLegendItem">
+        <div className="sessionLegendItem sessionLegendItemSsh">
           <span className="sessionLegendSwatch sessionLegendSwatchSsh" aria-hidden="true" />
           <span>ssh</span>
         </div>
-        <div className="sessionLegendItem">
+        <div className="sessionLegendItem sessionLegendItemPersistent">
           <span
             className="sessionLegendSwatch sessionLegendSwatchPersistent"
             aria-hidden="true"
