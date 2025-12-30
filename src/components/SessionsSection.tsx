@@ -172,6 +172,27 @@ export function SessionsSection({
         </div>
       )}
 
+      <div className="sessionLegend" aria-label="Session types">
+        <div className="sessionLegendItem">
+          <span
+            className="sessionLegendSwatch sessionLegendSwatchDefault"
+            aria-hidden="true"
+          />
+          <span>default</span>
+        </div>
+        <div className="sessionLegendItem">
+          <span className="sessionLegendSwatch sessionLegendSwatchSsh" aria-hidden="true" />
+          <span>ssh</span>
+        </div>
+        <div className="sessionLegendItem">
+          <span
+            className="sessionLegendSwatch sessionLegendSwatchPersistent"
+            aria-hidden="true"
+          />
+          <span>persistent (zellij)</span>
+        </div>
+      </div>
+
       <div className="sessionList">
         {sessions.length === 0 ? (
           <div className="empty">No sessions in this project.</div>
@@ -191,22 +212,27 @@ export function SessionsSection({
               null;
             const isSsh = isSshCommand(launchOrRestore);
             const isPersistent = Boolean(s.persistent);
-            const showSshStyle = isSsh && !isPersistent;
+            const isSshType = isSsh && !isPersistent;
+            const isDefaultType = !isPersistent && !isSshType;
             const chipClass = effect
               ? `chip chip-${effect.id}`
-              : showSshStyle
+              : isSshType
                 ? "chip chip-ssh"
                 : "chip";
-            const showSshChip = showSshStyle && (!chipLabel || chipLabel.toLowerCase() !== "ssh");
+            const showChipLabel =
+              Boolean(chipLabel) &&
+              !hasAgentIcon &&
+              !(isSshType && (chipLabel ?? "").trim().toLowerCase() === "ssh");
             return (
               <div
                 key={s.id}
                 className={`sessionItem ${isActive ? "sessionItemActive" : ""} ${
                   isExited ? "sessionItemExited" : ""
                 } ${isClosing ? "sessionItemClosing" : ""} ${
-                  showSshStyle ? "sessionItemSsh" : ""
-                } ${isPersistent ? "sessionItemPersistent" : ""}`}
-                title={isPersistent ? "Persistent (zellij)" : undefined}
+                  isSshType ? "sessionItemSsh" : ""
+                } ${isPersistent ? "sessionItemPersistent" : ""} ${
+                  isDefaultType ? "sessionItemDefault" : ""
+                }`}
                 onClick={() => onSelectSession(s.id)}
               >
                 <div className={`dot ${isActive ? "dotActive" : ""}`} />
@@ -221,12 +247,7 @@ export function SessionsSection({
                       </span>
                     )}
                     <span className="sessionNameText">{s.name}</span>
-                    {showSshChip ? (
-                      <span className="chip chip-ssh" title="SSH">
-                        <span className="chipLabel">ssh</span>
-                      </span>
-                    ) : null}
-                    {chipLabel && !hasAgentIcon && (
+                    {showChipLabel && chipLabel && (
                       <span className={chipClass} title={chipLabel}>
                         <span className="chipLabel">{chipLabel}</span>
                         {isWorking && <span className="chipActivity" aria-label="Working" />}
