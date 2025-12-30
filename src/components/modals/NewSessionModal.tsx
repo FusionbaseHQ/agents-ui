@@ -8,6 +8,7 @@ type NewSessionModalProps = {
   onChangeName: (value: string) => void;
   command: string;
   onChangeCommand: (value: string) => void;
+  commandSuggestions?: string[];
   persistent: boolean;
   onChangePersistent: (value: boolean) => void;
   cwd: string;
@@ -30,6 +31,7 @@ export function NewSessionModal({
   onChangeName,
   command,
   onChangeCommand,
+  commandSuggestions,
   persistent,
   onChangePersistent,
   cwd,
@@ -44,6 +46,7 @@ export function NewSessionModal({
   onSubmit,
 }: NewSessionModalProps) {
   if (!isOpen) return null;
+  const datalistId = "newSessionCommandSuggestions";
 
   return (
     <div className="modalBackdrop" onClick={onClose}>
@@ -66,8 +69,16 @@ export function NewSessionModal({
               className="input"
               value={command}
               onChange={(e) => onChangeCommand(e.target.value)}
+              list={commandSuggestions && commandSuggestions.length ? datalistId : undefined}
               placeholder="e.g. codex  (leave blank for a shell)"
             />
+            {commandSuggestions && commandSuggestions.length ? (
+              <datalist id={datalistId}>
+                {commandSuggestions.map((cmd) => (
+                  <option key={cmd} value={cmd} />
+                ))}
+              </datalist>
+            ) : null}
             <div className="hint">Uses your $SHELL by default; commands run as "$SHELL -lc".</div>
           </div>
           <div className="formRow">

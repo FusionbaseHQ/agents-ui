@@ -743,6 +743,31 @@ export default function App() {
     ];
   }, [agentShortcutIds]);
 
+  const commandSuggestions = useMemo(() => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const add = (raw: string | null | undefined) => {
+      const trimmed = (raw ?? "").trim();
+      if (!trimmed) return;
+      if (seen.has(trimmed)) return;
+      seen.add(trimmed);
+      out.push(trimmed);
+    };
+
+    sessions
+      .slice()
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .forEach((s) => {
+        add(s.launchCommand ?? null);
+        add((s.restoreCommand ?? null) as string | null);
+      });
+
+    for (const preset of quickStarts) add(preset.command ?? null);
+    for (const effect of PROCESS_EFFECTS) for (const cmd of effect.matchCommands) add(cmd);
+
+    return out.slice(0, 50);
+  }, [sessions, quickStarts]);
+
   const agentShortcuts = useMemo(() => {
     const seen = new Set<string>();
     return agentShortcutIds
@@ -3585,6 +3610,7 @@ export default function App() {
             onChangeName={setNewName}
             command={newCommand}
             onChangeCommand={setNewCommand}
+            commandSuggestions={commandSuggestions}
             persistent={newPersistent}
             onChangePersistent={setNewPersistent}
             cwd={newCwd}
