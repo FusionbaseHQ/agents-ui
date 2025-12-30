@@ -41,7 +41,7 @@ struct SessionRecording {
     last_flush: Instant,
     unflushed_bytes: usize,
     input_buffer: String,
-    enc_key: [u8; 32],
+    enc_key: Option<[u8; 32]>,
 }
 
 #[derive(Serialize, Clone)]
@@ -504,11 +504,14 @@ pub fn kill_persistent_session(window: WebviewWindow, persist_id: String) -> Res
 }
 
 fn write_recording_event(rec: &mut SessionRecording, t: u64, data: &str) -> Result<(), String> {
-    let data = crate::secure::encrypt_string_with_key(
-        &rec.enc_key,
-        crate::secure::SecretContext::Recording,
-        data,
-    )?;
+    let data = match rec.enc_key.as_ref() {
+        Some(key) => crate::secure::encrypt_string_with_key(
+            key,
+            crate::secure::SecretContext::Recording,
+            data,
+        )?,
+        None => data.to_string(),
+    };
     let line = crate::recording::RecordingLineV1::Input(crate::recording::RecordingEventV1 {
         t,
         data,
@@ -1323,6 +1326,7 @@ pub fn start_session_recording(
     id: String,
     recording_id: String,
     recording_name: Option<String>,
+    encrypt: Option<bool>,
     project_id: String,
     session_persist_id: String,
     cwd: Option<String>,
@@ -1330,7 +1334,12 @@ pub fn start_session_recording(
     bootstrap_command: Option<String>,
 ) -> Result<String, String> {
     let safe_id = crate::recording::sanitize_recording_id(&recording_id);
-    let enc_key = crate::secure::get_or_create_master_key(&window)?;
+    let encrypt_enabled = encrypt.unwrap_or(true);
+    let enc_key = if encrypt_enabled {
+        Some(crate::secure::get_or_create_master_key(&window)?)
+    } else {
+        None
+    };
 
     let mut sessions = state
         .inner
@@ -1374,6 +1383,7 @@ pub fn start_session_recording(
         cwd,
         effect_id,
         bootstrap_command,
+        encrypted: Some(encrypt_enabled),
     };
     let line = crate::recording::RecordingLineV1::Meta(meta);
     let json = serde_json::to_string(&line).map_err(|e| format!("serialize failed: {e}"))?;

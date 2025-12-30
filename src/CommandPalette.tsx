@@ -72,6 +72,7 @@ type CommandPaletteProps = {
   onNewPrompt: () => void;
   onStartRecording: () => void;
   onStopRecording: () => void;
+  onOpenSecureStorageSettings: () => void;
   isRecording: boolean;
   onOpenPromptsPanel: () => void;
   onOpenRecordingsPanel: () => void;
@@ -147,6 +148,7 @@ export function CommandPalette({
   onNewPrompt,
   onStartRecording,
   onStopRecording,
+  onOpenSecureStorageSettings,
   isRecording,
   onOpenPromptsPanel,
   onOpenRecordingsPanel,
@@ -287,6 +289,13 @@ export function CommandPalette({
       shortcut: "Shift+A",
     });
 
+    items.push({
+      id: "action-secure-storage",
+      type: "action",
+      title: "Secure Storage Settings",
+      icon: "settings",
+    });
+
     return items;
   }, [prompts, recordings, sessions, activeSessionId, isRecording, quickStarts]);
 
@@ -398,11 +407,14 @@ export function CommandPalette({
           case "action-open-assets":
             onOpenAssetsPanel();
             break;
+          case "action-secure-storage":
+            onOpenSecureStorageSettings();
+            break;
         }
         break;
       }
     }
-  }, [onClose, onSendPrompt, onOpenRecording, onSwitchSession, onNewSession, onOpenSshManager, onNewPrompt, onStartRecording, onStopRecording, onOpenPromptsPanel, onOpenRecordingsPanel, onOpenAssetsPanel, onQuickStart]);
+  }, [onClose, onSendPrompt, onOpenRecording, onSwitchSession, onNewSession, onOpenSshManager, onNewPrompt, onStartRecording, onStopRecording, onOpenSecureStorageSettings, onOpenPromptsPanel, onOpenRecordingsPanel, onOpenAssetsPanel, onQuickStart]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     e.stopPropagation();
@@ -451,6 +463,7 @@ export function CommandPalette({
       case "recording": return <Icon name="record" />;
       case "plus": return <Icon name="plus" />;
       case "panel": return <Icon name="panel" />;
+      case "settings": return <Icon name="settings" />;
       case "active": return "\u25CF";
       case "session": return "\u25CB";
       case "ssh": return <Icon name="ssh" />;

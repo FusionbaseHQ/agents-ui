@@ -15,6 +15,8 @@ pub struct RecordingMetaV1 {
     pub cwd: Option<String>,
     pub effect_id: Option<String>,
     pub bootstrap_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -107,7 +109,11 @@ fn read_recording_meta(path: &PathBuf) -> Result<Option<RecordingMetaV1>, String
 }
 
 #[tauri::command]
-pub fn load_recording(window: WebviewWindow, recording_id: String) -> Result<LoadedRecordingV1, String> {
+pub fn load_recording(
+    window: WebviewWindow,
+    recording_id: String,
+    decrypt: Option<bool>,
+) -> Result<LoadedRecordingV1, String> {
     let safe_id = sanitize_recording_id(&recording_id);
     let path = recording_file_path(&window, &safe_id)?;
     let file = fs::File::open(&path).map_err(|e| format!("open failed: {e}"))?;
@@ -116,6 +122,7 @@ pub fn load_recording(window: WebviewWindow, recording_id: String) -> Result<Loa
     let mut meta: Option<RecordingMetaV1> = None;
     let mut events: Vec<RecordingEventV1> = Vec::new();
     let mut key: Option<[u8; 32]> = None;
+    let decrypt_allowed = decrypt.unwrap_or(true);
 
     for line in reader.lines() {
         let line = line.map_err(|e| format!("read failed: {e}"))?;
@@ -133,6 +140,12 @@ pub fn load_recording(window: WebviewWindow, recording_id: String) -> Result<Loa
             }
             RecordingLineV1::Input(mut ev) => {
                 if crate::secure::is_probably_encrypted_value(&ev.data) {
+                    if !decrypt_allowed {
+                        return Err(
+                            "Recording is encrypted. Enable macOS Keychain encryption to replay it."
+                                .to_string(),
+                        );
+                    }
                     if key.is_none() {
                         key = Some(crate::secure::get_or_create_master_key(&window)?);
                     }

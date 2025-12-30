@@ -331,8 +331,11 @@ type PersistedSession = {
   createdAt: number;
 };
 
+type SecureStorageMode = "keychain" | "plaintext";
+
 type PersistedStateV1 = {
   schemaVersion: number;
+  secureStorageMode?: SecureStorageMode;
   projects: Project[];
   activeProjectId: string;
   sessions: PersistedSession[];
@@ -348,6 +351,7 @@ type PersistedStateMetaV1 = {
   schemaVersion: number;
   environmentCount: number;
   encryptedEnvironmentCount: number;
+  secureStorageMode?: SecureStorageMode;
 };
 
 type DirectoryEntry = { name: string; path: string };
@@ -401,6 +405,7 @@ type RecordingMeta = {
   cwd: string | null;
   effectId?: string | null;
   bootstrapCommand?: string | null;
+  encrypted?: boolean | null;
 };
 
 type RecordingEvent = { t: number; data: string };
@@ -638,6 +643,7 @@ export default function App() {
   const [environmentEditorId, setEnvironmentEditorId] = useState<string | null>(null);
   const [environmentEditorName, setEnvironmentEditorName] = useState("");
   const [environmentEditorContent, setEnvironmentEditorContent] = useState("");
+  const [environmentEditorLocked, setEnvironmentEditorLocked] = useState(false);
   const [assetEditorOpen, setAssetEditorOpen] = useState(false);
   const [assetEditorId, setAssetEditorId] = useState<string | null>(null);
   const [assetEditorName, setAssetEditorName] = useState("");
@@ -648,10 +654,17 @@ export default function App() {
   const [applyAssetApplying, setApplyAssetApplying] = useState(false);
   const [applyAssetError, setApplyAssetError] = useState<string | null>(null);
   const [persistenceDisabledReason, setPersistenceDisabledReason] = useState<string | null>(null);
+  const [secureStorageMode, setSecureStorageMode] = useState<SecureStorageMode | null>(null);
+  const [secureStorageSettingsOpen, setSecureStorageSettingsOpen] = useState(false);
+  const [secureStorageSettingsMode, setSecureStorageSettingsMode] =
+    useState<SecureStorageMode>("keychain");
+  const [secureStorageSettingsBusy, setSecureStorageSettingsBusy] = useState(false);
+  const [secureStorageSettingsError, setSecureStorageSettingsError] = useState<string | null>(null);
   const [secureStorageRetrying, setSecureStorageRetrying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
+  const secureStoragePromptedRef = useRef(false);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [updatesOpen, setUpdatesOpen] = useState(false);
   const [updateCheckState, setUpdateCheckState] = useState<UpdateCheckState>({ status: "idle" });
@@ -958,6 +971,7 @@ export default function App() {
 
     pendingSaveRef.current = {
       schemaVersion: 1,
+      secureStorageMode: secureStorageMode ?? undefined,
       projects,
       activeProjectId,
       sessions: persistedSessions,
@@ -976,14 +990,17 @@ export default function App() {
         void invoke("save_persisted_state", { state }).catch((err) => {
           const msg = formatError(err);
           const lower = msg.toLowerCase();
-          if (lower.includes("keychain") || lower.includes("keyring")) {
+          if (
+            secureStorageMode === "keychain" &&
+            (lower.includes("keychain") || lower.includes("keyring"))
+          ) {
             setPersistenceDisabledReason(`Secure storage is locked (changes won’t be saved): ${msg}`);
             return;
           }
           reportError("Failed to save state", err);
         });
       }, 400);
-  }, [projects, activeProjectId, activeSessionByProject, sessions, prompts, environments, assets, assetSettings, agentShortcutIds, hydrated, persistenceDisabledReason]);
+  }, [projects, activeProjectId, activeSessionByProject, sessions, prompts, environments, assets, assetSettings, agentShortcutIds, secureStorageMode, hydrated, persistenceDisabledReason]);
 
   const activeAgentCount = useMemo(() => {
     return sessions.filter(
@@ -1031,6 +1048,16 @@ export default function App() {
   }, [hydrated]);
 
   useEffect(() => {
+    if (!hydrated) return;
+    if (secureStoragePromptedRef.current) return;
+    if (secureStorageMode !== null) return;
+    secureStoragePromptedRef.current = true;
+    setSecureStorageSettingsError(null);
+    setSecureStorageSettingsMode("keychain");
+    setSecureStorageSettingsOpen(true);
+  }, [hydrated, secureStorageMode]);
+
+  useEffect(() => {
     const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
     const onKeyDown = (e: KeyboardEvent) => {
       const modalOpen =
@@ -1048,6 +1075,7 @@ export default function App() {
         replayOpen ||
         recordPromptOpen ||
         recordingsOpen ||
+        secureStorageSettingsOpen ||
         promptsOpen ||
         promptEditorOpen ||
         environmentsOpen ||
@@ -1104,6 +1132,10 @@ export default function App() {
         }
         if (agentShortcutsOpen) {
           setAgentShortcutsOpen(false);
+          return;
+        }
+        if (secureStorageSettingsOpen) {
+          closeSecureStorageSettings();
           return;
         }
           if (environmentEditorOpen) {
@@ -1392,6 +1424,105 @@ export default function App() {
       noticeTimerRef.current = null;
       setNotice(null);
     }, timeoutMs);
+  }
+
+  function openSecureStorageSettings() {
+    setSecureStorageSettingsError(null);
+    setSecureStorageSettingsMode(secureStorageMode ?? "keychain");
+    setSecureStorageSettingsOpen(true);
+  }
+
+  function closeSecureStorageSettings() {
+    if (secureStorageSettingsBusy) return;
+    setSecureStorageSettingsOpen(false);
+    setSecureStorageSettingsError(null);
+  }
+
+  async function applySecureStorageSettings() {
+    if (secureStorageSettingsBusy) return;
+    setSecureStorageSettingsError(null);
+
+    const nextMode = secureStorageSettingsMode;
+    if (nextMode === secureStorageMode) {
+      setSecureStorageSettingsOpen(false);
+      return;
+    }
+
+    const persistedSessions: PersistedSession[] = sessionsRef.current
+      .filter((s) => !s.closing)
+      .map((s) => ({
+        persistId: s.persistId,
+        projectId: s.projectId,
+        name: s.name,
+        launchCommand: s.launchCommand,
+        restoreCommand: s.restoreCommand ?? null,
+        lastRecordingId: s.lastRecordingId ?? null,
+        cwd: s.cwd,
+        persistent: s.persistent,
+        createdAt: s.createdAt,
+      }))
+      .sort((a, b) => a.createdAt - b.createdAt);
+
+    const state: PersistedStateV1 = {
+      schemaVersion: 1,
+      secureStorageMode: nextMode,
+      projects,
+      activeProjectId,
+      sessions: persistedSessions,
+      activeSessionByProject,
+      prompts,
+      environments,
+      assets,
+      assetSettings,
+      agentShortcutIds,
+    };
+
+    if (nextMode === "plaintext") {
+      setSecureStorageMode("plaintext");
+      setPersistenceDisabledReason(null);
+      try {
+        await invoke("save_persisted_state", { state });
+      } catch (err) {
+        reportError("Failed to save state", err);
+      }
+      setSecureStorageSettingsOpen(false);
+      showNotice(
+        "Secure storage disabled: environments + recordings will be stored unencrypted on disk.",
+        12000,
+      );
+      return;
+    }
+
+    setSecureStorageSettingsBusy(true);
+    showNotice(
+      "macOS Keychain access is needed to enable encryption. You may see 1–2 prompts; choose “Always Allow” to avoid future prompts.",
+      20000,
+    );
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+
+    try {
+      await invoke("reset_secure_storage");
+      await invoke("prepare_secure_storage");
+
+      await invoke("save_persisted_state", { state });
+      setSecureStorageMode("keychain");
+      setPersistenceDisabledReason(null);
+
+      const refreshed = await invoke<PersistedStateV1 | null>("load_persisted_state").catch(() => null);
+      if (refreshed?.schemaVersion === 1) {
+        setEnvironments(refreshed.environments ?? []);
+      }
+
+      setSecureStorageSettingsOpen(false);
+      showNotice(
+        "Secure storage enabled: environments + recording inputs are encrypted at rest (key stored in macOS Keychain).",
+        10000,
+      );
+    } catch (err) {
+      setSecureStorageSettingsError(formatError(err));
+    } finally {
+      setSecureStorageSettingsBusy(false);
+    }
   }
 
   async function retrySecureStorage() {
@@ -1711,6 +1842,7 @@ export default function App() {
         id: s.id,
         recordingId,
         recordingName: name,
+        encrypt: secureStorageMode === "keychain",
         projectId: s.projectId,
         sessionPersistId: s.persistId,
         cwd: s.cwd,
@@ -1772,6 +1904,7 @@ export default function App() {
     try {
       const rec = await invoke<LoadedRecording>("load_recording", {
         recordingId,
+        decrypt: secureStorageMode === "keychain",
       });
       setReplayRecording(rec);
       setReplaySteps(splitRecordingIntoSteps(rec.events));
@@ -1962,7 +2095,9 @@ export default function App() {
     setEnvironmentsOpen(false);
     setEnvironmentEditorId(env?.id ?? null);
     setEnvironmentEditorName(env?.name ?? "");
-    setEnvironmentEditorContent(env?.content ?? "");
+    const locked = Boolean((env?.content ?? "").trimStart().startsWith("enc:v1:"));
+    setEnvironmentEditorLocked(locked);
+    setEnvironmentEditorContent(locked ? "" : env?.content ?? "");
     setEnvironmentEditorOpen(true);
     window.setTimeout(() => envNameRef.current?.focus(), 0);
   }
@@ -1972,9 +2107,11 @@ export default function App() {
     setEnvironmentEditorId(null);
     setEnvironmentEditorName("");
     setEnvironmentEditorContent("");
+    setEnvironmentEditorLocked(false);
   }
 
   function saveEnvironmentFromEditor() {
+    if (environmentEditorLocked) return;
     const name = environmentEditorName.trim();
     if (!name) return;
     const content = environmentEditorContent;
@@ -2591,10 +2728,12 @@ export default function App() {
       const stateMeta = await invoke<PersistedStateMetaV1 | null>("load_persisted_state_meta").catch(
         () => null,
       );
+      const metaMode = stateMeta?.secureStorageMode ?? null;
       const needsSecureStorage = Boolean(
         stateMeta &&
           stateMeta.schemaVersion === 1 &&
-          (stateMeta.environmentCount > 0 || stateMeta.encryptedEnvironmentCount > 0),
+          metaMode === "keychain" &&
+          stateMeta.encryptedEnvironmentCount > 0,
       );
       if (needsSecureStorage) {
         showNotice(
@@ -2696,16 +2835,26 @@ export default function App() {
       setActiveProjectId(activeProjectId);
       activeProjectIdRef.current = activeProjectId;
       setActiveSessionByProject(activeSessionByProject);
+      const loadedSecureStorageMode =
+        (state as { secureStorageMode?: SecureStorageMode | null }).secureStorageMode ?? metaMode;
+      setSecureStorageMode(loadedSecureStorageMode ?? null);
       setPrompts(state.prompts ?? []);
       setEnvironments(state.environments ?? []);
       const encryptedEnvCount = (state.environments ?? []).filter((e) =>
         (e.content ?? "").trimStart().startsWith("enc:v1:"),
       ).length;
       if (encryptedEnvCount > 0) {
-        showNotice(
-          `Some environments could not be decrypted (${encryptedEnvCount}). Check macOS Keychain access.`,
-          9000,
-        );
+        if (loadedSecureStorageMode === "keychain") {
+          showNotice(
+            `Some environments could not be decrypted (${encryptedEnvCount}). Check macOS Keychain access.`,
+            9000,
+          );
+        } else {
+          showNotice(
+            `Some environments are encrypted (${encryptedEnvCount}). Enable macOS Keychain encryption to unlock them.`,
+            12000,
+          );
+        }
       }
       setAssetSettings(state.assetSettings ?? { autoApplyEnabled: true });
       setAgentShortcutIds(() => {
@@ -3291,15 +3440,26 @@ export default function App() {
 		                <div className="errorText" title={persistenceDisabledReason}>
 		                  {persistenceDisabledReason}
 		                </div>
-		                <button
-		                  type="button"
-		                  className="errorClose"
-		                  onClick={() => void retrySecureStorage()}
-		                  disabled={secureStorageRetrying}
-		                  title="Retry Keychain access"
-		                >
-		                  {secureStorageRetrying ? "Retrying…" : "Retry"}
-		                </button>
+		                {secureStorageMode === "keychain" &&
+		                /keychain|keyring/i.test(persistenceDisabledReason) ? (
+		                  <button
+		                    type="button"
+		                    className="errorClose"
+		                    onClick={() => void retrySecureStorage()}
+		                    disabled={secureStorageRetrying}
+		                    title="Retry Keychain access"
+		                  >
+		                    {secureStorageRetrying ? "Retrying…" : "Retry"}
+		                  </button>
+		                ) : (
+		                  <button
+		                    className="errorClose"
+		                    onClick={() => setPersistenceDisabledReason(null)}
+		                    title="Dismiss"
+		                  >
+		                    ×
+		                  </button>
+		                )}
 		              </div>
 		            )}
 
@@ -3658,6 +3818,87 @@ export default function App() {
             onOpenRelease={(url) => void openExternal(url)}
           />
 
+          {secureStorageSettingsOpen && (
+            <div
+              className="modalBackdrop modalBackdropTop"
+              onClick={() => {
+                if (secureStorageSettingsBusy) return;
+                closeSecureStorageSettings();
+              }}
+            >
+              <div className="modal" onClick={(e) => e.stopPropagation()}>
+                <h3 className="modalTitle">Secure storage</h3>
+
+                {secureStorageSettingsError && (
+                  <div className="pathPickerError" role="alert">
+                    {secureStorageSettingsError}
+                  </div>
+                )}
+
+                <div className="hint" style={{ marginTop: 0 }}>
+                  Agents UI stores environment configs and recording inputs on disk. Choose whether to encrypt them on this Mac.
+                </div>
+
+                <div className="formRow">
+                  <div className="label">Encryption</div>
+                  <label className="checkRow">
+                    <input
+                      type="radio"
+                      name="secureStorageMode"
+                      checked={secureStorageSettingsMode === "keychain"}
+                      onChange={() => setSecureStorageSettingsMode("keychain")}
+                      disabled={secureStorageSettingsBusy}
+                    />
+                    Encrypt with macOS Keychain (recommended)
+                  </label>
+                  <div className="hint" style={{ marginTop: 0 }}>
+                    Stores a master key in macOS Keychain; you may see 1–2 system prompts when enabling for the first time.
+                  </div>
+
+                  <label className="checkRow" style={{ marginTop: 10 }}>
+                    <input
+                      type="radio"
+                      name="secureStorageMode"
+                      checked={secureStorageSettingsMode === "plaintext"}
+                      onChange={() => setSecureStorageSettingsMode("plaintext")}
+                      disabled={secureStorageSettingsBusy}
+                    />
+                    Store unencrypted (no Keychain prompts)
+                  </label>
+                  <div className="hint" style={{ marginTop: 0 }}>
+                    Environments and recordings are stored in plaintext in the app data directory. Anyone with access to your account can read them.
+                  </div>
+                </div>
+
+                {secureStorageSettingsMode !== "keychain" &&
+                  environments.some((e) => (e.content ?? "").trimStart().startsWith("enc:v1:")) && (
+                    <div className="pathPickerError" role="alert">
+                      Some environments are currently encrypted and will remain locked until Keychain encryption is enabled.
+                    </div>
+                  )}
+
+                <div className="modalActions">
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={closeSecureStorageSettings}
+                    disabled={secureStorageSettingsBusy}
+                  >
+                    {secureStorageMode === null ? "Not now" : "Cancel"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => void applySecureStorageSettings()}
+                    disabled={secureStorageSettingsBusy}
+                  >
+                    {secureStorageSettingsBusy ? "Working…" : secureStorageMode === null ? "Continue" : "Apply"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
           {recordPromptOpen && (
             <div className="modalBackdrop" onClick={closeRecordPrompt}>
               <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -3681,7 +3922,10 @@ export default function App() {
                       placeholder="e.g. Fix failing tests"
                     />
                     <div className="hint" style={{ marginTop: 0 }}>
-                      Records only your input (may include secrets). Stored encrypted at rest (key in macOS Keychain).
+                      Records only your input (may include secrets).{" "}
+                      {secureStorageMode === "keychain"
+                        ? "Stored encrypted at rest (key in macOS Keychain)."
+                        : "Stored unencrypted on disk (secure storage disabled)."}
                     </div>
                   </div>
                   <div className="modalActions">
@@ -3929,8 +4173,8 @@ export default function App() {
                       .sort((a, b) => b.createdAt - a.createdAt)
                       .map((env) => {
                         const when = env.createdAt ? new Date(env.createdAt).toLocaleString() : null;
-                        const vars = parseEnvContentToVars(env.content);
-                        const count = Object.keys(vars).length;
+                        const locked = Boolean((env.content ?? "").trimStart().startsWith("enc:v1:"));
+                        const count = locked ? null : Object.keys(parseEnvContentToVars(env.content)).length;
                         return (
                           <div key={env.id} className="recordingItem">
                             <div className="recordingMain">
@@ -3938,7 +4182,7 @@ export default function App() {
                                 {env.name}
                               </div>
                               <div className="recordingMeta">
-                                {[when, `${count} vars`].filter(Boolean).join(" • ")}
+                                {[when, locked ? "Encrypted" : `${count} vars`].filter(Boolean).join(" • ")}
                               </div>
                             </div>
                             <div className="recordingActions">
@@ -4004,18 +4248,47 @@ export default function App() {
                     <textarea
                       className="textarea"
                       value={environmentEditorContent}
+                      disabled={environmentEditorLocked}
                       onChange={(e) => setEnvironmentEditorContent(normalizeSmartQuotes(e.target.value))}
-                      placeholder={"KEY=value\n# Comments supported"}
+                      placeholder={
+                        environmentEditorLocked
+                          ? "Encrypted environment (locked)"
+                          : "KEY=value\n# Comments supported"
+                      }
                     />
                     <div className="hint" style={{ marginTop: 0 }}>
-                      Parsed like an <code>.env</code> file. Applied to new sessions in a project. Stored encrypted at rest (key in macOS Keychain).
+                      {environmentEditorLocked ? (
+                        <>
+                          This environment is encrypted and locked. Enable macOS Keychain encryption to view/edit it.
+                          <div style={{ marginTop: 8 }}>
+                            <button
+                              type="button"
+                              className="btnSmall"
+                              onClick={openSecureStorageSettings}
+                            >
+                              Secure storage…
+                            </button>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          Parsed like an <code>.env</code> file. Applied to new sessions in a project.{" "}
+                          {secureStorageMode === "keychain"
+                            ? "Stored encrypted at rest (key in macOS Keychain)."
+                            : "Stored unencrypted on disk (secure storage disabled)."}
+                        </>
+                      )}
                     </div>
                   </div>
                   <div className="modalActions">
                     <button type="button" className="btn" onClick={closeEnvironmentEditor}>
                       Cancel
                     </button>
-                    <button type="submit" className="btn" disabled={!environmentEditorName.trim()}>
+                    <button
+                      type="submit"
+                      className="btn"
+                      disabled={environmentEditorLocked || !environmentEditorName.trim()}
+                    >
                       Save
                     </button>
                   </div>
@@ -4615,6 +4888,7 @@ export default function App() {
         onNewPrompt={() => openPromptEditor()}
         onStartRecording={() => activeId && openRecordPrompt(activeId)}
         onStopRecording={() => activeId && void stopRecording(activeId)}
+        onOpenSecureStorageSettings={openSecureStorageSettings}
         isRecording={Boolean(active?.recordingActive)}
         onOpenPromptsPanel={() => {
           setSlidePanelTab("prompts");

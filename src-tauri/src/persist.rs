@@ -7,6 +7,13 @@ use tauri::{Manager, WebviewWindow};
 
 use crate::secure::{decrypt_string_with_key, encrypt_string_with_key, get_or_create_master_key, SecretContext};
 
+#[derive(Serialize, Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum SecureStorageModeV1 {
+    Keychain,
+    Plaintext,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedProjectV1 {
@@ -70,6 +77,8 @@ pub struct PersistedAssetSettingsV1 {
 #[serde(rename_all = "camelCase")]
 pub struct PersistedStateV1 {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secure_storage_mode: Option<SecureStorageModeV1>,
     pub projects: Vec<PersistedProjectV1>,
     pub active_project_id: String,
     pub sessions: Vec<PersistedSessionV1>,
@@ -91,6 +100,8 @@ pub struct PersistedStateMetaV1 {
     pub schema_version: u32,
     pub environment_count: usize,
     pub encrypted_environment_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secure_storage_mode: Option<SecureStorageModeV1>,
 }
 
 fn state_file_path(window: &WebviewWindow) -> Result<PathBuf, String> {
@@ -127,6 +138,7 @@ pub fn load_persisted_state_meta(window: WebviewWindow) -> Result<Option<Persist
         schema_version: state.schema_version,
         environment_count,
         encrypted_environment_count,
+        secure_storage_mode: state.secure_storage_mode,
     }))
 }
 
@@ -168,10 +180,12 @@ pub fn load_persisted_state(window: WebviewWindow) -> Result<Option<PersistedSta
         return Ok(None);
     }
 
-    let needs_decrypt = state
-        .environments
-        .iter()
-        .any(|env| crate::secure::is_probably_encrypted_value(&env.content));
+    let decrypt_allowed = matches!(state.secure_storage_mode, Some(SecureStorageModeV1::Keychain));
+    let needs_decrypt = decrypt_allowed
+        && state
+            .environments
+            .iter()
+            .any(|env| crate::secure::is_probably_encrypted_value(&env.content));
     if needs_decrypt {
         let key = match get_or_create_master_key(&window) {
             Ok(key) => Some(key),
@@ -212,7 +226,8 @@ pub fn save_persisted_state(window: WebviewWindow, state: PersistedStateV1) -> R
 
     let tmp = path.with_extension("json.tmp");
     let mut state = state;
-    if !state.environments.is_empty() {
+    let encrypt_allowed = matches!(state.secure_storage_mode, Some(SecureStorageModeV1::Keychain));
+    if encrypt_allowed && !state.environments.is_empty() {
         let key = get_or_create_master_key(&window)?;
         for env in &mut state.environments {
             if crate::secure::is_probably_encrypted_value(&env.content) {

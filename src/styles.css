@@ -617,7 +617,8 @@ body {
 }
 
 .terminalHidden {
-  display: none;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .modalBackdrop {
@@ -777,6 +778,12 @@ body {
 }
 
 .checkRow input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+}
+
+.checkRow input[type="radio"] {
   width: 14px;
   height: 14px;
   accent-color: var(--accent);

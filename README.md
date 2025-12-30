@@ -277,7 +277,7 @@ export const PROCESS_EFFECTS: ProcessEffect[] = [
 
 Agents UI runs local shells and can execute commands with **your user permissions**. Treat agent output as untrusted, and avoid running commands you don’t understand.
 
-- **Encrypted at rest (macOS):** environment configs and recording inputs are stored encrypted in the app data directory; the master key is stored in **macOS Keychain**.
+- **Optional encryption at rest (macOS):** environment configs and recording inputs can be stored encrypted in the app data directory using a master key stored in **macOS Keychain**. You can also disable encryption (no Keychain prompts) and store data in plaintext.
 - **Recordings may include secrets:** recordings can capture what you typed. Use recording sparingly when handling credentials.
 - **SSH host list:** the SSH picker reads `~/.ssh/config` to list host aliases.
 - **No telemetry:** Agents UI doesn’t send session contents anywhere. The only built-in network call is the optional “Check for updates” request to GitHub (agents you run may of course use the network).
