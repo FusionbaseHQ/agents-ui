@@ -88,8 +88,8 @@ Add your screenshots here:
 
 ```bash
 # Clone the repository and enter it
-git clone <repo-url>
-cd <repo>
+git clone https://github.com/FusionbaseHQ/agents-ui.git
+cd agents-ui
 
 # Install dependencies
 npm install
@@ -182,7 +182,6 @@ Press `Cmd+K` / `Ctrl+K` to open the command palette. Search and access:
 ### Development Mode
 
 ```bash
-cd desktop
 npm install
 npm run tauri dev
 ```
@@ -206,8 +205,8 @@ npm run tauri:dev:clear
 Agents UI bundles `nu` (Nushell) and `zellij` as Tauri sidecars under `src-tauri/bin` so the app runs without system dependencies.
 
 ```bash
-./scripts/fetch-nu-macos.sh <nu-version>
-./scripts/fetch-zellij-macos.sh <zellij-version-or-latest>
+./scripts/fetch-nu-macos.sh 0.104.0
+./scripts/fetch-zellij-macos.sh latest
 ```
 
 ### Production Build
@@ -316,7 +315,7 @@ Yes! Agents UI works as a regular terminal multiplexer. Create sessions with a b
 <summary><strong>Where is my data stored?</strong></summary>
 
 All data is stored locally on your machine via Tauri's app data directory:
-- **macOS:** `~/Library/Application Support/<bundle-id>/`
+- **macOS:** `~/Library/Application Support/` (under the app’s bundle identifier)
 
 Data includes projects, sessions, prompts, recordings, and settings.
 </details>
@@ -346,11 +345,12 @@ The app uses a dark theme by default. Custom theming is planned for future relea
 
 ## Contributing
 
-Contributions are welcome! Here's how you can help:
+Contributions are welcome!
 
-1. **Report bugs** - Open an issue describing the problem
-2. **Suggest features** - Open an issue with your idea
-3. **Submit PRs** - Fork the repo and submit a pull request
+- Start here: `CONTRIBUTING.md`
+- Community standards: `CODE_OF_CONDUCT.md`
+- Security reports: `SECURITY.md`
+- Getting help: `SUPPORT.md`
 
 ### Development Guidelines
 

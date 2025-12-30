@@ -11,6 +11,6 @@
     "core:webview:default",
     "core:webview:allow-webview-close",
     "core:window:default",
-    "shell:default"
+    "shell:allow-open"
   ]
 }
