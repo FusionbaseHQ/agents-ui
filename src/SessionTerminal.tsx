@@ -7,6 +7,35 @@ import { detectProcessEffect } from "./processEffects";
 
 export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon }>;
 
+async function copyToClipboard(text: string): Promise<boolean> {
+  const value = text ?? "";
+  if (!value) return false;
+
+  try {
+    await navigator.clipboard.writeText(value);
+    return true;
+  } catch {
+    // fall through
+  }
+
+  try {
+    const el = document.createElement("textarea");
+    el.value = value;
+    el.setAttribute("readonly", "true");
+    el.style.position = "fixed";
+    el.style.left = "-9999px";
+    el.style.top = "0";
+    document.body.appendChild(el);
+    el.focus();
+    el.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(el);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 export default function SessionTerminal(props: {
   id: string;
   active: boolean;
@@ -160,6 +189,14 @@ export default function SessionTerminal(props: {
       term.attachCustomKeyEventHandler((event) => {
         if (event.type !== "keydown") return true;
         const key = event.key;
+        const isCopy =
+          (event.metaKey || (event.ctrlKey && event.shiftKey)) &&
+          !event.altKey &&
+          key.toLowerCase() === "c";
+        if (isCopy && term.hasSelection()) {
+          void copyToClipboard(term.getSelection());
+          return false;
+        }
         const isPageUp = key === "PageUp";
         const isPageDown = key === "PageDown";
         const isHome = key === "Home";
@@ -213,6 +250,19 @@ export default function SessionTerminal(props: {
         ingestUserInputForCommandDetection(data);
       });
     } else {
+      term.attachCustomKeyEventHandler((event) => {
+        if (event.type !== "keydown") return true;
+        const key = event.key;
+        const isCopy =
+          (event.metaKey || (event.ctrlKey && event.shiftKey)) &&
+          !event.altKey &&
+          key.toLowerCase() === "c";
+        if (isCopy && term.hasSelection()) {
+          void copyToClipboard(term.getSelection());
+          return false;
+        }
+        return true;
+      });
       term.onData((data) => {
         void invoke("write_to_session", { id: props.id, data, source: "user" }).catch(() => {});
         if (data.includes("\r") || data.includes("\n")) {

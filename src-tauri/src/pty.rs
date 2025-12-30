@@ -814,6 +814,62 @@ fn ensure_nu_config(window: &WebviewWindow, env_keys: &[String]) -> Option<(Stri
     config.push_str("# Agents UI managed Nushell config\n\n");
     config.push_str("$env.config = ($env.config | upsert show_banner false)\n\n");
     config.push_str(
+        r#"# Completion UX (standalone)
+$env.config = ($env.config | upsert completions.algorithm "fuzzy")
+
+$env.config = ($env.config | upsert menus [
+  {
+    name: completion_menu
+    only_buffer_difference: false
+    marker: "| "
+    type: {
+      layout: columnar
+      columns: 4
+      col_width: 20
+      col_padding: 2
+    }
+    style: {
+      text: green
+      selected_text: green_reverse
+      description_text: yellow
+    }
+  }
+  {
+    name: history_menu
+    only_buffer_difference: true
+    marker: "? "
+    type: {
+      layout: list
+      page_size: 12
+    }
+    style: {
+      text: green
+      selected_text: green_reverse
+      description_text: yellow
+    }
+  }
+])
+
+$env.config = ($env.config | upsert keybindings [
+  {
+    name: completion_menu
+    modifier: none
+    keycode: tab
+    mode: [emacs vi_normal vi_insert]
+    event: { send: menu name: completion_menu }
+  }
+  {
+    name: history_menu
+    modifier: none
+    keycode: f7
+    mode: [emacs vi_normal vi_insert]
+    event: { send: menu name: history_menu }
+  }
+])
+
+"#,
+    );
+    config.push_str(
         r#"$env.config = ($env.config | upsert hooks.pre_execution [
   {||
     let cleaned = (commandline | str trim | str replace --all (char newline) " ")
