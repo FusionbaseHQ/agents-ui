@@ -53,6 +53,32 @@ export function SessionsSection({
   onOpenPersistentSessions,
   onOpenSshManager,
 }: SessionsSectionProps) {
+  const menuRef = React.useRef<HTMLDivElement | null>(null);
+  const [settingsOpen, setSettingsOpen] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!settingsOpen) return;
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!menuRef.current) return;
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (menuRef.current.contains(target)) return;
+      setSettingsOpen(false);
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSettingsOpen(false);
+    };
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [settingsOpen]);
+
   return (
     <>
       <div className="sidebarHeader">
@@ -67,33 +93,59 @@ export function SessionsSection({
           >
             <Icon name="plus" />
           </button>
-          <button
-            type="button"
-            className="btnSmall btnIcon"
-            onClick={onOpenPersistentSessions}
-            title="Persistent sessions"
-            aria-label="Persistent sessions"
-          >
-            <Icon name="layers" />
-          </button>
-          <button
-            type="button"
-            className="btnSmall btnIcon"
-            onClick={onOpenSshManager}
-            title="SSH connect"
-            aria-label="SSH connect"
-          >
-            <Icon name="ssh" />
-          </button>
-          <button
-            type="button"
-            className="btnSmall btnIcon"
-            onClick={onOpenAgentShortcuts}
-            title="Agent shortcuts"
-            aria-label="Agent shortcuts"
-          >
-            <Icon name="bolt" />
-          </button>
+          <div className="sidebarActionMenu" ref={menuRef}>
+            <button
+              type="button"
+              className={`btnSmall btnIcon ${settingsOpen ? "btnIconActive" : ""}`}
+              onClick={() => setSettingsOpen((prev) => !prev)}
+              title="Session settings"
+              aria-label="Session settings"
+              aria-haspopup="menu"
+              aria-expanded={settingsOpen}
+            >
+              <Icon name="settings" />
+            </button>
+            {settingsOpen && (
+              <div className="sidebarActionMenuDropdown" role="menu" aria-label="Session settings">
+                <button
+                  type="button"
+                  className="sidebarActionMenuItem"
+                  role="menuitem"
+                  onClick={() => {
+                    setSettingsOpen(false);
+                    onOpenPersistentSessions();
+                  }}
+                >
+                  <Icon name="layers" />
+                  <span>Persistent sessions</span>
+                </button>
+                <button
+                  type="button"
+                  className="sidebarActionMenuItem"
+                  role="menuitem"
+                  onClick={() => {
+                    setSettingsOpen(false);
+                    onOpenAgentShortcuts();
+                  }}
+                >
+                  <Icon name="bolt" />
+                  <span>Agent shortcuts</span>
+                </button>
+                <button
+                  type="button"
+                  className="sidebarActionMenuItem"
+                  role="menuitem"
+                  onClick={() => {
+                    setSettingsOpen(false);
+                    onOpenSshManager();
+                  }}
+                >
+                  <Icon name="ssh" />
+                  <span>SSH connect</span>
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
