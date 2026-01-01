@@ -19,7 +19,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License">
   <img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-0.1.0-green.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.1.1-green.svg" alt="Version">
   <img src="https://img.shields.io/badge/tauri-v2-orange.svg" alt="Tauri">
 </p>
 

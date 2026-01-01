@@ -8,6 +8,11 @@ This project aims to follow Semantic Versioning.
 
 - No unreleased changes yet.
 
+## 0.1.1
+
+- Harmonize project creation button with sessions (+).
+- Import login shell PATH for bundled Nushell sessions on macOS.
+
 ## 0.1.0
 
 - Initial open source release.
