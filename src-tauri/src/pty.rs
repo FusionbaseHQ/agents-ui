@@ -14,10 +14,20 @@ const AGENTS_UI_ZELLIJ_PREFIX: &str = "agents-ui-";
 #[cfg(target_family = "unix")]
 const AGENTS_UI_ZELLIJ_LEGACY_SOCKET_BASE: &str = "/tmp/agents-ui-zellij";
 
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct LoginPathCache {
+    initialized: bool,
+    shell: Option<String>,
+    path: Option<String>,
+}
+
 #[derive(Default)]
 struct AppStateInner {
     next_id: AtomicU64,
     sessions: Mutex<HashMap<String, PtySession>>,
+    #[cfg(target_os = "macos")]
+    login_path_cache: Mutex<LoginPathCache>,
 }
 
 #[derive(Clone, Default)]
@@ -133,6 +143,39 @@ fn capture_original_env(cmd: &mut CommandBuilder, name: &str, present_key: &str,
             cmd.env(value_key, "");
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn login_shell_path(shell: &str, base_path: &str) -> Option<String> {
+    let shell_name = Path::new(shell)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if !shell_name.contains("zsh") && !shell_name.contains("bash") {
+        return None;
+    }
+
+    const START: &str = "__AGENTS_UI_PATH_START__";
+    const END: &str = "__AGENTS_UI_PATH_END__";
+    let script = format!("printf '{START}%s{END}' \"$PATH\"");
+
+    let out = Command::new(shell)
+        .args(["-i", "-l", "-c", script.as_str()])
+        .env("PATH", base_path)
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let start = stdout.find(START)?;
+    let rest = &stdout[start + START.len()..];
+    let end = rest.find(END)?;
+    let path = rest[..end].trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(path.to_string())
 }
 
 #[cfg(target_family = "unix")]
@@ -1181,26 +1224,65 @@ pub fn create_session(
 
     #[cfg(target_os = "macos")]
     {
-        let mut path_entries: Vec<String> = std::env::var("PATH")
-            .unwrap_or_default()
-            .split(':')
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.to_string())
-            .collect();
+        if cmd.get_env("PATH").is_none() {
+            let mut fallback_entries: Vec<String> = std::env::var("PATH")
+                .unwrap_or_default()
+                .split(':')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string())
+                .collect();
 
-        for candidate in [
-            "/opt/homebrew/bin",
-            "/opt/homebrew/sbin",
-            "/usr/local/bin",
-            "/usr/local/sbin",
-        ] {
-            if Path::new(candidate).is_dir() && !path_entries.iter().any(|p| p == candidate) {
-                path_entries.insert(0, candidate.to_string());
+            for candidate in [
+                "/opt/homebrew/bin",
+                "/opt/homebrew/sbin",
+                "/usr/local/bin",
+                "/usr/local/sbin",
+            ] {
+                if Path::new(candidate).is_dir() && !fallback_entries.iter().any(|p| p == candidate) {
+                    fallback_entries.insert(0, candidate.to_string());
+                }
             }
-        }
 
-        if !path_entries.is_empty() {
-            cmd.env("PATH", path_entries.join(":"));
+            let fallback_path = fallback_entries.join(":");
+            let imported_path = if use_nu {
+                if let Ok(mut cache) = state.inner.login_path_cache.lock() {
+                    if cache.initialized && cache.shell.as_deref() == Some(shell.as_str()) {
+                        cache.path.clone()
+                    } else {
+                        let computed = login_shell_path(&shell, &fallback_path);
+                        cache.initialized = true;
+                        cache.shell = Some(shell.clone());
+                        cache.path = computed.clone();
+                        computed
+                    }
+                } else {
+                    login_shell_path(&shell, &fallback_path)
+                }
+            } else {
+                None
+            };
+
+            let base_path = imported_path.unwrap_or(fallback_path);
+            let mut path_entries: Vec<String> = base_path
+                .split(':')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string())
+                .collect();
+
+            for candidate in [
+                "/opt/homebrew/bin",
+                "/opt/homebrew/sbin",
+                "/usr/local/bin",
+                "/usr/local/sbin",
+            ] {
+                if Path::new(candidate).is_dir() && !path_entries.iter().any(|p| p == candidate) {
+                    path_entries.insert(0, candidate.to_string());
+                }
+            }
+
+            if !path_entries.is_empty() {
+                cmd.env("PATH", path_entries.join(":"));
+            }
         }
     }
 

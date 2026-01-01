@@ -45,8 +45,14 @@ export function ProjectsSection({
       <div className="sidebarHeader">
         <div className="title">Projects</div>
         <div className="sidebarHeaderActions">
-          <button type="button" className="btn" onClick={onNewProject}>
-            New
+          <button
+            type="button"
+            className="btnSmall btnIcon"
+            onClick={onNewProject}
+            title="New project"
+            aria-label="New project"
+          >
+            <Icon name="plus" />
           </button>
           <button
             type="button"
