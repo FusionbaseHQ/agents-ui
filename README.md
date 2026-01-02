@@ -27,6 +27,10 @@
 
 Agents UI is a native desktop application for managing multiple AI coding agent sessions alongside regular shell terminals. Run Claude, Codex, Gemini, and shell sessions in a unified interface with real embedded terminals, session recording, and project organization.
 
+## Demo
+
+[Watch the demo video](docs/agents-ui-demo-video.mp4)
+
 <!--
 ## Screenshots
 
