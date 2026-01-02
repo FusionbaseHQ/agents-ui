@@ -29,7 +29,7 @@ Agents UI is a native desktop application for managing multiple AI coding agent 
 
 ## Demo
 
-[Watch the demo video](docs/agents-ui-demo-video.mp4)
+[![Agents UI demo](docs/agents-ui-demo-video.gif)](docs/agents-ui-demo-video.mp4)
 
 <!--
 ## Screenshots
