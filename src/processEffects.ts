@@ -1,6 +1,6 @@
-import claudeIcon from "./assets/claude-code-icon.png";
-import codexIcon from "./assets/openai-codex-icon.png";
-import geminiIcon from "./assets/gemini-logo.png";
+const claudeIcon = "/agent-icons/claude-code-icon.png";
+const codexIcon = "/agent-icons/openai-codex-icon.png";
+const geminiIcon = "/agent-icons/gemini-logo.png";
 
 export type ProcessEffect = {
   id: string;
