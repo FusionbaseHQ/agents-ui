@@ -145,6 +145,29 @@ fn capture_original_env(cmd: &mut CommandBuilder, name: &str, present_key: &str,
     }
 }
 
+#[cfg(target_family = "unix")]
+fn default_user_shell() -> String {
+    if let Ok(shell) = std::env::var("SHELL") {
+        let trimmed = shell.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return "/bin/zsh".to_string();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if Path::new("/bin/bash").is_file() {
+            return "/bin/bash".to_string();
+        }
+        return "/bin/sh".to_string();
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn login_shell_path(shell: &str, base_path: &str) -> Option<String> {
     let shell_name = Path::new(shell)
@@ -1005,7 +1028,7 @@ pub fn create_session(
     persist_id: Option<String>,
 ) -> Result<SessionInfo, String> {
     #[cfg(target_family = "unix")]
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let shell = default_user_shell();
     #[cfg(not(target_family = "unix"))]
     let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
 
@@ -1177,6 +1200,10 @@ pub fn create_session(
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     #[cfg(target_family = "unix")]
+    if cmd.get_env("SHELL").is_none() {
+        cmd.env("SHELL", shell.clone());
+    }
+    #[cfg(target_family = "unix")]
     if persistent {
         if let Some((zellij_home, zellij_socket_dir)) = persistent_zellij_env.as_ref() {
             cmd.env("HOME", zellij_home.clone());
@@ -1232,6 +1259,14 @@ pub fn create_session(
                 .map(|s| s.to_string())
                 .collect();
 
+            if let Ok(home) = std::env::var("HOME") {
+                for candidate in [format!("{home}/.cargo/bin"), format!("{home}/.local/bin"), format!("{home}/bin")] {
+                    if Path::new(&candidate).is_dir() && !fallback_entries.iter().any(|p| p == &candidate) {
+                        fallback_entries.insert(0, candidate);
+                    }
+                }
+            }
+
             for candidate in [
                 "/opt/homebrew/bin",
                 "/opt/homebrew/sbin",
@@ -1240,6 +1275,12 @@ pub fn create_session(
             ] {
                 if Path::new(candidate).is_dir() && !fallback_entries.iter().any(|p| p == candidate) {
                     fallback_entries.insert(0, candidate.to_string());
+                }
+            }
+
+            for candidate in ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+                if Path::new(candidate).is_dir() && !fallback_entries.iter().any(|p| p == candidate) {
+                    fallback_entries.push(candidate.to_string());
                 }
             }
 
@@ -1262,22 +1303,21 @@ pub fn create_session(
                 None
             };
 
-            let base_path = imported_path.unwrap_or(fallback_path);
-            let mut path_entries: Vec<String> = base_path
-                .split(':')
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| s.to_string())
-                .collect();
-
-            for candidate in [
-                "/opt/homebrew/bin",
-                "/opt/homebrew/sbin",
-                "/usr/local/bin",
-                "/usr/local/sbin",
-            ] {
-                if Path::new(candidate).is_dir() && !path_entries.iter().any(|p| p == candidate) {
-                    path_entries.insert(0, candidate.to_string());
+            let mut path_entries: Vec<String> = Vec::new();
+            let mut push_unique = |value: &str| {
+                if !value.trim().is_empty() && !path_entries.iter().any(|p| p == value) {
+                    path_entries.push(value.to_string());
                 }
+            };
+
+            if let Some(ref imported) = imported_path {
+                for entry in imported.split(':') {
+                    push_unique(entry);
+                }
+            }
+
+            for entry in &fallback_entries {
+                push_unique(entry);
             }
 
             if !path_entries.is_empty() {

@@ -1,6 +1,7 @@
 mod app_menu;
 mod app_info;
 mod assets;
+mod file_manager;
 mod pty;
 mod persist;
 mod recording;
@@ -12,6 +13,7 @@ mod tray;
 use app_info::get_app_info;
 use assets::apply_text_assets;
 use app_menu::{build_app_menu, handle_app_menu_event};
+use file_manager::open_path_in_file_manager;
 use pty::{
     close_session, create_session, detach_session, kill_persistent_session, list_persistent_sessions,
     list_sessions, resize_session, start_session_recording, stop_session_recording, write_to_session,
@@ -68,6 +70,7 @@ fn main() {
             list_ssh_hosts,
             apply_text_assets,
             set_tray_agent_count,
+            open_path_in_file_manager,
             get_app_info
         ])
         .run(tauri::generate_context!())

@@ -3373,13 +3373,20 @@ export default function App() {
       const createdRaw = await createSession({
         projectId: activeProjectId,
         name: preset.title,
-        launchCommand: preset.command,
+        launchCommand: null,
         cwd,
         envVars: envVarsForProjectId(activeProjectId, projects, environments),
       });
       const s = applyPendingExit(createdRaw);
       setSessions((prev) => [...prev, s]);
       setActiveId(s.id);
+
+      const commandLine = (preset.command ?? "").trim();
+      if (commandLine) {
+        void invoke("write_to_session", { id: s.id, data: `${commandLine}\r`, source: "ui" }).catch((err) =>
+          reportError(`Failed to start ${preset.title}`, err),
+        );
+      }
     } catch (err) {
       reportError(`Failed to start ${preset.title}`, err);
     }
@@ -3540,6 +3547,27 @@ export default function App() {
 
             {active && (
               <>
+                <button
+                  className="iconBtn"
+                  onClick={() => {
+                    const cwd = active.cwd?.trim() ?? "";
+                    if (!cwd || activeIsSsh) return;
+                    void invoke("open_path_in_file_manager", { path: cwd }).catch((err) =>
+                      reportError("Failed to open folder in Finder", err),
+                    );
+                  }}
+                  disabled={activeIsSsh || !active.cwd}
+                  title={
+                    activeIsSsh
+                      ? "Not available for SSH sessions"
+                      : active.cwd
+                        ? `Open in Finder: ${active.cwd}`
+                        : "Waiting for current folder…"
+                  }
+                >
+                  <Icon name="folder" />
+                </button>
+
                 {/* Record Button */}
                 <button
                   className={`iconBtn ${active.recordingActive ? "iconBtnRecording" : ""}`}
