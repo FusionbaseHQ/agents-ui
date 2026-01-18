@@ -3,6 +3,7 @@ import React from "react";
 export type IconName =
   | "plus"
   | "trash"
+  | "code"
   | "folder"
   | "settings"
   | "bolt"
@@ -51,6 +52,14 @@ export function Icon({ name, size = 16, className }: IconProps) {
           <path d="M14 11v7" />
           <path d="M6 7l1 14h10l1-14" />
           <path d="M9 7V4h6v3" />
+        </svg>
+      );
+    case "code":
+      return (
+        <svg {...common}>
+          <path d="M8 9l-3 3 3 3" />
+          <path d="M16 9l3 3-3 3" />
+          <path d="M14 7l-4 10" />
         </svg>
       );
     case "folder":

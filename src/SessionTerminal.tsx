@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import React, { useEffect, useRef } from "react";
-import { Terminal } from "xterm";
+import { Terminal, type ILink } from "xterm";
 import { FitAddon } from "xterm-addon-fit";
 import type { PendingDataBuffer } from "./App";
 import { detectProcessEffect } from "./processEffects";
@@ -40,6 +40,7 @@ export default function SessionTerminal(props: {
   id: string;
   active: boolean;
   readOnly: boolean;
+  cwd: string | null;
   persistent?: boolean;
   onCwdChange?: (id: string, cwd: string) => void;
   onCommandChange?: (id: string, commandLine: string) => void;
@@ -52,11 +53,16 @@ export default function SessionTerminal(props: {
   const fitRef = useRef<FitAddon | null>(null);
   const resizeRafRef = useRef<number | null>(null);
   const lastSizeRef = useRef<{ cols: number; rows: number } | null>(null);
+  const cwdRef = useRef<string | null>(props.cwd ?? null);
   const zellijAutoScrollRef = useRef<{
     active: boolean;
     wheelRemainder: number;
   }>({ active: false, wheelRemainder: 0 });
   const commandBufferRef = useRef<string>("");
+
+  useEffect(() => {
+    cwdRef.current = props.cwd ?? null;
+  }, [props.cwd]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -296,6 +302,118 @@ export default function SessionTerminal(props: {
         return rawPath;
       }
     };
+
+    const parseFileLink = (
+      raw: string,
+    ): { target: string; line: number | null; column: number | null } | null => {
+      const trimmed = raw.trim();
+      if (!trimmed) return null;
+
+      let target = trimmed;
+      const fromFileUrl = parseFileUrlPath(target);
+      if (fromFileUrl) target = fromFileUrl;
+
+      let line: number | null = null;
+      let column: number | null = null;
+      const m = target.match(/:(\d+)(?::(\d+))?$/);
+      if (m) {
+        line = Number.parseInt(m[1], 10);
+        column = m[2] ? Number.parseInt(m[2], 10) : null;
+        target = target.slice(0, -m[0].length);
+      }
+
+      target = target.trim();
+      if (!target) return null;
+      return { target, line, column };
+    };
+
+    const isPlausibleFilePath = (raw: string): boolean => {
+      const value = raw.trim();
+      if (!value) return false;
+      if (value.startsWith("file://")) return true;
+      if (value.startsWith("http://") || value.startsWith("https://")) return false;
+      if (/[^\w@.~%+\-/:\\]/.test(value)) return false;
+
+      const hasLineSuffix = /:\d+(?::\d+)?$/.test(value);
+      if (hasLineSuffix) return true;
+
+      const lastSep = Math.max(value.lastIndexOf("/"), value.lastIndexOf("\\"));
+      const lastSegment = lastSep >= 0 ? value.slice(lastSep + 1) : value;
+      return lastSegment.includes(".");
+    };
+
+    const trimToken = (raw: string): { text: string; startOffset: number } | null => {
+      let text = raw;
+      let startOffset = 0;
+      while (text.length > 0 && /[([{<"'`]/.test(text[0])) {
+        text = text.slice(1);
+        startOffset += 1;
+      }
+      while (text.length > 0 && /[)\]}>.,;'"!?`]/.test(text[text.length - 1])) {
+        text = text.slice(0, -1);
+      }
+      if (!text.trim()) return null;
+      return { text, startOffset };
+    };
+
+    const candidateRe = /(?:file:\/\/\S+|[^\s"'`<>]+[\\/][^\s"'`<>]+)/g;
+    oscDisposables.push(
+      term.registerLinkProvider({
+        provideLinks: (bufferLineNumber, callback) => {
+          const line = term.buffer.active.getLine(bufferLineNumber - 1);
+          if (!line) {
+            callback(undefined);
+            return;
+          }
+
+          const contents = line.translateToString(true);
+          if (!contents) {
+            callback(undefined);
+            return;
+          }
+
+          const links: ILink[] = [];
+
+          candidateRe.lastIndex = 0;
+          let match: RegExpExecArray | null = null;
+          while ((match = candidateRe.exec(contents)) !== null) {
+            const idx = match.index;
+            const trimmed = trimToken(match[0]);
+            if (!trimmed) continue;
+
+            const token = trimmed.text;
+            if (!isPlausibleFilePath(token)) continue;
+
+            const parsed = parseFileLink(token);
+            if (!parsed) continue;
+
+            const startX = idx + trimmed.startOffset + 1;
+            const endX = idx + trimmed.startOffset + token.length;
+
+            links.push({
+              range: {
+                start: { x: startX, y: bufferLineNumber },
+                end: { x: endX, y: bufferLineNumber },
+              },
+              text: token,
+              decorations: { pointerCursor: true, underline: true },
+              activate: (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                void invoke("open_in_vscode", {
+                  target: parsed.target,
+                  cwd: cwdRef.current,
+                  line: parsed.line,
+                  column: parsed.column,
+                }).catch(() => {});
+              },
+            });
+          }
+
+          callback(links.length ? links : undefined);
+        },
+      }),
+    );
 
     if (term.parser) {
       oscDisposables.push(
