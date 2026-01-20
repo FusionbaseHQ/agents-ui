@@ -3568,6 +3568,27 @@ export default function App() {
                   <Icon name="folder" />
                 </button>
 
+                <button
+                  className="iconBtn"
+                  onClick={() => {
+                    const cwd = active.cwd?.trim() ?? "";
+                    if (!cwd || activeIsSsh) return;
+                    void invoke("open_path_in_vscode", { path: cwd }).catch((err) =>
+                      reportError("Failed to open VS Code", err),
+                    );
+                  }}
+                  disabled={activeIsSsh || !active.cwd}
+                  title={
+                    activeIsSsh
+                      ? "Not available for SSH sessions"
+                      : active.cwd
+                        ? `Open in VS Code: ${active.cwd}`
+                        : "Waiting for current folder…"
+                  }
+                >
+                  <Icon name="code" />
+                </button>
+
                 {/* Record Button */}
                 <button
                   className={`iconBtn ${active.recordingActive ? "iconBtnRecording" : ""}`}

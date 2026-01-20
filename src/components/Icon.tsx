@@ -4,6 +4,7 @@ export type IconName =
   | "plus"
   | "trash"
   | "folder"
+  | "code"
   | "settings"
   | "bolt"
   | "layers"
@@ -57,6 +58,14 @@ export function Icon({ name, size = 16, className }: IconProps) {
       return (
         <svg {...common}>
           <path d="M3 7a2 2 0 0 1 2-2h5l2 2h9a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+        </svg>
+      );
+    case "code":
+      return (
+        <svg {...common}>
+          <path d="M8 7l-5 5 5 5" />
+          <path d="M16 7l5 5-5 5" />
+          <path d="M14 4l-4 16" />
         </svg>
       );
     case "settings":

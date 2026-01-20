@@ -44,3 +44,27 @@ pub fn open_path_in_file_manager(path: String) -> Result<(), String> {
     }
 }
 
+#[tauri::command]
+pub fn open_path_in_vscode(path: String) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("missing path".to_string());
+    }
+
+    let path = Path::new(trimmed);
+    if !path.is_absolute() {
+        return Err("path must be absolute".to_string());
+    }
+    if !path.is_dir() {
+        return Err("path is not a directory".to_string());
+    }
+
+    // Use 'code' command which is typically in PATH after VS Code installation
+    Command::new("code")
+        .arg(trimmed)
+        .spawn()
+        .map_err(|e| format!("code command failed: {e}"))?;
+
+    Ok(())
+}
+
