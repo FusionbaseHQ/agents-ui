@@ -28,6 +28,30 @@ use tray::{build_status_tray, set_tray_agent_count};
 use tauri::Manager;
 
 fn main() {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        // Pre-seed PATH with common directories so shell init scripts can run properly.
+        // Without this, commands like `brew` or `nvm` in .zshrc may fail when
+        // the app is launched from Finder (which starts with minimal PATH).
+        if let Ok(current_path) = std::env::var("PATH") {
+            let mut paths: Vec<&str> = current_path.split(':').collect();
+            let additions = [
+                "/opt/homebrew/bin",
+                "/opt/homebrew/sbin",
+                "/usr/local/bin",
+                "/usr/local/sbin",
+            ];
+            for dir in additions {
+                if std::path::Path::new(dir).is_dir() && !paths.contains(&dir) {
+                    paths.insert(0, dir);
+                }
+            }
+            std::env::set_var("PATH", paths.join(":"));
+        }
+
+        // Now fix_path_env can properly spawn the shell to extract full PATH.
+        let _ = fix_path_env::fix();
+    }
     startup::init_startup_flags();
     tauri::Builder::default()
         .manage(AppState::default())

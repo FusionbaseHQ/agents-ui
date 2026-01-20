@@ -146,12 +146,40 @@ fn capture_original_env(cmd: &mut CommandBuilder, name: &str, present_key: &str,
 }
 
 #[cfg(target_family = "unix")]
+#[cfg(target_family = "unix")]
+fn shell_from_passwd() -> Option<String> {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()?;
+    let prefix = format!("{user}:");
+    let contents = fs::read_to_string("/etc/passwd").ok()?;
+    for line in contents.lines() {
+        if !line.starts_with(&prefix) {
+            continue;
+        }
+        let shell = line.split(':').last()?.trim();
+        if shell.is_empty() {
+            return None;
+        }
+        if Path::new(shell).is_file() {
+            return Some(shell.to_string());
+        }
+        return None;
+    }
+    None
+}
+
 fn default_user_shell() -> String {
     if let Ok(shell) = std::env::var("SHELL") {
         let trimmed = shell.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
         }
+    }
+
+    #[cfg(target_family = "unix")]
+    if let Some(shell) = shell_from_passwd() {
+        return shell;
     }
 
     #[cfg(target_os = "macos")]
@@ -176,29 +204,119 @@ fn login_shell_path(shell: &str, base_path: &str) -> Option<String> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    if !shell_name.contains("zsh") && !shell_name.contains("bash") {
-        return None;
-    }
-
     const START: &str = "__AGENTS_UI_PATH_START__";
     const END: &str = "__AGENTS_UI_PATH_END__";
-    let script = format!("printf '{START}%s{END}' \"$PATH\"");
 
-    let out = Command::new(shell)
-        .args(["-i", "-l", "-c", script.as_str()])
-        .env("PATH", base_path)
-        .output()
-        .ok()?;
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let start = stdout.find(START)?;
-    let rest = &stdout[start + START.len()..];
-    let end = rest.find(END)?;
-    let path = rest[..end].trim();
-    if path.is_empty() {
+    let (script, arg_sets): (String, Vec<Vec<&str>>) = if shell_name.contains("zsh") || shell_name.contains("bash") {
+        (format!("printf '{START}%s{END}' \"$PATH\""), vec![vec!["-i", "-l", "-c"]])
+    } else if shell_name == "fish" {
+        (
+            format!("printf '{START}%s{END}' (string join ':' $PATH)"),
+            vec![vec!["-i", "-l", "-c"], vec!["-l", "-c"]],
+        )
+    } else if shell_name == "nu" || shell_name == "nushell" {
+        (
+            format!("print $\"{START}($env.PATH | str join ':'){END}\""),
+            vec![vec!["-l", "-c"], vec!["-i", "-l", "-c"]],
+        )
+    } else {
         return None;
+    };
+
+    let extract_path = |stdout: &str| -> Option<String> {
+        let start = stdout.find(START)?;
+        let rest = &stdout[start + START.len()..];
+        let end = rest.find(END)?;
+        let path = rest[..end].trim();
+        if path.is_empty() {
+            return None;
+        }
+        Some(path.to_string())
+    };
+
+    let run_with_pty = |args: &[&str]| -> Option<String> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .ok()?;
+
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.args(args);
+        cmd.arg(&script);
+        cmd.env("PATH", base_path);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("SHELL", shell);
+
+        let mut child = pair.slave.spawn_command(cmd).ok()?;
+        let mut reader = pair.master.try_clone_reader().ok()?;
+
+        let mut buf = [0u8; 4096];
+        let mut utf8_carry: Vec<u8> = Vec::new();
+        let mut output = String::new();
+        let start_time = Instant::now();
+
+        loop {
+            if start_time.elapsed().as_millis() > 2000 {
+                break;
+            }
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    output.push_str(&decode_utf8_stream(&mut utf8_carry, &buf[..n]));
+                    if output.contains(START) && output.contains(END) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        if !utf8_carry.is_empty() {
+            output.push_str(&String::from_utf8_lossy(&utf8_carry));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        if output.is_empty() {
+            None
+        } else {
+            Some(output)
+        }
+    };
+
+    for args in &arg_sets {
+        if let Some(stdout) = run_with_pty(args.as_slice()) {
+            if let Some(path) = extract_path(&stdout) {
+                return Some(path);
+            }
+        }
     }
-    Some(path.to_string())
+
+    for args in arg_sets {
+        let out = Command::new(shell)
+            .args(&args)
+            .arg(&script)
+            .env("PATH", base_path)
+            .env("TERM", "xterm-256color")
+            .env("COLORTERM", "truecolor")
+            .env("SHELL", shell)
+            .output()
+            .ok()?;
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if let Some(path) = extract_path(&stdout) {
+            return Some(path);
+        }
+    }
+
+    None
 }
 
 #[cfg(target_family = "unix")]
@@ -1187,6 +1305,10 @@ pub fn create_session(
         .as_ref()
         .map(|vars| vars.keys().map(|k| k.trim().to_string()).collect())
         .unwrap_or_default();
+    let frontend_set_path = env_vars
+        .as_ref()
+        .map(|vars| vars.contains_key("PATH"))
+        .unwrap_or(false);
 
     if let Some(vars) = env_vars {
         for (k, v) in vars {
@@ -1251,7 +1373,10 @@ pub fn create_session(
 
     #[cfg(target_os = "macos")]
     {
-        if cmd.get_env("PATH").is_none() {
+        // Always construct a clean PATH on macOS. Don't check cmd.get_env("PATH")
+        // because CommandBuilder inherits the parent environment which may be corrupted.
+        // Only skip if frontend explicitly passed PATH in env_vars.
+        if !frontend_set_path {
             let mut fallback_entries: Vec<String> = std::env::var("PATH")
                 .unwrap_or_default()
                 .split(':')
@@ -1285,28 +1410,34 @@ pub fn create_session(
             }
 
             let fallback_path = fallback_entries.join(":");
-            let imported_path = if use_nu {
-                if let Ok(mut cache) = state.inner.login_path_cache.lock() {
-                    if cache.initialized && cache.shell.as_deref() == Some(shell.as_str()) {
-                        cache.path.clone()
-                    } else {
-                        let computed = login_shell_path(&shell, &fallback_path);
-                        cache.initialized = true;
-                        cache.shell = Some(shell.clone());
-                        cache.path = computed.clone();
-                        computed
-                    }
+            let imported_path = if let Ok(mut cache) = state.inner.login_path_cache.lock() {
+                if cache.initialized && cache.shell.as_deref() == Some(shell.as_str()) {
+                    cache.path.clone()
                 } else {
-                    login_shell_path(&shell, &fallback_path)
+                    let computed = login_shell_path(&shell, &fallback_path);
+                    cache.initialized = true;
+                    cache.shell = Some(shell.clone());
+                    cache.path = computed.clone();
+                    computed
                 }
             } else {
-                None
+                login_shell_path(&shell, &fallback_path)
             };
 
             let mut path_entries: Vec<String> = Vec::new();
             let mut push_unique = |value: &str| {
-                if !value.trim().is_empty() && !path_entries.iter().any(|p| p == value) {
-                    path_entries.push(value.to_string());
+                let trimmed = value.trim();
+                // Filter out entries that don't look like valid paths.
+                // Shell startup scripts can pollute PATH with error messages.
+                if trimmed.is_empty()
+                    || !trimmed.starts_with('/')
+                    || trimmed.contains('\n')
+                    || trimmed.contains('\r')
+                {
+                    return;
+                }
+                if !path_entries.iter().any(|p| p == trimmed) {
+                    path_entries.push(trimmed.to_string());
                 }
             };
 
@@ -1322,6 +1453,15 @@ pub fn create_session(
 
             if !path_entries.is_empty() {
                 cmd.env("PATH", path_entries.join(":"));
+            }
+        }
+    }
+
+    if cmd.get_env("PATH").is_none() {
+        if let Ok(path) = std::env::var("PATH") {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                cmd.env("PATH", trimmed);
             }
         }
     }
