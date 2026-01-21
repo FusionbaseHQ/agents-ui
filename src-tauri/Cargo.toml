@@ -1,6 +1,6 @@
 [package]
 name = "agents-ui"
-version = "0.2.0"
+version = "0.2.2"
 description = "Agents UI desktop app"
 authors = ["you"]
 edition = "2021"

@@ -51,20 +51,38 @@ pub fn open_path_in_vscode(path: String) -> Result<(), String> {
         return Err("missing path".to_string());
     }
 
-    let path = Path::new(trimmed);
-    if !path.is_absolute() {
+    let p = Path::new(trimmed);
+    if !p.is_absolute() {
         return Err("path must be absolute".to_string());
     }
-    if !path.is_dir() {
+    if !p.is_dir() {
         return Err("path is not a directory".to_string());
     }
 
-    // Use 'code' command which is typically in PATH after VS Code installation
-    Command::new("code")
-        .arg(trimmed)
-        .spawn()
-        .map_err(|e| format!("code command failed: {e}"))?;
+    // On macOS, use 'open -a' which goes through Launch Services.
+    // This is more reliable than the 'code' CLI when app is launched from Finder/Dock.
+    #[cfg(target_os = "macos")]
+    {
+        return Command::new("/usr/bin/open")
+            .args(["-a", "Visual Studio Code", trimmed])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("Failed to open VS Code: {e}"));
+    }
 
-    Ok(())
+    // On other platforms, try common locations for the 'code' command
+    #[cfg(not(target_os = "macos"))]
+    {
+        for code_path in &["/usr/local/bin/code", "/opt/homebrew/bin/code"] {
+            if Path::new(code_path).exists() {
+                return Command::new(code_path)
+                    .arg(trimmed)
+                    .spawn()
+                    .map(|_| ())
+                    .map_err(|e| format!("code command failed: {e}"));
+            }
+        }
+        Err("VS Code not found".to_string())
+    }
 }
 
