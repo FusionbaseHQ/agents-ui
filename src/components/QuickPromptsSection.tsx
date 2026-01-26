@@ -59,7 +59,6 @@ export function QuickPromptsSection({
           </button>
         ))}
       </div>
-      <div className="divider" />
     </>
   );
 }

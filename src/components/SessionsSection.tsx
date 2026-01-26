@@ -53,22 +53,27 @@ export function SessionsSection({
   onOpenPersistentSessions,
   onOpenSshManager,
 }: SessionsSectionProps) {
-  const menuRef = React.useRef<HTMLDivElement | null>(null);
+  const createMenuRef = React.useRef<HTMLDivElement | null>(null);
+  const settingsMenuRef = React.useRef<HTMLDivElement | null>(null);
+  const [createOpen, setCreateOpen] = React.useState(false);
   const [settingsOpen, setSettingsOpen] = React.useState(false);
 
   React.useEffect(() => {
-    if (!settingsOpen) return;
+    if (!createOpen && !settingsOpen) return;
 
     const handlePointerDown = (event: MouseEvent) => {
-      if (!menuRef.current) return;
       const target = event.target;
       if (!(target instanceof Node)) return;
-      if (menuRef.current.contains(target)) return;
+      if (createMenuRef.current?.contains(target)) return;
+      if (settingsMenuRef.current?.contains(target)) return;
+      setCreateOpen(false);
       setSettingsOpen(false);
     };
 
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setSettingsOpen(false);
+      if (event.key !== "Escape") return;
+      setCreateOpen(false);
+      setSettingsOpen(false);
     };
 
     document.addEventListener("mousedown", handlePointerDown);
@@ -77,48 +82,93 @@ export function SessionsSection({
       document.removeEventListener("mousedown", handlePointerDown);
       document.removeEventListener("keydown", handleKeyDown);
     };
-  }, [settingsOpen]);
+  }, [createOpen, settingsOpen]);
 
   return (
     <>
       <div className="sidebarHeader">
         <div className="title">Sessions</div>
         <div className="sidebarHeaderActions">
-          <button
-            type="button"
-            className="btnSmall btnIcon"
-            onClick={onOpenNewSession}
-            title="New session"
-            aria-label="New session"
-          >
-            <Icon name="plus" />
-          </button>
-          <div className="sidebarActionMenu" ref={menuRef}>
+          <div className="sidebarActionMenu" ref={createMenuRef}>
             <button
               type="button"
-              className={`btnSmall btnIcon ${settingsOpen ? "btnIconActive" : ""}`}
-              onClick={() => setSettingsOpen((prev) => !prev)}
-              title="Session settings"
-              aria-label="Session settings"
+              className={`btnSmall btnIcon ${createOpen ? "btnIconActive" : ""}`}
+              onClick={() =>
+                setCreateOpen((prev) => {
+                  const next = !prev;
+                  if (next) setSettingsOpen(false);
+                  return next;
+                })
+              }
+              title="New session"
+              aria-label="New session"
               aria-haspopup="menu"
-              aria-expanded={settingsOpen}
+              aria-expanded={createOpen}
             >
-              <Icon name="settings" />
+              <Icon name="plus" />
             </button>
-            {settingsOpen && (
-              <div className="sidebarActionMenuDropdown" role="menu" aria-label="Session settings">
+            {createOpen && (
+              <div className="sidebarActionMenuDropdown" role="menu" aria-label="New session">
                 <button
                   type="button"
                   className="sidebarActionMenuItem"
                   role="menuitem"
                   onClick={() => {
-                    setSettingsOpen(false);
+                    setCreateOpen(false);
+                    onOpenNewSession();
+                  }}
+                >
+                  <Icon name="plus" />
+                  <span>New session</span>
+                </button>
+                <button
+                  type="button"
+                  className="sidebarActionMenuItem"
+                  role="menuitem"
+                  onClick={() => {
+                    setCreateOpen(false);
+                    onOpenSshManager();
+                  }}
+                >
+                  <Icon name="ssh" />
+                  <span>SSH connect</span>
+                </button>
+                <button
+                  type="button"
+                  className="sidebarActionMenuItem"
+                  role="menuitem"
+                  onClick={() => {
+                    setCreateOpen(false);
                     onOpenPersistentSessions();
                   }}
                 >
                   <Icon name="layers" />
                   <span>Persistent sessions</span>
                 </button>
+              </div>
+            )}
+          </div>
+
+          <div className="sidebarActionMenu" ref={settingsMenuRef}>
+            <button
+              type="button"
+              className={`btnSmall btnIcon ${settingsOpen ? "btnIconActive" : ""}`}
+              onClick={() =>
+                setSettingsOpen((prev) => {
+                  const next = !prev;
+                  if (next) setCreateOpen(false);
+                  return next;
+                })
+              }
+              title="Session tools"
+              aria-label="Session tools"
+              aria-haspopup="menu"
+              aria-expanded={settingsOpen}
+            >
+              <Icon name="settings" />
+            </button>
+            {settingsOpen && (
+              <div className="sidebarActionMenuDropdown" role="menu" aria-label="Session tools">
                 <button
                   type="button"
                   className="sidebarActionMenuItem"
@@ -130,18 +180,6 @@ export function SessionsSection({
                 >
                   <Icon name="bolt" />
                   <span>Agent shortcuts</span>
-                </button>
-                <button
-                  type="button"
-                  className="sidebarActionMenuItem"
-                  role="menuitem"
-                  onClick={() => {
-                    setSettingsOpen(false);
-                    onOpenSshManager();
-                  }}
-                >
-                  <Icon name="ssh" />
-                  <span>SSH connect</span>
                 </button>
               </div>
             )}

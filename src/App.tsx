@@ -1,7 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { homeDir } from "@tauri-apps/api/path";
-import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import React, { useEffect, useMemo, useRef, useState, useCallback, useLayoutEffect } from "react";
 import SessionTerminal, { TerminalRegistry } from "./SessionTerminal";
 import {
   commandTagFromCommandLine,
@@ -82,11 +82,17 @@ const STORAGE_PROJECTS_KEY = "agents-ui-projects";
 const STORAGE_ACTIVE_PROJECT_KEY = "agents-ui-active-project-id";
 const STORAGE_SESSIONS_KEY = "agents-ui-sessions-v1";
 const STORAGE_ACTIVE_SESSION_BY_PROJECT_KEY = "agents-ui-active-session-by-project-v1";
+const STORAGE_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT_KEY = "agents-ui-sidebar-projects-list-max-height-v1";
 
 const MAX_PENDING_SESSIONS = 32;
 const MAX_PENDING_CHUNKS_PER_SESSION = 200;
 
 const DEFAULT_AGENT_SHORTCUT_IDS = ["codex", "claude", "gemini"];
+const DEFAULT_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT = 290;
+const MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT = 0;
+const MAX_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT = 1200;
+const SIDEBAR_RESIZE_BOTTOM_MIN_PX = 200;
+const SIDEBAR_PROJECTS_LIST_AUTO_MAX_VISIBLE = 6;
 
 function makeId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -582,6 +588,32 @@ export default function App() {
   const [assetSettings, setAssetSettings] = useState<AssetSettings>({ autoApplyEnabled: true });
   const [agentShortcutIds, setAgentShortcutIds] = useState<string[]>(DEFAULT_AGENT_SHORTCUT_IDS);
   const [agentShortcutsOpen, setAgentShortcutsOpen] = useState(false);
+  const sidebarRef = useRef<HTMLElement | null>(null);
+  const [projectsListHeightMode, setProjectsListHeightMode] = useState<"auto" | "manual">(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT_KEY);
+      const parsed = raw != null ? Number(raw) : NaN;
+      return Number.isFinite(parsed) ? "manual" : "auto";
+    } catch {
+      // Best-effort: localStorage may be unavailable in some contexts.
+      return "auto";
+    }
+  });
+  const [projectsListMaxHeight, setProjectsListMaxHeight] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT_KEY);
+      const parsed = raw != null ? Number(raw) : NaN;
+      if (Number.isFinite(parsed)) {
+        return Math.min(
+          MAX_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT,
+          Math.max(MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT, parsed),
+        );
+      }
+    } catch {
+      // Best-effort: localStorage may be unavailable in some contexts.
+    }
+    return DEFAULT_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT;
+  });
   const [activeId, setActiveId] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
   const [newOpen, setNewOpen] = useState(false);
@@ -3406,9 +3438,244 @@ export default function App() {
     ? assets.find((a) => a.id === confirmDeleteAssetId) ?? null
     : null;
 
+  const persistProjectsListMaxHeight = useCallback((value: number) => {
+    setProjectsListHeightMode("manual");
+    try {
+      localStorage.setItem(
+        STORAGE_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT_KEY,
+        String(Math.round(value)),
+      );
+    } catch {
+      // Best-effort: localStorage may be unavailable in some contexts.
+    }
+  }, [setProjectsListHeightMode]);
+
+  const clearPersistedProjectsListMaxHeight = useCallback(() => {
+    try {
+      localStorage.removeItem(STORAGE_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT_KEY);
+    } catch {
+      // Best-effort: localStorage may be unavailable in some contexts.
+    }
+  }, []);
+
+  const computeProjectsListMaxHeightLimit = useCallback(() => {
+    const sidebar = sidebarRef.current;
+    const projectList = sidebar?.querySelector<HTMLElement>(".projectList");
+    if (!sidebar || !projectList) return MAX_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT;
+    const sidebarRect = sidebar.getBoundingClientRect();
+    const listRect = projectList.getBoundingClientRect();
+    const available = sidebarRect.bottom - listRect.top - SIDEBAR_RESIZE_BOTTOM_MIN_PX;
+    return Math.min(
+      MAX_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT,
+      Math.max(MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT, Math.floor(available)),
+    );
+  }, []);
+
+  const projectsListResizingRef = useRef(false);
+  const projectsListSyncRafRef = useRef<number | null>(null);
+
+  const computeProjectsListAutoHeight = useCallback((): number => {
+    const sidebar = sidebarRef.current;
+    const projectList = sidebar?.querySelector<HTMLElement>(".projectList");
+    if (!sidebar || !projectList) return DEFAULT_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT;
+
+    const items = Array.from(projectList.querySelectorAll<HTMLElement>(".projectItem"));
+    const visibleCount = Math.min(items.length, SIDEBAR_PROJECTS_LIST_AUTO_MAX_VISIBLE);
+    if (!visibleCount) return 0;
+
+    const style = getComputedStyle(projectList);
+    const gap = Number.parseFloat(style.rowGap || style.gap || "0") || 0;
+
+    let height = 0;
+    for (let i = 0; i < visibleCount; i++) {
+      height += items[i].getBoundingClientRect().height;
+    }
+    height += gap * Math.max(0, visibleCount - 1);
+    return height;
+  }, []);
+
+  const syncProjectsListHeight = useCallback(
+    (modeOverride?: "auto" | "manual") => {
+      if (projectsListResizingRef.current) return;
+
+      const max = computeProjectsListMaxHeightLimit();
+      const clamp = (value: number) =>
+        Math.min(max, Math.max(MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT, value));
+
+      const mode = modeOverride ?? projectsListHeightMode;
+      if (mode === "auto") {
+        setProjectsListMaxHeight(clamp(computeProjectsListAutoHeight()));
+        return;
+      }
+
+      setProjectsListMaxHeight((prev) => {
+        const clamped = clamp(prev);
+        if (clamped !== prev) persistProjectsListMaxHeight(clamped);
+        return clamped;
+      });
+    },
+    [
+      computeProjectsListAutoHeight,
+      computeProjectsListMaxHeightLimit,
+      persistProjectsListMaxHeight,
+      projectsListHeightMode,
+    ],
+  );
+
+  const scheduleProjectsListHeightSync = useCallback(
+    (modeOverride?: "auto" | "manual") => {
+      if (projectsListSyncRafRef.current != null) {
+        cancelAnimationFrame(projectsListSyncRafRef.current);
+      }
+
+      projectsListSyncRafRef.current = requestAnimationFrame(() => {
+        projectsListSyncRafRef.current = null;
+        syncProjectsListHeight(modeOverride);
+      });
+    },
+    [syncProjectsListHeight],
+  );
+
+  useLayoutEffect(() => {
+    syncProjectsListHeight();
+  }, [projects.length, projectsListHeightMode, syncProjectsListHeight]);
+
+  const handleWindowResize = useCallback(() => {
+    scheduleProjectsListHeightSync();
+  }, [scheduleProjectsListHeightSync]);
+
+  useEffect(() => {
+    window.addEventListener("resize", handleWindowResize);
+    return () => window.removeEventListener("resize", handleWindowResize);
+  }, [handleWindowResize]);
+
+  useEffect(() => {
+    return () => {
+      if (projectsListSyncRafRef.current != null) {
+        cancelAnimationFrame(projectsListSyncRafRef.current);
+      }
+    };
+  }, []);
+
+  const resetProjectsListMaxHeight = useCallback(() => {
+    setProjectsListHeightMode("auto");
+    clearPersistedProjectsListMaxHeight();
+    scheduleProjectsListHeightSync("auto");
+  }, [clearPersistedProjectsListMaxHeight, scheduleProjectsListHeightSync, setProjectsListHeightMode]);
+
+  const handleProjectsDividerKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>) => {
+      const step = event.shiftKey ? 60 : 20;
+      const max = computeProjectsListMaxHeightLimit();
+      const clamp = (value: number) =>
+        Math.min(max, Math.max(MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT, value));
+
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setProjectsListMaxHeight((prev) => {
+          const next = clamp(prev + step);
+          persistProjectsListMaxHeight(next);
+          return next;
+        });
+        return;
+      }
+
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setProjectsListMaxHeight((prev) => {
+          const next = clamp(prev - step);
+          persistProjectsListMaxHeight(next);
+          return next;
+        });
+        return;
+      }
+
+      if (event.key === "Home") {
+        event.preventDefault();
+        setProjectsListMaxHeight(MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT);
+        persistProjectsListMaxHeight(MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT);
+        return;
+      }
+
+      if (event.key === "End") {
+        event.preventDefault();
+        setProjectsListMaxHeight(max);
+        persistProjectsListMaxHeight(max);
+      }
+    },
+    [computeProjectsListMaxHeightLimit, persistProjectsListMaxHeight],
+  );
+
+	  const handleProjectsDividerPointerDown = useCallback(
+	    (event: React.PointerEvent<HTMLDivElement>) => {
+	      if (event.button !== 0) return;
+	      event.preventDefault();
+
+	      projectsListResizingRef.current = true;
+	      if (projectsListSyncRafRef.current != null) {
+	        cancelAnimationFrame(projectsListSyncRafRef.current);
+	        projectsListSyncRafRef.current = null;
+	      }
+
+	      const pointerId = event.pointerId;
+	      const target = event.currentTarget;
+	      const startY = event.clientY;
+	      const startHeight = projectsListMaxHeight;
+      const maxHeight = computeProjectsListMaxHeightLimit();
+
+      const clamp = (value: number) =>
+        Math.min(maxHeight, Math.max(MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT, value));
+
+      let current = startHeight;
+      const prevCursor = document.body.style.cursor;
+      const prevUserSelect = document.body.style.userSelect;
+      document.body.style.cursor = "row-resize";
+      document.body.style.userSelect = "none";
+
+      try {
+        target.setPointerCapture(pointerId);
+      } catch {
+        // ignore
+      }
+
+      const handlePointerMove = (e: PointerEvent) => {
+        if (e.pointerId !== pointerId) return;
+        current = clamp(startHeight + (e.clientY - startY));
+        setProjectsListMaxHeight(current);
+      };
+
+	      const handlePointerUp = (e: PointerEvent) => {
+	        if (e.pointerId !== pointerId) return;
+	        document.removeEventListener("pointermove", handlePointerMove);
+	        document.removeEventListener("pointerup", handlePointerUp);
+	        document.removeEventListener("pointercancel", handlePointerUp);
+	        projectsListResizingRef.current = false;
+	        document.body.style.cursor = prevCursor;
+	        document.body.style.userSelect = prevUserSelect;
+	        persistProjectsListMaxHeight(current);
+	        try {
+	          target.releasePointerCapture(pointerId);
+        } catch {
+          // ignore
+        }
+      };
+
+	      document.addEventListener("pointermove", handlePointerMove);
+	      document.addEventListener("pointerup", handlePointerUp);
+	      document.addEventListener("pointercancel", handlePointerUp);
+	    },
+	    [computeProjectsListMaxHeightLimit, persistProjectsListMaxHeight, projectsListMaxHeight],
+	  );
+
   return (
     <div className="app">
-      <aside className="sidebar">
+      <aside
+        className="sidebar"
+        ref={sidebarRef}
+        style={
+          { ["--projectsListMaxHeight" as any]: `${projectsListMaxHeight}px` } as React.CSSProperties
+        }
+      >
         <ProjectsSection
           projects={projects}
           activeProjectId={activeProjectId}
@@ -3423,8 +3690,6 @@ export default function App() {
           onOpenProjectSettings={openProjectSettings}
         />
 
-        <div className="divider" />
-
         <QuickPromptsSection
           prompts={prompts}
           activeSessionId={activeId}
@@ -3434,6 +3699,21 @@ export default function App() {
             setSlidePanelTab("prompts");
             setSlidePanelOpen(true);
           }}
+        />
+
+        <div
+          className="sidebarResizeHandle"
+          role="separator"
+          aria-label="Resize Projects and Sessions"
+          aria-orientation="horizontal"
+          aria-valuemin={MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT}
+          aria-valuemax={MAX_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT}
+          aria-valuenow={Math.round(projectsListMaxHeight)}
+          tabIndex={0}
+          onDoubleClick={resetProjectsListMaxHeight}
+          onKeyDown={handleProjectsDividerKeyDown}
+          onPointerDown={handleProjectsDividerPointerDown}
+          title="Drag to resize • Double-click to auto-fit"
         />
 
         <SessionsSection
