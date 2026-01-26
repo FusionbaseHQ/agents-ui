@@ -3,7 +3,11 @@ import React from "react";
 export type IconName =
   | "plus"
   | "trash"
+  | "close"
+  | "refresh"
   | "folder"
+  | "file"
+  | "files"
   | "code"
   | "settings"
   | "bolt"
@@ -54,10 +58,42 @@ export function Icon({ name, size = 16, className }: IconProps) {
           <path d="M9 7V4h6v3" />
         </svg>
       );
+    case "close":
+      return (
+        <svg {...common}>
+          <path d="M18 6L6 18" />
+          <path d="M6 6l12 12" />
+        </svg>
+      );
+    case "refresh":
+      return (
+        <svg {...common}>
+          <path d="M21 12a9 9 0 1 1-3-6.7" />
+          <path d="M21 3v6h-6" />
+        </svg>
+      );
     case "folder":
       return (
         <svg {...common}>
           <path d="M3 7a2 2 0 0 1 2-2h5l2 2h9a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+        </svg>
+      );
+    case "file":
+      return (
+        <svg {...common}>
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+          <path d="M14 2v6h6" />
+        </svg>
+      );
+    case "files":
+      return (
+        <svg {...common}>
+          <path d="M8 6h13" />
+          <path d="M8 12h13" />
+          <path d="M8 18h13" />
+          <path d="M3 6h1" />
+          <path d="M3 12h1" />
+          <path d="M3 18h1" />
         </svg>
       );
     case "code":

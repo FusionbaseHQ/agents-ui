@@ -16,6 +16,8 @@ import { ProjectsSection } from "./components/ProjectsSection";
 import { QuickPromptsSection } from "./components/QuickPromptsSection";
 import { SessionsSection } from "./components/SessionsSection";
 import { Icon } from "./components/Icon";
+import { FileExplorerPanel } from "./components/FileExplorerPanel";
+import type { CodeEditorOpenFileRequest, CodeEditorPersistedState } from "./components/CodeEditorPanel";
 import { AgentShortcutsModal } from "./components/AgentShortcutsModal";
 import { NewSessionModal } from "./components/modals/NewSessionModal";
 import {
@@ -35,6 +37,8 @@ import {
   type SshForwardType,
   type SshHostEntry,
 } from "./components/modals/SshManagerModal";
+
+const LazyCodeEditorPanel = React.lazy(() => import("./components/CodeEditorPanel"));
 
 type Project = {
   id: string;
@@ -69,6 +73,18 @@ type Session = SessionInfo & {
   exitCode?: number | null;
 };
 
+type ProjectWorkspaceView = {
+  fileExplorerOpen: boolean;
+  fileExplorerRootDir: string | null;
+  codeEditorOpen: boolean;
+  codeEditorRootDir: string | null;
+  openFileRequest: CodeEditorOpenFileRequest | null;
+  codeEditorActiveFilePath: string | null;
+  codeEditorPersistedState: CodeEditorPersistedState | null;
+  editorWidth: number;
+  treeWidth: number;
+};
+
 type PtyOutput = { id: string; data: string };
 type PtyExit = { id: string; exit_code?: number | null };
 type AppInfo = { name: string; version: string; homepage?: string | null };
@@ -83,6 +99,8 @@ const STORAGE_ACTIVE_PROJECT_KEY = "agents-ui-active-project-id";
 const STORAGE_SESSIONS_KEY = "agents-ui-sessions-v1";
 const STORAGE_ACTIVE_SESSION_BY_PROJECT_KEY = "agents-ui-active-session-by-project-v1";
 const STORAGE_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT_KEY = "agents-ui-sidebar-projects-list-max-height-v1";
+const STORAGE_WORKSPACE_EDITOR_WIDTH_KEY = "agents-ui-workspace-editor-width-v1";
+const STORAGE_WORKSPACE_FILE_TREE_WIDTH_KEY = "agents-ui-workspace-file-tree-width-v1";
 
 const MAX_PENDING_SESSIONS = 32;
 const MAX_PENDING_CHUNKS_PER_SESSION = 200;
@@ -93,6 +111,11 @@ const MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT = 0;
 const MAX_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT = 1200;
 const SIDEBAR_RESIZE_BOTTOM_MIN_PX = 200;
 const SIDEBAR_PROJECTS_LIST_AUTO_MAX_VISIBLE = 6;
+const DEFAULT_WORKSPACE_EDITOR_WIDTH = 520;
+const DEFAULT_WORKSPACE_FILE_TREE_WIDTH = 320;
+const MIN_WORKSPACE_TERMINAL_WIDTH = 160;
+const MIN_WORKSPACE_EDITOR_WIDTH = 260;
+const MIN_WORKSPACE_FILE_TREE_WIDTH = 200;
 
 function makeId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -720,6 +743,114 @@ export default function App() {
   const [recordingStartTime, setRecordingStartTime] = useState<number | null>(null);
   const [recordingElapsed, setRecordingElapsed] = useState(0);
 
+  const [workspaceViewByProjectId, setWorkspaceViewByProjectId] = useState<
+    Record<string, ProjectWorkspaceView>
+  >({});
+  const workspaceRowRef = useRef<HTMLDivElement | null>(null);
+
+  const workspaceEditorWidthStorageKey = useCallback(
+    (projectId: string) => `${STORAGE_WORKSPACE_EDITOR_WIDTH_KEY}:${projectId}`,
+    [],
+  );
+  const workspaceFileTreeWidthStorageKey = useCallback(
+    (projectId: string) => `${STORAGE_WORKSPACE_FILE_TREE_WIDTH_KEY}:${projectId}`,
+    [],
+  );
+
+  const readStoredNumber = useCallback((key: string, fallback: number) => {
+    try {
+      const raw = localStorage.getItem(key);
+      const parsed = raw != null ? Number(raw) : NaN;
+      return Number.isFinite(parsed) ? parsed : fallback;
+    } catch {
+      return fallback;
+    }
+  }, []);
+
+  const createInitialWorkspaceView = useCallback(
+    (projectId: string): ProjectWorkspaceView => {
+      const editorWidth = Math.max(
+        MIN_WORKSPACE_EDITOR_WIDTH,
+        readStoredNumber(workspaceEditorWidthStorageKey(projectId), DEFAULT_WORKSPACE_EDITOR_WIDTH),
+      );
+      const treeWidth = Math.max(
+        MIN_WORKSPACE_FILE_TREE_WIDTH,
+        readStoredNumber(workspaceFileTreeWidthStorageKey(projectId), DEFAULT_WORKSPACE_FILE_TREE_WIDTH),
+      );
+      return {
+        fileExplorerOpen: true,
+        fileExplorerRootDir: null,
+        codeEditorOpen: false,
+        codeEditorRootDir: null,
+        openFileRequest: null,
+        codeEditorActiveFilePath: null,
+        codeEditorPersistedState: null,
+        editorWidth,
+        treeWidth,
+      };
+    },
+    [readStoredNumber, workspaceEditorWidthStorageKey, workspaceFileTreeWidthStorageKey],
+  );
+
+  const activeWorkspaceView = useMemo(() => {
+    return workspaceViewByProjectId[activeProjectId] ?? createInitialWorkspaceView(activeProjectId);
+  }, [activeProjectId, createInitialWorkspaceView, workspaceViewByProjectId]);
+
+  const updateWorkspaceViewForProject = useCallback(
+    (projectId: string, updater: (prev: ProjectWorkspaceView) => ProjectWorkspaceView) => {
+      setWorkspaceViewByProjectId((prev) => {
+        const current = prev[projectId] ?? createInitialWorkspaceView(projectId);
+        const next = updater(current);
+        if (next === current) return prev;
+        return { ...prev, [projectId]: next };
+      });
+    },
+    [createInitialWorkspaceView],
+  );
+
+  const updateActiveWorkspaceView = useCallback(
+    (updater: (prev: ProjectWorkspaceView) => ProjectWorkspaceView) =>
+      updateWorkspaceViewForProject(activeProjectId, updater),
+    [activeProjectId, updateWorkspaceViewForProject],
+  );
+
+  const workspaceEditorWidthRef = useRef(activeWorkspaceView.editorWidth);
+  const workspaceFileTreeWidthRef = useRef(activeWorkspaceView.treeWidth);
+  useEffect(() => {
+    workspaceEditorWidthRef.current = activeWorkspaceView.editorWidth;
+  }, [activeWorkspaceView.editorWidth]);
+  useEffect(() => {
+    workspaceFileTreeWidthRef.current = activeWorkspaceView.treeWidth;
+  }, [activeWorkspaceView.treeWidth]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        workspaceEditorWidthStorageKey(activeProjectId),
+        String(Math.max(MIN_WORKSPACE_EDITOR_WIDTH, Math.floor(activeWorkspaceView.editorWidth))),
+      );
+    } catch {
+      // Best-effort.
+    }
+  }, [activeProjectId, activeWorkspaceView.editorWidth, workspaceEditorWidthStorageKey]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        workspaceFileTreeWidthStorageKey(activeProjectId),
+        String(Math.max(MIN_WORKSPACE_FILE_TREE_WIDTH, Math.floor(activeWorkspaceView.treeWidth))),
+      );
+    } catch {
+      // Best-effort.
+    }
+  }, [activeProjectId, activeWorkspaceView.treeWidth, workspaceFileTreeWidthStorageKey]);
+
+  const [workspaceResizeMode, setWorkspaceResizeMode] = useState<"editor" | "tree" | null>(null);
+  const workspaceResizeStartRef = useRef<
+    { x: number; editorWidth: number; treeWidth: number; projectId: string } | null
+  >(null);
+  const workspaceResizeDraftRef = useRef<{ editorWidth: number; treeWidth: number } | null>(null);
+
   const updateSourceLabel = useMemo(() => {
     const repo = parseGithubRepo(appInfo?.homepage);
     if (repo) return `${repo.owner}/${repo.repo}`;
@@ -896,6 +1027,118 @@ export default function App() {
     if (!active) return false;
     return isSshCommandLine(active.launchCommand ?? active.restoreCommand ?? null);
   }, [active]);
+
+  const closeCodeEditor = useCallback(() => {
+    updateActiveWorkspaceView((prev) => ({
+      ...prev,
+      codeEditorOpen: false,
+      openFileRequest: null,
+    }));
+  }, [updateActiveWorkspaceView]);
+
+  const handleSelectLocalFile = useCallback(
+    (path: string) => {
+      updateActiveWorkspaceView((prev) => {
+        const project = projects.find((p) => p.id === activeProjectId) ?? null;
+        const root = (prev.codeEditorRootDir ?? prev.fileExplorerRootDir ?? project?.basePath ?? active?.cwd ?? "")
+          .trim();
+        if (!root) return prev;
+        return {
+          ...prev,
+          codeEditorOpen: true,
+          codeEditorRootDir: prev.codeEditorRootDir ?? root,
+          fileExplorerRootDir: prev.fileExplorerRootDir ?? root,
+          openFileRequest: { path, nonce: Date.now() },
+        };
+      });
+    },
+    [active?.cwd, activeProjectId, projects, updateActiveWorkspaceView],
+  );
+
+  const workspaceEditorVisible = activeWorkspaceView.codeEditorOpen;
+  const workspaceTreeVisible = activeWorkspaceView.fileExplorerOpen;
+
+  const beginWorkspaceResize = useCallback(
+    (mode: "editor" | "tree") => (e: React.MouseEvent) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      setWorkspaceResizeMode(mode);
+      const editorWidth = workspaceEditorWidthRef.current;
+      const treeWidth = workspaceFileTreeWidthRef.current;
+      workspaceResizeStartRef.current = { x: e.clientX, editorWidth, treeWidth, projectId: activeProjectId };
+      workspaceResizeDraftRef.current = { editorWidth, treeWidth };
+      document.body.style.cursor = "ew-resize";
+      document.body.style.userSelect = "none";
+    },
+    [activeProjectId],
+  );
+
+  useEffect(() => {
+    if (!workspaceResizeMode) return;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      const start = workspaceResizeStartRef.current;
+      const container = workspaceRowRef.current;
+      if (!start || !container) return;
+
+      const dx = e.clientX - start.x;
+      const rect = container.getBoundingClientRect();
+      const containerWidth = rect.width;
+
+      const currentDraft = workspaceResizeDraftRef.current ?? { editorWidth: start.editorWidth, treeWidth: start.treeWidth };
+
+      if (workspaceResizeMode === "editor" && workspaceEditorVisible) {
+        const treeWidth = workspaceTreeVisible ? currentDraft.treeWidth : 0;
+        const max = Math.max(
+          MIN_WORKSPACE_EDITOR_WIDTH,
+          containerWidth - treeWidth - MIN_WORKSPACE_TERMINAL_WIDTH,
+        );
+        const next = Math.min(max, Math.max(MIN_WORKSPACE_EDITOR_WIDTH, start.editorWidth - dx));
+        workspaceResizeDraftRef.current = { ...currentDraft, editorWidth: next };
+        container.style.setProperty("--workspaceEditorWidthPx", `${next}px`);
+        return;
+      }
+
+      if (workspaceResizeMode === "tree" && workspaceTreeVisible) {
+        const editorWidth = workspaceEditorVisible ? currentDraft.editorWidth : 0;
+        const max = Math.max(
+          MIN_WORKSPACE_FILE_TREE_WIDTH,
+          containerWidth - editorWidth - MIN_WORKSPACE_TERMINAL_WIDTH,
+        );
+        const next = Math.min(max, Math.max(MIN_WORKSPACE_FILE_TREE_WIDTH, start.treeWidth - dx));
+        workspaceResizeDraftRef.current = { ...currentDraft, treeWidth: next };
+        container.style.setProperty("--workspaceFileTreeWidthPx", `${next}px`);
+      }
+    };
+
+    const handleMouseUp = () => {
+      const draft = workspaceResizeDraftRef.current;
+      const start = workspaceResizeStartRef.current;
+      if (draft && start) {
+        const editorWidth = Math.max(MIN_WORKSPACE_EDITOR_WIDTH, Math.floor(draft.editorWidth));
+        const treeWidth = Math.max(MIN_WORKSPACE_FILE_TREE_WIDTH, Math.floor(draft.treeWidth));
+        updateWorkspaceViewForProject(start.projectId, (prev) => ({
+          ...prev,
+          editorWidth,
+          treeWidth,
+        }));
+      }
+      workspaceResizeStartRef.current = null;
+      workspaceResizeDraftRef.current = null;
+      setWorkspaceResizeMode(null);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+
+    document.addEventListener("mousemove", handleMouseMove);
+    document.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      document.removeEventListener("mousemove", handleMouseMove);
+      document.removeEventListener("mouseup", handleMouseUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [updateWorkspaceViewForProject, workspaceEditorVisible, workspaceResizeMode, workspaceTreeVisible]);
 
   const activeProject = useMemo(
     () => projects.find((p) => p.id === activeProjectId) ?? null,
@@ -3827,47 +4070,90 @@ export default function App() {
 
             {active && (
               <>
-                <button
-                  className="iconBtn"
-                  onClick={() => {
-                    const cwd = active.cwd?.trim() ?? "";
-                    if (!cwd || activeIsSsh) return;
-                    void invoke("open_path_in_file_manager", { path: cwd }).catch((err) =>
-                      reportError("Failed to open folder in Finder", err),
-                    );
-                  }}
-                  disabled={activeIsSsh || !active.cwd}
-                  title={
-                    activeIsSsh
-                      ? "Not available for SSH sessions"
-                      : active.cwd
-                        ? `Open in Finder: ${active.cwd}`
-                        : "Waiting for current folder…"
-                  }
-                >
-                  <Icon name="folder" />
-                </button>
+                {!activeIsSsh ? (
+                  <>
+	                    <div className="topbarExternalActions">
+	                      <button
+	                        className="iconBtn iconBtnText"
+	                        onClick={() => {
+	                          const cwd = active.cwd?.trim() ?? "";
+	                          if (!cwd) return;
+	                          void invoke("open_path_in_file_manager", { path: cwd }).catch((err) =>
+	                            reportError("Failed to open folder in Finder", err),
+                          );
+                        }}
+                        disabled={!active.cwd}
+                        title={active.cwd ? `Open in Finder — ${active.cwd}` : "Open in Finder"}
+                      >
+                        Open in Finder
+	                      </button>
 
-                <button
-                  className="iconBtn"
-                  onClick={() => {
-                    const cwd = active.cwd?.trim() ?? "";
-                    if (!cwd || activeIsSsh) return;
-                    void invoke("open_path_in_vscode", { path: cwd }).catch((err) =>
-                      reportError("Failed to open VS Code", err),
-                    );
-                  }}
-                  disabled={activeIsSsh || !active.cwd}
-                  title={
-                    activeIsSsh
-                      ? "Not available for SSH sessions"
-                      : active.cwd
-                        ? `Open in VS Code: ${active.cwd}`
-                        : "Waiting for current folder…"
-                  }
-                >
-                  <Icon name="code" />
-                </button>
+	                      <button
+	                        className="iconBtn iconBtnText"
+	                        onClick={() => {
+	                          const cwd = active.cwd?.trim() ?? "";
+	                          if (!cwd) return;
+	                          void invoke("open_path_in_vscode", { path: cwd }).catch((err) =>
+	                            reportError("Failed to open VS Code", err),
+                          );
+                        }}
+                        disabled={!active.cwd}
+                        title={active.cwd ? `Open in VS Code — ${active.cwd}` : "Open in VS Code"}
+                      >
+                        Open in VS Code
+                      </button>
+                    </div>
+
+                    <button
+                      className={`iconBtn ${activeWorkspaceView.fileExplorerOpen ? "iconBtnActive" : ""}`}
+                      onClick={() => {
+                        updateActiveWorkspaceView((prev) => {
+                          if (prev.fileExplorerOpen) {
+                            return { ...prev, fileExplorerOpen: false };
+                          }
+                          const root = (
+                            prev.fileExplorerRootDir ??
+                            prev.codeEditorRootDir ??
+                            activeProject?.basePath ??
+                            active?.cwd ??
+                            ""
+                          ).trim();
+                          if (!root) return prev;
+                          return {
+                            ...prev,
+                            fileExplorerOpen: true,
+                            fileExplorerRootDir: prev.fileExplorerRootDir ?? root,
+                          };
+                        });
+                      }}
+                      disabled={
+                        !activeWorkspaceView.fileExplorerOpen &&
+                        !(
+                          activeWorkspaceView.fileExplorerRootDir ??
+                          activeWorkspaceView.codeEditorRootDir ??
+                          activeProject?.basePath ??
+                          active?.cwd ??
+                          ""
+                        ).trim()
+                      }
+                      title={
+                        activeWorkspaceView.fileExplorerOpen
+                          ? "Close file tree"
+                          : `Open file tree — ${
+                              (
+                                activeWorkspaceView.fileExplorerRootDir ??
+                                activeWorkspaceView.codeEditorRootDir ??
+                                activeProject?.basePath ??
+                                active?.cwd ??
+                                ""
+                              ).trim() || "—"
+                            }`
+                      }
+                    >
+                      <Icon name="folder" />
+                    </button>
+                  </>
+                ) : null}
 
                 {/* Record Button */}
                 <button
@@ -3911,31 +4197,138 @@ export default function App() {
           </div>
         </div>
 
-        <div className="terminalArea">
-          {sessions.map((s) => (
-            <div
-              key={s.id}
-              className={`terminalContainer ${
-                s.id === activeId ? "" : "terminalHidden"
-              }`}
-            >
-              <SessionTerminal
-                id={s.id}
-                active={s.id === activeId}
-                readOnly={Boolean(s.exited || s.closing)}
-                persistent={s.persistent}
-                onCwdChange={onCwdChange}
-                onCommandChange={onCommandChange}
-                onUserEnter={() => markAgentWorking(s.id)}
-                registry={registry}
-                pendingData={pendingData}
-              />
-            </div>
-          ))}
+		        <div className="terminalArea">
+	            <div
+	              ref={workspaceRowRef}
+	              className={`workspaceRow ${workspaceResizeMode ? "workspaceResizing" : ""}`}
+	              style={
+	                {
+	                  "--workspaceEditorWidthPx": `${activeWorkspaceView.editorWidth}px`,
+	                  "--workspaceFileTreeWidthPx": `${activeWorkspaceView.treeWidth}px`,
+	                } as React.CSSProperties
+	              }
+	            >
+              <div className="terminalPane" aria-label="Terminal">
+                {sessions.map((s) => (
+                  <div
+                    key={s.id}
+                    className={`terminalContainer ${s.id === activeId ? "" : "terminalHidden"}`}
+                  >
+                    <SessionTerminal
+                      id={s.id}
+                      active={s.id === activeId}
+                      readOnly={Boolean(s.exited || s.closing)}
+                      persistent={s.persistent}
+                      onCwdChange={onCwdChange}
+                      onCommandChange={onCommandChange}
+                      onUserEnter={() => markAgentWorking(s.id)}
+                      registry={registry}
+                      pendingData={pendingData}
+                    />
+                  </div>
+                ))}
+              </div>
 
-          <NewSessionModal
-            isOpen={newOpen}
-            projectTitle={activeProject?.title ?? null}
+	              {activeWorkspaceView.codeEditorOpen &&
+	              (
+	                activeWorkspaceView.codeEditorRootDir ??
+	                activeWorkspaceView.fileExplorerRootDir ??
+	                activeProject?.basePath ??
+	                active?.cwd ??
+	                ""
+	              ).trim() ? (
+	                <>
+	                  <div
+	                    className="workspaceResize"
+	                    onMouseDown={beginWorkspaceResize("editor")}
+	                    aria-hidden="true"
+	                  />
+	                  <React.Suspense
+	                    fallback={
+	                      <section className="codeEditorPanel" aria-label="Editor">
+	                        <div className="empty">Loading editor…</div>
+	                      </section>
+	                    }
+	                  >
+	                    <LazyCodeEditorPanel
+	                      key={`code-editor:${activeProjectId}`}
+	                      rootDir={
+	                        (
+	                          activeWorkspaceView.codeEditorRootDir ??
+	                          activeWorkspaceView.fileExplorerRootDir ??
+	                          activeProject?.basePath ??
+	                          active?.cwd ??
+	                          ""
+	                        ).trim()
+	                      }
+	                      openFileRequest={activeWorkspaceView.openFileRequest}
+	                      persistedState={activeWorkspaceView.codeEditorPersistedState}
+	                      onPersistState={(state) =>
+	                        updateWorkspaceViewForProject(activeProjectId, (prev) => ({
+	                          ...prev,
+	                          codeEditorPersistedState: state,
+	                        }))
+	                      }
+	                      onConsumeOpenFileRequest={() =>
+	                        updateWorkspaceViewForProject(activeProjectId, (prev) => ({
+	                          ...prev,
+	                          openFileRequest: null,
+	                        }))
+	                      }
+	                      onActiveFilePathChange={(path) =>
+	                        updateWorkspaceViewForProject(activeProjectId, (prev) => ({
+	                          ...prev,
+	                          codeEditorActiveFilePath: path,
+	                        }))
+	                      }
+	                      onCloseEditor={closeCodeEditor}
+	                    />
+	                  </React.Suspense>
+	                </>
+	              ) : null}
+
+	              {activeWorkspaceView.fileExplorerOpen &&
+	              (
+	                activeWorkspaceView.fileExplorerRootDir ??
+	                activeWorkspaceView.codeEditorRootDir ??
+	                activeProject?.basePath ??
+	                active?.cwd ??
+	                ""
+	              ).trim() ? (
+	                <>
+	                  <div
+	                    className="workspaceResize"
+	                    onMouseDown={beginWorkspaceResize("tree")}
+	                    aria-hidden="true"
+	                  />
+	                  <FileExplorerPanel
+	                    key={`file-tree:${activeProjectId}`}
+	                    isOpen
+	                    rootDir={
+	                      (
+	                        activeWorkspaceView.fileExplorerRootDir ??
+	                        activeWorkspaceView.codeEditorRootDir ??
+	                        activeProject?.basePath ??
+	                        active?.cwd ??
+	                        ""
+	                      ).trim()
+	                    }
+	                    activeFilePath={activeWorkspaceView.codeEditorActiveFilePath}
+	                    onSelectFile={handleSelectLocalFile}
+	                    onClose={() =>
+	                      updateWorkspaceViewForProject(activeProjectId, (prev) => ({
+	                        ...prev,
+	                        fileExplorerOpen: false,
+	                      }))
+	                    }
+	                  />
+	                </>
+	              ) : null}
+            </div>
+	
+	          <NewSessionModal
+	            isOpen={newOpen}
+	            projectTitle={activeProject?.title ?? null}
             name={newName}
             nameInputRef={newNameRef}
             onChangeName={(value) => setNewName(normalizeSmartQuotes(value))}
