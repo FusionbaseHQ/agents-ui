@@ -5,6 +5,7 @@ import * as bundledMonaco from "monaco-editor";
 import React from "react";
 import { shortenPathSmart } from "../pathDisplay";
 import { Icon } from "./Icon";
+import { ConfirmActionModal } from "./modals/ConfirmActionModal";
 
 type MonacoType = typeof import("monaco-editor");
 
@@ -34,6 +35,10 @@ type Tab = {
   loading: boolean;
   error: string | null;
 };
+
+type PendingCloseAction =
+  | { kind: "editor" }
+  | { kind: "tab"; path: string };
 
 function basename(path: string): string {
   const cleaned = path.trim().replace(/\/+$/, "");
@@ -119,6 +124,7 @@ export function CodeEditorPanel({
   const [activePath, setActivePath] = React.useState<string | null>(null);
   const [saveStatus, setSaveStatus] = React.useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveError, setSaveError] = React.useState<string | null>(null);
+  const [pendingClose, setPendingClose] = React.useState<PendingCloseAction | null>(null);
   const saveTimerRef = React.useRef<number | null>(null);
 
   const restoredRef = React.useRef(false);
@@ -364,12 +370,6 @@ export function CodeEditorPanel({
 
   const closeTab = React.useCallback(
     (path: string) => {
-      const isDirty = dirtyPathsRef.current.has(path);
-      if (isDirty) {
-        const ok = window.confirm(`Discard unsaved changes in "${basename(path)}"?`);
-        if (!ok) return;
-      }
-
       const editor = editorRef.current;
       if (editor && editor.getModel() === modelsRef.current.get(path)) {
         editor.setModel(null);
@@ -398,6 +398,19 @@ export function CodeEditorPanel({
       }
     },
     [onCloseEditor, setEditorModel],
+  );
+
+  const requestCloseTab = React.useCallback(
+    (path: string) => {
+      const normalized = path.trim();
+      if (!normalized) return;
+      if (dirtyPathsRef.current.has(normalized)) {
+        setPendingClose({ kind: "tab", path: normalized });
+        return;
+      }
+      closeTab(normalized);
+    },
+    [closeTab],
   );
 
   const saveActive = React.useCallback(async () => {
@@ -429,8 +442,8 @@ export function CodeEditorPanel({
 
   const requestCloseEditor = React.useCallback(() => {
     if (dirtyPathsRef.current.size > 0) {
-      const ok = window.confirm("Close editor and discard unsaved changes?");
-      if (!ok) return;
+      setPendingClose({ kind: "editor" });
+      return;
     }
     onCloseEditor();
   }, [onCloseEditor]);
@@ -582,6 +595,7 @@ export function CodeEditorPanel({
   }, [fsEvent, markDirty, onCloseEditor, setEditorModel]);
 
   const activeTab = React.useMemo(() => tabs.find((t) => t.path === activePath) ?? null, [activePath, tabs]);
+  const dirtyCount = React.useMemo(() => tabs.reduce((count, tab) => count + (tab.dirty ? 1 : 0), 0), [tabs]);
 
   return (
     <section className="codeEditorPanel" aria-label="Editor">
@@ -606,7 +620,7 @@ export function CodeEditorPanel({
               <button
                 type="button"
                 className="codeEditorTabClose"
-                onClick={() => closeTab(tab.path)}
+                onClick={() => requestCloseTab(tab.path)}
                 title="Close"
               >
                 ×
@@ -674,6 +688,48 @@ export function CodeEditorPanel({
           </div>
         ) : null}
       </div>
+
+      <ConfirmActionModal
+        isOpen={pendingClose != null}
+        title={pendingClose?.kind === "tab" ? "Discard changes" : "Close editor"}
+        message={
+          pendingClose?.kind === "tab" ? (
+            <>
+              <div>
+                Discard unsaved changes in{" "}
+                <span style={{ fontFamily: "ui-monospace, monospace" }}>{basename(pendingClose.path)}</span>?
+              </div>
+              <div className="hint" style={{ marginTop: 6 }}>
+                {pendingClose.path}
+              </div>
+            </>
+          ) : (
+            <>
+              <div>
+                Close editor? You have{" "}
+                <span style={{ fontFamily: "ui-monospace, monospace" }}>{dirtyCount}</span> unsaved file
+                {dirtyCount === 1 ? "" : "s"}.
+              </div>
+              <div className="hint" style={{ marginTop: 6 }}>
+                Unsaved changes are preserved when you reopen the editor.
+              </div>
+            </>
+          )
+        }
+        confirmLabel={pendingClose?.kind === "tab" ? "Discard" : "Close"}
+        confirmDanger={pendingClose?.kind === "tab"}
+        onClose={() => setPendingClose(null)}
+        onConfirm={() => {
+          if (!pendingClose) return;
+          const action = pendingClose;
+          setPendingClose(null);
+          if (action.kind === "tab") {
+            closeTab(action.path);
+            return;
+          }
+          onCloseEditor();
+        }}
+      />
     </section>
   );
 }
