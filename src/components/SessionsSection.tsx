@@ -100,15 +100,15 @@ export function SessionsSection({
                   return next;
                 })
               }
-              title="New session"
-              aria-label="New session"
+              title="New terminal"
+              aria-label="New terminal"
               aria-haspopup="menu"
               aria-expanded={createOpen}
             >
               <Icon name="plus" />
             </button>
             {createOpen && (
-              <div className="sidebarActionMenuDropdown" role="menu" aria-label="New session">
+              <div className="sidebarActionMenuDropdown" role="menu" aria-label="New terminal">
                 <button
                   type="button"
                   className="sidebarActionMenuItem"
@@ -119,7 +119,11 @@ export function SessionsSection({
                   }}
                 >
                   <Icon name="plus" />
-                  <span>New session</span>
+                  <span
+                    className="sessionLegendSwatch sessionLegendSwatchDefault"
+                    aria-hidden="true"
+                  />
+                  <span>New terminal</span>
                 </button>
                 <button
                   type="button"
@@ -131,19 +135,8 @@ export function SessionsSection({
                   }}
                 >
                   <Icon name="ssh" />
+                  <span className="sessionLegendSwatch sessionLegendSwatchSsh" aria-hidden="true" />
                   <span>SSH connect</span>
-                </button>
-                <button
-                  type="button"
-                  className="sidebarActionMenuItem"
-                  role="menuitem"
-                  onClick={() => {
-                    setCreateOpen(false);
-                    onOpenPersistentSessions();
-                  }}
-                >
-                  <Icon name="layers" />
-                  <span>Persistent sessions</span>
                 </button>
               </div>
             )}
@@ -181,6 +174,22 @@ export function SessionsSection({
                   <Icon name="bolt" />
                   <span>Agent shortcuts</span>
                 </button>
+                <button
+                  type="button"
+                  className="sidebarActionMenuItem"
+                  role="menuitem"
+                  onClick={() => {
+                    setSettingsOpen(false);
+                    onOpenPersistentSessions();
+                  }}
+                >
+                  <Icon name="layers" />
+                  <span
+                    className="sessionLegendSwatch sessionLegendSwatchPersistent"
+                    aria-hidden="true"
+                  />
+                  <span>Manage persistent terminals</span>
+                </button>
               </div>
             )}
           </div>
@@ -209,27 +218,6 @@ export function SessionsSection({
           ))}
         </div>
       )}
-
-      <div className="sessionLegend" aria-label="Session types">
-        <div className="sessionLegendItem sessionLegendItemDefault">
-          <span
-            className="sessionLegendSwatch sessionLegendSwatchDefault"
-            aria-hidden="true"
-          />
-          <span>default</span>
-        </div>
-        <div className="sessionLegendItem sessionLegendItemSsh">
-          <span className="sessionLegendSwatch sessionLegendSwatchSsh" aria-hidden="true" />
-          <span>ssh</span>
-        </div>
-        <div className="sessionLegendItem sessionLegendItemPersistent">
-          <span
-            className="sessionLegendSwatch sessionLegendSwatchPersistent"
-            aria-hidden="true"
-          />
-          <span>persistent (zellij)</span>
-        </div>
-      </div>
 
       <div className="sessionList">
         {sessions.length === 0 ? (

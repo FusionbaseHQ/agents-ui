@@ -10,6 +10,7 @@
   --accent: #6b8afd;
   --accent-2: #22d3ee;
   --accent-3: #818cf8;
+  --accent-persistent: #f472b6;
   --radius-control: 6px;
 }
 
@@ -453,7 +454,7 @@ body {
 }
 
 .sessionLegendItemPersistent {
-  color: rgba(129, 140, 248, 0.78);
+  color: rgba(244, 114, 182, 0.82);
 }
 
 .sessionLegendSwatchDefault {
@@ -471,10 +472,10 @@ body {
 }
 
 .sessionLegendSwatchPersistent {
-  background: var(--accent-3);
+  background: var(--accent-persistent);
   box-shadow:
     0 0 0 1px rgba(255, 255, 255, 0.22),
-    0 0 0 3px rgba(129, 140, 248, 0.14);
+    0 0 0 3px rgba(244, 114, 182, 0.14);
 }
 
 .empty {
@@ -523,8 +524,8 @@ body {
 }
 
 .sessionItemActive.sessionItemPersistent {
-  border-color: rgba(129, 140, 248, 0.55);
-  background: rgba(129, 140, 248, 0.085);
+  border-color: rgba(244, 114, 182, 0.55);
+  background: rgba(244, 114, 182, 0.085);
 }
 
 .sessionItemActive.sessionItemSsh .dotActive {
@@ -532,7 +533,7 @@ body {
 }
 
 .sessionItemActive.sessionItemPersistent .dotActive {
-  background: var(--accent-3);
+  background: var(--accent-persistent);
 }
 
 .sessionItemExited {
@@ -574,16 +575,16 @@ body {
 }
 
 .sessionItemPersistent .dot:not(.dotActive) {
-  background: rgba(129, 140, 248, 0.78);
+  background: rgba(244, 114, 182, 0.82);
 }
 
 .sessionItem:not(.sessionItemActive).sessionItemPersistent {
-  background: rgba(129, 140, 248, 0.035);
+  background: rgba(244, 114, 182, 0.04);
 }
 
 .sessionItem:not(.sessionItemActive).sessionItemPersistent:hover {
-  border-color: rgba(129, 140, 248, 0.24);
-  background: rgba(129, 140, 248, 0.055);
+  border-color: rgba(244, 114, 182, 0.24);
+  background: rgba(244, 114, 182, 0.06);
 }
 
 .sessionItemDefault .dot:not(.dotActive) {

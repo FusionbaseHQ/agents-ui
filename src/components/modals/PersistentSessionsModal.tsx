@@ -33,7 +33,7 @@ export function PersistentSessionsModal({
   return (
     <div className="modalBackdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h3 className="modalTitle">Persistent sessions</h3>
+        <h3 className="modalTitle">Persistent terminals</h3>
         <div className="hint" style={{ marginTop: 0 }}>
           Running bundled <code>zellij</code> sessions started by Agents UI. Kill them to stop background shells.
         </div>
@@ -45,7 +45,7 @@ export function PersistentSessionsModal({
           ) : error ? (
             <div className="empty">{error}</div>
           ) : sessions.length === 0 ? (
-            <div className="empty">No persistent sessions found.</div>
+            <div className="empty">No persistent terminals found.</div>
           ) : (
             <div className="agentShortcutEditorList">
               {sessions.map((s) => (

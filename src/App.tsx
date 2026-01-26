@@ -3392,7 +3392,7 @@ export default function App() {
     try {
       const launchCommand = newCommand.trim() || null;
       if (newPersistent && launchCommand) {
-        setError("Persistent sessions require an empty command (run commands inside the session).");
+        setError("Persistent terminals require an empty command (run commands inside the terminal).");
         return;
       }
       const desiredCwd =
@@ -3585,10 +3585,10 @@ export default function App() {
 
     if (wasPersistent && session) {
       if (killedPersistent) {
-        showNotice(`Closed "${session.name}" and killed persistent session.`);
+        showNotice(`Closed "${session.name}" and killed persistent terminal.`);
       } else if (killErr) {
         showNotice(
-          `Closed "${session.name}" but failed to kill persistent session. Manage via Persistent sessions (∞).`,
+          `Closed "${session.name}" but failed to kill persistent terminal. Manage via Persistent terminals (∞).`,
         );
       } else {
         showNotice(`Closed "${session.name}".`);

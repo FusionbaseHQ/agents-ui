@@ -49,9 +49,9 @@ export function NewSessionModal({
   const datalistId = "newSessionCommandSuggestions";
 
   return (
-    <div className="modalBackdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h3 className="modalTitle">New session{projectTitle ? ` — ${projectTitle}` : ""}</h3>
+      <div className="modalBackdrop" onClick={onClose}>
+        <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h3 className="modalTitle">New terminal{projectTitle ? ` — ${projectTitle}` : ""}</h3>
         <form onSubmit={onSubmit}>
           <div className="formRow">
             <div className="label">Name (optional)</div>
@@ -88,7 +88,7 @@ export function NewSessionModal({
                 checked={persistent}
                 onChange={(e) => onChangePersistent(e.target.checked)}
               />
-              Persistent session (zellij)
+              Persistent terminal (zellij)
             </label>
             <div className="hint">
               Keeps the shell running after you close the app so you can resume later (uses a bundled{" "}
