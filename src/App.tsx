@@ -17,7 +17,11 @@ import { QuickPromptsSection } from "./components/QuickPromptsSection";
 import { SessionsSection } from "./components/SessionsSection";
 import { Icon } from "./components/Icon";
 import { FileExplorerPanel } from "./components/FileExplorerPanel";
-import type { CodeEditorOpenFileRequest, CodeEditorPersistedState } from "./components/CodeEditorPanel";
+import type {
+  CodeEditorFsEvent,
+  CodeEditorOpenFileRequest,
+  CodeEditorPersistedState,
+} from "./components/CodeEditorPanel";
 import { AgentShortcutsModal } from "./components/AgentShortcutsModal";
 import { NewSessionModal } from "./components/modals/NewSessionModal";
 import {
@@ -81,6 +85,7 @@ type ProjectWorkspaceView = {
   openFileRequest: CodeEditorOpenFileRequest | null;
   codeEditorActiveFilePath: string | null;
   codeEditorPersistedState: CodeEditorPersistedState | null;
+  codeEditorFsEvent: CodeEditorFsEvent | null;
   editorWidth: number;
   treeWidth: number;
 };
@@ -785,6 +790,7 @@ export default function App() {
         openFileRequest: null,
         codeEditorActiveFilePath: null,
         codeEditorPersistedState: null,
+        codeEditorFsEvent: null,
         editorWidth,
         treeWidth,
       };
@@ -1055,6 +1061,26 @@ export default function App() {
     [active?.cwd, activeProjectId, projects, updateActiveWorkspaceView],
   );
 
+  const handleRenameWorkspacePath = useCallback(
+    (fromPath: string, toPath: string) => {
+      updateActiveWorkspaceView((prev) => ({
+        ...prev,
+        codeEditorFsEvent: { type: "rename", from: fromPath, to: toPath, nonce: Date.now() } satisfies CodeEditorFsEvent,
+      }));
+    },
+    [updateActiveWorkspaceView],
+  );
+
+  const handleDeleteWorkspacePath = useCallback(
+    (path: string) => {
+      updateActiveWorkspaceView((prev) => ({
+        ...prev,
+        codeEditorFsEvent: { type: "delete", path, nonce: Date.now() } satisfies CodeEditorFsEvent,
+      }));
+    },
+    [updateActiveWorkspaceView],
+  );
+
   const workspaceEditorVisible = activeWorkspaceView.codeEditorOpen;
   const workspaceTreeVisible = activeWorkspaceView.fileExplorerOpen;
 
@@ -1302,6 +1328,19 @@ export default function App() {
         });
       }, 400);
   }, [projects, activeProjectId, activeSessionByProject, sessions, prompts, environments, assets, assetSettings, agentShortcutIds, secureStorageMode, hydrated, persistenceDisabledReason]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    try {
+      localStorage.setItem(
+        STORAGE_PROJECTS_KEY,
+        JSON.stringify(projects.map((p) => ({ id: p.id, title: p.title }))),
+      );
+      localStorage.setItem(STORAGE_ACTIVE_PROJECT_KEY, activeProjectId);
+    } catch {
+      // Best-effort: localStorage may be unavailable in some contexts.
+    }
+  }, [activeProjectId, hydrated, projects]);
 
   const activeAgentCount = useMemo(() => {
     return sessions.filter(
@@ -2768,6 +2807,24 @@ export default function App() {
     setActiveId(pickActiveSessionId(projectId));
   }
 
+  function moveProject(projectId: string, targetProjectId: string, position: "before" | "after") {
+    setProjects((prev) => {
+      if (projectId === targetProjectId) return prev;
+      const project = prev.find((p) => p.id === projectId);
+      if (!project) return prev;
+
+      const next = prev.filter((p) => p.id !== projectId);
+      const targetIndex = next.findIndex((p) => p.id === targetProjectId);
+      if (targetIndex < 0) return prev;
+      const insertIndex = position === "after" ? targetIndex + 1 : targetIndex;
+      next.splice(insertIndex, 0, project);
+
+      const unchanged =
+        prev.length === next.length && prev.every((p, index) => p.id === next[index]?.id);
+      return unchanged ? prev : next;
+    });
+  }
+
   function openNewProject() {
     setNewOpen(false);
     setProjectMode("new");
@@ -3931,6 +3988,7 @@ export default function App() {
           onDeleteProject={() => setConfirmDeleteProjectOpen(true)}
           onSelectProject={selectProject}
           onOpenProjectSettings={openProjectSettings}
+          onMoveProject={moveProject}
         />
 
         <QuickPromptsSection
@@ -4263,6 +4321,7 @@ export default function App() {
 	                      }
 	                      openFileRequest={activeWorkspaceView.openFileRequest}
 	                      persistedState={activeWorkspaceView.codeEditorPersistedState}
+                        fsEvent={activeWorkspaceView.codeEditorFsEvent}
 	                      onPersistState={(state) =>
 	                        updateWorkspaceViewForProject(activeProjectId, (prev) => ({
 	                          ...prev,
@@ -4315,6 +4374,8 @@ export default function App() {
 	                    }
 	                    activeFilePath={activeWorkspaceView.codeEditorActiveFilePath}
 	                    onSelectFile={handleSelectLocalFile}
+                      onPathRenamed={handleRenameWorkspacePath}
+                      onPathDeleted={handleDeleteWorkspacePath}
 	                    onClose={() =>
 	                      updateWorkspaceViewForProject(activeProjectId, (prev) => ({
 	                        ...prev,

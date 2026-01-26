@@ -23,6 +23,10 @@ export type CodeEditorPersistedState = {
   activePath: string | null;
 };
 
+export type CodeEditorFsEvent =
+  | { type: "rename"; from: string; to: string; nonce: number }
+  | { type: "delete"; path: string; nonce: number };
+
 type Tab = {
   path: string;
   title: string;
@@ -96,6 +100,7 @@ export function CodeEditorPanel({
   rootDir,
   openFileRequest,
   persistedState,
+  fsEvent,
   onPersistState,
   onConsumeOpenFileRequest,
   onActiveFilePathChange,
@@ -104,6 +109,7 @@ export function CodeEditorPanel({
   rootDir: string;
   openFileRequest: CodeEditorOpenFileRequest | null;
   persistedState: CodeEditorPersistedState | null;
+  fsEvent?: CodeEditorFsEvent | null;
   onPersistState: (state: CodeEditorPersistedState) => void;
   onConsumeOpenFileRequest?: () => void;
   onActiveFilePathChange: (path: string | null) => void;
@@ -444,6 +450,136 @@ export function CodeEditorPanel({
     },
     [ensureModel, saveActive, setEditorModel],
   );
+
+  const lastFsEventNonceRef = React.useRef<number | null>(null);
+  React.useEffect(() => {
+    if (!fsEvent) return;
+    if (lastFsEventNonceRef.current === fsEvent.nonce) return;
+    lastFsEventNonceRef.current = fsEvent.nonce;
+
+    if (fsEvent.type === "rename") {
+      const from = fsEvent.from.trim();
+      const to = fsEvent.to.trim();
+      if (!from || !to || from === to) return;
+      const fromPrefix = `${from}/`;
+
+      const transformPath = (path: string): string => {
+        const trimmed = path.trim();
+        if (trimmed === from) return to;
+        if (trimmed.startsWith(fromPrefix)) return `${to}${trimmed.slice(from.length)}`;
+        return trimmed;
+      };
+
+      const activeBefore = activePathRef.current;
+      const activeAfter = activeBefore ? transformPath(activeBefore) : null;
+
+      setTabs((prev) =>
+        prev.map((tab) => {
+          const nextPath = transformPath(tab.path);
+          if (nextPath === tab.path) return tab;
+          return { ...tab, path: nextPath, title: basename(nextPath) };
+        }),
+      );
+
+      const nextOpenPaths = new Set<string>();
+      for (const p of openPathsRef.current) nextOpenPaths.add(transformPath(p));
+      openPathsRef.current = nextOpenPaths;
+
+      const nextDirtyPaths = new Set<string>();
+      for (const p of dirtyPathsRef.current) nextDirtyPaths.add(transformPath(p));
+      dirtyPathsRef.current = nextDirtyPaths;
+
+      if (pendingContentRef.current.size > 0) {
+        const nextPending = new Map<string, string>();
+        for (const [p, content] of pendingContentRef.current.entries()) {
+          nextPending.set(transformPath(p), content);
+        }
+        pendingContentRef.current = nextPending;
+      }
+
+      const monaco = monacoRef.current;
+      if (monaco) {
+        const editor = editorRef.current;
+        const activeModel = editor?.getModel() ?? null;
+        const activeModelPath = activeModel?.uri?.fsPath ?? null;
+        if (activeModelPath && (activeModelPath === from || activeModelPath.startsWith(fromPrefix))) {
+          editor?.setModel(null);
+        }
+
+        const nextModels = new Map<string, import("monaco-editor").editor.ITextModel>();
+        for (const [path, model] of modelsRef.current.entries()) {
+          const nextPath = transformPath(path);
+          if (nextPath === path) {
+            nextModels.set(path, model);
+            continue;
+          }
+          const content = model.getValue();
+          const uri = monaco.Uri.file(nextPath);
+          const language = inferLanguageId(nextPath);
+          const existing = monaco.editor.getModel(uri);
+          if (existing && existing !== model) existing.dispose();
+          const created = monaco.editor.createModel(content, language, uri);
+          created.onDidChangeContent(() => markDirty(nextPath));
+          nextModels.set(nextPath, created);
+          model.dispose();
+        }
+        modelsRef.current = nextModels;
+      }
+
+      if (activeBefore && activeAfter && activeAfter !== activeBefore) {
+        setActivePath(activeAfter);
+        setEditorModel(activeAfter);
+      }
+      return;
+    }
+
+    if (fsEvent.type === "delete") {
+      const base = fsEvent.path.trim();
+      if (!base) return;
+      const basePrefix = `${base}/`;
+      const shouldClose = (path: string) => path === base || path.startsWith(basePrefix);
+
+      const prevTabs = tabsRef.current;
+      const nextTabs = prevTabs.filter((t) => !shouldClose(t.path));
+      setTabs(nextTabs);
+
+      openPathsRef.current = new Set(Array.from(openPathsRef.current).filter((p) => !shouldClose(p)));
+      dirtyPathsRef.current = new Set(Array.from(dirtyPathsRef.current).filter((p) => !shouldClose(p)));
+
+      if (pendingContentRef.current.size > 0) {
+        const nextPending = new Map<string, string>();
+        for (const [p, content] of pendingContentRef.current.entries()) {
+          if (shouldClose(p)) continue;
+          nextPending.set(p, content);
+        }
+        pendingContentRef.current = nextPending;
+      }
+
+      const editor = editorRef.current;
+      const activeModel = editor?.getModel() ?? null;
+      const activeModelPath = activeModel?.uri?.fsPath ?? null;
+      if (activeModelPath && shouldClose(activeModelPath)) {
+        editor?.setModel(null);
+      }
+
+      for (const [path, model] of modelsRef.current.entries()) {
+        if (!shouldClose(path)) continue;
+        model.dispose();
+        modelsRef.current.delete(path);
+      }
+
+      const active = activePathRef.current;
+      if (!active || !shouldClose(active)) return;
+      if (nextTabs.length === 0) {
+        setActivePath(null);
+        onCloseEditor();
+        return;
+      }
+      const nextActive = nextTabs[nextTabs.length - 1].path;
+      setActivePath(nextActive);
+      setEditorModel(nextActive);
+    }
+  }, [fsEvent, markDirty, onCloseEditor, setEditorModel]);
 
   const activeTab = React.useMemo(() => tabs.find((t) => t.path === activePath) ?? null, [activePath, tabs]);
 

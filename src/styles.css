@@ -1,15 +1,16 @@
 :root {
   color-scheme: dark;
-  --bg: #0b0f14;
-  --panel: #0f1620;
-  --panel-2: #121b26;
+  --bg: #0a0e16;
+  --panel: #10151e;
+  --panel-2: #111820;
   --border: rgba(255, 255, 255, 0.08);
-  --text: rgba(255, 255, 255, 0.92);
-  --muted: rgba(255, 255, 255, 0.65);
-  --accent: #7aa2f7;
-  --accent-2: #2ac3de;
-  --accent-3: #c084fc;
-  --radius-control: 4px;
+  --border-subtle: rgba(255, 255, 255, 0.04);
+  --text: #f0f4f8;
+  --muted: rgba(240, 244, 248, 0.7);
+  --accent: #6b8afd;
+  --accent-2: #22d3ee;
+  --accent-3: #818cf8;
+  --radius-control: 6px;
 }
 
 * {
@@ -48,7 +49,7 @@ body {
 .sidebar {
   width: 260px;
   background:
-    radial-gradient(900px 520px at 10% 0%, rgba(122, 162, 247, 0.12), transparent 55%),
+    radial-gradient(900px 520px at 10% 0%, rgba(107, 138, 253, 0.12), transparent 55%),
     linear-gradient(180deg, var(--panel), var(--panel-2));
   border-right: 1px solid var(--border);
   display: flex;
@@ -75,8 +76,8 @@ body {
 }
 
 .btnSmall.btnIcon.btnIconActive {
-  border-color: rgba(122, 162, 247, 0.4);
-  background: rgba(122, 162, 247, 0.12);
+  border-color: rgba(107, 138, 253, 0.4);
+  background: rgba(107, 138, 253, 0.12);
 }
 
 .sidebarActionMenuDropdown {
@@ -130,17 +131,87 @@ body {
 }
 
 .projectItem {
+  position: relative;
   border: 1px solid transparent;
   background: rgba(255, 255, 255, 0.02);
   color: var(--text);
-  padding: 10px 10px;
   border-radius: var(--radius-control);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: background 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
+}
+
+.projectItemMain {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  padding: 10px 10px;
   cursor: pointer;
   display: flex;
   align-items: center;
   gap: 8px;
   text-align: left;
-  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.projectDragHandle {
+  width: 32px;
+  height: 32px;
+  flex: 0 0 auto;
+  margin-right: 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--muted);
+  cursor: grab;
+  opacity: 0.35;
+  touch-action: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.projectItem:hover .projectDragHandle {
+  opacity: 0.75;
+  border-color: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.projectDragHandle:active {
+  cursor: grabbing;
+}
+
+.projectDragHandle:disabled {
+  opacity: 0.15;
+  cursor: default;
+}
+
+.projectItemDragging {
+  opacity: 0.6;
+}
+
+.projectItemDropBefore::before {
+  content: "";
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: -1px;
+  height: 2px;
+  border-radius: 999px;
+  background: rgba(34, 211, 238, 0.75);
+}
+
+.projectItemDropAfter::after {
+  content: "";
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: -1px;
+  height: 2px;
+  border-radius: 999px;
+  background: rgba(34, 211, 238, 0.75);
 }
 
 .projectItem:hover {
@@ -148,8 +219,8 @@ body {
 }
 
 .projectItemActive {
-  border-color: rgba(122, 162, 247, 0.5);
-  background: rgba(122, 162, 247, 0.09);
+  border-color: rgba(107, 138, 253, 0.5);
+  background: rgba(107, 138, 253, 0.09);
 }
 
 .projectTitle {
@@ -171,7 +242,7 @@ body {
   font-size: 11px;
   color: rgba(255, 255, 255, 0.88);
   border: 1px solid rgba(255, 255, 255, 0.12);
-  background: linear-gradient(180deg, rgba(122, 162, 247, 0.22), rgba(42, 195, 222, 0.14));
+  background: linear-gradient(180deg, rgba(107, 138, 253, 0.22), rgba(34, 211, 238, 0.14));
   border-radius: 999px;
   padding: 2px 8px;
   white-space: nowrap;
@@ -275,11 +346,11 @@ body {
 
 .sidebarResizeHandle:hover::before,
 .sidebarResizeHandle:focus-visible::before {
-  background: rgba(122, 162, 247, 0.35);
+  background: rgba(107, 138, 253, 0.35);
 }
 
 .sidebarResizeHandle:focus-visible {
-  outline: 2px solid rgba(122, 162, 247, 0.22);
+  outline: 2px solid rgba(34, 211, 238, 0.22);
   outline-offset: 2px;
 }
 
@@ -374,36 +445,36 @@ body {
 }
 
 .sessionLegendItemDefault {
-  color: rgba(122, 162, 247, 0.75);
+  color: rgba(107, 138, 253, 0.75);
 }
 
 .sessionLegendItemSsh {
-  color: rgba(42, 195, 222, 0.78);
+  color: rgba(34, 211, 238, 0.78);
 }
 
 .sessionLegendItemPersistent {
-  color: rgba(192, 132, 252, 0.78);
+  color: rgba(129, 140, 248, 0.78);
 }
 
 .sessionLegendSwatchDefault {
   background: var(--accent);
   box-shadow:
     0 0 0 1px rgba(255, 255, 255, 0.22),
-    0 0 0 3px rgba(122, 162, 247, 0.14);
+    0 0 0 3px rgba(107, 138, 253, 0.14);
 }
 
 .sessionLegendSwatchSsh {
   background: var(--accent-2);
   box-shadow:
     0 0 0 1px rgba(255, 255, 255, 0.22),
-    0 0 0 3px rgba(42, 195, 222, 0.14);
+    0 0 0 3px rgba(34, 211, 238, 0.14);
 }
 
 .sessionLegendSwatchPersistent {
   background: var(--accent-3);
   box-shadow:
     0 0 0 1px rgba(255, 255, 255, 0.22),
-    0 0 0 3px rgba(192, 132, 252, 0.14);
+    0 0 0 3px rgba(129, 140, 248, 0.14);
 }
 
 .empty {
@@ -414,12 +485,14 @@ body {
 
 .btn:focus-visible,
 .btnSmall:focus-visible,
+.sidebarActionMenuItem:focus-visible,
 .agentShortcutBtn:focus-visible,
-.projectItem:focus-visible,
+.projectItemMain:focus-visible,
+.projectDragHandle:focus-visible,
 .sessionItem:focus-visible,
 .pathPickerItem:focus-visible,
 .iconBtn:focus-visible {
-  outline: 2px solid rgba(122, 162, 247, 0.55);
+  outline: 2px solid rgba(34, 211, 238, 0.55);
   outline-offset: 2px;
 }
 
@@ -440,18 +513,18 @@ body {
 }
 
 .sessionItemActive {
-  border-color: rgba(122, 162, 247, 0.5);
-  background: rgba(122, 162, 247, 0.09);
+  border-color: rgba(107, 138, 253, 0.5);
+  background: rgba(107, 138, 253, 0.09);
 }
 
 .sessionItemActive.sessionItemSsh {
-  border-color: rgba(42, 195, 222, 0.55);
-  background: rgba(42, 195, 222, 0.085);
+  border-color: rgba(34, 211, 238, 0.55);
+  background: rgba(34, 211, 238, 0.085);
 }
 
 .sessionItemActive.sessionItemPersistent {
-  border-color: rgba(192, 132, 252, 0.55);
-  background: rgba(192, 132, 252, 0.085);
+  border-color: rgba(129, 140, 248, 0.55);
+  background: rgba(129, 140, 248, 0.085);
 }
 
 .sessionItemActive.sessionItemSsh .dotActive {
@@ -475,21 +548,21 @@ body {
 }
 
 .sessionItem:not(.sessionItemActive).sessionItemDefault {
-  background: rgba(122, 162, 247, 0.035);
+  background: rgba(107, 138, 253, 0.035);
 }
 
 .sessionItem:not(.sessionItemActive).sessionItemDefault:hover {
-  border-color: rgba(122, 162, 247, 0.22);
-  background: rgba(122, 162, 247, 0.055);
+  border-color: rgba(107, 138, 253, 0.22);
+  background: rgba(107, 138, 253, 0.055);
 }
 
 .sessionItem:not(.sessionItemActive).sessionItemSsh {
-  background: rgba(42, 195, 222, 0.035);
+  background: rgba(34, 211, 238, 0.035);
 }
 
 .sessionItem:not(.sessionItemActive).sessionItemSsh:hover {
-  border-color: rgba(42, 195, 222, 0.24);
-  background: rgba(42, 195, 222, 0.055);
+  border-color: rgba(34, 211, 238, 0.24);
+  background: rgba(34, 211, 238, 0.055);
 }
 
 .sessionItemPersistent {
@@ -497,24 +570,24 @@ body {
 }
 
 .sessionItemSsh .dot:not(.dotActive) {
-  background: rgba(42, 195, 222, 0.78);
+  background: rgba(34, 211, 238, 0.78);
 }
 
 .sessionItemPersistent .dot:not(.dotActive) {
-  background: rgba(192, 132, 252, 0.78);
+  background: rgba(129, 140, 248, 0.78);
 }
 
 .sessionItem:not(.sessionItemActive).sessionItemPersistent {
-  background: rgba(192, 132, 252, 0.035);
+  background: rgba(129, 140, 248, 0.035);
 }
 
 .sessionItem:not(.sessionItemActive).sessionItemPersistent:hover {
-  border-color: rgba(192, 132, 252, 0.24);
-  background: rgba(192, 132, 252, 0.055);
+  border-color: rgba(129, 140, 248, 0.24);
+  background: rgba(129, 140, 248, 0.055);
 }
 
 .sessionItemDefault .dot:not(.dotActive) {
-  background: rgba(122, 162, 247, 0.78);
+  background: rgba(107, 138, 253, 0.78);
 }
 
 .dot {
@@ -661,26 +734,26 @@ body {
 }
 
 .chip-codex {
-  border-color: rgba(122, 162, 247, 0.45);
-  background: rgba(122, 162, 247, 0.12);
+  border-color: rgba(107, 138, 253, 0.45);
+  background: rgba(107, 138, 253, 0.12);
   color: rgba(255, 255, 255, 0.88);
 }
 
 .chip-claude {
-  border-color: rgba(42, 195, 222, 0.45);
-  background: rgba(42, 195, 222, 0.12);
+  border-color: rgba(34, 211, 238, 0.45);
+  background: rgba(34, 211, 238, 0.12);
   color: rgba(255, 255, 255, 0.88);
 }
 
 .chip-gemini {
-  border-color: rgba(192, 132, 252, 0.45);
-  background: rgba(192, 132, 252, 0.12);
+  border-color: rgba(129, 140, 248, 0.45);
+  background: rgba(129, 140, 248, 0.12);
   color: rgba(255, 255, 255, 0.88);
 }
 
 .chip-ssh {
-  border-color: rgba(42, 195, 222, 0.42);
-  background: linear-gradient(180deg, rgba(42, 195, 222, 0.14), rgba(42, 195, 222, 0.06));
+  border-color: rgba(34, 211, 238, 0.42);
+  background: linear-gradient(180deg, rgba(34, 211, 238, 0.14), rgba(34, 211, 238, 0.06));
   color: rgba(255, 255, 255, 0.88);
   border-radius: 8px;
 }
@@ -726,8 +799,10 @@ body {
   align-items: center;
   justify-content: space-between;
   padding: 0 12px;
-  border-bottom: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.02);
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgba(6, 9, 15, 0.75);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
 }
 
 .topbarRight {
@@ -765,8 +840,8 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
-  border: 1px solid rgba(122, 162, 247, 0.35);
-  background: rgba(122, 162, 247, 0.12);
+  border: 1px solid rgba(107, 138, 253, 0.35);
+  background: rgba(107, 138, 253, 0.12);
   padding: 8px 10px;
   border-radius: 12px;
   min-width: 0;
@@ -851,7 +926,7 @@ body {
 
 .workspaceResize:hover::before,
 .workspaceResizing .workspaceResize::before {
-  background: rgba(122, 162, 247, 0.35);
+  background: rgba(107, 138, 253, 0.35);
 }
 
 .terminalPane {
@@ -944,7 +1019,38 @@ body {
 }
 
 .fileExplorerRowActive {
-  background: rgba(122, 162, 247, 0.12);
+  background: rgba(107, 138, 253, 0.12);
+}
+
+.fileExplorerRowContext {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.fileContextMenu {
+  position: fixed;
+  min-width: 220px;
+  max-width: 280px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(17, 24, 34, 0.98), rgba(10, 14, 20, 0.98));
+  border-radius: 12px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+  z-index: 640;
+}
+
+.fileContextMenuSep {
+  height: 1px;
+  background: var(--border-subtle);
+  margin: 6px 4px;
+}
+
+.fileContextMenuItemDanger {
+  color: rgba(255, 130, 130, 0.95);
+}
+
+.fileContextMenuItemDanger:hover {
+  border-color: rgba(255, 80, 80, 0.35);
+  background: rgba(255, 80, 80, 0.12);
 }
 
 .fileExplorerDisclosure {
@@ -1027,7 +1133,7 @@ body {
 
 .codeEditorTabActive {
   background: rgba(255, 255, 255, 0.04);
-  border-bottom-color: rgba(122, 162, 247, 0.6);
+  border-bottom-color: rgba(107, 138, 253, 0.6);
 }
 
 .codeEditorTabMain {
@@ -1447,12 +1553,12 @@ body {
 }
 
 .replayFlowGroupNext {
-  border-color: rgba(122, 162, 247, 0.22);
-  background: rgba(122, 162, 247, 0.08);
+  border-color: rgba(107, 138, 253, 0.22);
+  background: rgba(107, 138, 253, 0.08);
 }
 
 .replayFlowGroupNext .replayFlowGroupHeader:hover {
-  background: rgba(122, 162, 247, 0.12);
+  background: rgba(107, 138, 253, 0.12);
 }
 
 .replayFlowGroupHeader {
@@ -1496,14 +1602,14 @@ body {
   font-size: 11px;
   padding: 1px 7px;
   border-radius: 999px;
-  border: 1px solid rgba(122, 162, 247, 0.25);
-  background: rgba(122, 162, 247, 0.12);
-  color: rgba(122, 162, 247, 0.95);
+  border: 1px solid rgba(107, 138, 253, 0.25);
+  background: rgba(107, 138, 253, 0.12);
+  color: rgba(107, 138, 253, 0.95);
 }
 
 .replayFlowCountNext {
-  border-color: rgba(122, 162, 247, 0.45);
-  background: rgba(122, 162, 247, 0.22);
+  border-color: rgba(107, 138, 253, 0.45);
+  background: rgba(107, 138, 253, 0.22);
   color: rgba(255, 255, 255, 0.95);
 }
 
@@ -1531,8 +1637,8 @@ body {
 .replayFlowItemNext {
   border-radius: 10px;
   padding: 6px 8px;
-  border: 1px solid rgba(122, 162, 247, 0.35);
-  background: rgba(122, 162, 247, 0.12);
+  border: 1px solid rgba(107, 138, 253, 0.35);
+  background: rgba(107, 138, 253, 0.12);
 }
 
 .replayFlowItemSent {
@@ -1557,8 +1663,8 @@ body {
   margin-left: 6px;
   padding: 1px 6px;
   border-radius: 999px;
-  border: 1px solid rgba(122, 162, 247, 0.35);
-  background: rgba(122, 162, 247, 0.16);
+  border: 1px solid rgba(107, 138, 253, 0.35);
+  background: rgba(107, 138, 253, 0.16);
   color: rgba(255, 255, 255, 0.92);
   font-size: 10px;
   line-height: 1.4;
@@ -1648,8 +1754,8 @@ body {
 }
 
 .pathPickerItem:hover {
-  border-color: rgba(122, 162, 247, 0.35);
-  background: rgba(122, 162, 247, 0.08);
+  border-color: rgba(107, 138, 253, 0.35);
+  background: rgba(107, 138, 253, 0.08);
 }
 
 .pathPickerItem:active {
@@ -1671,7 +1777,7 @@ body {
 }
 
 .input:focus {
-  border-color: rgba(122, 162, 247, 0.5);
+  border-color: rgba(107, 138, 253, 0.5);
 }
 
 select.input {
@@ -1712,7 +1818,7 @@ select.input {
 }
 
 .textarea:focus {
-  border-color: rgba(122, 162, 247, 0.5);
+  border-color: rgba(107, 138, 253, 0.5);
 }
 
 .modalActions {
@@ -1772,7 +1878,7 @@ select.input {
 
 .slidePanelResize:hover,
 .slidePanelResizing .slidePanelResize {
-  background: linear-gradient(90deg, transparent, rgba(122, 162, 247, 0.2), transparent);
+  background: linear-gradient(90deg, transparent, rgba(107, 138, 253, 0.2), transparent);
 }
 
 .slidePanelHeader {
@@ -1811,7 +1917,7 @@ select.input {
 
 .slidePanelTabActive {
   color: var(--text);
-  background: rgba(122, 162, 247, 0.15);
+  background: rgba(107, 138, 253, 0.15);
 }
 
 .slidePanelClose {
@@ -1855,7 +1961,7 @@ select.input {
 }
 
 .panelSearchInput:focus {
-  border-color: rgba(122, 162, 247, 0.5);
+  border-color: rgba(107, 138, 253, 0.5);
 }
 
 .panelSearchInput::placeholder {
@@ -1905,8 +2011,8 @@ select.input {
 }
 
 .panelCard:hover {
-  border-color: rgba(122, 162, 247, 0.3);
-  background: rgba(122, 162, 247, 0.06);
+  border-color: rgba(107, 138, 253, 0.3);
+  background: rgba(107, 138, 253, 0.06);
 }
 
 .panelCardHeader {
@@ -2140,7 +2246,7 @@ select.input {
 }
 
 .commandPaletteItemSelected {
-  background: rgba(122, 162, 247, 0.12);
+  background: rgba(107, 138, 253, 0.12);
 }
 
 .commandPaletteItemIcon {
@@ -2241,8 +2347,8 @@ select.input {
 }
 
 .quickPromptItem:hover {
-  border-color: rgba(122, 162, 247, 0.35);
-  background: rgba(122, 162, 247, 0.08);
+  border-color: rgba(107, 138, 253, 0.35);
+  background: rgba(107, 138, 253, 0.08);
 }
 
 .quickPromptIcon {
@@ -2302,8 +2408,8 @@ select.input {
 }
 
 .iconBtn.iconBtnActive {
-  border-color: rgba(122, 162, 247, 0.4);
-  background: rgba(122, 162, 247, 0.12);
+  border-color: rgba(107, 138, 253, 0.4);
+  background: rgba(107, 138, 253, 0.12);
 }
 
 /* Recording Timer */
@@ -2362,8 +2468,8 @@ select.input {
   align-items: center;
   justify-content: center;
   border-radius: 10px;
-  border: 1px solid rgba(42, 195, 222, 0.22);
-  background: linear-gradient(180deg, rgba(42, 195, 222, 0.14), rgba(122, 162, 247, 0.08));
+  border: 1px solid rgba(34, 211, 238, 0.22);
+  background: linear-gradient(180deg, rgba(34, 211, 238, 0.14), rgba(107, 138, 253, 0.08));
   box-shadow: 0 12px 26px rgba(0, 0, 0, 0.35);
   color: rgba(255, 255, 255, 0.92);
   flex: 0 0 auto;
@@ -2454,13 +2560,13 @@ select.input {
 }
 
 .sshHostItem:hover {
-  border-color: rgba(42, 195, 222, 0.28);
-  background: rgba(42, 195, 222, 0.06);
+  border-color: rgba(34, 211, 238, 0.28);
+  background: rgba(34, 211, 238, 0.06);
 }
 
 .sshHostItemActive {
-  border-color: rgba(42, 195, 222, 0.45);
-  background: rgba(42, 195, 222, 0.08);
+  border-color: rgba(34, 211, 238, 0.45);
+  background: rgba(34, 211, 238, 0.08);
 }
 
 .sshHostItemMain {
@@ -2491,8 +2597,8 @@ select.input {
   justify-content: center;
   border-radius: 8px;
   color: rgba(255, 255, 255, 0.85);
-  background: rgba(42, 195, 222, 0.12);
-  border: 1px solid rgba(42, 195, 222, 0.2);
+  background: rgba(34, 211, 238, 0.12);
+  border: 1px solid rgba(34, 211, 238, 0.2);
 }
 
 .sshHostItem:not(.sshHostItemActive) .sshHostPick {
@@ -2603,10 +2709,10 @@ select.input {
 }
 
 .btn.btnPrimary {
-  border-color: rgba(122, 162, 247, 0.45);
-  background: linear-gradient(180deg, rgba(122, 162, 247, 0.18), rgba(42, 195, 222, 0.1));
+  border-color: rgba(107, 138, 253, 0.45);
+  background: linear-gradient(180deg, rgba(107, 138, 253, 0.18), rgba(34, 211, 238, 0.1));
 }
 
 .btn.btnPrimary:hover {
-  background: linear-gradient(180deg, rgba(122, 162, 247, 0.22), rgba(42, 195, 222, 0.12));
+  background: linear-gradient(180deg, rgba(107, 138, 253, 0.22), rgba(34, 211, 238, 0.12));
 }

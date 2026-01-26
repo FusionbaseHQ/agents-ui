@@ -17,7 +17,8 @@ export type IconName =
   | "record"
   | "stop"
   | "search"
-  | "ssh";
+  | "ssh"
+  | "grip";
 
 type IconProps = {
   name: IconName;
@@ -171,6 +172,17 @@ export function Icon({ name, size = 16, className }: IconProps) {
         <svg {...common}>
           <path d="M7 8l5 4-5 4" />
           <path d="M15 16h5" />
+        </svg>
+      );
+    case "grip":
+      return (
+        <svg {...common}>
+          <circle cx="9" cy="7" r="1.25" fill="currentColor" stroke="none" />
+          <circle cx="15" cy="7" r="1.25" fill="currentColor" stroke="none" />
+          <circle cx="9" cy="12" r="1.25" fill="currentColor" stroke="none" />
+          <circle cx="15" cy="12" r="1.25" fill="currentColor" stroke="none" />
+          <circle cx="9" cy="17" r="1.25" fill="currentColor" stroke="none" />
+          <circle cx="15" cy="17" r="1.25" fill="currentColor" stroke="none" />
         </svg>
       );
     default:

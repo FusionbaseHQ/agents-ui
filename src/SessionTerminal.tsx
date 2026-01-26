@@ -70,10 +70,10 @@ export default function SessionTerminal(props: {
         'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
       fontSize: 13,
       theme: {
-        background: "#0b0f14",
-        foreground: "rgba(255,255,255,0.92)",
-        cursor: "#7aa2f7",
-        selectionBackground: "rgba(122,162,247,0.25)",
+        background: "#0a0e16",
+        foreground: "#f0f4f8",
+        cursor: "#6b8afd",
+        selectionBackground: "rgba(34,211,238,0.25)",
       },
       scrollback: 5000,
     });

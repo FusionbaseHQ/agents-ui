@@ -14,7 +14,7 @@ mod tray;
 use app_info::get_app_info;
 use assets::apply_text_assets;
 use app_menu::{build_app_menu, handle_app_menu_event};
-use files::{list_fs_entries, read_text_file, write_text_file};
+use files::{delete_fs_entry, list_fs_entries, read_text_file, rename_fs_entry, write_text_file};
 use file_manager::{open_path_in_file_manager, open_path_in_vscode};
 use pty::{
     close_session, create_session, detach_session, kill_persistent_session, list_persistent_sessions,
@@ -91,6 +91,8 @@ fn main() {
             list_fs_entries,
             read_text_file,
             write_text_file,
+            rename_fs_entry,
+            delete_fs_entry,
             load_recording,
             list_recordings,
             delete_recording,

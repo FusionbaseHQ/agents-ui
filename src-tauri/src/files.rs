@@ -128,3 +128,71 @@ pub fn write_text_file(root: String, path: String, content: String) -> Result<()
     Ok(())
 }
 
+fn ensure_parent_within_root(root: &Path, path: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let root = ensure_root_dir(root)?;
+    if !path.is_absolute() {
+        return Err("path must be absolute".to_string());
+    }
+    let parent = path.parent().ok_or_else(|| "missing parent directory".to_string())?;
+    let canon_parent = canonicalize_existing(parent)?;
+    if !canon_parent.starts_with(&root) {
+        return Err("path is outside root".to_string());
+    }
+    Ok((root, canon_parent))
+}
+
+#[tauri::command]
+pub fn rename_fs_entry(root: String, path: String, new_name: String) -> Result<String, String> {
+    let root = Path::new(root.trim());
+    let path = Path::new(path.trim());
+    let (canon_root, _) = ensure_parent_within_root(root, path)?;
+    let from = path.to_path_buf();
+    if from == canon_root {
+        return Err("cannot rename root".to_string());
+    }
+
+    let name = new_name.trim();
+    if name.is_empty() {
+        return Err("missing new name".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err("invalid name".to_string());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("name must not contain path separators".to_string());
+    }
+
+    let parent = from
+        .parent()
+        .ok_or_else(|| "missing parent directory".to_string())?;
+    let to = parent.join(name);
+    if to.exists() {
+        return Err("target already exists".to_string());
+    }
+    fs::symlink_metadata(&from).map_err(|e| format!("metadata failed: {e}"))?;
+
+    fs::rename(&from, &to).map_err(|e| format!("rename failed: {e}"))?;
+    Ok(to.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn delete_fs_entry(root: String, path: String) -> Result<(), String> {
+    let root = Path::new(root.trim());
+    let path = Path::new(path.trim());
+    let (canon_root, _) = ensure_parent_within_root(root, path)?;
+    let target = path.to_path_buf();
+    if target == canon_root {
+        return Err("cannot delete root".to_string());
+    }
+
+    let meta = fs::symlink_metadata(&target).map_err(|e| format!("metadata failed: {e}"))?;
+    if meta.file_type().is_symlink() {
+        return fs::remove_file(&target).map_err(|e| format!("delete failed: {e}"));
+    }
+    if meta.is_dir() {
+        fs::remove_dir_all(&target).map_err(|e| format!("delete failed: {e}"))?;
+        return Ok(());
+    }
+    fs::remove_file(&target).map_err(|e| format!("delete failed: {e}"))?;
+    Ok(())
+}

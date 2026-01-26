@@ -1,7 +1,7 @@
 {
   "name": "agents-ui-desktop",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite --port 1420 --strictPort",
