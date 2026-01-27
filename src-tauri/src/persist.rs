@@ -32,6 +32,8 @@ pub struct PersistedSessionV1 {
     pub name: String,
     pub launch_command: Option<String>,
     pub restore_command: Option<String>,
+    pub ssh_target: Option<String>,
+    pub ssh_root_dir: Option<String>,
     pub last_recording_id: Option<String>,
     pub cwd: Option<String>,
     pub persistent: Option<bool>,

@@ -8,6 +8,7 @@ mod persist;
 mod recording;
 mod secure;
 mod ssh;
+mod ssh_fs;
 mod startup;
 mod tray;
 
@@ -25,6 +26,10 @@ use persist::{list_directories, load_persisted_state, load_persisted_state_meta,
 use recording::{delete_recording, list_recordings, load_recording};
 use secure::{prepare_secure_storage, reset_secure_storage};
 use ssh::list_ssh_hosts;
+use ssh_fs::{
+    ssh_default_root, ssh_delete_fs_entry, ssh_list_fs_entries, ssh_read_text_file,
+    ssh_rename_fs_entry, ssh_write_text_file,
+};
 use startup::get_startup_flags;
 use tray::{build_status_tray, set_tray_agent_count};
 use tauri::Manager;
@@ -93,6 +98,12 @@ fn main() {
             write_text_file,
             rename_fs_entry,
             delete_fs_entry,
+            ssh_default_root,
+            ssh_list_fs_entries,
+            ssh_read_text_file,
+            ssh_write_text_file,
+            ssh_rename_fs_entry,
+            ssh_delete_fs_entry,
             load_recording,
             list_recordings,
             delete_recording,

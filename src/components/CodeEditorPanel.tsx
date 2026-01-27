@@ -102,6 +102,8 @@ function inferLanguageId(path: string): string {
 }
 
 export function CodeEditorPanel({
+  provider,
+  sshTarget,
   rootDir,
   openFileRequest,
   persistedState,
@@ -111,6 +113,8 @@ export function CodeEditorPanel({
   onActiveFilePathChange,
   onCloseEditor,
 }: {
+  provider: "local" | "ssh";
+  sshTarget?: string | null;
   rootDir: string;
   openFileRequest: CodeEditorOpenFileRequest | null;
   persistedState: CodeEditorPersistedState | null;
@@ -126,6 +130,30 @@ export function CodeEditorPanel({
   const [saveError, setSaveError] = React.useState<string | null>(null);
   const [pendingClose, setPendingClose] = React.useState<PendingCloseAction | null>(null);
   const saveTimerRef = React.useRef<number | null>(null);
+  const sshTargetValue = React.useMemo(() => (sshTarget ?? "").trim() || null, [sshTarget]);
+
+  const readTextFile = React.useCallback(
+    async (path: string): Promise<string> => {
+      if (provider === "ssh") {
+        if (!sshTargetValue) throw new Error("Missing SSH target.");
+        return await invoke<string>("ssh_read_text_file", { target: sshTargetValue, root: rootDir, path });
+      }
+      return await invoke<string>("read_text_file", { root: rootDir, path });
+    },
+    [provider, rootDir, sshTargetValue],
+  );
+
+  const writeTextFile = React.useCallback(
+    async (path: string, content: string): Promise<void> => {
+      if (provider === "ssh") {
+        if (!sshTargetValue) throw new Error("Missing SSH target.");
+        await invoke("ssh_write_text_file", { target: sshTargetValue, root: rootDir, path, content });
+        return;
+      }
+      await invoke("write_text_file", { root: rootDir, path, content });
+    },
+    [provider, rootDir, sshTargetValue],
+  );
 
   const restoredRef = React.useRef(false);
   const lastOpenRequestRef = React.useRef<string | null>(null);
@@ -278,7 +306,7 @@ export function CodeEditorPanel({
         }
         updateTab(normalized, (tab) => ({ ...tab, loading: true, error: null }));
         try {
-          const content = await invoke<string>("read_text_file", { root: rootDir, path: normalized });
+          const content = await readTextFile(normalized);
           ensureModel(normalized, content);
           updateTab(normalized, (tab) => ({ ...tab, loading: false, error: null }));
           setEditorModel(normalized);
@@ -297,7 +325,7 @@ export function CodeEditorPanel({
       setActivePath(normalized);
 
       try {
-        const content = await invoke<string>("read_text_file", { root: rootDir, path: normalized });
+        const content = await readTextFile(normalized);
         ensureModel(normalized, content);
         updateTab(normalized, (tab) => ({ ...tab, loading: false, error: null }));
         setEditorModel(normalized);
@@ -306,7 +334,7 @@ export function CodeEditorPanel({
         updateTab(normalized, (tab) => ({ ...tab, loading: false, error: message }));
       }
     },
-    [ensureModel, rootDir, setEditorModel, updateTab],
+    [ensureModel, readTextFile, setEditorModel, updateTab],
   );
 
   React.useEffect(() => {
@@ -348,9 +376,12 @@ export function CodeEditorPanel({
     const key = `${openFileRequest.nonce}:${openFileRequest.path}`;
     if (lastOpenRequestRef.current === key) return;
     lastOpenRequestRef.current = key;
-    // Consume immediately to avoid duplicate tabs in React StrictMode double-mount.
-    onConsumeOpenFileRequestRef.current?.();
-    void openFile(openFileRequest.path);
+    // Defer consumption until the next tick so React StrictMode test mounts don't eat the request.
+    const timer = window.setTimeout(() => {
+      onConsumeOpenFileRequestRef.current?.();
+      void openFile(openFileRequest.path);
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [openFile, openFileRequest]);
 
   React.useEffect(() => {
@@ -425,7 +456,7 @@ export function CodeEditorPanel({
     setSaveStatus("saving");
     setSaveError(null);
     try {
-      await invoke("write_text_file", { root: rootDir, path, content: model.getValue() });
+      await writeTextFile(path, model.getValue());
       dirtyPathsRef.current.delete(path);
       updateTab(path, (tab) => ({ ...tab, dirty: false }));
       setSaveStatus("saved");
@@ -438,7 +469,7 @@ export function CodeEditorPanel({
       if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
       saveTimerRef.current = window.setTimeout(() => setSaveStatus("idle"), 2500);
     }
-  }, [rootDir, updateTab]);
+  }, [updateTab, writeTextFile]);
 
   const requestCloseEditor = React.useCallback(() => {
     if (dirtyPathsRef.current.size > 0) {
@@ -676,7 +707,7 @@ export function CodeEditorPanel({
             {activeTab?.loading ? <div className="codeEditorOverlay">Loading…</div> : null}
             {activeTab?.error ? (
               <div className="codeEditorOverlay" title={activeTab.error}>
-                Failed to open file.
+                {activeTab.error.length > 220 ? `${activeTab.error.slice(0, 220)}…` : activeTab.error}
               </div>
             ) : null}
           </div>

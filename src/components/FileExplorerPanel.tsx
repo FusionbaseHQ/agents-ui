@@ -72,6 +72,8 @@ async function copyToClipboard(text: string): Promise<boolean> {
 
 export function FileExplorerPanel({
   isOpen,
+  provider,
+  sshTarget,
   rootDir,
   activeFilePath,
   onSelectFile,
@@ -80,6 +82,8 @@ export function FileExplorerPanel({
   onPathDeleted,
 }: {
   isOpen: boolean;
+  provider: "local" | "ssh";
+  sshTarget?: string | null;
   rootDir: string;
   activeFilePath: string | null;
   onSelectFile: (path: string) => void;
@@ -88,6 +92,7 @@ export function FileExplorerPanel({
   onPathDeleted?: (path: string) => void;
 }) {
   const root = React.useMemo(() => normalizePath(rootDir), [rootDir]);
+  const sshTargetValue = React.useMemo(() => (sshTarget ?? "").trim() || null, [sshTarget]);
   const [expandedDirs, setExpandedDirs] = React.useState<Set<string>>(() => new Set([root]));
   const [dirStateByPath, setDirStateByPath] = React.useState<Record<string, DirectoryState>>({});
 
@@ -117,7 +122,13 @@ export function FileExplorerPanel({
         },
       }));
       try {
-        const entries = await invoke<FsEntry[]>("list_fs_entries", { root, path: dirPath });
+        if (provider === "ssh" && !sshTargetValue) {
+          throw new Error("Missing SSH target.");
+        }
+        const entries =
+          provider === "ssh"
+            ? await invoke<FsEntry[]>("ssh_list_fs_entries", { target: sshTargetValue, root, path: dirPath })
+            : await invoke<FsEntry[]>("list_fs_entries", { root, path: dirPath });
         setDirStateByPath((prev) => ({
           ...prev,
           [dirPath]: { entries, loading: false, error: null },
@@ -130,7 +141,7 @@ export function FileExplorerPanel({
         }));
       }
     },
-    [root],
+    [provider, root, sshTargetValue],
   );
 
   React.useEffect(() => {
@@ -303,8 +314,8 @@ export function FileExplorerPanel({
   const submitRename = React.useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
-      const target = renameTarget;
-      if (!target) return;
+      const entry = renameTarget;
+      if (!entry) return;
 
       const name = renameValue.trim();
       if (!name) return;
@@ -320,9 +331,15 @@ export function FileExplorerPanel({
       setRenameBusy(true);
       setRenameError(null);
       try {
-        const fromPath = target.path;
-        const toPath = await invoke<string>("rename_fs_entry", { root, path: fromPath, newName: name });
-        if (target.isDir) remapDirectoryPrefix(fromPath, toPath);
+        if (provider === "ssh" && !sshTargetValue) {
+          throw new Error("Missing SSH target.");
+        }
+        const fromPath = entry.path;
+        const toPath =
+          provider === "ssh"
+            ? await invoke<string>("ssh_rename_fs_entry", { target: sshTargetValue, root, path: fromPath, newName: name })
+            : await invoke<string>("rename_fs_entry", { root, path: fromPath, newName: name });
+        if (entry.isDir) remapDirectoryPrefix(fromPath, toPath);
         void loadDirectory(dirname(fromPath));
         onPathRenamed?.(fromPath, toPath);
         closeRenameModal();
@@ -333,7 +350,7 @@ export function FileExplorerPanel({
         setRenameBusy(false);
       }
     },
-    [closeRenameModal, loadDirectory, onPathRenamed, remapDirectoryPrefix, renameTarget, renameValue, root],
+    [closeRenameModal, loadDirectory, onPathRenamed, provider, remapDirectoryPrefix, renameTarget, renameValue, root, sshTargetValue],
   );
 
   const confirmDelete = React.useCallback(async () => {
@@ -342,7 +359,12 @@ export function FileExplorerPanel({
     setDeleteBusy(true);
     setDeleteError(null);
     try {
-      await invoke("delete_fs_entry", { root, path: target.path });
+      if (provider === "ssh" && !sshTargetValue) {
+        throw new Error("Missing SSH target.");
+      }
+      await (provider === "ssh"
+        ? invoke("ssh_delete_fs_entry", { target: sshTargetValue, root, path: target.path })
+        : invoke("delete_fs_entry", { root, path: target.path }));
       if (target.isDir) removeDirectoryPrefix(target.path);
       void loadDirectory(dirname(target.path));
       onPathDeleted?.(target.path);
@@ -353,7 +375,7 @@ export function FileExplorerPanel({
     } finally {
       setDeleteBusy(false);
     }
-  }, [closeDeleteModal, deleteTarget, loadDirectory, onPathDeleted, removeDirectoryPrefix, root]);
+  }, [closeDeleteModal, deleteTarget, loadDirectory, onPathDeleted, provider, removeDirectoryPrefix, root, sshTargetValue]);
 
   if (!isOpen) return null;
 
@@ -495,31 +517,37 @@ export function FileExplorerPanel({
           >
             Copy full path
           </button>
-          <button
-            type="button"
-            className="sidebarActionMenuItem"
-            role="menuitem"
-            onClick={() => {
-              const folder = contextMenu.entry.isDir ? contextMenu.entry.path : dirname(contextMenu.entry.path);
-              void invoke("open_path_in_file_manager", { path: folder }).catch(() => {});
-              setContextMenu(null);
-            }}
-          >
-            Open folder in Finder
-          </button>
-          <button
-            type="button"
-            className="sidebarActionMenuItem"
-            role="menuitem"
-            onClick={() => {
-              const folder = contextMenu.entry.isDir ? contextMenu.entry.path : dirname(contextMenu.entry.path);
-              void invoke("open_path_in_vscode", { path: folder }).catch(() => {});
-              setContextMenu(null);
-            }}
-          >
-            Open folder in VS Code
-          </button>
-          <div className="fileContextMenuSep" role="separator" />
+          {provider === "local" ? (
+            <>
+              <button
+                type="button"
+                className="sidebarActionMenuItem"
+                role="menuitem"
+                onClick={() => {
+                  const folder = contextMenu.entry.isDir ? contextMenu.entry.path : dirname(contextMenu.entry.path);
+                  void invoke("open_path_in_file_manager", { path: folder }).catch(() => {});
+                  setContextMenu(null);
+                }}
+              >
+                Open folder in Finder
+              </button>
+              <button
+                type="button"
+                className="sidebarActionMenuItem"
+                role="menuitem"
+                onClick={() => {
+                  const folder = contextMenu.entry.isDir ? contextMenu.entry.path : dirname(contextMenu.entry.path);
+                  void invoke("open_path_in_vscode", { path: folder }).catch(() => {});
+                  setContextMenu(null);
+                }}
+              >
+                Open folder in VS Code
+              </button>
+              <div className="fileContextMenuSep" role="separator" />
+            </>
+          ) : (
+            <div className="fileContextMenuSep" role="separator" />
+          )}
           <button
             type="button"
             className="sidebarActionMenuItem"

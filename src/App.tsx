@@ -66,6 +66,8 @@ type Session = SessionInfo & {
   createdAt: number;
   launchCommand: string | null;
   restoreCommand?: string | null;
+  sshTarget: string | null;
+  sshRootDir: string | null;
   lastRecordingId?: string | null;
   recordingActive?: boolean;
   cwd: string | null;
@@ -77,7 +79,8 @@ type Session = SessionInfo & {
   exitCode?: number | null;
 };
 
-type ProjectWorkspaceView = {
+type WorkspaceView = {
+  projectId: string;
   fileExplorerOpen: boolean;
   fileExplorerRootDir: string | null;
   codeEditorOpen: boolean;
@@ -288,6 +291,15 @@ function isSshCommandLine(commandLine: string | null | undefined): boolean {
   return base.toLowerCase().replace(/\.exe$/, "") === "ssh";
 }
 
+function sshTargetFromCommandLine(commandLine: string | null | undefined): string | null {
+  const trimmed = commandLine?.trim() ?? "";
+  if (!trimmed) return null;
+  if (!isSshCommandLine(trimmed)) return null;
+  const parts = trimmed.split(/\s+/);
+  const target = parts[parts.length - 1]?.trim() ?? "";
+  return target ? target : null;
+}
+
 function parseEnvContentToVars(content: string): Record<string, string> {
   const out: Record<string, string> = {};
   const normalized = normalizeSmartQuotes(content);
@@ -360,6 +372,8 @@ type PersistedSession = {
   name: string;
   launchCommand: string | null;
   restoreCommand?: string | null;
+  sshTarget?: string | null;
+  sshRootDir?: string | null;
   lastRecordingId?: string | null;
   cwd: string | null;
   persistent?: boolean;
@@ -554,6 +568,8 @@ async function createSession(input: {
   name?: string;
   launchCommand?: string | null;
   restoreCommand?: string | null;
+  sshTarget?: string | null;
+  sshRootDir?: string | null;
   lastRecordingId?: string | null;
   cwd?: string | null;
   envVars?: Record<string, string> | null;
@@ -566,6 +582,11 @@ async function createSession(input: {
 
   const trimmedCommand = (input.launchCommand ?? "").trim();
   const launchCommand = persistent ? null : trimmedCommand ? trimmedCommand : null;
+  const isSshSession = isSshCommandLine(launchCommand ?? input.restoreCommand ?? null);
+  const sshTarget = isSshSession
+    ? (input.sshTarget?.trim() || sshTargetFromCommandLine(launchCommand ?? input.restoreCommand ?? null))
+    : null;
+  const sshRootDir = isSshSession ? input.sshRootDir?.trim() || null : null;
   const processTag = launchCommand ? commandTagFromCommandLine(launchCommand) : null;
   const effect = detectProcessEffect({
     command: launchCommand,
@@ -587,6 +608,8 @@ async function createSession(input: {
     createdAt: input.createdAt ?? Date.now(),
     launchCommand,
     restoreCommand: input.restoreCommand ?? null,
+    sshTarget,
+    sshRootDir,
     lastRecordingId: input.lastRecordingId ?? null,
     recordingActive: false,
     cwd: info.cwd ?? input.cwd ?? null,
@@ -748,9 +771,7 @@ export default function App() {
   const [recordingStartTime, setRecordingStartTime] = useState<number | null>(null);
   const [recordingElapsed, setRecordingElapsed] = useState(0);
 
-  const [workspaceViewByProjectId, setWorkspaceViewByProjectId] = useState<
-    Record<string, ProjectWorkspaceView>
-  >({});
+  const [workspaceViewByKey, setWorkspaceViewByKey] = useState<Record<string, WorkspaceView>>({});
   const workspaceRowRef = useRef<HTMLDivElement | null>(null);
 
   const workspaceEditorWidthStorageKey = useCallback(
@@ -773,7 +794,7 @@ export default function App() {
   }, []);
 
   const createInitialWorkspaceView = useCallback(
-    (projectId: string): ProjectWorkspaceView => {
+    (projectId: string): WorkspaceView => {
       const editorWidth = Math.max(
         MIN_WORKSPACE_EDITOR_WIDTH,
         readStoredNumber(workspaceEditorWidthStorageKey(projectId), DEFAULT_WORKSPACE_EDITOR_WIDTH),
@@ -783,6 +804,7 @@ export default function App() {
         readStoredNumber(workspaceFileTreeWidthStorageKey(projectId), DEFAULT_WORKSPACE_FILE_TREE_WIDTH),
       );
       return {
+        projectId,
         fileExplorerOpen: true,
         fileExplorerRootDir: null,
         codeEditorOpen: false,
@@ -798,26 +820,34 @@ export default function App() {
     [readStoredNumber, workspaceEditorWidthStorageKey, workspaceFileTreeWidthStorageKey],
   );
 
-  const activeWorkspaceView = useMemo(() => {
-    return workspaceViewByProjectId[activeProjectId] ?? createInitialWorkspaceView(activeProjectId);
-  }, [activeProjectId, createInitialWorkspaceView, workspaceViewByProjectId]);
+  const activeWorkspaceKey = useMemo(() => {
+    const active = sessions.find((s) => s.id === activeId) ?? null;
+    if (!active) return activeProjectId;
+    const isSsh = isSshCommandLine(active.launchCommand ?? active.restoreCommand ?? null);
+    if (isSsh) return `ssh:${active.persistId}`;
+    return activeProjectId;
+  }, [activeId, activeProjectId, sessions]);
 
-  const updateWorkspaceViewForProject = useCallback(
-    (projectId: string, updater: (prev: ProjectWorkspaceView) => ProjectWorkspaceView) => {
-      setWorkspaceViewByProjectId((prev) => {
-        const current = prev[projectId] ?? createInitialWorkspaceView(projectId);
+  const activeWorkspaceView = useMemo(() => {
+    return workspaceViewByKey[activeWorkspaceKey] ?? createInitialWorkspaceView(activeProjectId);
+  }, [activeProjectId, activeWorkspaceKey, createInitialWorkspaceView, workspaceViewByKey]);
+
+  const updateWorkspaceViewForKey = useCallback(
+    (key: string, projectId: string, updater: (prev: WorkspaceView) => WorkspaceView) => {
+      setWorkspaceViewByKey((prev) => {
+        const current = prev[key] ?? createInitialWorkspaceView(projectId);
         const next = updater(current);
         if (next === current) return prev;
-        return { ...prev, [projectId]: next };
+        return { ...prev, [key]: next };
       });
     },
     [createInitialWorkspaceView],
   );
 
   const updateActiveWorkspaceView = useCallback(
-    (updater: (prev: ProjectWorkspaceView) => ProjectWorkspaceView) =>
-      updateWorkspaceViewForProject(activeProjectId, updater),
-    [activeProjectId, updateWorkspaceViewForProject],
+    (updater: (prev: WorkspaceView) => WorkspaceView) =>
+      updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, updater),
+    [activeProjectId, activeWorkspaceKey, updateWorkspaceViewForKey],
   );
 
   const workspaceEditorWidthRef = useRef(activeWorkspaceView.editorWidth);
@@ -853,7 +883,7 @@ export default function App() {
 
   const [workspaceResizeMode, setWorkspaceResizeMode] = useState<"editor" | "tree" | null>(null);
   const workspaceResizeStartRef = useRef<
-    { x: number; editorWidth: number; treeWidth: number; projectId: string } | null
+    { x: number; editorWidth: number; treeWidth: number; projectId: string; workspaceKey: string } | null
   >(null);
   const workspaceResizeDraftRef = useRef<{ editorWidth: number; treeWidth: number } | null>(null);
 
@@ -1034,6 +1064,81 @@ export default function App() {
     return isSshCommandLine(active.launchCommand ?? active.restoreCommand ?? null);
   }, [active]);
 
+  const activeSshTarget = useMemo(() => {
+    if (!activeIsSsh || !active) return null;
+    const stored = active.sshTarget?.trim() ?? "";
+    if (stored) return stored;
+    return sshTargetFromCommandLine(active.launchCommand ?? active.restoreCommand ?? null);
+  }, [active, activeIsSsh]);
+
+  const sshRootResolveInFlightRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!activeIsSsh || !active) return;
+    if (active.exited || active.closing) return;
+    if (!activeWorkspaceView.fileExplorerOpen && !activeWorkspaceView.codeEditorOpen) return;
+
+    const currentRoot = (
+      activeWorkspaceView.fileExplorerRootDir ??
+      activeWorkspaceView.codeEditorRootDir ??
+      ""
+    ).trim();
+    if (currentRoot) return;
+
+    const persistedRoot = (active.sshRootDir ?? "").trim();
+    if (persistedRoot) {
+      updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => {
+        const existing = (prev.fileExplorerRootDir ?? prev.codeEditorRootDir ?? "").trim();
+        if (existing) return prev;
+        return { ...prev, fileExplorerRootDir: persistedRoot, codeEditorRootDir: persistedRoot };
+      });
+      return;
+    }
+
+    const target = activeSshTarget;
+    if (!target) return;
+    if (sshRootResolveInFlightRef.current.has(activeWorkspaceKey)) return;
+
+    let cancelled = false;
+    sshRootResolveInFlightRef.current.add(activeWorkspaceKey);
+    void (async () => {
+      try {
+        const root = await invoke<string>("ssh_default_root", { target });
+        if (cancelled) return;
+        updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => {
+          const existing = (prev.fileExplorerRootDir ?? prev.codeEditorRootDir ?? "").trim();
+          if (existing) return prev;
+          return { ...prev, fileExplorerRootDir: root, codeEditorRootDir: root };
+        });
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === active.id
+              ? { ...s, sshTarget: s.sshTarget ?? target, sshRootDir: root }
+              : s,
+          ),
+        );
+      } catch (err) {
+        if (!cancelled) reportError(`Failed to load remote files for ${target}`, err);
+      } finally {
+        sshRootResolveInFlightRef.current.delete(activeWorkspaceKey);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    active,
+    activeIsSsh,
+    activeProjectId,
+    activeSshTarget,
+    activeWorkspaceKey,
+    activeWorkspaceView.codeEditorOpen,
+    activeWorkspaceView.codeEditorRootDir,
+    activeWorkspaceView.fileExplorerOpen,
+    activeWorkspaceView.fileExplorerRootDir,
+    updateWorkspaceViewForKey,
+  ]);
+
   const closeCodeEditor = useCallback(() => {
     updateActiveWorkspaceView((prev) => ({
       ...prev,
@@ -1042,11 +1147,17 @@ export default function App() {
     }));
   }, [updateActiveWorkspaceView]);
 
-  const handleSelectLocalFile = useCallback(
+  const handleSelectWorkspaceFile = useCallback(
     (path: string) => {
       updateActiveWorkspaceView((prev) => {
         const project = projects.find((p) => p.id === activeProjectId) ?? null;
-        const root = (prev.codeEditorRootDir ?? prev.fileExplorerRootDir ?? project?.basePath ?? active?.cwd ?? "")
+        const root = (
+          prev.codeEditorRootDir ??
+          prev.fileExplorerRootDir ??
+          (!activeIsSsh ? project?.basePath : null) ??
+          (!activeIsSsh ? active?.cwd : null) ??
+          ""
+        )
           .trim();
         if (!root) return prev;
         return {
@@ -1058,7 +1169,7 @@ export default function App() {
         };
       });
     },
-    [active?.cwd, activeProjectId, projects, updateActiveWorkspaceView],
+    [active?.cwd, activeIsSsh, activeProjectId, projects, updateActiveWorkspaceView],
   );
 
   const handleRenameWorkspacePath = useCallback(
@@ -1091,12 +1202,12 @@ export default function App() {
       setWorkspaceResizeMode(mode);
       const editorWidth = workspaceEditorWidthRef.current;
       const treeWidth = workspaceFileTreeWidthRef.current;
-      workspaceResizeStartRef.current = { x: e.clientX, editorWidth, treeWidth, projectId: activeProjectId };
+      workspaceResizeStartRef.current = { x: e.clientX, editorWidth, treeWidth, projectId: activeProjectId, workspaceKey: activeWorkspaceKey };
       workspaceResizeDraftRef.current = { editorWidth, treeWidth };
       document.body.style.cursor = "ew-resize";
       document.body.style.userSelect = "none";
     },
-    [activeProjectId],
+    [activeProjectId, activeWorkspaceKey],
   );
 
   useEffect(() => {
@@ -1143,11 +1254,25 @@ export default function App() {
       if (draft && start) {
         const editorWidth = Math.max(MIN_WORKSPACE_EDITOR_WIDTH, Math.floor(draft.editorWidth));
         const treeWidth = Math.max(MIN_WORKSPACE_FILE_TREE_WIDTH, Math.floor(draft.treeWidth));
-        updateWorkspaceViewForProject(start.projectId, (prev) => ({
-          ...prev,
-          editorWidth,
-          treeWidth,
-        }));
+        setWorkspaceViewByKey((prev) => {
+          let changed = false;
+          const next: Record<string, WorkspaceView> = { ...prev };
+
+          for (const [key, view] of Object.entries(prev)) {
+            if (view.projectId !== start.projectId) continue;
+            if (view.editorWidth === editorWidth && view.treeWidth === treeWidth) continue;
+            next[key] = { ...view, editorWidth, treeWidth };
+            changed = true;
+          }
+
+          const current = prev[start.workspaceKey] ?? createInitialWorkspaceView(start.projectId);
+          if (!prev[start.workspaceKey] || current.editorWidth !== editorWidth || current.treeWidth !== treeWidth) {
+            next[start.workspaceKey] = { ...current, editorWidth, treeWidth };
+            changed = true;
+          }
+
+          return changed ? next : prev;
+        });
       }
       workspaceResizeStartRef.current = null;
       workspaceResizeDraftRef.current = null;
@@ -1164,7 +1289,7 @@ export default function App() {
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
-  }, [updateWorkspaceViewForProject, workspaceEditorVisible, workspaceResizeMode, workspaceTreeVisible]);
+  }, [createInitialWorkspaceView, workspaceEditorVisible, workspaceResizeMode, workspaceTreeVisible]);
 
   const activeProject = useMemo(
     () => projects.find((p) => p.id === activeProjectId) ?? null,
@@ -1289,6 +1414,8 @@ export default function App() {
         name: s.name,
         launchCommand: s.launchCommand,
         restoreCommand: s.restoreCommand ?? null,
+        sshTarget: s.sshTarget ?? null,
+        sshRootDir: s.sshRootDir ?? null,
         lastRecordingId: s.lastRecordingId ?? null,
         cwd: s.cwd,
         persistent: s.persistent,
@@ -1796,6 +1923,8 @@ export default function App() {
         name: s.name,
         launchCommand: s.launchCommand,
         restoreCommand: s.restoreCommand ?? null,
+        sshTarget: s.sshTarget ?? null,
+        sshRootDir: s.sshRootDir ?? null,
         lastRecordingId: s.lastRecordingId ?? null,
         cwd: s.cwd,
         persistent: s.persistent,
@@ -3276,6 +3405,8 @@ export default function App() {
             name: s.name,
             launchCommand: s.launchCommand,
             restoreCommand: s.restoreCommand ?? null,
+            sshTarget: s.sshTarget ?? null,
+            sshRootDir: s.sshRootDir ?? null,
             lastRecordingId: s.lastRecordingId ?? null,
             cwd: s.cwd ?? projectById.get(s.projectId)?.basePath ?? resolvedHome ?? null,
             envVars: envVarsForProject(s.projectId),
@@ -4161,31 +4292,38 @@ export default function App() {
                         Open in VS Code
                       </button>
                     </div>
+                  </>
+                ) : null}
 
-                    <button
-                      className={`iconBtn ${activeWorkspaceView.fileExplorerOpen ? "iconBtnActive" : ""}`}
-                      onClick={() => {
-                        updateActiveWorkspaceView((prev) => {
-                          if (prev.fileExplorerOpen) {
-                            return { ...prev, fileExplorerOpen: false };
-                          }
-                          const root = (
-                            prev.fileExplorerRootDir ??
-                            prev.codeEditorRootDir ??
-                            activeProject?.basePath ??
-                            active?.cwd ??
-                            ""
-                          ).trim();
-                          if (!root) return prev;
-                          return {
-                            ...prev,
-                            fileExplorerOpen: true,
-                            fileExplorerRootDir: prev.fileExplorerRootDir ?? root,
-                          };
-                        });
-                      }}
-                      disabled={
-                        !activeWorkspaceView.fileExplorerOpen &&
+                <button
+                  className={`iconBtn ${activeWorkspaceView.fileExplorerOpen ? "iconBtnActive" : ""}`}
+                  onClick={() => {
+                    updateActiveWorkspaceView((prev) => {
+                      if (prev.fileExplorerOpen) {
+                        return { ...prev, fileExplorerOpen: false };
+                      }
+                      if (activeIsSsh) {
+                        return { ...prev, fileExplorerOpen: true };
+                      }
+                      const root = (
+                        prev.fileExplorerRootDir ??
+                        prev.codeEditorRootDir ??
+                        activeProject?.basePath ??
+                        active?.cwd ??
+                        ""
+                      ).trim();
+                      if (!root) return prev;
+                      return {
+                        ...prev,
+                        fileExplorerOpen: true,
+                        fileExplorerRootDir: prev.fileExplorerRootDir ?? root,
+                      };
+                    });
+                  }}
+                  disabled={
+                    activeIsSsh
+                      ? !activeWorkspaceView.fileExplorerOpen && !activeSshTarget
+                      : !activeWorkspaceView.fileExplorerOpen &&
                         !(
                           activeWorkspaceView.fileExplorerRootDir ??
                           activeWorkspaceView.codeEditorRootDir ??
@@ -4193,25 +4331,27 @@ export default function App() {
                           active?.cwd ??
                           ""
                         ).trim()
-                      }
-                      title={
-                        activeWorkspaceView.fileExplorerOpen
-                          ? "Close file tree"
-                          : `Open file tree — ${
-                              (
-                                activeWorkspaceView.fileExplorerRootDir ??
-                                activeWorkspaceView.codeEditorRootDir ??
-                                activeProject?.basePath ??
-                                active?.cwd ??
-                                ""
-                              ).trim() || "—"
-                            }`
-                      }
-                    >
-                      <Icon name="folder" />
-                    </button>
-                  </>
-                ) : null}
+                  }
+                  title={
+                    activeWorkspaceView.fileExplorerOpen
+                      ? activeIsSsh
+                        ? "Close remote file tree"
+                        : "Close file tree"
+                      : activeIsSsh
+                        ? `Open remote file tree — ${activeSshTarget ?? "ssh"}`
+                        : `Open file tree — ${
+                            (
+                              activeWorkspaceView.fileExplorerRootDir ??
+                              activeWorkspaceView.codeEditorRootDir ??
+                              activeProject?.basePath ??
+                              active?.cwd ??
+                              ""
+                            ).trim() || "—"
+                          }`
+                  }
+                >
+                  <Icon name="folder" />
+                </button>
 
                 {/* Record Button */}
                 <button
@@ -4291,9 +4431,7 @@ export default function App() {
 	              (
 	                activeWorkspaceView.codeEditorRootDir ??
 	                activeWorkspaceView.fileExplorerRootDir ??
-	                activeProject?.basePath ??
-	                active?.cwd ??
-	                ""
+                  (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
 	              ).trim() ? (
 	                <>
 	                  <div
@@ -4309,33 +4447,33 @@ export default function App() {
 	                    }
 	                  >
 	                    <LazyCodeEditorPanel
-	                      key={`code-editor:${activeProjectId}`}
+	                      key={`code-editor:${activeWorkspaceKey}`}
+                        provider={activeIsSsh ? "ssh" : "local"}
+                        sshTarget={activeIsSsh ? activeSshTarget : null}
 	                      rootDir={
 	                        (
 	                          activeWorkspaceView.codeEditorRootDir ??
 	                          activeWorkspaceView.fileExplorerRootDir ??
-	                          activeProject?.basePath ??
-	                          active?.cwd ??
-	                          ""
+	                          (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
 	                        ).trim()
 	                      }
 	                      openFileRequest={activeWorkspaceView.openFileRequest}
 	                      persistedState={activeWorkspaceView.codeEditorPersistedState}
                         fsEvent={activeWorkspaceView.codeEditorFsEvent}
 	                      onPersistState={(state) =>
-	                        updateWorkspaceViewForProject(activeProjectId, (prev) => ({
+	                        updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
 	                          ...prev,
 	                          codeEditorPersistedState: state,
 	                        }))
 	                      }
 	                      onConsumeOpenFileRequest={() =>
-	                        updateWorkspaceViewForProject(activeProjectId, (prev) => ({
+	                        updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
 	                          ...prev,
 	                          openFileRequest: null,
 	                        }))
 	                      }
 	                      onActiveFilePathChange={(path) =>
-	                        updateWorkspaceViewForProject(activeProjectId, (prev) => ({
+	                        updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
 	                          ...prev,
 	                          codeEditorActiveFilePath: path,
 	                        }))
@@ -4350,9 +4488,7 @@ export default function App() {
 	              (
 	                activeWorkspaceView.fileExplorerRootDir ??
 	                activeWorkspaceView.codeEditorRootDir ??
-	                activeProject?.basePath ??
-	                active?.cwd ??
-	                ""
+                  (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
 	              ).trim() ? (
 	                <>
 	                  <div
@@ -4361,30 +4497,66 @@ export default function App() {
 	                    aria-hidden="true"
 	                  />
 	                  <FileExplorerPanel
-	                    key={`file-tree:${activeProjectId}`}
+	                    key={`file-tree:${activeWorkspaceKey}`}
 	                    isOpen
+                      provider={activeIsSsh ? "ssh" : "local"}
+                      sshTarget={activeIsSsh ? activeSshTarget : null}
 	                    rootDir={
 	                      (
 	                        activeWorkspaceView.fileExplorerRootDir ??
 	                        activeWorkspaceView.codeEditorRootDir ??
-	                        activeProject?.basePath ??
-	                        active?.cwd ??
-	                        ""
+	                        (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
 	                      ).trim()
 	                    }
 	                    activeFilePath={activeWorkspaceView.codeEditorActiveFilePath}
-	                    onSelectFile={handleSelectLocalFile}
+	                    onSelectFile={handleSelectWorkspaceFile}
                       onPathRenamed={handleRenameWorkspacePath}
                       onPathDeleted={handleDeleteWorkspacePath}
 	                    onClose={() =>
-	                      updateWorkspaceViewForProject(activeProjectId, (prev) => ({
+	                      updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
 	                        ...prev,
 	                        fileExplorerOpen: false,
 	                      }))
 	                    }
 	                  />
 	                </>
-	              ) : null}
+	              ) : activeWorkspaceView.fileExplorerOpen && activeIsSsh ? (
+                  <>
+                    <div
+                      className="workspaceResize"
+                      onMouseDown={beginWorkspaceResize("tree")}
+                      aria-hidden="true"
+                    />
+                    <aside className="fileExplorerPanel" aria-label="Files">
+                      <div className="fileExplorerHeader">
+                        <div className="fileExplorerTitle">
+                          <span>Files</span>
+                          <span className="fileExplorerPath">remote</span>
+                        </div>
+                        <div className="fileExplorerActions">
+                          <button
+                            type="button"
+                            className="btnSmall btnIcon"
+                            onClick={() =>
+                              updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
+                                ...prev,
+                                fileExplorerOpen: false,
+                              }))
+                            }
+                            title="Close"
+                          >
+                            <Icon name="close" />
+                          </button>
+                        </div>
+                      </div>
+                      <div className="fileExplorerList" role="tree">
+                        <div className="fileExplorerRow fileExplorerMeta">
+                          {activeSshTarget ? "Loading remote files…" : "Missing SSH target."}
+                        </div>
+                      </div>
+                    </aside>
+                  </>
+                ) : null}
             </div>
 	
 	          <NewSessionModal
