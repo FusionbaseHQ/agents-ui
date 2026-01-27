@@ -1,9 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import React from "react";
 import { shortenPathSmart } from "../pathDisplay";
 import { Icon } from "./Icon";
 import { ConfirmActionModal } from "./modals/ConfirmActionModal";
+
+// Cache for downloaded SSH files to avoid re-downloading during the same session
+const sshFileCache = new Map<string, string>();
+const dragIconCache = new Map<"file" | "folder", string>();
 
 type FsEntry = {
   name: string;
@@ -35,6 +42,37 @@ function dirname(input: string): string {
   const idx = path.lastIndexOf("/");
   if (idx <= 0) return path;
   return path.slice(0, idx);
+}
+
+function basename(input: string): string {
+  const path = normalizePath(input).replace(/\\/g, "/");
+  if (!path) return "";
+  if (path === "/") return "/";
+  const idx = path.lastIndexOf("/");
+  if (idx < 0) return path;
+  return path.slice(idx + 1);
+}
+
+function joinPath(dir: string, name: string): string {
+  const base = normalizePath(dir);
+  if (base === "/") return `/${name}`;
+  return `${base}/${name}`;
+}
+
+function parseFileUrlPath(data: string): string | null {
+  if (!data.startsWith("file://")) return null;
+  const rest = data.slice("file://".length);
+  const slashIdx = rest.indexOf("/");
+  if (slashIdx < 0) return null;
+  const rawPath = rest.slice(slashIdx);
+  try {
+    const decoded = decodeURIComponent(rawPath);
+    if (/^\/[A-Za-z]:\//.test(decoded)) return decoded.slice(1);
+    return decoded;
+  } catch {
+    if (/^\/[A-Za-z]:\//.test(rawPath)) return rawPath.slice(1);
+    return rawPath;
+  }
 }
 
 function relativePath(rootDir: string, absolutePath: string): string {
@@ -99,6 +137,7 @@ export function FileExplorerPanel({
   const sshTargetValue = React.useMemo(() => (sshTarget ?? "").trim() || null, [sshTarget]);
   const [expandedDirs, setExpandedDirs] = React.useState<Set<string>>(() => new Set([root]));
   const [dirStateByPath, setDirStateByPath] = React.useState<Record<string, DirectoryState>>({});
+  const panelRef = React.useRef<HTMLElement | null>(null);
   const listRef = React.useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = React.useState(0);
   const [listHeight, setListHeight] = React.useState(0);
@@ -119,8 +158,21 @@ export function FileExplorerPanel({
 
   const [downloadBusy, setDownloadBusy] = React.useState(false);
   const [downloadError, setDownloadError] = React.useState<string | null>(null);
+  const [dragDropActive, setDragDropActive] = React.useState(false);
   const [dropTarget, setDropTarget] = React.useState<string | null>(null);
-  const [draggedItem, setDraggedItem] = React.useState<FsEntry | null>(null);
+  const [dragPreparing, setDragPreparing] = React.useState<string | null>(null);
+
+  // Track mouse state for native drag initiation
+  const mouseDownRef = React.useRef<{
+    attemptId: number;
+    entry: FsEntry;
+    startX: number;
+    startY: number;
+    moved: boolean;
+  } | null>(null);
+  const dragAttemptSeqRef = React.useRef(0);
+  const dropRafRef = React.useRef<number | null>(null);
+  const lastDropPosRef = React.useRef<{ x: number; y: number } | null>(null);
 
   const loadDirectory = React.useCallback(
     async (path: string) => {
@@ -182,6 +234,9 @@ export function FileExplorerPanel({
     setContextMenu(null);
     setRenameTarget(null);
     setDeleteTarget(null);
+    setDragDropActive(false);
+    setDropTarget(null);
+    setDragPreparing(null);
     void loadDirectory(root);
   }, [isOpen, loadDirectory, root]);
 
@@ -443,45 +498,315 @@ export function FileExplorerPanel({
     }
   }, [sshTargetValue, root]);
 
-  const handleFileDrop = React.useCallback(async (
-    sourceProvider: "local" | "ssh",
-    sourceSshTarget: string | null,
-    sourceRoot: string,
-    sourcePath: string,
-    sourceName: string,
-    destDirPath: string,
-  ) => {
-    const destPath = destDirPath === "/" ? `/${sourceName}` : `${destDirPath}/${sourceName}`;
+  const getDragIcon = React.useCallback((kind: "file" | "folder"): string => {
+    const cached = dragIconCache.get(kind);
+    if (cached) return cached;
 
-    try {
-      if (sourceProvider === "ssh" && provider === "local") {
-        // SSH → Local: download
-        if (!sourceSshTarget) return;
-        await invoke("ssh_download_file", {
-          target: sourceSshTarget,
-          root: sourceRoot,
-          remotePath: sourcePath,
-          localPath: destPath,
-        });
-      } else if (sourceProvider === "local" && provider === "ssh") {
-        // Local → SSH: upload
-        if (!sshTargetValue) return;
-        await invoke("ssh_upload_file", {
-          target: sshTargetValue,
-          root,
-          localPath: sourcePath,
-          remotePath: destPath,
-        });
-      } else {
-        // Same provider - not supported for now
-        return;
-      }
-      // Refresh directory to show new file
-      void loadDirectory(destDirPath);
-    } catch (err) {
-      console.error("File transfer failed:", err);
+    const size = 64;
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return "data:image/png;base64,";
+
+    const roundRect = (x: number, y: number, w: number, h: number, r: number) => {
+      const radius = Math.max(0, Math.min(r, w / 2, h / 2));
+      ctx.beginPath();
+      ctx.moveTo(x + radius, y);
+      ctx.arcTo(x + w, y, x + w, y + h, radius);
+      ctx.arcTo(x + w, y + h, x, y + h, radius);
+      ctx.arcTo(x, y + h, x, y, radius);
+      ctx.arcTo(x, y, x + w, y, radius);
+      ctx.closePath();
+    };
+
+    ctx.clearRect(0, 0, size, size);
+    ctx.shadowColor = "rgba(0,0,0,0.35)";
+    ctx.shadowBlur = 10;
+    ctx.shadowOffsetY = 4;
+    ctx.fillStyle = "rgba(15, 23, 42, 0.94)";
+    roundRect(6, 6, size - 12, size - 12, 14);
+    ctx.fill();
+
+    ctx.shadowColor = "transparent";
+    ctx.shadowBlur = 0;
+    ctx.shadowOffsetY = 0;
+
+    ctx.fillStyle = "rgba(240, 244, 248, 0.95)";
+    if (kind === "folder") {
+      roundRect(16, 20, 22, 10, 4);
+      ctx.fill();
+      roundRect(14, 26, 36, 24, 6);
+      ctx.fill();
+      ctx.fillStyle = "rgba(107, 138, 253, 0.35)";
+      roundRect(14, 26, 36, 10, 6);
+      ctx.fill();
+    } else {
+      roundRect(20, 16, 24, 32, 6);
+      ctx.fill();
+      ctx.fillStyle = "rgba(15, 23, 42, 0.5)";
+      ctx.beginPath();
+      ctx.moveTo(40, 16);
+      ctx.lineTo(44, 20);
+      ctx.lineTo(44, 30);
+      ctx.lineTo(34, 30);
+      ctx.closePath();
+      ctx.fill();
     }
-  }, [provider, sshTargetValue, root, loadDirectory]);
+
+    const dataUrl = canvas.toDataURL("image/png");
+    dragIconCache.set(kind, dataUrl);
+    return dataUrl;
+  }, []);
+
+  const resolveDropDestination = React.useCallback(
+    (logicalX: number, logicalY: number): string | null => {
+      if (!panelRef.current) return null;
+      const el = document.elementFromPoint(logicalX, logicalY);
+      if (!el || !(el instanceof Element)) return null;
+      if (!panelRef.current.contains(el)) return null;
+
+      const row = el.closest("[data-fs-entry-path]") as HTMLElement | null;
+      if (!row) return root;
+      const entryPath = row.dataset.fsEntryPath;
+      if (!entryPath) return root;
+      const isDir = row.dataset.fsEntryIsDir === "true";
+      return isDir ? entryPath : dirname(entryPath);
+    },
+    [root],
+  );
+
+  const transferDroppedPaths = React.useCallback(
+    async (paths: string[], destinationDir: string) => {
+      const destDir = normalizePath(destinationDir);
+      if (!destDir) return;
+
+      if (provider === "ssh" && !sshTargetValue) return;
+
+      setExpandedDirs((prev) => {
+        if (prev.has(destDir)) return prev;
+        const next = new Set(prev);
+        next.add(destDir);
+        return next;
+      });
+
+      for (const sourcePathRaw of paths) {
+        const raw = sourcePathRaw.trim();
+        const sourcePath = parseFileUrlPath(raw) ?? raw;
+        if (!sourcePath) continue;
+
+        const name = basename(sourcePath);
+        if (!name || name === "/") continue;
+        const destPath = joinPath(destDir, name);
+
+        if (normalizePath(sourcePath) === normalizePath(destPath)) continue;
+        if (normalizePath(destPath).startsWith(`${normalizePath(sourcePath)}/`)) continue;
+
+        try {
+          if (provider === "ssh" && sshTargetValue) {
+            await invoke("ssh_upload_file", {
+              target: sshTargetValue,
+              root,
+              localPath: sourcePath,
+              remotePath: destPath,
+            });
+          } else if (provider === "local") {
+            await invoke("copy_fs_entry", {
+              root,
+              sourcePath,
+              destPath,
+            });
+          }
+        } catch (err) {
+          console.error("File transfer failed:", err);
+        }
+      }
+
+      void loadDirectory(destDir);
+    },
+    [loadDirectory, provider, root, sshTargetValue],
+  );
+
+  // Initiate native drag to Finder/Desktop
+  const initiateNativeDrag = React.useCallback(async (entry: FsEntry, attemptId: number) => {
+    try {
+      if (mouseDownRef.current?.attemptId !== attemptId) return;
+      let localPath: string;
+
+      if (provider === "local") {
+        // Local file - use path directly
+        localPath = entry.path;
+      } else {
+        // SSH file - need to download first
+        // Check cache first
+        const cacheKey = `${sshTargetValue}:${entry.path}`;
+        const cached = sshFileCache.get(cacheKey);
+        if (cached) {
+          localPath = cached;
+        } else {
+          // Download to temp
+          setDragPreparing(entry.path);
+          if (!sshTargetValue) return;
+          localPath = await invoke<string>("ssh_download_to_temp", {
+            target: sshTargetValue,
+            root,
+            remotePath: entry.path,
+          });
+          // Cache for future drags
+          sshFileCache.set(cacheKey, localPath);
+          setDragPreparing(null);
+        }
+      }
+
+      if (mouseDownRef.current?.attemptId !== attemptId) return;
+      // Clear drag tracking before handing off to OS drag.
+      mouseDownRef.current = null;
+      await startDrag({
+        item: [localPath],
+        icon: getDragIcon(entry.isDir ? "folder" : "file"),
+        mode: "copy",
+      });
+    } catch (err) {
+      console.error("Native drag failed:", err);
+      setDragPreparing(null);
+    }
+  }, [getDragIcon, provider, sshTargetValue, root]);
+
+  // Handle mouse events for native drag detection
+  const handleMouseDown = React.useCallback((e: React.MouseEvent, entry: FsEntry) => {
+    // Only track left mouse button
+    if (e.button !== 0) return;
+    dragAttemptSeqRef.current += 1;
+    mouseDownRef.current = {
+      attemptId: dragAttemptSeqRef.current,
+      entry,
+      startX: e.clientX,
+      startY: e.clientY,
+      moved: false,
+    };
+  }, []);
+
+  const handleMouseMove = React.useCallback((e: React.MouseEvent) => {
+    const state = mouseDownRef.current;
+    if (!state || state.moved) return;
+
+    // Check if mouse has moved enough to consider it a drag (5px threshold)
+    const dx = e.clientX - state.startX;
+    const dy = e.clientY - state.startY;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+
+    if (distance > 5) {
+      state.moved = true;
+      // Initiate native drag
+      void initiateNativeDrag(state.entry, state.attemptId);
+    }
+  }, [initiateNativeDrag]);
+
+  const handleMouseUp = React.useCallback(() => {
+    mouseDownRef.current = null;
+  }, []);
+
+  // Global mouse up listener to handle mouse release outside the component
+  React.useEffect(() => {
+    const handleGlobalMouseUp = () => {
+      mouseDownRef.current = null;
+    };
+    window.addEventListener("mouseup", handleGlobalMouseUp);
+    return () => window.removeEventListener("mouseup", handleGlobalMouseUp);
+  }, []);
+
+  React.useEffect(() => {
+    if (!isOpen) return;
+
+    let unlistenWebview: (() => void) | null = null;
+    let unlistenWindow: (() => void) | null = null;
+    let cancelled = false;
+    let lastDropSignature = "";
+    let lastDropAt = 0;
+
+    const setDropTargetFromPhysical = (pos: { x: number; y: number }) => {
+      lastDropPosRef.current = pos;
+      if (dropRafRef.current !== null) return;
+      dropRafRef.current = window.requestAnimationFrame(() => {
+        dropRafRef.current = null;
+        const nextPos = lastDropPosRef.current;
+        if (!nextPos) return;
+        // Tauri reports drag/drop position as PhysicalPosition, but on some platforms/configs
+        // it may already be in logical coordinates. Try both for resilience.
+        const scale = window.devicePixelRatio || 1;
+        const logicalX = nextPos.x / scale;
+        const logicalY = nextPos.y / scale;
+        const resolved =
+          resolveDropDestination(logicalX, logicalY) ?? resolveDropDestination(nextPos.x, nextPos.y);
+        setDropTarget(resolved);
+      });
+    };
+
+    const setup = async () => {
+      const handleEvent = (event: { payload: any }) => {
+        if (cancelled) return;
+        const payload = event.payload;
+
+        if (payload.type === "enter") {
+          setDragDropActive(true);
+          setDropTargetFromPhysical({ x: payload.position.x, y: payload.position.y });
+          return;
+        }
+        if (payload.type === "over") {
+          setDropTargetFromPhysical({ x: payload.position.x, y: payload.position.y });
+          return;
+        }
+        if (payload.type === "leave") {
+          setDragDropActive(false);
+          setDropTarget(null);
+          return;
+        }
+        if (payload.type === "drop") {
+          const signature = `${payload.paths?.join("\n") ?? ""}@${payload.position.x},${payload.position.y}`;
+          const now = Date.now();
+          if (signature === lastDropSignature && now - lastDropAt < 200) return;
+          lastDropSignature = signature;
+          lastDropAt = now;
+
+          setDragDropActive(false);
+          setDropTarget(null);
+
+          const scale = window.devicePixelRatio || 1;
+          const logicalX = payload.position.x / scale;
+          const logicalY = payload.position.y / scale;
+          const destDir =
+            resolveDropDestination(logicalX, logicalY) ??
+            resolveDropDestination(payload.position.x, payload.position.y);
+          if (!destDir) return;
+          if (!payload.paths || payload.paths.length === 0) return;
+          void transferDroppedPaths(payload.paths, destDir);
+        }
+      };
+
+      try {
+        unlistenWebview = await getCurrentWebview().onDragDropEvent(handleEvent);
+      } catch (err) {
+        console.error("Failed to register drag-drop listener (webview):", err);
+      }
+
+      try {
+        unlistenWindow = await getCurrentWindow().onDragDropEvent(handleEvent);
+      } catch (err) {
+        console.error("Failed to register drag-drop listener (window):", err);
+      }
+    };
+
+    void setup();
+    return () => {
+      cancelled = true;
+      if (dropRafRef.current !== null) {
+        window.cancelAnimationFrame(dropRafRef.current);
+        dropRafRef.current = null;
+      }
+      unlistenWebview?.();
+      unlistenWindow?.();
+    };
+  }, [isOpen, resolveDropDestination, transferDroppedPaths]);
 
   if (!isOpen) return null;
 
@@ -493,7 +818,7 @@ export function FileExplorerPanel({
     : 0;
 
   return (
-    <aside className="fileExplorerPanel" aria-label="Files">
+    <aside className="fileExplorerPanel" aria-label="Files" ref={panelRef}>
       <div className="fileExplorerHeader">
         <div className="fileExplorerTitle">
           <span>Files</span>
@@ -511,7 +836,16 @@ export function FileExplorerPanel({
         </div>
       </div>
 
-      <div className="fileExplorerList" role="tree" ref={listRef}>
+      <div
+        className={[
+          "fileExplorerList",
+          dragDropActive && dropTarget === root ? "fileExplorerListDropTarget" : "",
+        ]
+          .filter(Boolean)
+          .join(" ")}
+        role="tree"
+        ref={listRef}
+      >
         {visibleItems.length === 0 ? (
           <div className="empty">No files.</div>
         ) : (
@@ -558,7 +892,7 @@ export function FileExplorerPanel({
                   const isContextTarget = Boolean(contextNorm && contextNorm === normalizePath(entry.path));
                   const isExpanded = entry.isDir && expandedDirs.has(entry.path);
                   const isDropTarget = dropTarget === entry.path;
-                  const isDragging = draggedItem?.path === entry.path;
+                  const isPreparing = dragPreparing === entry.path;
                   const indent = 12 + item.depth * 14;
                   return (
                     <button
@@ -569,104 +903,16 @@ export function FileExplorerPanel({
                         isActive ? "fileExplorerRowActive" : "",
                         isContextTarget ? "fileExplorerRowContext" : "",
                         isDropTarget ? "fileExplorerRowDropTarget" : "",
-                        isDragging ? "fileExplorerRowDragging" : "",
+                        isPreparing ? "fileExplorerRowPreparing" : "",
                       ]
                         .filter(Boolean)
                         .join(" ")}
                       style={{ paddingLeft: indent, height: rowHeight }}
-                      draggable
-                      onDragStart={(e) => {
-                        setDraggedItem(entry);
-                        e.dataTransfer.effectAllowed = "copy";
-                        e.dataTransfer.setData("application/x-file-transfer", JSON.stringify({
-                          provider,
-                          sshTarget: sshTargetValue,
-                          root,
-                          path: entry.path,
-                          name: entry.name,
-                          isDir: entry.isDir,
-                        }));
-                      }}
-                      onDragEnd={() => {
-                        setDraggedItem(null);
-                        setDropTarget(null);
-                      }}
-                      onDragOver={(e) => {
-                        if (!entry.isDir) return;
-                        e.preventDefault();
-                        e.dataTransfer.dropEffect = "copy";
-                        setDropTarget(entry.path);
-                      }}
-                      onDragLeave={(e) => {
-                        // Only clear if leaving this element, not entering a child
-                        const relatedTarget = e.relatedTarget as Node | null;
-                        if (relatedTarget && e.currentTarget.contains(relatedTarget)) return;
-                        if (dropTarget === entry.path) setDropTarget(null);
-                      }}
-                      onDrop={async (e) => {
-                        e.preventDefault();
-                        setDropTarget(null);
-                        if (!entry.isDir) return;
-
-                        // Check for files from Finder/external source
-                        const files = e.dataTransfer.files;
-                        if (files && files.length > 0) {
-                          // Handle external file drops (from Finder)
-                          for (const file of Array.from(files)) {
-                            // file.path contains the full path on macOS/Tauri
-                            const filePath = (file as File & { path?: string }).path;
-                            if (!filePath) continue;
-                            const fileName = file.name;
-                            try {
-                              if (provider === "ssh" && sshTargetValue) {
-                                // Upload to SSH
-                                const destPath = entry.path === "/" ? `/${fileName}` : `${entry.path}/${fileName}`;
-                                await invoke("ssh_upload_file", {
-                                  target: sshTargetValue,
-                                  root,
-                                  localPath: filePath,
-                                  remotePath: destPath,
-                                });
-                              }
-                              // For local provider, we'd need a local copy command
-                              // but that's less common use case
-                            } catch (err) {
-                              console.error("Upload failed:", err);
-                            }
-                          }
-                          void loadDirectory(entry.path);
-                          return;
-                        }
-
-                        // Check for in-app file transfer
-                        const data = e.dataTransfer.getData("application/x-file-transfer");
-                        if (!data) return;
-                        try {
-                          const source = JSON.parse(data) as {
-                            provider: "local" | "ssh";
-                            sshTarget: string | null;
-                            root: string;
-                            path: string;
-                            name: string;
-                            isDir: boolean;
-                          };
-                          // Prevent dropping onto itself or its children
-                          if (source.path === entry.path) return;
-                          if (source.isDir && entry.path.startsWith(source.path + "/")) return;
-                          // Only allow cross-provider drops for now
-                          if (source.provider === provider) return;
-                          await handleFileDrop(
-                            source.provider,
-                            source.sshTarget,
-                            source.root,
-                            source.path,
-                            source.name,
-                            entry.path,
-                          );
-                        } catch {
-                          // Invalid JSON, ignore
-                        }
-                      }}
+                      data-fs-entry-path={entry.path}
+                      data-fs-entry-is-dir={entry.isDir ? "true" : "false"}
+                      onMouseDown={(e) => handleMouseDown(e, entry)}
+                      onMouseMove={handleMouseMove}
+                      onMouseUp={handleMouseUp}
                       onClick={() => {
                         if (entry.isDir) {
                           toggleDir(entry.path);

@@ -581,33 +581,17 @@ fn ssh_delete_fs_entry_sync(target: String, root: String, path: String) -> Resul
 }
 
 fn run_scp(scp_flags: &[&str], ssh_args: Vec<String>, paths: &[String]) -> Result<Output, String> {
-    let scp_path = program_path("scp")?;
-    let mut cmd = Command::new(&scp_path);
+    let mut cmd = Command::new(program_path("scp")?);
     // scp flags first (like -r)
     cmd.args(scp_flags);
     // SSH options next
-    cmd.args(&ssh_args);
+    cmd.args(ssh_args);
     // Source and destination paths last
     cmd.args(paths);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-
-    eprintln!(
-        "[scp] command: {:?} {:?} {:?} {:?}",
-        scp_path, scp_flags, ssh_args, paths
-    );
-
-    let output = cmd.output().map_err(|e| format!("run scp failed: {e}"))?;
-
-    eprintln!(
-        "[scp] exit={} stdout={} stderr={}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    Ok(output)
+    cmd.output().map_err(|e| format!("run scp failed: {e}"))
 }
 
 #[tauri::command]

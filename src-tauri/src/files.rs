@@ -1,6 +1,7 @@
 use serde::Serialize;
 use std::{
     fs,
+    io,
     path::{Path, PathBuf},
 };
 
@@ -203,5 +204,63 @@ pub fn delete_fs_entry(root: String, path: String) -> Result<(), String> {
         return Ok(());
     }
     fs::remove_file(&target).map_err(|e| format!("delete failed: {e}"))?;
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dest: &Path) -> io::Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dest_path)?;
+        } else {
+            fs::copy(&src_path, &dest_path)?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn copy_fs_entry(root: String, source_path: String, dest_path: String) -> Result<(), String> {
+    let root = Path::new(root.trim());
+    let source = Path::new(source_path.trim());
+    let dest = Path::new(dest_path.trim());
+
+    // Validate root
+    let canon_root = ensure_root_dir(root)?;
+
+    // Validate destination is within root
+    if !dest.is_absolute() {
+        return Err("destination path must be absolute".to_string());
+    }
+    let dest_parent = dest.parent().ok_or_else(|| "missing destination parent".to_string())?;
+    let canon_dest_parent = canonicalize_existing(dest_parent)?;
+    if !canon_dest_parent.starts_with(&canon_root) {
+        return Err("destination is outside root".to_string());
+    }
+
+    // Source doesn't need to be within root (can copy from anywhere)
+    if !source.is_absolute() {
+        return Err("source path must be absolute".to_string());
+    }
+    if !source.exists() {
+        return Err("source does not exist".to_string());
+    }
+
+    // Check if destination already exists
+    if dest.exists() {
+        return Err("destination already exists".to_string());
+    }
+
+    // Perform the copy
+    let meta = fs::metadata(source).map_err(|e| format!("metadata failed: {e}"))?;
+    if meta.is_dir() {
+        copy_dir_recursive(source, dest).map_err(|e| format!("copy failed: {e}"))?;
+    } else {
+        fs::copy(source, dest).map_err(|e| format!("copy failed: {e}"))?;
+    }
+
     Ok(())
 }

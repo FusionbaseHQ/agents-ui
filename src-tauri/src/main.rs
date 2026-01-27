@@ -15,7 +15,7 @@ mod tray;
 use app_info::get_app_info;
 use assets::apply_text_assets;
 use app_menu::{build_app_menu, handle_app_menu_event};
-use files::{delete_fs_entry, list_fs_entries, read_text_file, rename_fs_entry, write_text_file};
+use files::{copy_fs_entry, delete_fs_entry, list_fs_entries, read_text_file, rename_fs_entry, write_text_file};
 use file_manager::{open_path_in_file_manager, open_path_in_vscode};
 use pty::{
     close_session, create_session, detach_session, kill_persistent_session, list_persistent_sessions,
@@ -65,6 +65,7 @@ fn main() {
         .manage(AppState::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_drag::init())
         .menu(|app| build_app_menu(app))
         .on_menu_event(|app, event| handle_app_menu_event(app, event))
         .setup(|app| {
@@ -100,6 +101,7 @@ fn main() {
             write_text_file,
             rename_fs_entry,
             delete_fs_entry,
+            copy_fs_entry,
             ssh_default_root,
             ssh_list_fs_entries,
             ssh_read_text_file,
