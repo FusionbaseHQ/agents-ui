@@ -21,19 +21,25 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-AGPL%203.0-blue.svg" alt="License">
   <img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-0.1.1-green.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.2.2-green.svg" alt="Version">
   <img src="https://img.shields.io/badge/tauri-v2-orange.svg" alt="Tauri">
 </p>
 
 ---
 
-Agents UI is a **Tauri (Rust) + React** desktop app that combines:
+<p align="center">
+  <strong>The terminal that runs AI agents</strong>
+</p>
 
-- **Real PTY terminals** (xterm.js) for shells and agent CLIs
-- A **file workspace** (Explorer + Monaco editor) for **local and SSH** files
-- **Session recording/replay**, prompts, and templates to speed up repetitive work
+<p align="center">
+  A native desktop terminal for running AI coding agents alongside regular shells — with persistent zellij sessions, an SSH host picker, recording &amp; replay, and project organization.
+</p>
 
-> **Status:** macOS-first. Other platforms may work, but macOS is the primary target today.
+<p align="center">
+  <a href="https://github.com/FusionbaseHQ/agents-ui/releases/tag/v0.2.2">
+    <img src="https://img.shields.io/badge/Download-v0.2.2%20(macOS)-brightgreen" alt="Download v0.2.2 for macOS">
+  </a>
+</p>
 
 ## Demo
 
@@ -41,15 +47,13 @@ Agents UI is a **Tauri (Rust) + React** desktop app that combines:
 
 ## Highlights
 
-- Run multiple terminals and agent sessions side-by-side
-- Persistent sessions (keep long-running work around across app restarts)
-- Local + SSH file explorer with rename/delete + context actions
-- Monaco editor with multi-tab editing and syntax highlighting for common languages
+- Real PTY sessions
+- Persistent zellij sessions
+- SSH host picker (and port forwards)
+- Projects, prompts & assets
+- Recording & replay
+- Local + SSH file explorer + Monaco editor
 - Drag & drop file transfers: **Finder ↔ local ↔ SSH**
-- Record and replay sessions (great for audits, demos, and debugging)
-- Command palette, prompts, quick prompts, and asset templates
-- Projects with base paths and per-project environments
-- Native integration: tray, native menu items, “Check for updates…”
 
 ## Features
 
