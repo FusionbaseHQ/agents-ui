@@ -7,6 +7,56 @@ import { detectProcessEffect } from "./processEffects";
 
 export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon }>;
 
+type RenderDimension = { width: number; height: number };
+type RenderDimensionsFallback = {
+  css: { canvas: RenderDimension; cell: RenderDimension };
+  device: {
+    canvas: RenderDimension;
+    cell: RenderDimension;
+    char: { width: number; height: number; left: number; top: number };
+  };
+};
+
+function createEmptyRenderDimensions(): RenderDimensionsFallback {
+  const dim = (): RenderDimension => ({ width: 0, height: 0 });
+  return {
+    css: { canvas: dim(), cell: dim() },
+    device: { canvas: dim(), cell: dim(), char: { width: 0, height: 0, left: 0, top: 0 } },
+  };
+}
+
+function patchXtermRenderServiceDimensions(term: Terminal): void {
+  try {
+    const core = (term as unknown as { _core?: any })._core;
+    const renderService = core?._renderService;
+    if (!renderService) return;
+    if (renderService.__agentsUiSafeDimensions) return;
+
+    const fallback = createEmptyRenderDimensions();
+    Object.defineProperty(renderService, "dimensions", {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        const rendererRef = renderService?._renderer;
+        const renderer = rendererRef?.value ?? rendererRef?._value ?? null;
+        return renderer?.dimensions ?? fallback;
+      },
+    });
+
+    renderService.__agentsUiSafeDimensions = true;
+  } catch {
+    // ignore
+  }
+}
+
+function isXtermRendererReady(term: Terminal): boolean {
+  const core = (term as unknown as { _core?: any })._core;
+  const renderService = core?._renderService;
+  const rendererRef = renderService?._renderer;
+  const renderer = rendererRef?.value ?? rendererRef?._value ?? null;
+  return Boolean(renderer && renderer.dimensions);
+}
+
 async function copyToClipboard(text: string): Promise<boolean> {
   const value = text ?? "";
   if (!value) return false;
@@ -80,6 +130,7 @@ export default function SessionTerminal(props: {
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(containerRef.current);
+    patchXtermRenderServiceDimensions(term);
 
     if (props.persistent) {
       const sendZellij = (data: string) =>
@@ -271,8 +322,8 @@ export default function SessionTerminal(props: {
       });
     }
 
-    termRef.current = term;
-    fitRef.current = fit;
+	    termRef.current = term;
+	    fitRef.current = fit;
 
     const oscDisposables: Array<{ dispose: () => void }> = [];
     const reportCwd = (cwd: string) => {
@@ -328,47 +379,81 @@ export default function SessionTerminal(props: {
       // keep zellij's alternate screen behavior intact
     }
 
-    const sendResize = () => {
-      const term = termRef.current;
-      const fit = fitRef.current;
-      const container = containerRef.current;
-      if (!term || !fit) return;
-      if (!container) return;
-      const rect = container.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) return;
-      fit.fit();
-      const { cols, rows } = term;
-      const last = lastSizeRef.current;
-      if (last && last.cols === cols && last.rows === rows) return;
-      lastSizeRef.current = { cols, rows };
-      void invoke("resize_session", { id: props.id, cols, rows }).catch(() => {});
-    };
+	    const scheduleResize = () => {
+	      if (resizeRafRef.current !== null) return;
+	      resizeRafRef.current = window.requestAnimationFrame(() => {
+	        resizeRafRef.current = null;
+	        sendResize();
+	      });
+	    };
 
-    const scheduleResize = () => {
-      if (resizeRafRef.current !== null) return;
-      resizeRafRef.current = window.requestAnimationFrame(() => {
-        resizeRafRef.current = null;
-        sendResize();
-      });
-    };
+	    const sendResize = () => {
+	      const term = termRef.current;
+	      const fit = fitRef.current;
+	      const container = containerRef.current;
+	      if (!term || !fit) return;
+	      if (!term.element) return;
+	      if (!container) return;
+	      const rect = container.getBoundingClientRect();
+	      if (rect.width === 0 || rect.height === 0) return;
+	      if (!isXtermRendererReady(term)) {
+	        scheduleResize();
+	        return;
+	      }
+	      try {
+	        fit.fit();
+	      } catch {
+	        scheduleResize();
+	        return;
+	      }
+	      const { cols, rows } = term;
+	      const last = lastSizeRef.current;
+	      if (last && last.cols === cols && last.rows === rows) return;
+	      lastSizeRef.current = { cols, rows };
+	      void invoke("resize_session", { id: props.id, cols, rows }).catch(() => {});
+	    };
 
-    // Register BEFORE flushing to avoid race with incoming events
-    props.registry.current.set(props.id, { term, fit });
+	    // Register BEFORE flushing to avoid race with incoming events
+	    props.registry.current.set(props.id, { term, fit });
 
-    // Flush any buffered data that arrived before we were ready
-    const buffered = props.pendingData.current.get(props.id);
-    if (buffered && buffered.length > 0) {
-      for (const data of buffered) {
-        term.write(data);
-      }
-      props.pendingData.current.delete(props.id);
-    }
+	    // Flush any buffered data that arrived before we were ready (but wait for renderer readiness)
+	    const flushPending = (attemptsLeft: number) => {
+	      const term = termRef.current;
+	      if (!term) return;
+	      const buffered = props.pendingData.current.get(props.id);
+	      if (!buffered || buffered.length === 0) {
+	        props.pendingData.current.delete(props.id);
+	        return;
+	      }
+	      if (!isXtermRendererReady(term)) {
+	        if (attemptsLeft > 0) {
+	          window.requestAnimationFrame(() => flushPending(attemptsLeft - 1));
+	        }
+	        return;
+	      }
 
-    // Create ResizeObserver inside useEffect for proper cleanup
-    const resizeObserver = new ResizeObserver(() => scheduleResize());
+	      let index = 0;
+	      try {
+	        for (; index < buffered.length; index += 1) {
+	          term.write(buffered[index]);
+	        }
+	        props.pendingData.current.delete(props.id);
+	      } catch {
+	        if (index > 0) {
+	          props.pendingData.current.set(props.id, buffered.slice(index));
+	        }
+	        if (attemptsLeft > 0) {
+	          window.requestAnimationFrame(() => flushPending(attemptsLeft - 1));
+	        }
+	      }
+	    };
+	    flushPending(20);
 
-    resizeObserver.observe(containerRef.current);
-    sendResize();
+	    // Create ResizeObserver inside useEffect for proper cleanup
+	    const resizeObserver = new ResizeObserver(() => scheduleResize());
+
+	    resizeObserver.observe(containerRef.current);
+	    scheduleResize();
 
     let wheelCleanup: (() => void) | null = null;
     if (props.persistent) {
@@ -445,23 +530,43 @@ export default function SessionTerminal(props: {
     if (!term || !fit || !container) return;
 
     let cancelled = false;
-    const attemptFit = (attemptsLeft: number) => {
-      if (cancelled) return;
-      const rect = container.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) {
-        if (attemptsLeft > 0) {
-          window.requestAnimationFrame(() => attemptFit(attemptsLeft - 1));
-        }
-        return;
-      }
+	    const attemptFit = (attemptsLeft: number) => {
+	      if (cancelled) return;
+	      const rect = container.getBoundingClientRect();
+	      if (rect.width === 0 || rect.height === 0) {
+	        if (attemptsLeft > 0) {
+	          window.requestAnimationFrame(() => attemptFit(attemptsLeft - 1));
+	        }
+	        return;
+	      }
+	      if (!isXtermRendererReady(term)) {
+	        if (attemptsLeft > 0) {
+	          window.requestAnimationFrame(() => attemptFit(attemptsLeft - 1));
+	        }
+	        return;
+	      }
 
-      term.focus();
-      fit.fit();
-      const { cols, rows } = term;
-      const last = lastSizeRef.current;
-      if (!last || last.cols !== cols || last.rows !== rows) {
-        lastSizeRef.current = { cols, rows };
-        void invoke("resize_session", { id: props.id, cols, rows }).catch(() => {});
+	      try {
+	        term.focus();
+	      } catch {
+	        if (attemptsLeft > 0) {
+	          window.requestAnimationFrame(() => attemptFit(attemptsLeft - 1));
+	        }
+	        return;
+	      }
+	      try {
+	        fit.fit();
+	      } catch {
+	        if (attemptsLeft > 0) {
+	          window.requestAnimationFrame(() => attemptFit(attemptsLeft - 1));
+	        }
+	        return;
+	      }
+	      const { cols, rows } = term;
+	      const last = lastSizeRef.current;
+	      if (!last || last.cols !== cols || last.rows !== rows) {
+	        lastSizeRef.current = { cols, rows };
+	        void invoke("resize_session", { id: props.id, cols, rows }).catch(() => {});
       }
     };
 

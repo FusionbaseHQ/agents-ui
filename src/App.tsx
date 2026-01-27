@@ -1163,6 +1163,7 @@ export default function App() {
         return {
           ...prev,
           codeEditorOpen: true,
+          codeEditorActiveFilePath: path,
           codeEditorRootDir: prev.codeEditorRootDir ?? root,
           fileExplorerRootDir: prev.fileExplorerRootDir ?? root,
           openFileRequest: { path, nonce: Date.now() },
@@ -1873,6 +1874,26 @@ export default function App() {
   function reportError(prefix: string, err: unknown) {
     setError(`${prefix}: ${formatError(err)}`);
   }
+
+  const reportErrorRef = useRef(reportError);
+  useEffect(() => {
+    reportErrorRef.current = reportError;
+  }, [reportError]);
+
+  useEffect(() => {
+    const handleError = (event: ErrorEvent) => {
+      reportErrorRef.current("Unexpected error", event.error ?? event.message);
+    };
+    const handleRejection = (event: PromiseRejectionEvent) => {
+      reportErrorRef.current("Unhandled promise rejection", event.reason);
+    };
+    window.addEventListener("error", handleError);
+    window.addEventListener("unhandledrejection", handleRejection);
+    return () => {
+      window.removeEventListener("error", handleError);
+      window.removeEventListener("unhandledrejection", handleRejection);
+    };
+  }, []);
 
   function dismissNotice() {
     setNotice(null);
@@ -3123,25 +3144,40 @@ export default function App() {
     let cancelled = false;
     const unlisteners: Array<() => void> = [];
 
-    const setup = async () => {
-      // Set up event listeners FIRST, before creating any sessions
-      const unlistenOutput = await listen<PtyOutput>("pty-output", (event) => {
-        if (cancelled) return;
-        const { id, data } = event.payload;
+	    const setup = async () => {
+	      const isTerminalRendererReady = (term: unknown): boolean => {
+	        try {
+	          const anyTerm = term as any;
+	          const core = anyTerm?._core;
+	          const renderService = core?._renderService;
+	          const rendererRef = renderService?._renderer;
+	          const renderer = rendererRef?.value ?? rendererRef?._value ?? null;
+	          return Boolean(renderer && renderer.dimensions);
+	        } catch {
+	          return false;
+	        }
+	      };
+
+	      // Set up event listeners FIRST, before creating any sessions
+	      const unlistenOutput = await listen<PtyOutput>("pty-output", (event) => {
+	        if (cancelled) return;
+	        const { id, data } = event.payload;
 
         // Ignore events for sessions being closed
         if (closingSessions.current.has(id)) return;
 
-        markAgentWorking(id);
+	        markAgentWorking(id);
 
-        const entry = registry.current.get(id);
-        if (entry) {
-          entry.term.write(data);
-        } else {
-          // Buffer the data - the terminal will catch up
-          if (
-            !pendingData.current.has(id) &&
-            pendingData.current.size >= MAX_PENDING_SESSIONS
+		        const entry = registry.current.get(id);
+		        if (entry && isTerminalRendererReady(entry.term)) {
+		          entry.term.write(data);
+		          return;
+		        }
+		        {
+		          // Buffer the data - the terminal will catch up
+		          if (
+		            !pendingData.current.has(id) &&
+		            pendingData.current.size >= MAX_PENDING_SESSIONS
           ) {
             const oldest = pendingData.current.keys().next().value as string | undefined;
             if (oldest) pendingData.current.delete(oldest);
@@ -3150,10 +3186,10 @@ export default function App() {
           buffer.push(data);
           if (buffer.length > MAX_PENDING_CHUNKS_PER_SESSION) {
             buffer.splice(0, buffer.length - MAX_PENDING_CHUNKS_PER_SESSION);
-          }
-          pendingData.current.set(id, buffer);
-        }
-      });
+	          }
+	          pendingData.current.set(id, buffer);
+	        }
+	      });
       unlisteners.push(unlistenOutput);
 
       const unlistenExit = await listen<PtyExit>("pty-exit", (event) => {
@@ -4472,15 +4508,15 @@ export default function App() {
 	                          openFileRequest: null,
 	                        }))
 	                      }
-	                      onActiveFilePathChange={(path) =>
-	                        updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
-	                          ...prev,
-	                          codeEditorActiveFilePath: path,
-	                        }))
-	                      }
-	                      onCloseEditor={closeCodeEditor}
-	                    />
-	                  </React.Suspense>
+			                      onActiveFilePathChange={(path) =>
+			                        updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => {
+			                          if (prev.codeEditorActiveFilePath === path) return prev;
+			                          return { ...prev, codeEditorActiveFilePath: path };
+			                        })
+			                      }
+			                      onCloseEditor={closeCodeEditor}
+			                    />
+		                  </React.Suspense>
 	                </>
 	              ) : null}
 

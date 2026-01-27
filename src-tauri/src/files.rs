@@ -59,11 +59,20 @@ pub fn list_fs_entries(root: String, path: String) -> Result<Vec<FsEntry>, Strin
             Err(_) => continue,
         };
         let path = item.path();
-        let meta = match fs::metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
+        let mut size = 0u64;
+        let is_dir = match item.file_type() {
+            Ok(t) if t.is_dir() => true,
+            Ok(t) if t.is_file() => false,
+            Ok(_) | Err(_) => {
+                // Follow symlinks (matches previous behavior) and fall back when file_type is unavailable.
+                let meta = match fs::metadata(&path) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                size = meta.len();
+                meta.is_dir()
+            }
         };
-        let is_dir = meta.is_dir();
         let name = item
             .file_name()
             .to_string_lossy()
@@ -72,7 +81,7 @@ pub fn list_fs_entries(root: String, path: String) -> Result<Vec<FsEntry>, Strin
             name,
             path: path.to_string_lossy().to_string(),
             is_dir,
-            size: if is_dir { 0 } else { meta.len() },
+            size: if is_dir { 0 } else { size },
         });
     }
 
