@@ -259,8 +259,10 @@ impl StatusTrayState {
 
         #[cfg(not(windows))]
         {
+            // `None` is a no-op in Tauri, so it won't clear an existing title.
+            // Use an empty string to explicitly remove the count when idle.
             let title = if working_count == 0 {
-                None
+                Some(String::new())
             } else {
                 Some(working_count.to_string())
             };
