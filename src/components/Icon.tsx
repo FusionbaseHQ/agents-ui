@@ -18,7 +18,9 @@ export type IconName =
   | "stop"
   | "search"
   | "ssh"
-  | "grip";
+  | "grip"
+  | "chevron-left"
+  | "chevron-right";
 
 type IconProps = {
   name: IconName;
@@ -183,6 +185,18 @@ export function Icon({ name, size = 16, className }: IconProps) {
           <circle cx="15" cy="12" r="1.25" fill="currentColor" stroke="none" />
           <circle cx="9" cy="17" r="1.25" fill="currentColor" stroke="none" />
           <circle cx="15" cy="17" r="1.25" fill="currentColor" stroke="none" />
+        </svg>
+      );
+    case "chevron-left":
+      return (
+        <svg {...common}>
+          <path d="M15 18l-6-6 6-6" />
+        </svg>
+      );
+    case "chevron-right":
+      return (
+        <svg {...common}>
+          <path d="M9 18l6-6-6-6" />
         </svg>
       );
     default:

@@ -41,9 +41,20 @@ type PendingCloseAction =
   | { kind: "tab"; path: string };
 
 function basename(path: string): string {
-  const cleaned = path.trim().replace(/\/+$/, "");
+  const trimmed = path.trim();
+  if (!trimmed || trimmed === "/") return "/";
+  const cleaned = trimmed.replace(/\/+$/, "");
   const idx = cleaned.lastIndexOf("/");
   return idx >= 0 ? cleaned.slice(idx + 1) : cleaned;
+}
+
+function dirname(path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed || trimmed === "/") return "/";
+  const cleaned = trimmed.replace(/\/+$/, "");
+  const idx = cleaned.lastIndexOf("/");
+  if (idx <= 0) return "/";
+  return cleaned.slice(0, idx);
 }
 
 function inferLanguageId(path: string): string {
@@ -131,6 +142,24 @@ export function CodeEditorPanel({
   const [pendingClose, setPendingClose] = React.useState<PendingCloseAction | null>(null);
   const saveTimerRef = React.useRef<number | null>(null);
   const sshTargetValue = React.useMemo(() => (sshTarget ?? "").trim() || null, [sshTarget]);
+  const tabStripRef = React.useRef<HTMLDivElement | null>(null);
+  const tabButtonRefs = React.useRef<Map<string, HTMLButtonElement>>(new Map());
+  const [tabsMenuOpen, setTabsMenuOpen] = React.useState(false);
+  const tabsMenuRef = React.useRef<HTMLDivElement | null>(null);
+  const tabsMenuButtonRef = React.useRef<HTMLButtonElement | null>(null);
+  const [canScrollLeft, setCanScrollLeft] = React.useState(false);
+  const [canScrollRight, setCanScrollRight] = React.useState(false);
+
+  const modelUriForPath = React.useCallback(
+    (monaco: MonacoType, path: string) => {
+      if (provider === "ssh") {
+        const authority = encodeURIComponent(sshTargetValue ?? "ssh");
+        return monaco.Uri.from({ scheme: "ssh", authority, path });
+      }
+      return monaco.Uri.file(path);
+    },
+    [provider, sshTargetValue],
+  );
 
   const readTextFile = React.useCallback(
     async (path: string): Promise<string> => {
@@ -157,8 +186,9 @@ export function CodeEditorPanel({
 
   const restoredRef = React.useRef(false);
   const lastOpenRequestRef = React.useRef<string | null>(null);
+  const scheduledOpenRequestRef = React.useRef<string | null>(null);
   const tabsRef = React.useRef<Tab[]>([]);
-  React.useEffect(() => {
+  React.useLayoutEffect(() => {
     tabsRef.current = tabs;
   }, [tabs]);
 
@@ -166,6 +196,8 @@ export function CodeEditorPanel({
   const dirtyPathsRef = React.useRef<Set<string>>(new Set());
   const modelsRef = React.useRef<Map<string, import("monaco-editor").editor.ITextModel>>(new Map());
   const pendingContentRef = React.useRef<Map<string, string>>(new Map());
+  const loadNonceByPathRef = React.useRef<Map<string, number>>(new Map());
+  const nextLoadNonceRef = React.useRef(1);
   const monacoRef = React.useRef<MonacoType | null>(null);
   const editorRef = React.useRef<import("monaco-editor").editor.IStandaloneCodeEditor | null>(null);
 
@@ -179,23 +211,28 @@ export function CodeEditorPanel({
     onConsumeOpenFileRequestRef.current = onConsumeOpenFileRequest;
   }, [onConsumeOpenFileRequest]);
 
-  const activePathRef = React.useRef<string | null>(null);
+  const onActiveFilePathChangeRef = React.useRef(onActiveFilePathChange);
   React.useEffect(() => {
+    onActiveFilePathChangeRef.current = onActiveFilePathChange;
+  }, [onActiveFilePathChange]);
+
+  const activePathRef = React.useRef<string | null>(null);
+  React.useLayoutEffect(() => {
     activePathRef.current = activePath;
-    onActiveFilePathChange(activePath);
-  }, [activePath, onActiveFilePathChange]);
+    onActiveFilePathChangeRef.current(activePath);
+  }, [activePath]);
 
   const readModelValue = React.useCallback((path: string): string | null => {
     const monaco = monacoRef.current;
     if (monaco) {
-      const model = monaco.editor.getModel(monaco.Uri.file(path));
+      const model = monaco.editor.getModel(modelUriForPath(monaco, path));
       if (model) return model.getValue();
     }
     const model = modelsRef.current.get(path);
     if (model) return model.getValue();
     const pending = pendingContentRef.current.get(path);
     return pending ?? null;
-  }, []);
+  }, [modelUriForPath]);
 
   const serializeState = React.useCallback((): CodeEditorPersistedState => {
     const currentTabs = tabsRef.current;
@@ -234,6 +271,7 @@ export function CodeEditorPanel({
       if (nextTab === prev[idx]) return prev;
       const next = prev.slice();
       next[idx] = nextTab;
+      tabsRef.current = next;
       return next;
     });
   }, []);
@@ -255,7 +293,7 @@ export function CodeEditorPanel({
         return;
       }
 
-      const uri = monaco.Uri.file(path);
+      const uri = modelUriForPath(monaco, path);
       const existing = monaco.editor.getModel(uri);
       const language = inferLanguageId(path);
       if (existing) {
@@ -272,7 +310,7 @@ export function CodeEditorPanel({
       model.onDidChangeContent(() => markDirty(path));
       modelsRef.current.set(path, model);
     },
-    [markDirty],
+    [markDirty, modelUriForPath],
   );
 
   const setEditorModel = React.useCallback((path: string | null) => {
@@ -283,11 +321,11 @@ export function CodeEditorPanel({
       editor.setModel(null);
       return;
     }
-    const model = modelsRef.current.get(path) ?? monaco.editor.getModel(monaco.Uri.file(path));
+    const model = modelsRef.current.get(path) ?? monaco.editor.getModel(modelUriForPath(monaco, path));
     if (!model) return;
     modelsRef.current.set(path, model);
     editor.setModel(model);
-  }, []);
+  }, [modelUriForPath]);
 
   const openFile = React.useCallback(
     async (path: string) => {
@@ -296,45 +334,74 @@ export function CodeEditorPanel({
 
       if (openPathsRef.current.has(normalized)) {
         setActivePath(normalized);
+        activePathRef.current = normalized;
         const monaco = monacoRef.current;
         const hasModel =
           modelsRef.current.has(normalized) ||
-          (monaco ? Boolean(monaco.editor.getModel(monaco.Uri.file(normalized))) : false);
+          (monaco ? Boolean(monaco.editor.getModel(modelUriForPath(monaco, normalized))) : false);
         if (hasModel) {
           setEditorModel(normalized);
           return;
         }
+        if (loadNonceByPathRef.current.has(normalized)) {
+          return;
+        }
         updateTab(normalized, (tab) => ({ ...tab, loading: true, error: null }));
+        const loadNonce = nextLoadNonceRef.current++;
+        loadNonceByPathRef.current.set(normalized, loadNonce);
         try {
           const content = await readTextFile(normalized);
+          if (!openPathsRef.current.has(normalized)) return;
+          if (loadNonceByPathRef.current.get(normalized) !== loadNonce) return;
           ensureModel(normalized, content);
           updateTab(normalized, (tab) => ({ ...tab, loading: false, error: null }));
-          setEditorModel(normalized);
+          if (activePathRef.current === normalized) setEditorModel(normalized);
         } catch (err) {
+          if (!openPathsRef.current.has(normalized)) return;
+          if (loadNonceByPathRef.current.get(normalized) !== loadNonce) return;
           const message = err instanceof Error ? err.message : String(err);
           updateTab(normalized, (tab) => ({ ...tab, loading: false, error: message }));
+        } finally {
+          if (loadNonceByPathRef.current.get(normalized) === loadNonce) {
+            loadNonceByPathRef.current.delete(normalized);
+          }
         }
         return;
       }
 
       openPathsRef.current.add(normalized);
-      setTabs((prev) => [
-        ...prev,
-        { path: normalized, title: basename(normalized), dirty: false, loading: true, error: null },
-      ]);
+      setTabs((prev) => {
+        const next = [
+          ...prev,
+          { path: normalized, title: basename(normalized), dirty: false, loading: true, error: null },
+        ];
+        tabsRef.current = next;
+        return next;
+      });
       setActivePath(normalized);
+      activePathRef.current = normalized;
 
+      const loadNonce = nextLoadNonceRef.current++;
+      loadNonceByPathRef.current.set(normalized, loadNonce);
       try {
         const content = await readTextFile(normalized);
+        if (!openPathsRef.current.has(normalized)) return;
+        if (loadNonceByPathRef.current.get(normalized) !== loadNonce) return;
         ensureModel(normalized, content);
         updateTab(normalized, (tab) => ({ ...tab, loading: false, error: null }));
-        setEditorModel(normalized);
+        if (activePathRef.current === normalized) setEditorModel(normalized);
       } catch (err) {
+        if (!openPathsRef.current.has(normalized)) return;
+        if (loadNonceByPathRef.current.get(normalized) !== loadNonce) return;
         const message = err instanceof Error ? err.message : String(err);
         updateTab(normalized, (tab) => ({ ...tab, loading: false, error: message }));
+      } finally {
+        if (loadNonceByPathRef.current.get(normalized) === loadNonce) {
+          loadNonceByPathRef.current.delete(normalized);
+        }
       }
     },
-    [ensureModel, readTextFile, setEditorModel, updateTab],
+    [ensureModel, modelUriForPath, readTextFile, setEditorModel, updateTab],
   );
 
   React.useEffect(() => {
@@ -368,6 +435,7 @@ export function CodeEditorPanel({
       null;
 
     setActivePath(desiredActive);
+    activePathRef.current = desiredActive;
     if (desiredActive) void openFile(desiredActive);
   }, [ensureModel, openFile, persistedState]);
 
@@ -375,14 +443,93 @@ export function CodeEditorPanel({
     if (!openFileRequest) return;
     const key = `${openFileRequest.nonce}:${openFileRequest.path}`;
     if (lastOpenRequestRef.current === key) return;
-    lastOpenRequestRef.current = key;
-    // Defer consumption until the next tick so React StrictMode test mounts don't eat the request.
-    const timer = window.setTimeout(() => {
+    if (scheduledOpenRequestRef.current === key) return;
+    scheduledOpenRequestRef.current = key;
+
+    let cancelled = false;
+    const run = () => {
+      if (cancelled) return;
+      if (lastOpenRequestRef.current === key) return;
+      lastOpenRequestRef.current = key;
+      if (scheduledOpenRequestRef.current === key) scheduledOpenRequestRef.current = null;
       onConsumeOpenFileRequestRef.current?.();
       void openFile(openFileRequest.path);
-    }, 0);
-    return () => window.clearTimeout(timer);
+    };
+
+    // Defer to the microtask queue so StrictMode test mounts don't eat the request,
+    // while still feeling instant for users.
+    if (typeof queueMicrotask === "function") queueMicrotask(run);
+    else void Promise.resolve().then(run);
+
+    return () => {
+      cancelled = true;
+      if (scheduledOpenRequestRef.current === key) scheduledOpenRequestRef.current = null;
+    };
   }, [openFile, openFileRequest]);
+
+  React.useEffect(() => {
+    if (!tabsMenuOpen) return;
+
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (tabsMenuRef.current?.contains(target)) return;
+      if (tabsMenuButtonRef.current?.contains(target)) return;
+      setTabsMenuOpen(false);
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setTabsMenuOpen(false);
+    };
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [tabsMenuOpen]);
+
+  const updateScrollState = React.useCallback(() => {
+    const el = tabStripRef.current;
+    if (!el) {
+      setCanScrollLeft(false);
+      setCanScrollRight(false);
+      return;
+    }
+    const { scrollLeft, scrollWidth, clientWidth } = el;
+    setCanScrollLeft(scrollLeft > 1);
+    setCanScrollRight(scrollLeft + clientWidth < scrollWidth - 1);
+  }, []);
+
+  React.useEffect(() => {
+    const el = tabStripRef.current;
+    if (!el) return;
+
+    updateScrollState();
+
+    const handleScroll = () => updateScrollState();
+    el.addEventListener("scroll", handleScroll, { passive: true });
+
+    const resizeObserver = new ResizeObserver(() => updateScrollState());
+    resizeObserver.observe(el);
+
+    return () => {
+      el.removeEventListener("scroll", handleScroll);
+      resizeObserver.disconnect();
+    };
+  }, [updateScrollState, tabs.length]);
+
+  const scrollTabs = React.useCallback((direction: "left" | "right") => {
+    const el = tabStripRef.current;
+    if (!el) return;
+    const scrollAmount = 150;
+    el.scrollBy({
+      left: direction === "left" ? -scrollAmount : scrollAmount,
+      behavior: "smooth",
+    });
+  }, []);
 
   React.useEffect(() => {
     if (!activePath) {
@@ -391,13 +538,14 @@ export function CodeEditorPanel({
     }
     const monaco = monacoRef.current;
     const hasModel =
-      modelsRef.current.has(activePath) || (monaco ? Boolean(monaco.editor.getModel(monaco.Uri.file(activePath))) : false);
+      modelsRef.current.has(activePath) ||
+      (monaco ? Boolean(monaco.editor.getModel(modelUriForPath(monaco, activePath))) : false);
     if (!hasModel) {
       setEditorModel(null);
       return;
     }
     setEditorModel(activePath);
-  }, [activePath, setEditorModel]);
+  }, [activePath, modelUriForPath, setEditorModel]);
 
   const closeTab = React.useCallback(
     (path: string) => {
@@ -416,15 +564,18 @@ export function CodeEditorPanel({
 
       const prevTabs = tabsRef.current;
       const next = prevTabs.filter((t) => t.path !== path);
+      tabsRef.current = next;
       setTabs(next);
       if (next.length === 0) {
         setActivePath(null);
+        activePathRef.current = null;
         onCloseEditor();
         return;
       }
       if (activePathRef.current === path) {
         const nextActive = next[next.length - 1].path;
         setActivePath(nextActive);
+        activePathRef.current = nextActive;
         setEditorModel(nextActive);
       }
     },
@@ -450,7 +601,7 @@ export function CodeEditorPanel({
     if (!dirtyPathsRef.current.has(path)) return;
 
     const monaco = monacoRef.current;
-    const model = monaco ? monaco.editor.getModel(monaco.Uri.file(path)) : modelsRef.current.get(path);
+    const model = monaco ? monaco.editor.getModel(modelUriForPath(monaco, path)) : modelsRef.current.get(path);
     if (!model) return;
 
     setSaveStatus("saving");
@@ -469,7 +620,7 @@ export function CodeEditorPanel({
       if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
       saveTimerRef.current = window.setTimeout(() => setSaveStatus("idle"), 2500);
     }
-  }, [updateTab, writeTextFile]);
+  }, [modelUriForPath, updateTab, writeTextFile]);
 
   const requestCloseEditor = React.useCallback(() => {
     if (dirtyPathsRef.current.size > 0) {
@@ -486,13 +637,18 @@ export function CodeEditorPanel({
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
         void saveActive();
       });
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyW, () => {
+        const path = activePathRef.current;
+        if (!path) return;
+        requestCloseTab(path);
+      });
       for (const [path, content] of pendingContentRef.current.entries()) {
         ensureModel(path, content);
       }
       pendingContentRef.current.clear();
       if (activePathRef.current) setEditorModel(activePathRef.current);
     },
-    [ensureModel, saveActive, setEditorModel],
+    [ensureModel, requestCloseTab, saveActive, setEditorModel],
   );
 
   const lastFsEventNonceRef = React.useRef<number | null>(null);
@@ -518,11 +674,15 @@ export function CodeEditorPanel({
       const activeAfter = activeBefore ? transformPath(activeBefore) : null;
 
       setTabs((prev) =>
-        prev.map((tab) => {
+        {
+          const next = prev.map((tab) => {
           const nextPath = transformPath(tab.path);
           if (nextPath === tab.path) return tab;
           return { ...tab, path: nextPath, title: basename(nextPath) };
-        }),
+          });
+          tabsRef.current = next;
+          return next;
+        },
       );
 
       const nextOpenPaths = new Set<string>();
@@ -558,7 +718,7 @@ export function CodeEditorPanel({
             continue;
           }
           const content = model.getValue();
-          const uri = monaco.Uri.file(nextPath);
+          const uri = modelUriForPath(monaco, nextPath);
           const language = inferLanguageId(nextPath);
           const existing = monaco.editor.getModel(uri);
           if (existing && existing !== model) existing.dispose();
@@ -572,6 +732,7 @@ export function CodeEditorPanel({
 
       if (activeBefore && activeAfter && activeAfter !== activeBefore) {
         setActivePath(activeAfter);
+        activePathRef.current = activeAfter;
         setEditorModel(activeAfter);
       }
       return;
@@ -585,6 +746,7 @@ export function CodeEditorPanel({
 
       const prevTabs = tabsRef.current;
       const nextTabs = prevTabs.filter((t) => !shouldClose(t.path));
+      tabsRef.current = nextTabs;
       setTabs(nextTabs);
 
       openPathsRef.current = new Set(Array.from(openPathsRef.current).filter((p) => !shouldClose(p)));
@@ -599,11 +761,8 @@ export function CodeEditorPanel({
         pendingContentRef.current = nextPending;
       }
 
-      const editor = editorRef.current;
-      const activeModel = editor?.getModel() ?? null;
-      const activeModelPath = activeModel?.uri?.fsPath ?? null;
-      if (activeModelPath && shouldClose(activeModelPath)) {
-        editor?.setModel(null);
+      if (activePathRef.current && shouldClose(activePathRef.current)) {
+        editorRef.current?.setModel(null);
       }
 
       for (const [path, model] of modelsRef.current.entries()) {
@@ -616,56 +775,174 @@ export function CodeEditorPanel({
       if (!active || !shouldClose(active)) return;
       if (nextTabs.length === 0) {
         setActivePath(null);
+        activePathRef.current = null;
         onCloseEditor();
         return;
       }
       const nextActive = nextTabs[nextTabs.length - 1].path;
       setActivePath(nextActive);
+      activePathRef.current = nextActive;
       setEditorModel(nextActive);
     }
-  }, [fsEvent, markDirty, onCloseEditor, setEditorModel]);
+  }, [fsEvent, markDirty, modelUriForPath, onCloseEditor, setEditorModel]);
 
   const activeTab = React.useMemo(() => tabs.find((t) => t.path === activePath) ?? null, [activePath, tabs]);
   const dirtyCount = React.useMemo(() => tabs.reduce((count, tab) => count + (tab.dirty ? 1 : 0), 0), [tabs]);
+  const tabTitleCounts = React.useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const tab of tabs) {
+      const base = basename(tab.path);
+      counts.set(base, (counts.get(base) ?? 0) + 1);
+    }
+    return counts;
+  }, [tabs]);
+
+  React.useLayoutEffect(() => {
+    if (!activePath) return;
+    const el = tabButtonRefs.current.get(activePath);
+    if (!el) return;
+    el.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [activePath, tabs.length]);
 
   return (
     <section className="codeEditorPanel" aria-label="Editor">
       <div className="codeEditorHeader">
-        <div className="codeEditorTabs" role="tablist" aria-label="Open files">
-          {tabs.map((tab) => (
-            <div
-              key={tab.path}
-              className={`codeEditorTab ${tab.path === activePath ? "codeEditorTabActive" : ""}`}
-              role="tab"
-              aria-selected={tab.path === activePath}
+        <div className="codeEditorTabsWrapper">
+          {canScrollLeft ? (
+            <button
+              type="button"
+              className="codeEditorTabsScrollBtn codeEditorTabsScrollBtnLeft"
+              onClick={() => scrollTabs("left")}
+              aria-label="Scroll tabs left"
             >
-              <button
-                type="button"
-                className="codeEditorTabMain"
-                onClick={() => void openFile(tab.path)}
-                title={tab.path}
-              >
-                <span className="codeEditorTabTitle">{tab.title}</span>
-                {tab.dirty ? <span className="codeEditorTabDirty" aria-label="Unsaved changes" /> : null}
-              </button>
-              <button
-                type="button"
-                className="codeEditorTabClose"
-                onClick={() => requestCloseTab(tab.path)}
-                title="Close"
-              >
-                ×
-              </button>
-            </div>
-          ))}
+              <Icon name="chevron-left" size={14} />
+            </button>
+          ) : null}
+          <div
+            className="codeEditorTabs"
+            role="tablist"
+            aria-label="Open files"
+            ref={tabStripRef}
+            onWheel={(e) => {
+              const el = tabStripRef.current;
+              if (!el) return;
+              if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+              if (el.scrollWidth <= el.clientWidth) return;
+              el.scrollLeft += e.deltaY;
+              e.preventDefault();
+            }}
+          >
+            {tabs.map((tab) => {
+              const base = basename(tab.path);
+              const isDuplicate = (tabTitleCounts.get(base) ?? 0) > 1;
+              const parent = dirname(tab.path);
+              const parentName = parent === "/" ? "/" : parent.split("/").filter(Boolean).slice(-1)[0] ?? "";
+              const suffix = isDuplicate && parentName ? ` · ${parentName}` : "";
+              return (
+                <div
+                  key={tab.path}
+                  className={`codeEditorTab ${tab.path === activePath ? "codeEditorTabActive" : ""}`}
+                  role="tab"
+                  aria-selected={tab.path === activePath}
+                >
+                  <button
+                    type="button"
+                    className="codeEditorTabMain"
+                    onClick={() => void openFile(tab.path)}
+                    onAuxClick={(e) => {
+                      if (e.button !== 1) return;
+                      e.preventDefault();
+                      requestCloseTab(tab.path);
+                    }}
+                    ref={(el) => {
+                      if (!el) tabButtonRefs.current.delete(tab.path);
+                      else tabButtonRefs.current.set(tab.path, el);
+                    }}
+                    title={tab.path}
+                  >
+                    <span className="codeEditorTabTitle">
+                      {tab.title}
+                      {suffix ? <span className="codeEditorTabTitleSuffix">{suffix}</span> : null}
+                    </span>
+                    {tab.dirty ? <span className="codeEditorTabDirty" aria-label="Unsaved changes" /> : null}
+                  </button>
+                  <button
+                    type="button"
+                    className="codeEditorTabClose"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      requestCloseTab(tab.path);
+                    }}
+                    title="Close"
+                    aria-label={`Close ${tab.title}`}
+                  >
+                    <Icon name="close" size={12} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+          {canScrollRight ? (
+            <button
+              type="button"
+              className="codeEditorTabsScrollBtn codeEditorTabsScrollBtnRight"
+              onClick={() => scrollTabs("right")}
+              aria-label="Scroll tabs right"
+            >
+              <Icon name="chevron-right" size={14} />
+            </button>
+          ) : null}
         </div>
 
         <div className="codeEditorActions">
-          {activeTab ? (
-            <div className="codeEditorPath" title={activeTab.path}>
-              {shortenPathSmart(activeTab.path, 44)}
-            </div>
-          ) : null}
+          <div className="sidebarActionMenu">
+            <button
+              type="button"
+              ref={tabsMenuButtonRef}
+              className={`btnSmall btnIcon ${tabsMenuOpen ? "btnIconActive" : ""}`}
+              onClick={() => setTabsMenuOpen((v) => !v)}
+              title="Open tabs"
+            >
+              <Icon name="files" />
+            </button>
+            {tabsMenuOpen ? (
+              <div className="sidebarActionMenuDropdown codeEditorTabsMenuDropdown" ref={tabsMenuRef} role="menu">
+                {tabs.length === 0 ? (
+                  <div className="codeEditorTabsMenuEmpty">No open files.</div>
+                ) : (
+                  tabs.map((tab) => (
+                    <div key={`menu:${tab.path}`} className="codeEditorTabsMenuRow" role="none">
+                      <button
+                        type="button"
+                        className={`sidebarActionMenuItem codeEditorTabsMenuItem ${tab.path === activePath ? "codeEditorTabsMenuItemActive" : ""}`}
+                        role="menuitem"
+                        title={tab.path}
+                        onClick={() => {
+                          setTabsMenuOpen(false);
+                          void openFile(tab.path);
+                        }}
+                      >
+                        <Icon name="file" size={14} />
+                        <span className="codeEditorTabsMenuItemText">{shortenPathSmart(tab.path, 54)}</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="btnSmall btnIcon codeEditorTabsMenuClose"
+                        title="Close"
+                        aria-label={`Close ${tab.title}`}
+                        onClick={() => {
+                          setTabsMenuOpen(false);
+                          requestCloseTab(tab.path);
+                        }}
+                      >
+                        <Icon name="close" size={14} />
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+            ) : null}
+          </div>
           <button
             type="button"
             className="btnSmall"
@@ -680,6 +957,12 @@ export function CodeEditorPanel({
           </button>
         </div>
       </div>
+
+      {activeTab ? (
+        <div className="codeEditorPathBar" title={activeTab.path}>
+          {activeTab.path}
+        </div>
+      ) : null}
 
       <div className="codeEditorBody">
         {!activeTab ? <div className="empty">No file selected.</div> : null}

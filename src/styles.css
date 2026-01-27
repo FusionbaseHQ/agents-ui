@@ -1108,12 +1108,60 @@ body {
   background: rgba(255, 255, 255, 0.02);
 }
 
+.codeEditorTabsWrapper {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  flex: 1;
+}
+
 .codeEditorTabs {
   display: flex;
   align-items: stretch;
   gap: 0;
   min-width: 0;
   overflow-x: auto;
+  scroll-behavior: smooth;
+  scrollbar-width: none;
+}
+
+.codeEditorTabs::-webkit-scrollbar {
+  display: none;
+}
+
+.codeEditorTabsScrollBtn {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 28px;
+  border: 0;
+  background: linear-gradient(90deg, rgba(16, 21, 30, 0.95), rgba(16, 21, 30, 0.4));
+  color: rgba(255, 255, 255, 0.75);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2;
+  transition: color 0.1s ease, opacity 0.15s ease;
+}
+
+.codeEditorTabsScrollBtn:hover {
+  color: rgba(255, 255, 255, 0.95);
+}
+
+.codeEditorTabsScrollBtn:active {
+  color: var(--accent);
+}
+
+.codeEditorTabsScrollBtnLeft {
+  left: 0;
+  background: linear-gradient(90deg, rgba(16, 21, 30, 0.95), transparent);
+}
+
+.codeEditorTabsScrollBtnRight {
+  right: 0;
+  background: linear-gradient(270deg, rgba(16, 21, 30, 0.95), transparent);
 }
 
 .codeEditorTab {
@@ -1126,6 +1174,7 @@ body {
   border-radius: 0;
   overflow: hidden;
   flex-shrink: 0;
+  min-width: 100px;
   max-width: 260px;
 }
 
@@ -1157,6 +1206,11 @@ body {
   white-space: nowrap;
 }
 
+.codeEditorTabTitleSuffix {
+  opacity: 0.6;
+  font-size: 11px;
+}
+
 .codeEditorTabDirty {
   width: 7px;
   height: 7px;
@@ -1169,31 +1223,91 @@ body {
   border: 0;
   background: transparent;
   color: rgba(255, 255, 255, 0.65);
-  padding: 0 10px;
+  min-width: 24px;
+  min-height: 24px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  margin-right: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
+  border-radius: 4px;
+  transition: background 0.1s ease, color 0.1s ease;
 }
 
 .codeEditorTabClose:hover {
-  color: rgba(255, 255, 255, 0.9);
-  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.95);
+  background: rgba(255, 80, 80, 0.18);
+}
+
+.codeEditorTabClose:active {
+  background: rgba(255, 80, 80, 0.25);
+}
+
+.codeEditorTabsMenuRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.codeEditorTabsMenuDropdown {
+  max-height: 340px;
+  overflow: auto;
+}
+
+.codeEditorTabsMenuItem {
+  flex: 1;
+  min-width: 0;
+}
+
+.codeEditorTabsMenuItemText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.codeEditorTabsMenuItemActive {
+  border-color: rgba(107, 138, 253, 0.35);
+  background: rgba(107, 138, 253, 0.12);
+}
+
+.codeEditorTabsMenuClose {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.codeEditorTabsMenuEmpty {
+  padding: 10px 10px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .codeEditorActions {
   display: flex;
   align-items: center;
-  gap: 8px;
-  min-width: 0;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
-.codeEditorPath {
-  max-width: 280px;
-  min-width: 0;
-  font-size: 11px;
+.codeEditorPathBar {
+  padding: 3px 10px;
+  font-size: 10px;
   color: var(--muted);
   font-family: ui-monospace, monospace;
+  text-align: center;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  background: rgba(0, 0, 0, 0.15);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
 }
 
 .codeEditorBody {
