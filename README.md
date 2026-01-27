@@ -5,14 +5,16 @@
 <h1 align="center">Agents UI</h1>
 
 <p align="center">
-  <strong>A native desktop terminal for AI coding agents</strong>
+  <strong>Native desktop workspace for AI coding agents, terminals, and files</strong>
 </p>
 
 <p align="center">
+  <a href="#demo">Demo</a> •
   <a href="#features">Features</a> •
   <a href="#quick-start">Quick Start</a> •
   <a href="#usage">Usage</a> •
   <a href="#development">Development</a> •
+  <a href="#security--privacy">Security &amp; Privacy</a> •
   <a href="#faq">FAQ</a>
 </p>
 
@@ -25,60 +27,78 @@
 
 ---
 
-Agents UI is a native desktop application for managing multiple AI coding agent sessions alongside regular shell terminals. Run Claude, Codex, Gemini, and shell sessions in a unified interface with real embedded terminals, session recording, and project organization.
+Agents UI is a **Tauri (Rust) + React** desktop app that combines:
+
+- **Real PTY terminals** (xterm.js) for shells and agent CLIs
+- A **file workspace** (Explorer + Monaco editor) for **local and SSH** files
+- **Session recording/replay**, prompts, and templates to speed up repetitive work
+
+> **Status:** macOS-first. Other platforms may work, but macOS is the primary target today.
 
 ## Demo
 
 [![Agents UI demo](docs/agents-ui-demo-video.gif)](docs/agents-ui-demo-video.mp4)
 
-<!--
-## Screenshots
+## Highlights
 
-Add your screenshots here:
-![Main Interface](docs/images/screenshot-main.png)
-![Command Palette](docs/images/screenshot-palette.png)
--->
+- Run multiple terminals and agent sessions side-by-side
+- Persistent sessions (keep long-running work around across app restarts)
+- Local + SSH file explorer with rename/delete + context actions
+- Monaco editor with multi-tab editing and syntax highlighting for common languages
+- Drag & drop file transfers: **Finder ↔ local ↔ SSH**
+- Record and replay sessions (great for audits, demos, and debugging)
+- Command palette, prompts, quick prompts, and asset templates
+- Projects with base paths and per-project environments
+- Native integration: tray, native menu items, “Check for updates…”
 
 ## Features
 
+### Terminals & Sessions
+- Multiple concurrent sessions (shells and agent CLIs)
+- Real embedded terminals powered by xterm.js + PTY backend
+- Session persistence across app restarts (optional)
+- Working directory tracking and session status (exit codes, closed state)
+- Session recording and replay
+
 ### Multi-Agent Support
-- **Claude** (Anthropic), **Codex** (OpenAI), and **Gemini** (Google) integrations
+- Quick-start shortcuts for **Claude**, **Codex**, and **Gemini** (and configurable shortcuts for other agents)
 - Activity indicators show when agents are working
 - Automatic agent detection with branded icons
-- One-click quick-start buttons for each agent
 
-### Native Terminal Experience
-- Real embedded terminals powered by xterm.js
-- Full PTY support with bidirectional communication
-- 5000-line scrollback buffer
-- Working directory tracking
+### Projects & Workspace
+- Project-based organization (sessions, base paths, and environment sets)
+- Resizable workspace layout (terminals + file tree + editor + slide panels)
+- Per-project environments (env vars), optionally encrypted at rest on macOS
 
-### Session Management
-- Create and manage multiple concurrent sessions
-- Project-based organization
-- Session persistence across app restarts
-- Exit code tracking and status indicators
+### Files Workspace (Local + SSH)
+- File explorer with a fast, scrollable tree view
+- Open folders in Finder / VS Code (local)
+- Rename/delete files and folders (local + SSH)
+- Upload/download via SSH (SCP-based)
+- Drag & drop:
+  - Finder → local/SSH folder to copy/upload
+  - SSH/local → Finder (SSH items are downloaded to a temp file for the drag)
 
-### Recording & Replay
-- Record terminal sessions for later review
-- Step-by-step or full replay modes
-- Recording metadata with agent type and timestamps
+### Code Editor (Monaco)
+- Multi-tab editor with syntax highlighting for common languages
+- Save with `Cmd/Ctrl+S`, close tabs with `Cmd/Ctrl+W`
+- Works with both local and SSH-backed files
 
 ### Command Palette
 - Quick access with `Cmd+K` / `Ctrl+K`
 - Fuzzy search across prompts, recordings, and sessions
 - Keyboard-driven workflow
 
-### Prompts System
+### Prompts & Templates
 - Create and save reusable prompts
 - Pin up to 5 prompts for quick access (`Cmd+1-5`)
 - Paste or send-with-enter modes
+- Asset templates for one-click file creation
 
-### Additional Features
-- System tray integration with active agent count
-- Asset templates for automatic file creation
-- Environment variable management
-- Resizable slide panel for prompts, recordings, and assets
+### SSH (Remote Sessions + Port Forwards)
+- Host picker backed by `~/.ssh/config`
+- Port forwards: local (`-L`), remote (`-R`), dynamic (`-D`)
+- “Forward-only” mode (port-forward without starting an interactive shell)
 
 ## Quick Start
 
@@ -91,7 +111,7 @@ Add your screenshots here:
 ### Installation
 
 ```bash
-# Clone the repository and enter it
+# Clone the repository
 git clone https://github.com/FusionbaseHQ/agents-ui.git
 cd agents-ui
 
@@ -129,6 +149,13 @@ Use the quick-start buttons in the sidebar to instantly launch agent sessions:
 
 > **Note:** Agent CLI tools must be installed and available on your PATH.
 
+### Files & Editor
+
+- Open the file explorer to browse local or SSH directories.
+- Drag files/folders from Finder into a folder in the explorer to copy/upload.
+- Drag files/folders out of the explorer into Finder/Desktop to export (SSH items are downloaded to a temp file for the drag).
+- Open files in the Monaco editor for local/SSH editing.
+
 ### Command Palette
 
 Press `Cmd+K` / `Ctrl+K` to open the command palette. Search and access:
@@ -155,22 +182,25 @@ Press `Cmd+K` / `Ctrl+K` to open the command palette. Search and access:
 
 - Create projects to organize related sessions
 - Set a base path for each project
-- Assign environment configurations
+- Assign environment configurations (optionally encrypted at rest on macOS)
 - Enable asset templates per project
 
-## Keyboard Shortcuts
+<details>
+<summary><strong>Keyboard shortcuts</strong></summary>
 
 | Action | macOS | Windows/Linux |
 |--------|-------|---------------|
 | Command Palette | `Cmd+K` | `Ctrl+K` |
 | New Session | `Cmd+T` | `Ctrl+Shift+T` |
 | Close Session | `Cmd+W` | `Ctrl+Shift+W` |
-| Next Session | `Cmd+Tab` | `Ctrl+Tab` |
-| Previous Session | `Cmd+Shift+Tab` | `Ctrl+Shift+Tab` |
 | Prompts Panel | `Cmd+Shift+P` | `Ctrl+Shift+P` |
 | Recordings Panel | `Cmd+Shift+R` | `Ctrl+Shift+R` |
 | Assets Panel | `Cmd+Shift+A` | `Ctrl+Shift+A` |
 | Quick Prompt 1-5 | `Cmd+1-5` | `Ctrl+1-5` |
+| Editor: Save | `Cmd+S` | `Ctrl+S` |
+| Editor: Close tab | `Cmd+W` | `Ctrl+W` |
+
+</details>
 
 ## Development
 
@@ -181,7 +211,7 @@ Press `Cmd+K` / `Ctrl+K` to open the command palette. Search and access:
    ```bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    ```
-3. **Tauri Prerequisites** - Follow the [official guide](https://tauri.app/v1/guides/getting-started/prerequisites) for your OS
+3. **Tauri Prerequisites** - Follow the [official guide](https://tauri.app/start/prerequisites/) for your OS
 
 ### Development Mode
 
@@ -204,6 +234,13 @@ npm run tauri dev -- -- --clear-data
 npm run tauri:dev:clear
 ```
 
+On macOS you can also wipe app data from disk with:
+
+```bash
+scripts/purge-agents-ui-macos.sh --dry-run
+scripts/purge-agents-ui-macos.sh
+```
+
 ### Bundled Tools (macOS)
 
 Agents UI bundles `nu` (Nushell) and `zellij` as Tauri sidecars under `src-tauri/bin` so the app runs without system dependencies.
@@ -219,46 +256,40 @@ Agents UI bundles `nu` (Nushell) and `zellij` as Tauri sidecars under `src-tauri
 npm run tauri build
 ```
 
-### Project Structure
+<details>
+<summary><strong>Project structure</strong></summary>
 
 ```
-desktop/
+.
 ├── src/                      # React frontend
-│   ├── App.tsx              # Main application component
-│   ├── SessionTerminal.tsx  # Terminal embedding (xterm.js)
-│   ├── CommandPalette.tsx   # Command palette UI
-│   ├── SlidePanel.tsx       # Side panel component
-│   ├── processEffects.ts    # Agent detection logic
-│   ├── styles.css           # Application styles
-│   └── assets/              # Agent icons
-├── src-tauri/               # Rust backend
-│   ├── src/
-│   │   ├── main.rs         # Tauri entry point, IPC handlers
-│   │   ├── pty.rs          # PTY session management
-│   │   ├── persist.rs      # State persistence
-│   │   ├── recording.rs    # Session recording
-│   │   └── tray.rs         # System tray integration
-│   ├── Cargo.toml          # Rust dependencies
-│   └── tauri.conf.json     # Tauri configuration
-├── package.json            # Node dependencies
-└── vite.config.ts          # Vite configuration
+│   ├── App.tsx               # Main application component
+│   ├── SessionTerminal.tsx   # Terminal embedding (xterm.js)
+│   ├── CommandPalette.tsx    # Command palette UI
+│   ├── SlidePanel.tsx        # Side panel component
+│   ├── components/           # Editor, file explorer, modals, sections
+│   ├── processEffects.ts     # Agent detection + shortcut definitions
+│   └── styles.css            # Application styles
+├── src-tauri/                # Rust backend (Tauri)
+│   ├── src/                  # Commands + PTY + SSH + persistence
+│   └── bin/                  # Bundled sidecars (macOS)
+├── scripts/                  # Dev + packaging utilities
+└── docs/                     # Demo assets
 ```
 
-## Architecture
+</details>
+
+<details>
+<summary><strong>Architecture</strong></summary>
 
 Agents UI is built with:
 
 - **[Tauri v2](https://tauri.app/)** - Native app framework with Rust backend
 - **[React 18](https://react.dev/)** - Frontend UI framework
 - **[xterm.js](https://xtermjs.org/)** - Terminal emulator for the web
+- **[Monaco Editor](https://microsoft.github.io/monaco-editor/)** - Code editor
 - **[Vite](https://vitejs.dev/)** - Frontend build tool
 
-### How It Works
-
-1. **Frontend (React)** handles the UI, session tabs, command palette, and terminal rendering
-2. **Backend (Rust)** manages PTY sessions, state persistence, and system integration
-3. **IPC Bridge (Tauri)** enables communication between frontend and backend
-4. **xterm.js** provides the terminal emulator with full PTY support
+</details>
 
 ## Supported Agents
 
@@ -272,7 +303,8 @@ The application automatically detects running agents and displays their branded 
 
 ### Adding Custom Agents
 
-Edit `src/processEffects.ts` to add support for additional CLI tools:
+- Reorder/enable agent shortcuts in the UI (sidebar + command palette).
+- To add a new CLI for detection/icons, edit `src/processEffects.ts` to add support for additional tools:
 
 ```typescript
 export const PROCESS_EFFECTS: ProcessEffect[] = [
