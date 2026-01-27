@@ -393,7 +393,13 @@ fn parse_sftp_ls(dir_path: &str, stdout: &str) -> Vec<FsEntry> {
 }
 
 #[tauri::command]
-pub fn ssh_default_root(target: String) -> Result<String, String> {
+pub async fn ssh_default_root(target: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || ssh_default_root_sync(target))
+        .await
+        .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+fn ssh_default_root_sync(target: String) -> Result<String, String> {
     let target = target.trim();
     if target.is_empty() {
         return Err("missing ssh target".to_string());
@@ -416,7 +422,13 @@ pub fn ssh_default_root(target: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn ssh_list_fs_entries(target: String, root: String, path: String) -> Result<Vec<FsEntry>, String> {
+pub async fn ssh_list_fs_entries(target: String, root: String, path: String) -> Result<Vec<FsEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || ssh_list_fs_entries_sync(target, root, path))
+        .await
+        .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+fn ssh_list_fs_entries_sync(target: String, root: String, path: String) -> Result<Vec<FsEntry>, String> {
     let target = target.trim();
     if target.is_empty() {
         return Err("missing ssh target".to_string());
@@ -432,7 +444,13 @@ pub fn ssh_list_fs_entries(target: String, root: String, path: String) -> Result
 }
 
 #[tauri::command]
-pub fn ssh_read_text_file(target: String, root: String, path: String) -> Result<String, String> {
+pub async fn ssh_read_text_file(target: String, root: String, path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || ssh_read_text_file_sync(target, root, path))
+        .await
+        .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+fn ssh_read_text_file_sync(target: String, root: String, path: String) -> Result<String, String> {
     let target = target.trim();
     if target.is_empty() {
         return Err("missing ssh target".to_string());
@@ -468,7 +486,13 @@ pub fn ssh_read_text_file(target: String, root: String, path: String) -> Result<
 }
 
 #[tauri::command]
-pub fn ssh_write_text_file(target: String, root: String, path: String, content: String) -> Result<(), String> {
+pub async fn ssh_write_text_file(target: String, root: String, path: String, content: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || ssh_write_text_file_sync(target, root, path, content))
+        .await
+        .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+fn ssh_write_text_file_sync(target: String, root: String, path: String, content: String) -> Result<(), String> {
     let target = target.trim();
     if target.is_empty() {
         return Err("missing ssh target".to_string());
@@ -489,7 +513,13 @@ pub fn ssh_write_text_file(target: String, root: String, path: String, content: 
 }
 
 #[tauri::command]
-pub fn ssh_rename_fs_entry(target: String, root: String, path: String, new_name: String) -> Result<String, String> {
+pub async fn ssh_rename_fs_entry(target: String, root: String, path: String, new_name: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || ssh_rename_fs_entry_sync(target, root, path, new_name))
+        .await
+        .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+fn ssh_rename_fs_entry_sync(target: String, root: String, path: String, new_name: String) -> Result<String, String> {
     let target = target.trim();
     if target.is_empty() {
         return Err("missing ssh target".to_string());
@@ -526,7 +556,13 @@ pub fn ssh_rename_fs_entry(target: String, root: String, path: String, new_name:
 }
 
 #[tauri::command]
-pub fn ssh_delete_fs_entry(target: String, root: String, path: String) -> Result<(), String> {
+pub async fn ssh_delete_fs_entry(target: String, root: String, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || ssh_delete_fs_entry_sync(target, root, path))
+        .await
+        .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+fn ssh_delete_fs_entry_sync(target: String, root: String, path: String) -> Result<(), String> {
     let target = target.trim();
     if target.is_empty() {
         return Err("missing ssh target".to_string());
@@ -542,4 +578,182 @@ pub fn ssh_delete_fs_entry(target: String, root: String, path: String) -> Result
         return Err(output_to_error("ssh failed", &output));
     }
     Ok(())
+}
+
+fn run_scp(scp_flags: &[&str], ssh_args: Vec<String>, paths: &[String]) -> Result<Output, String> {
+    let scp_path = program_path("scp")?;
+    let mut cmd = Command::new(&scp_path);
+    // scp flags first (like -r)
+    cmd.args(scp_flags);
+    // SSH options next
+    cmd.args(&ssh_args);
+    // Source and destination paths last
+    cmd.args(paths);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    eprintln!(
+        "[scp] command: {:?} {:?} {:?} {:?}",
+        scp_path, scp_flags, ssh_args, paths
+    );
+
+    let output = cmd.output().map_err(|e| format!("run scp failed: {e}"))?;
+
+    eprintln!(
+        "[scp] exit={} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    Ok(output)
+}
+
+#[tauri::command]
+pub async fn ssh_download_file(
+    target: String,
+    root: String,
+    remote_path: String,
+    local_path: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ssh_download_file_sync(target, root, remote_path, local_path)
+    })
+    .await
+    .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+fn ssh_download_file_sync(
+    target: String,
+    root: String,
+    remote_path: String,
+    local_path: String,
+) -> Result<(), String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("missing ssh target".to_string());
+    }
+    let (_root, remote_path) = ensure_within_root(&root, &remote_path)?;
+
+    let local = local_path.trim();
+    if local.is_empty() {
+        return Err("missing local path".to_string());
+    }
+
+    // Use scp -r for recursive copy (works for files and directories)
+    // Format: scp -r user@host:/remote/path /local/path
+    // Note: No shell escaping needed - scp handles paths directly
+    let source = format!("{}:{}", target, remote_path);
+    let paths = vec![source, local.to_string()];
+    let output = run_scp(&["-r"], ssh_common_args()?, &paths)?;
+    if !output.status.success() {
+        return Err(output_to_error("scp download failed", &output));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn ssh_upload_file(
+    target: String,
+    root: String,
+    local_path: String,
+    remote_path: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ssh_upload_file_sync(target, root, local_path, remote_path)
+    })
+    .await
+    .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+fn ssh_upload_file_sync(
+    target: String,
+    root: String,
+    local_path: String,
+    remote_path: String,
+) -> Result<(), String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("missing ssh target".to_string());
+    }
+    let (_root, remote_path) = ensure_within_root(&root, &remote_path)?;
+
+    let local = local_path.trim();
+    if local.is_empty() {
+        return Err("missing local path".to_string());
+    }
+    if !Path::new(local).exists() {
+        return Err("local file does not exist".to_string());
+    }
+
+    // Use scp -r for recursive copy (works for files and directories)
+    // Format: scp -r /local/path user@host:/remote/path
+    // Note: No shell escaping needed - scp handles paths directly
+    let dest = format!("{}:{}", target, remote_path);
+    let paths = vec![local.to_string(), dest];
+    let output = run_scp(&["-r"], ssh_common_args()?, &paths)?;
+    if !output.status.success() {
+        return Err(output_to_error("scp upload failed", &output));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn ssh_download_to_temp(
+    target: String,
+    root: String,
+    remote_path: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ssh_download_to_temp_sync(target, root, remote_path)
+    })
+    .await
+    .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+fn ssh_download_to_temp_sync(
+    target: String,
+    root: String,
+    remote_path: String,
+) -> Result<String, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("missing ssh target".to_string());
+    }
+    let (_root, remote_path) = ensure_within_root(&root, &remote_path)?;
+
+    // Extract filename from remote path
+    let file_name = Path::new(&remote_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("download");
+
+    // Create temp directory for this download
+    let temp_base = std::env::temp_dir().join("agents-ui-downloads");
+    std::fs::create_dir_all(&temp_base)
+        .map_err(|e| format!("failed to create temp directory: {e}"))?;
+
+    // Generate unique subdirectory
+    let unique_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let unique_dir = temp_base.join(format!("{unique_id}"));
+    std::fs::create_dir_all(&unique_dir)
+        .map_err(|e| format!("failed to create temp subdirectory: {e}"))?;
+
+    let local_path = unique_dir.join(file_name);
+    let local_path_str = local_path.to_string_lossy().to_string();
+
+    // Download using scp
+    // Note: No shell escaping needed - scp handles paths directly
+    let source = format!("{}:{}", target, remote_path);
+    let paths = vec![source, local_path_str.clone()];
+    let output = run_scp(&["-r"], ssh_common_args()?, &paths)?;
+    if !output.status.success() {
+        return Err(output_to_error("scp download failed", &output));
+    }
+
+    Ok(local_path_str)
 }

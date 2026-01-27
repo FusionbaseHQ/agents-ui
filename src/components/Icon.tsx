@@ -20,7 +20,9 @@ export type IconName =
   | "ssh"
   | "grip"
   | "chevron-left"
-  | "chevron-right";
+  | "chevron-right"
+  | "download"
+  | "upload";
 
 type IconProps = {
   name: IconName;
@@ -197,6 +199,22 @@ export function Icon({ name, size = 16, className }: IconProps) {
       return (
         <svg {...common}>
           <path d="M9 18l6-6-6-6" />
+        </svg>
+      );
+    case "download":
+      return (
+        <svg {...common}>
+          <path d="M12 5v10" />
+          <path d="M8 13l4 4 4-4" />
+          <path d="M5 19h14" />
+        </svg>
+      );
+    case "upload":
+      return (
+        <svg {...common}>
+          <path d="M12 19V9" />
+          <path d="M8 11l4-4 4 4" />
+          <path d="M5 19h14" />
         </svg>
       );
     default:

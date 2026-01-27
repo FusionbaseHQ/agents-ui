@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
 import React from "react";
 import { shortenPathSmart } from "../pathDisplay";
 import { Icon } from "./Icon";
@@ -23,7 +24,10 @@ type VisibleItem =
   | { type: "error"; path: string; depth: number; message: string };
 
 function normalizePath(input: string): string {
-  return input.trim().replace(/\/+$/, "");
+  const trimmed = input.trim();
+  if (!trimmed) return "";
+  if (trimmed === "/") return "/";
+  return trimmed.replace(/\/+$/, "");
 }
 
 function dirname(input: string): string {
@@ -95,6 +99,9 @@ export function FileExplorerPanel({
   const sshTargetValue = React.useMemo(() => (sshTarget ?? "").trim() || null, [sshTarget]);
   const [expandedDirs, setExpandedDirs] = React.useState<Set<string>>(() => new Set([root]));
   const [dirStateByPath, setDirStateByPath] = React.useState<Record<string, DirectoryState>>({});
+  const listRef = React.useRef<HTMLDivElement | null>(null);
+  const [scrollTop, setScrollTop] = React.useState(0);
+  const [listHeight, setListHeight] = React.useState(0);
 
   const [contextMenu, setContextMenu] = React.useState<{ x: number; y: number; entry: FsEntry } | null>(null);
   const contextMenuRef = React.useRef<HTMLDivElement | null>(null);
@@ -109,6 +116,11 @@ export function FileExplorerPanel({
   const [deleteTarget, setDeleteTarget] = React.useState<FsEntry | null>(null);
   const [deleteBusy, setDeleteBusy] = React.useState(false);
   const [deleteError, setDeleteError] = React.useState<string | null>(null);
+
+  const [downloadBusy, setDownloadBusy] = React.useState(false);
+  const [downloadError, setDownloadError] = React.useState<string | null>(null);
+  const [dropTarget, setDropTarget] = React.useState<string | null>(null);
+  const [draggedItem, setDraggedItem] = React.useState<FsEntry | null>(null);
 
   const loadDirectory = React.useCallback(
     async (path: string) => {
@@ -145,6 +157,25 @@ export function FileExplorerPanel({
   );
 
   React.useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const update = () => setListHeight(el.clientHeight);
+    update();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => update());
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  React.useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const onScroll = () => setScrollTop(el.scrollTop);
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
+  React.useEffect(() => {
     if (!isOpen) return;
     setExpandedDirs(new Set([root]));
     setDirStateByPath({});
@@ -153,6 +184,11 @@ export function FileExplorerPanel({
     setDeleteTarget(null);
     void loadDirectory(root);
   }, [isOpen, loadDirectory, root]);
+
+  React.useEffect(() => {
+    setScrollTop(0);
+    if (listRef.current) listRef.current.scrollTop = 0;
+  }, [isOpen, root]);
 
   React.useEffect(() => {
     if (!contextMenu) return;
@@ -298,9 +334,8 @@ export function FileExplorerPanel({
         next.add(path);
         return next;
       });
-      if (!dirStateByPath[path] || (!dirStateByPath[path].loading && dirStateByPath[path].entries.length === 0)) {
-        void loadDirectory(path);
-      }
+      const state = dirStateByPath[path];
+      if (!state || state.error) void loadDirectory(path);
     },
     [dirStateByPath, loadDirectory],
   );
@@ -377,6 +412,77 @@ export function FileExplorerPanel({
     }
   }, [closeDeleteModal, deleteTarget, loadDirectory, onPathDeleted, provider, removeDirectoryPrefix, root, sshTargetValue]);
 
+  const handleDownload = React.useCallback(async (entry: FsEntry) => {
+    setContextMenu(null);
+    if (!sshTargetValue) return;
+
+    try {
+      setDownloadBusy(true);
+      setDownloadError(null);
+      const savePath = await save({
+        defaultPath: entry.name,
+        title: entry.isDir ? "Download folder" : "Download file",
+      });
+      if (!savePath) {
+        setDownloadBusy(false);
+        return;
+      }
+
+      await invoke("ssh_download_file", {
+        target: sshTargetValue,
+        root,
+        remotePath: entry.path,
+        localPath: savePath,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error("Download failed:", message);
+      setDownloadError(message);
+    } finally {
+      setDownloadBusy(false);
+    }
+  }, [sshTargetValue, root]);
+
+  const handleFileDrop = React.useCallback(async (
+    sourceProvider: "local" | "ssh",
+    sourceSshTarget: string | null,
+    sourceRoot: string,
+    sourcePath: string,
+    sourceName: string,
+    destDirPath: string,
+  ) => {
+    const destPath = destDirPath === "/" ? `/${sourceName}` : `${destDirPath}/${sourceName}`;
+
+    try {
+      if (sourceProvider === "ssh" && provider === "local") {
+        // SSH → Local: download
+        if (!sourceSshTarget) return;
+        await invoke("ssh_download_file", {
+          target: sourceSshTarget,
+          root: sourceRoot,
+          remotePath: sourcePath,
+          localPath: destPath,
+        });
+      } else if (sourceProvider === "local" && provider === "ssh") {
+        // Local → SSH: upload
+        if (!sshTargetValue) return;
+        await invoke("ssh_upload_file", {
+          target: sshTargetValue,
+          root,
+          localPath: sourcePath,
+          remotePath: destPath,
+        });
+      } else {
+        // Same provider - not supported for now
+        return;
+      }
+      // Refresh directory to show new file
+      void loadDirectory(destDirPath);
+    } catch (err) {
+      console.error("File transfer failed:", err);
+    }
+  }, [provider, sshTargetValue, root, loadDirectory]);
+
   if (!isOpen) return null;
 
   const menuX = contextMenu
@@ -405,84 +511,197 @@ export function FileExplorerPanel({
         </div>
       </div>
 
-      <div className="fileExplorerList" role="tree">
+      <div className="fileExplorerList" role="tree" ref={listRef}>
         {visibleItems.length === 0 ? (
           <div className="empty">No files.</div>
         ) : (
-          visibleItems.map((item) => {
-            if (item.type === "loading") {
-              return (
-                <div
-                  key={`loading:${item.path}`}
-                  className="fileExplorerRow fileExplorerMeta"
-                  style={{ paddingLeft: 12 + item.depth * 14 }}
-                >
-                  loading…
-                </div>
-              );
-            }
-            if (item.type === "error") {
-              return (
-                <div
-                  key={`error:${item.path}`}
-                  className="fileExplorerRow fileExplorerMeta fileExplorerError"
-                  style={{ paddingLeft: 12 + item.depth * 14 }}
-                  title={item.message}
-                >
-                  failed to load
-                </div>
-              );
-            }
+          (() => {
+            const rowHeight = 28;
+            const overscan = 12;
+            const total = visibleItems.length;
+            const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+            const endIndex = Math.min(total, Math.ceil((scrollTop + listHeight) / rowHeight) + overscan);
+            const topSpace = startIndex * rowHeight;
+            const bottomSpace = Math.max(0, (total - endIndex) * rowHeight);
+            const activeNorm = activeFilePath ? normalizePath(activeFilePath) : null;
+            const contextNorm = contextMenuOpenPath ? normalizePath(contextMenuOpenPath) : null;
 
-            const entry = item.entry;
-            const isActive = Boolean(activeFilePath && normalizePath(activeFilePath) === normalizePath(entry.path));
-            const isContextTarget = Boolean(contextMenuOpenPath && normalizePath(contextMenuOpenPath) === normalizePath(entry.path));
-            const isExpanded = entry.isDir && expandedDirs.has(entry.path);
-            const indent = 12 + item.depth * 14;
             return (
-              <button
-                key={entry.path}
-                type="button"
-                className={[
-                  "fileExplorerRow",
-                  isActive ? "fileExplorerRowActive" : "",
-                  isContextTarget ? "fileExplorerRowContext" : "",
-                ]
-                  .filter(Boolean)
-                  .join(" ")}
-                style={{ paddingLeft: indent }}
-                onClick={() => {
-                  if (entry.isDir) {
-                    toggleDir(entry.path);
-                    return;
+              <div style={{ paddingTop: topSpace, paddingBottom: bottomSpace }}>
+                {visibleItems.slice(startIndex, endIndex).map((item) => {
+                  if (item.type === "loading") {
+                    return (
+                      <div
+                        key={`loading:${item.path}`}
+                        className="fileExplorerRow fileExplorerMeta"
+                        style={{ paddingLeft: 12 + item.depth * 14, height: rowHeight }}
+                      >
+                        loading…
+                      </div>
+                    );
                   }
-                  onSelectFile(entry.path);
-                }}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setContextMenu({ x: e.clientX, y: e.clientY, entry });
-                }}
-                role="treeitem"
-                aria-expanded={entry.isDir ? isExpanded : undefined}
-                title={entry.path}
-              >
-                {entry.isDir ? (
-                  <span className="fileExplorerDisclosure" aria-hidden="true">
-                    {isExpanded ? "▾" : "▸"}
-                  </span>
-                ) : (
-                  <span className="fileExplorerDisclosure" aria-hidden="true">
-                    {" "}
-                  </span>
-                )}
-                <span className="fileExplorerIcon" aria-hidden="true">
-                  <Icon name={entry.isDir ? "folder" : "file"} size={14} />
-                </span>
-                <span className="fileExplorerName">{entry.name}</span>
-              </button>
+                  if (item.type === "error") {
+                    return (
+                      <div
+                        key={`error:${item.path}`}
+                        className="fileExplorerRow fileExplorerMeta fileExplorerError"
+                        style={{ paddingLeft: 12 + item.depth * 14, height: rowHeight }}
+                        title={item.message}
+                      >
+                        failed to load
+                      </div>
+                    );
+                  }
+
+                  const entry = item.entry;
+                  const isActive = Boolean(activeNorm && activeNorm === normalizePath(entry.path));
+                  const isContextTarget = Boolean(contextNorm && contextNorm === normalizePath(entry.path));
+                  const isExpanded = entry.isDir && expandedDirs.has(entry.path);
+                  const isDropTarget = dropTarget === entry.path;
+                  const isDragging = draggedItem?.path === entry.path;
+                  const indent = 12 + item.depth * 14;
+                  return (
+                    <button
+                      key={entry.path}
+                      type="button"
+                      className={[
+                        "fileExplorerRow",
+                        isActive ? "fileExplorerRowActive" : "",
+                        isContextTarget ? "fileExplorerRowContext" : "",
+                        isDropTarget ? "fileExplorerRowDropTarget" : "",
+                        isDragging ? "fileExplorerRowDragging" : "",
+                      ]
+                        .filter(Boolean)
+                        .join(" ")}
+                      style={{ paddingLeft: indent, height: rowHeight }}
+                      draggable
+                      onDragStart={(e) => {
+                        setDraggedItem(entry);
+                        e.dataTransfer.effectAllowed = "copy";
+                        e.dataTransfer.setData("application/x-file-transfer", JSON.stringify({
+                          provider,
+                          sshTarget: sshTargetValue,
+                          root,
+                          path: entry.path,
+                          name: entry.name,
+                          isDir: entry.isDir,
+                        }));
+                      }}
+                      onDragEnd={() => {
+                        setDraggedItem(null);
+                        setDropTarget(null);
+                      }}
+                      onDragOver={(e) => {
+                        if (!entry.isDir) return;
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = "copy";
+                        setDropTarget(entry.path);
+                      }}
+                      onDragLeave={(e) => {
+                        // Only clear if leaving this element, not entering a child
+                        const relatedTarget = e.relatedTarget as Node | null;
+                        if (relatedTarget && e.currentTarget.contains(relatedTarget)) return;
+                        if (dropTarget === entry.path) setDropTarget(null);
+                      }}
+                      onDrop={async (e) => {
+                        e.preventDefault();
+                        setDropTarget(null);
+                        if (!entry.isDir) return;
+
+                        // Check for files from Finder/external source
+                        const files = e.dataTransfer.files;
+                        if (files && files.length > 0) {
+                          // Handle external file drops (from Finder)
+                          for (const file of Array.from(files)) {
+                            // file.path contains the full path on macOS/Tauri
+                            const filePath = (file as File & { path?: string }).path;
+                            if (!filePath) continue;
+                            const fileName = file.name;
+                            try {
+                              if (provider === "ssh" && sshTargetValue) {
+                                // Upload to SSH
+                                const destPath = entry.path === "/" ? `/${fileName}` : `${entry.path}/${fileName}`;
+                                await invoke("ssh_upload_file", {
+                                  target: sshTargetValue,
+                                  root,
+                                  localPath: filePath,
+                                  remotePath: destPath,
+                                });
+                              }
+                              // For local provider, we'd need a local copy command
+                              // but that's less common use case
+                            } catch (err) {
+                              console.error("Upload failed:", err);
+                            }
+                          }
+                          void loadDirectory(entry.path);
+                          return;
+                        }
+
+                        // Check for in-app file transfer
+                        const data = e.dataTransfer.getData("application/x-file-transfer");
+                        if (!data) return;
+                        try {
+                          const source = JSON.parse(data) as {
+                            provider: "local" | "ssh";
+                            sshTarget: string | null;
+                            root: string;
+                            path: string;
+                            name: string;
+                            isDir: boolean;
+                          };
+                          // Prevent dropping onto itself or its children
+                          if (source.path === entry.path) return;
+                          if (source.isDir && entry.path.startsWith(source.path + "/")) return;
+                          // Only allow cross-provider drops for now
+                          if (source.provider === provider) return;
+                          await handleFileDrop(
+                            source.provider,
+                            source.sshTarget,
+                            source.root,
+                            source.path,
+                            source.name,
+                            entry.path,
+                          );
+                        } catch {
+                          // Invalid JSON, ignore
+                        }
+                      }}
+                      onClick={() => {
+                        if (entry.isDir) {
+                          toggleDir(entry.path);
+                          return;
+                        }
+                        onSelectFile(entry.path);
+                      }}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setContextMenu({ x: e.clientX, y: e.clientY, entry });
+                      }}
+                      role="treeitem"
+                      aria-expanded={entry.isDir ? isExpanded : undefined}
+                      title={entry.path}
+                    >
+                      {entry.isDir ? (
+                        <span className="fileExplorerDisclosure" aria-hidden="true">
+                          {isExpanded ? "▾" : "▸"}
+                        </span>
+                      ) : (
+                        <span className="fileExplorerDisclosure" aria-hidden="true">
+                          {" "}
+                        </span>
+                      )}
+                      <span className="fileExplorerIcon" aria-hidden="true">
+                        <Icon name={entry.isDir ? "folder" : "file"} size={14} />
+                      </span>
+                      <span className="fileExplorerName">{entry.name}</span>
+                    </button>
+                  );
+                })}
+              </div>
             );
-          })
+          })()
         )}
       </div>
 
@@ -546,7 +765,19 @@ export function FileExplorerPanel({
               <div className="fileContextMenuSep" role="separator" />
             </>
           ) : (
-            <div className="fileContextMenuSep" role="separator" />
+            <>
+              <button
+                type="button"
+                className="sidebarActionMenuItem"
+                role="menuitem"
+                disabled={downloadBusy}
+                onClick={() => void handleDownload(contextMenu.entry)}
+              >
+                <Icon name="download" size={14} />
+                Download{contextMenu.entry.isDir ? " folder" : ""}…
+              </button>
+              <div className="fileContextMenuSep" role="separator" />
+            </>
           )}
           <button
             type="button"
@@ -648,6 +879,25 @@ export function FileExplorerPanel({
         onClose={closeDeleteModal}
         onConfirm={() => void confirmDelete()}
       />
+
+      {downloadError && (
+        <div
+          className="modalBackdrop modalBackdropTop"
+          onClick={() => setDownloadError(null)}
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3 className="modalTitle">Download Failed</h3>
+            <div className="pathPickerError" role="alert">
+              {downloadError}
+            </div>
+            <div className="modalActions">
+              <button type="button" className="btn" onClick={() => setDownloadError(null)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </aside>
   );
 }

@@ -1085,6 +1085,17 @@ body {
   color: rgba(255, 120, 120, 0.95);
 }
 
+.fileExplorerRowDropTarget {
+  background: rgba(34, 211, 238, 0.18);
+  border-color: rgba(34, 211, 238, 0.45);
+  outline: 1px dashed rgba(34, 211, 238, 0.6);
+  outline-offset: -1px;
+}
+
+.fileExplorerRowDragging {
+  opacity: 0.5;
+}
+
 .codeEditorPanel {
   width: var(--workspaceEditorWidthPx, 520px);
   flex: 0 1 var(--workspaceEditorWidthPx, 520px);

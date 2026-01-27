@@ -27,8 +27,9 @@ use recording::{delete_recording, list_recordings, load_recording};
 use secure::{prepare_secure_storage, reset_secure_storage};
 use ssh::list_ssh_hosts;
 use ssh_fs::{
-    ssh_default_root, ssh_delete_fs_entry, ssh_list_fs_entries, ssh_read_text_file,
-    ssh_rename_fs_entry, ssh_write_text_file,
+    ssh_default_root, ssh_delete_fs_entry, ssh_download_file, ssh_download_to_temp,
+    ssh_list_fs_entries, ssh_read_text_file, ssh_rename_fs_entry, ssh_upload_file,
+    ssh_write_text_file,
 };
 use startup::get_startup_flags;
 use tray::{build_status_tray, set_tray_agent_count};
@@ -63,6 +64,7 @@ fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .menu(|app| build_app_menu(app))
         .on_menu_event(|app, event| handle_app_menu_event(app, event))
         .setup(|app| {
@@ -104,6 +106,9 @@ fn main() {
             ssh_write_text_file,
             ssh_rename_fs_entry,
             ssh_delete_fs_entry,
+            ssh_download_file,
+            ssh_upload_file,
+            ssh_download_to_temp,
             load_recording,
             list_recordings,
             delete_recording,
