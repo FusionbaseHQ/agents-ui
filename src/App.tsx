@@ -98,6 +98,7 @@ type PtyExit = { id: string; exit_code?: number | null };
 type AppInfo = { name: string; version: string; homepage?: string | null };
 type AppMenuEventPayload = { id: string };
 type StartupFlags = { clearData: boolean };
+type TrayMenuEventPayload = { id: string; effectId?: string | null };
 
 // Buffer for data that arrives before terminal is ready
 export type PendingDataBuffer = Map<string, string[]>;
@@ -752,6 +753,7 @@ export default function App() {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [updatesOpen, setUpdatesOpen] = useState(false);
   const [updateCheckState, setUpdateCheckState] = useState<UpdateCheckState>({ status: "idle" });
+  const [pendingTrayAction, setPendingTrayAction] = useState<TrayMenuEventPayload | null>(null);
 
   const [persistentSessionsOpen, setPersistentSessionsOpen] = useState(false);
   const [persistentSessionsLoading, setPersistentSessionsLoading] = useState(false);
@@ -1039,19 +1041,25 @@ export default function App() {
     agentIdleTimersRef.current.set(id, timeout);
   }
 
-  function markAgentWorking(id: string) {
-    const s = sessionsRef.current.find((s) => s.id === id);
-    if (!s) return;
-    if (!s.effectId || s.exited || s.closing) return;
+  function markAgentWorkingFromOutput(id: string) {
+    const session = sessionsRef.current.find((s) => s.id === id);
+    if (!session) return;
+    if (!session.effectId || session.exited || session.closing) return;
 
-    if (!s.agentWorking) {
+    // Persistent sessions (zellij) can emit background output even when "idle".
+    // Shell sessions can also keep producing output after an agent exits.
+    // Only treat PTY output as "agent activity" when:
+    // - the session was launched as a one-off command, OR
+    // - the session is already marked as working (i.e. we explicitly started/detected an agent).
+    if (session.persistent) return;
+    if (!session.launchCommand && !session.agentWorking) return;
+
+    if (!session.agentWorking) {
       setSessions((prev) =>
-        prev.map((session) =>
-          session.id === id ? { ...session, agentWorking: true } : session,
-        ),
+        prev.map((s) => (s.id === id ? { ...s, agentWorking: true } : s)),
       );
     }
-    scheduleAgentIdle(id, s.effectId);
+    scheduleAgentIdle(id, session.effectId);
   }
 
   const active = useMemo(
@@ -1470,19 +1478,61 @@ export default function App() {
     }
   }, [activeProjectId, hydrated, projects]);
 
-  const activeAgentCount = useMemo(() => {
-    return sessions.filter(
-      (s) => s.projectId === activeProjectId && Boolean(s.effectId) && !s.exited && !s.closing,
+  const trayStatus = useMemo(() => {
+    const workingCount = sessions.filter(
+      (s) => Boolean(s.effectId) && Boolean(s.agentWorking) && !s.exited && !s.closing,
     ).length;
-  }, [sessions, activeProjectId]);
+    const sessionsOpen = sessions.filter((s) => !s.exited && !s.closing).length;
+    const recordingCount = sessions.filter(
+      (s) => Boolean(s.recordingActive) && !s.exited && !s.closing,
+    ).length;
+    return {
+      workingCount,
+      sessionsOpen,
+      recordingCount,
+      activeProject: activeProject?.title ?? null,
+      activeSession: active?.name ?? null,
+    };
+  }, [active?.name, activeProject?.title, sessions]);
 
-  const lastTrayCountRef = useRef<number | null>(null);
+  const lastTrayStatusRef = useRef<string | null>(null);
   useEffect(() => {
     if (!hydrated) return;
-    if (lastTrayCountRef.current === activeAgentCount) return;
-    lastTrayCountRef.current = activeAgentCount;
-    void invoke("set_tray_agent_count", { count: activeAgentCount }).catch(() => {});
-  }, [activeAgentCount, hydrated]);
+    const key = JSON.stringify(trayStatus);
+    if (lastTrayStatusRef.current === key) return;
+    lastTrayStatusRef.current = key;
+    void invoke("set_tray_status", {
+      workingCount: trayStatus.workingCount,
+      sessionsOpen: trayStatus.sessionsOpen,
+      activeProject: trayStatus.activeProject,
+      activeSession: trayStatus.activeSession,
+      recordingCount: trayStatus.recordingCount,
+    }).catch(() => {});
+  }, [trayStatus, hydrated]);
+
+  useEffect(() => {
+    if (!pendingTrayAction) return;
+    if (!hydrated) return;
+
+    const action = pendingTrayAction;
+    setPendingTrayAction(null);
+
+    if (action.id === "new-terminal") {
+      setProjectOpen(false);
+      setNewOpen(true);
+      return;
+    }
+
+    if (action.id === "start-agent") {
+      const effect = getProcessEffectById(action.effectId ?? null);
+      if (!effect) return;
+      void quickStart({
+        id: effect.id,
+        title: effect.label,
+        command: effect.matchCommands[0] ?? effect.label,
+      });
+    }
+  }, [hydrated, pendingTrayAction, quickStart]);
 
   useEffect(() => {
     if (!newOpen) return;
@@ -3166,7 +3216,7 @@ export default function App() {
         // Ignore events for sessions being closed
         if (closingSessions.current.has(id)) return;
 
-	        markAgentWorking(id);
+	        markAgentWorkingFromOutput(id);
 
 		        const entry = registry.current.get(id);
 		        if (entry && isTerminalRendererReady(entry.term)) {
@@ -3232,6 +3282,12 @@ export default function App() {
         }
       });
       unlisteners.push(unlistenMenu);
+
+      const unlistenTray = await listen<TrayMenuEventPayload>("tray-menu", (event) => {
+        if (cancelled) return;
+        setPendingTrayAction(event.payload);
+      });
+      unlisteners.push(unlistenTray);
 
       // Check if we were cancelled during async setup
       if (cancelled) {
@@ -3876,13 +3932,15 @@ export default function App() {
         cwd,
         envVars: envVarsForProjectId(activeProjectId, projects, environments),
       });
-      const s = applyPendingExit(createdRaw);
-      setSessions((prev) => [...prev, s]);
-      setActiveId(s.id);
+      const created = applyPendingExit(createdRaw);
+      const next = created.effectId ? { ...created, agentWorking: true } : created;
+      setSessions((prev) => [...prev, next]);
+      setActiveId(next.id);
+      if (next.effectId) scheduleAgentIdle(next.id, next.effectId);
 
       const commandLine = (preset.command ?? "").trim();
       if (commandLine) {
-        void invoke("write_to_session", { id: s.id, data: `${commandLine}\r`, source: "ui" }).catch((err) =>
+        void invoke("write_to_session", { id: next.id, data: `${commandLine}\r`, source: "ui" }).catch((err) =>
           reportError(`Failed to start ${preset.title}`, err),
         );
       }
@@ -4455,7 +4513,6 @@ export default function App() {
                       persistent={s.persistent}
                       onCwdChange={onCwdChange}
                       onCommandChange={onCommandChange}
-                      onUserEnter={() => markAgentWorking(s.id)}
                       registry={registry}
                       pendingData={pendingData}
                     />

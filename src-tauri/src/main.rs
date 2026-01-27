@@ -32,7 +32,7 @@ use ssh_fs::{
     ssh_write_text_file,
 };
 use startup::get_startup_flags;
-use tray::{build_status_tray, set_tray_agent_count};
+use tray::{build_status_tray, set_tray_agent_count, set_tray_status};
 use tauri::Manager;
 
 fn main() {
@@ -119,6 +119,7 @@ fn main() {
             list_ssh_hosts,
             apply_text_assets,
             set_tray_agent_count,
+            set_tray_status,
             open_path_in_file_manager,
             open_path_in_vscode,
             get_app_info
