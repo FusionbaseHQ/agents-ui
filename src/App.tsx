@@ -98,7 +98,14 @@ type PtyExit = { id: string; exit_code?: number | null };
 type AppInfo = { name: string; version: string; homepage?: string | null };
 type AppMenuEventPayload = { id: string };
 type StartupFlags = { clearData: boolean };
-type TrayMenuEventPayload = { id: string; effectId?: string | null };
+type TrayMenuEventPayload = {
+  id: string;
+  effectId?: string | null;
+  projectId?: string | null;
+  persistId?: string | null;
+};
+type RecentSessionKey = { projectId: string; persistId: string };
+type TrayRecentSession = { label: string; projectId: string; persistId: string };
 
 // Buffer for data that arrives before terminal is ready
 export type PendingDataBuffer = Map<string, string[]>;
@@ -110,6 +117,7 @@ const STORAGE_ACTIVE_SESSION_BY_PROJECT_KEY = "agents-ui-active-session-by-proje
 const STORAGE_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT_KEY = "agents-ui-sidebar-projects-list-max-height-v1";
 const STORAGE_WORKSPACE_EDITOR_WIDTH_KEY = "agents-ui-workspace-editor-width-v1";
 const STORAGE_WORKSPACE_FILE_TREE_WIDTH_KEY = "agents-ui-workspace-file-tree-width-v1";
+const STORAGE_RECENT_SESSIONS_KEY = "agents-ui-recent-sessions-v1";
 
 const MAX_PENDING_SESSIONS = 32;
 const MAX_PENDING_CHUNKS_PER_SESSION = 200;
@@ -754,6 +762,25 @@ export default function App() {
   const [updatesOpen, setUpdatesOpen] = useState(false);
   const [updateCheckState, setUpdateCheckState] = useState<UpdateCheckState>({ status: "idle" });
   const [pendingTrayAction, setPendingTrayAction] = useState<TrayMenuEventPayload | null>(null);
+  const [recentSessionKeys, setRecentSessionKeys] = useState<RecentSessionKey[]>(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_RECENT_SESSIONS_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .filter(
+          (entry): entry is { projectId: string; persistId: string } =>
+            Boolean(entry) &&
+            typeof (entry as { projectId?: unknown }).projectId === "string" &&
+            typeof (entry as { persistId?: unknown }).persistId === "string",
+        )
+        .map((entry) => ({ projectId: entry.projectId, persistId: entry.persistId }))
+        .slice(0, 50);
+    } catch {
+      return [];
+    }
+  });
 
   const [persistentSessionsOpen, setPersistentSessionsOpen] = useState(false);
   const [persistentSessionsLoading, setPersistentSessionsLoading] = useState(false);
@@ -1478,6 +1505,42 @@ export default function App() {
     }
   }, [activeProjectId, hydrated, projects]);
 
+  useEffect(() => {
+    if (!hydrated) return;
+    if (!active) return;
+
+    const key: RecentSessionKey = { projectId: active.projectId, persistId: active.persistId };
+    setRecentSessionKeys((prev) => {
+      const head = prev[0] ?? null;
+      if (head && head.projectId === key.projectId && head.persistId === key.persistId) return prev;
+      const next = [
+        key,
+        ...prev.filter((s) => !(s.projectId === key.projectId && s.persistId === key.persistId)),
+      ].slice(0, 50);
+      try {
+        localStorage.setItem(STORAGE_RECENT_SESSIONS_KEY, JSON.stringify(next));
+      } catch {
+        // Best-effort.
+      }
+      return next;
+    });
+  }, [active?.persistId, active?.projectId, hydrated]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    const validProjects = new Set(projects.map((p) => p.id));
+    setRecentSessionKeys((prev) => {
+      const next = prev.filter((s) => validProjects.has(s.projectId));
+      if (next.length === prev.length) return prev;
+      try {
+        localStorage.setItem(STORAGE_RECENT_SESSIONS_KEY, JSON.stringify(next));
+      } catch {
+        // Best-effort.
+      }
+      return next;
+    });
+  }, [hydrated, projects]);
+
   const trayStatus = useMemo(() => {
     const workingCount = sessions.filter(
       (s) => Boolean(s.effectId) && Boolean(s.agentWorking) && !s.exited && !s.closing,
@@ -1510,12 +1573,75 @@ export default function App() {
     }).catch(() => {});
   }, [trayStatus, hydrated]);
 
+  const trayRecentSessions = useMemo<TrayRecentSession[]>(() => {
+    const open = sessions.filter((s) => !s.exited && !s.closing);
+    const byKey = new Map<string, Session>();
+    for (const s of open) byKey.set(`${s.projectId}:${s.persistId}`, s);
+
+    const projectTitleById = new Map(
+      projects.map((p) => [p.id, p.title?.trim?.() ? p.title.trim() : p.title]),
+    );
+
+    const out: TrayRecentSession[] = [];
+    const seen = new Set<string>();
+
+    const add = (s: Session) => {
+      const key = `${s.projectId}:${s.persistId}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      const projectTitle = projectTitleById.get(s.projectId) ?? "—";
+      const rec = s.recordingActive ? " (REC)" : "";
+      const label = `${s.name}${rec} — ${projectTitle}`;
+      out.push({ label, projectId: s.projectId, persistId: s.persistId });
+    };
+
+    if (active && !active.exited && !active.closing) add(active);
+
+    for (const key of recentSessionKeys) {
+      const s = byKey.get(`${key.projectId}:${key.persistId}`);
+      if (s) add(s);
+      if (out.length >= 10) break;
+    }
+
+    return out.slice(0, 10);
+  }, [projects, recentSessionKeys, sessions, activeId]);
+
+  const lastTrayRecentsRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!hydrated) return;
+    const key = JSON.stringify(trayRecentSessions);
+    if (lastTrayRecentsRef.current === key) return;
+    lastTrayRecentsRef.current = key;
+    void invoke("set_tray_recent_sessions", { sessions: trayRecentSessions }).catch(() => {});
+  }, [trayRecentSessions, hydrated]);
+
   useEffect(() => {
     if (!pendingTrayAction) return;
     if (!hydrated) return;
 
     const action = pendingTrayAction;
     setPendingTrayAction(null);
+
+    if (action.id === "recent-session") {
+      const projectId = action.projectId ?? null;
+      const persistId = action.persistId ?? null;
+      if (!projectId || !persistId) return;
+      const target =
+        sessionsRef.current.find(
+          (s) =>
+            s.projectId === projectId &&
+            s.persistId === persistId &&
+            !s.exited &&
+            !s.closing,
+        ) ?? null;
+      if (!target) return;
+
+      activeProjectIdRef.current = projectId;
+      activeIdRef.current = target.id;
+      setActiveProjectId(projectId);
+      setActiveId(target.id);
+      return;
+    }
 
     if (action.id === "new-terminal") {
       setProjectOpen(false);
