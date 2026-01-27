@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License">
+  <img src="https://img.shields.io/badge/license-AGPL%203.0-blue.svg" alt="License">
   <img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg" alt="Platform">
   <img src="https://img.shields.io/badge/version-0.1.1-green.svg" alt="Version">
   <img src="https://img.shields.io/badge/tauri-v2-orange.svg" alt="Tauri">
@@ -365,7 +365,7 @@ Contributions are welcome!
 
 ## License
 
-Apache-2.0. See `LICENSE`.
+AGPL-3.0-only. See `LICENSE`.
 
 ## Acknowledgments
 
