@@ -91,7 +91,8 @@ export default function SessionTerminal(props: {
   readOnly: boolean;
   persistent?: boolean;
   onCwdChange?: (id: string, cwd: string) => void;
-  onCommandChange?: (id: string, commandLine: string) => void;
+  onCommandChange?: (id: string, commandLine: string, source?: "osc" | "input") => void;
+  onResize?: (id: string, size: { cols: number; rows: number }) => void;
   onUserEnter?: (id: string) => void;
   registry: React.MutableRefObject<TerminalRegistry>;
   pendingData: React.MutableRefObject<PendingDataBuffer>;
@@ -215,7 +216,7 @@ export default function SessionTerminal(props: {
         for (const line of submitted) {
           const trimmed = line.trim();
           if (!trimmed) continue;
-          props.onCommandChange?.(props.id, trimmed);
+          props.onCommandChange?.(props.id, trimmed, "input");
         }
       };
 
@@ -330,7 +331,7 @@ export default function SessionTerminal(props: {
       props.onCwdChange?.(props.id, trimmed);
     };
     const reportCommand = (commandLine: string) => {
-      props.onCommandChange?.(props.id, commandLine);
+      props.onCommandChange?.(props.id, commandLine, "osc");
     };
 
     const parseFileUrlPath = (data: string): string | null => {
@@ -385,10 +386,10 @@ export default function SessionTerminal(props: {
 	      });
 	    };
 
-	    const sendResize = () => {
-	      const term = termRef.current;
-	      const fit = fitRef.current;
-	      const container = containerRef.current;
+		    const sendResize = () => {
+		      const term = termRef.current;
+		      const fit = fitRef.current;
+		      const container = containerRef.current;
 	      if (!term || !fit) return;
 	      if (!term.element) return;
 	      if (!container) return;
@@ -404,12 +405,13 @@ export default function SessionTerminal(props: {
 	        scheduleResize();
 	        return;
 	      }
-	      const { cols, rows } = term;
-	      const last = lastSizeRef.current;
-	      if (last && last.cols === cols && last.rows === rows) return;
-	      lastSizeRef.current = { cols, rows };
-	      void invoke("resize_session", { id: props.id, cols, rows }).catch(() => {});
-	    };
+		      const { cols, rows } = term;
+		      const last = lastSizeRef.current;
+		      if (last && last.cols === cols && last.rows === rows) return;
+		      lastSizeRef.current = { cols, rows };
+          props.onResize?.(props.id, { cols, rows });
+		      void invoke("resize_session", { id: props.id, cols, rows }).catch(() => {});
+		    };
 
 	    // Register BEFORE flushing to avoid race with incoming events
 	    props.registry.current.set(props.id, { term, fit });
@@ -518,7 +520,7 @@ export default function SessionTerminal(props: {
       fitRef.current = null;
       resizeRafRef.current = null;
     };
-  }, [props.id, props.registry, props.pendingData]);
+  }, [props.id, props.registry, props.pendingData, props.onResize]);
 
   useEffect(() => {
     if (!props.active) return;

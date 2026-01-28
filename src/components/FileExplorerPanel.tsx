@@ -40,7 +40,8 @@ function normalizePath(input: string): string {
 function dirname(input: string): string {
   const path = normalizePath(input);
   const idx = path.lastIndexOf("/");
-  if (idx <= 0) return path;
+  if (idx < 0) return path;
+  if (idx === 0) return "/";
   return path.slice(0, idx);
 }
 
@@ -119,6 +120,7 @@ export function FileExplorerPanel({
   rootDir,
   activeFilePath,
   onSelectFile,
+  onOpenTerminalAtPath,
   onClose,
   onPathRenamed,
   onPathDeleted,
@@ -129,6 +131,7 @@ export function FileExplorerPanel({
   rootDir: string;
   activeFilePath: string | null;
   onSelectFile: (path: string) => void;
+  onOpenTerminalAtPath?: (path: string, provider: "local" | "ssh", sshTarget: string | null) => void;
   onClose: () => void;
   onPathRenamed?: (fromPath: string, toPath: string) => void;
   onPathDeleted?: (path: string) => void;
@@ -959,6 +962,21 @@ export function FileExplorerPanel({
           aria-label={`Actions for ${contextMenu.entry.name}`}
           style={{ top: menuY, left: menuX }}
         >
+          <button
+            type="button"
+            className="sidebarActionMenuItem"
+            role="menuitem"
+            disabled={provider === "ssh" ? !sshTargetValue || !onOpenTerminalAtPath : !onOpenTerminalAtPath}
+            onClick={() => {
+              if (!onOpenTerminalAtPath) return;
+              const folder = contextMenu.entry.isDir ? contextMenu.entry.path : dirname(contextMenu.entry.path);
+              onOpenTerminalAtPath(folder, provider, sshTargetValue);
+              setContextMenu(null);
+            }}
+          >
+            Open terminal here
+          </button>
+          <div className="fileContextMenuSep" role="separator" />
           <button
             type="button"
             className="sidebarActionMenuItem"

@@ -292,6 +292,52 @@ function buildSshCommand(input: {
   return args.join(" ");
 }
 
+function shellEscapePosix(value: string): string {
+  let out = "'";
+  for (const ch of value) {
+    if (ch === "'") out += "'\"'\"'";
+    else out += ch;
+  }
+  out += "'";
+  return out;
+}
+
+function basenamePath(input: string): string {
+  const normalized = input.trim().replace(/[\\/]+$/, "");
+  if (!normalized) return "";
+  if (normalized === "/") return "/";
+  const parts = normalized.replace(/\\/g, "/").split("/");
+  return parts[parts.length - 1] ?? "";
+}
+
+function buildSshCommandAtRemoteDir(input: {
+  baseCommandLine: string | null;
+  target: string;
+  remoteDir: string;
+}): string {
+  const target = input.target.trim();
+  const remoteDir = input.remoteDir.trim();
+  const base = input.baseCommandLine?.trim() ?? "";
+
+  const parts = base && isSshCommandLine(base) ? base.split(/\s+/).filter(Boolean) : [];
+  const program = parts[0] ?? "ssh";
+
+  // Best-effort reuse of SSH options from the current session's command line.
+  // IMPORTANT: Never assume the last token is the target; SSH commands may already include a remote command.
+  const idxTarget = parts.findIndex((p) => p === target);
+  const optionsRaw = idxTarget > 0 ? parts.slice(1, idxTarget) : [];
+  const options = optionsRaw.filter(
+    (tok) => tok !== "-N" && tok !== "-n" && tok !== "-f" && tok !== "-T" && tok !== "-t" && tok !== "-tt",
+  );
+
+  const script = `cd -- "$1" 2>/dev/null || echo "cd failed: $1" >&2; exec "\${SHELL:-sh}"`;
+  const remoteCommand = `sh -lc ${shellEscapePosix(script)} -- ${shellEscapePosix(remoteDir)}`;
+  // IMPORTANT: pass the remote command as a *single* ssh argument so remote quoting survives.
+  const remoteCommandArg = shellEscapePosix(remoteCommand);
+
+  return [program, ...options, "-t", target, remoteCommandArg].join(" ");
+}
+
 function isSshCommandLine(commandLine: string | null | undefined): boolean {
   const trimmed = commandLine?.trim() ?? "";
   if (!trimmed) return false;
@@ -1027,6 +1073,8 @@ export default function App() {
   const saveTimerRef = useRef<number | null>(null);
   const pendingSaveRef = useRef<PersistedStateV1 | null>(null);
   const agentIdleTimersRef = useRef<Map<string, number>>(new Map());
+  const commandLifecycleSessionsRef = useRef<Set<string>>(new Set());
+  const lastResizeAtRef = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
     let cancelled = false;
@@ -1068,10 +1116,101 @@ export default function App() {
     agentIdleTimersRef.current.set(id, timeout);
   }
 
-  function markAgentWorkingFromOutput(id: string) {
+  const RESIZE_OUTPUT_SUPPRESS_MS = 900;
+
+  const coercePtyDataToString = (data: unknown): string | null => {
+    if (typeof data === "string") return data;
+    if (!data) return null;
+    try {
+      if (data instanceof Uint8Array) {
+        return new TextDecoder().decode(data);
+      }
+      if (data instanceof ArrayBuffer) {
+        return new TextDecoder().decode(new Uint8Array(data));
+      }
+      if (Array.isArray(data) && data.every((x) => typeof x === "number")) {
+        return new TextDecoder().decode(new Uint8Array(data as number[]));
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  };
+
+  const skipEscapeSequence = (data: string, start: number): number => {
+    const next = data[start];
+    if (!next) return start;
+    if (next === "[") {
+      let i = start + 1;
+      while (i < data.length) {
+        const ch = data[i];
+        if (ch >= "@" && ch <= "~") return i + 1;
+        i += 1;
+      }
+      return i;
+    }
+    if (next === "]") {
+      let i = start + 1;
+      while (i < data.length) {
+        const ch = data[i];
+        if (ch === "\u0007") return i + 1;
+        if (ch === "\u001b" && data[i + 1] === "\\") return i + 2;
+        i += 1;
+      }
+      return i;
+    }
+    if (next === "P" || next === "^" || next === "_") {
+      let i = start + 1;
+      while (i < data.length) {
+        if (data[i] === "\u001b" && data[i + 1] === "\\") return i + 2;
+        i += 1;
+      }
+      return i;
+    }
+    return start + 1;
+  };
+
+  const hasMeaningfulOutput = (data: string): boolean => {
+    let visibleNonWhitespace = 0;
+    let hasAlphaNum = false;
+
+    let i = 0;
+    while (i < data.length) {
+      const ch = data[i];
+      if (ch === "\u001b") {
+        i = skipEscapeSequence(data, i + 1);
+        continue;
+      }
+      if (ch < " " || ch === "\u007f") {
+        i += 1;
+        continue;
+      }
+      if (ch.trim() === "") {
+        i += 1;
+        continue;
+      }
+
+      visibleNonWhitespace += 1;
+      if (visibleNonWhitespace >= 2) return true;
+      if (/[0-9A-Za-z]/.test(ch)) hasAlphaNum = true;
+
+      i += 1;
+    }
+    return hasAlphaNum;
+  };
+
+  function markAgentWorkingFromOutput(id: string, data: string) {
     const session = sessionsRef.current.find((s) => s.id === id);
     if (!session) return;
     if (!session.effectId || session.exited || session.closing) return;
+
+    if (!data) return;
+
+    const lastResizeAt = lastResizeAtRef.current.get(id);
+    if (lastResizeAt !== undefined && Date.now() - lastResizeAt < RESIZE_OUTPUT_SUPPRESS_MS) {
+      return;
+    }
+    if (!hasMeaningfulOutput(data)) return;
 
     // Persistent sessions (zellij) can emit background output even when "idle".
     // Avoid re-activating a background persistent session unless it's already marked working
@@ -1079,9 +1218,7 @@ export default function App() {
     if (session.persistent && !session.agentWorking && activeIdRef.current !== id) return;
 
     if (!session.agentWorking) {
-      setSessions((prev) =>
-        prev.map((s) => (s.id === id ? { ...s, agentWorking: true } : s)),
-      );
+      setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, agentWorking: true } : s)));
     }
     scheduleAgentIdle(id, session.effectId);
   }
@@ -1395,6 +1532,93 @@ export default function App() {
       recordingActive: false,
     };
   }, []);
+
+  const handleOpenTerminalAtPath = useCallback(
+    async (path: string, provider: "local" | "ssh", sshTarget: string | null) => {
+      const desiredPath = path.trim();
+      if (!desiredPath) return;
+
+      const projectId = activeProjectId;
+      const envVars = envVarsForProjectId(projectId, projects, environments);
+
+      if (provider === "local") {
+        const validatedCwd = await invoke<string | null>("validate_directory", { path: desiredPath }).catch(() => null);
+        if (!validatedCwd) {
+          showNotice("Working directory must be an existing folder.");
+          return;
+        }
+        await ensureAutoAssets(validatedCwd, projectId);
+        try {
+          const createdRaw = await createSession({
+            projectId,
+            name: basenamePath(validatedCwd) || undefined,
+            cwd: validatedCwd,
+            envVars,
+          });
+          const s = applyPendingExit(createdRaw);
+          setSessions((prev) => [...prev, s]);
+          setActiveId(s.id);
+        } catch (err) {
+          reportError("Failed to create session", err);
+        }
+        return;
+      }
+
+      const target = (sshTarget ?? "").trim();
+      if (!target) {
+        showNotice("Missing SSH target.");
+        return;
+      }
+
+      const localDesiredCwd = activeProject?.basePath ?? homeDirRef.current ?? "";
+      const localValidatedCwd = await invoke<string | null>("validate_directory", { path: localDesiredCwd }).catch(
+        () => null,
+      );
+      if (localValidatedCwd) {
+        await ensureAutoAssets(localValidatedCwd, projectId);
+      }
+
+      const baseCommandLine = (active?.restoreCommand ?? active?.launchCommand ?? "").trim() || null;
+      const launchCommand = buildSshCommandAtRemoteDir({
+        baseCommandLine,
+        target,
+        remoteDir: desiredPath,
+      });
+
+      try {
+        const createdRaw = await createSession({
+          projectId,
+          name: `ssh ${target}: ${shortenPathSmart(desiredPath, 48)}`,
+          launchCommand,
+          cwd: localValidatedCwd ?? localDesiredCwd ?? null,
+          envVars,
+          sshTarget: target,
+          sshRootDir:
+            (activeWorkspaceView.fileExplorerRootDir ?? activeWorkspaceView.codeEditorRootDir ?? active?.sshRootDir) ??
+            null,
+        });
+        const s = applyPendingExit(createdRaw);
+        setSessions((prev) => [...prev, s]);
+        setActiveId(s.id);
+      } catch (err) {
+        reportError("Failed to create SSH session", err);
+      }
+    },
+    [
+      active?.launchCommand,
+      active?.restoreCommand,
+      active?.sshRootDir,
+      activeProject?.basePath,
+      activeProjectId,
+      activeWorkspaceView.codeEditorRootDir,
+      activeWorkspaceView.fileExplorerRootDir,
+      applyPendingExit,
+      assetSettings.autoApplyEnabled,
+      assets,
+      environments,
+      projects,
+    ],
+  );
 
   useEffect(() => {
     sessionIdsRef.current = sessions.map((s) => s.id);
@@ -3079,40 +3303,96 @@ export default function App() {
     void loadPathPicker(initial);
   }
 
+  const onSessionResize = useCallback((id: string) => {
+    lastResizeAtRef.current.set(id, Date.now());
+  }, []);
+
   function onCwdChange(id: string, cwd: string) {
-    setSessions((prev) =>
-      prev.map((s) => (s.id === id && s.cwd !== cwd ? { ...s, cwd } : s)),
-    );
-  }
+    const trimmed = cwd.trim();
+    if (!trimmed) return;
 
-  function onCommandChange(id: string, commandLine: string) {
-    const trimmed = commandLine.trim();
-    const effect = trimmed ? detectProcessEffect({ command: trimmed, name: null }) : null;
-    const nextEffectId = effect?.id ?? null;
-    const session = sessionsRef.current.find((s) => s.id === id) ?? null;
-    const nextRestoreCommand = effect && !session?.persistent ? trimmed : null;
-    const nextAgentWorking = Boolean(nextEffectId);
-
-    if (nextEffectId) scheduleAgentIdle(id, nextEffectId);
-    else clearAgentIdleTimer(id);
+    // Our shell integrations emit CurrentDir right before drawing the prompt. Treat it as a
+    // definitive "command finished / prompt returned" signal to clear any lingering activity.
+    commandLifecycleSessionsRef.current.add(id);
+    clearAgentIdleTimer(id);
 
     setSessions((prev) =>
       prev.map((s) => {
         if (s.id !== id) return s;
-        if (
-          s.effectId === nextEffectId &&
-          (s.restoreCommand ?? null) === nextRestoreCommand &&
-          Boolean(s.agentWorking) === nextAgentWorking
-        ) {
-          return s;
-        }
+        const nextCwd = s.cwd !== trimmed ? trimmed : s.cwd;
+        if (nextCwd === s.cwd && !s.agentWorking && !s.effectId) return s;
+        return { ...s, cwd: nextCwd, effectId: null, agentWorking: false, processTag: null };
+      }),
+    );
+  }
+
+  function onCommandChange(id: string, commandLine: string, source: "osc" | "input" = "input") {
+    const trimmed = commandLine.trim();
+
+    if (source === "osc") {
+      commandLifecycleSessionsRef.current.add(id);
+
+      // Shell integration sends an empty Command= right before the prompt is shown again.
+      // Treat this as "no foreground command running" (back at prompt).
+      if (!trimmed) {
+        clearAgentIdleTimer(id);
+        setSessions((prev) =>
+          prev.map((s) => {
+            if (s.id !== id) return s;
+            if (!s.effectId && !s.agentWorking) return s;
+            return { ...s, effectId: null, agentWorking: false, processTag: null };
+          }),
+        );
+        return;
+      }
+
+      const effect = detectProcessEffect({ command: trimmed, name: null });
+      const nextEffectId = effect?.id ?? null;
+      clearAgentIdleTimer(id);
+      setSessions((prev) =>
+        prev.map((s) => {
+          if (s.id !== id) return s;
+          const nextRestoreCommand = effect && !s.persistent ? trimmed : null;
+          if (
+            s.effectId === nextEffectId &&
+            (s.restoreCommand ?? null) === nextRestoreCommand &&
+            !s.agentWorking
+          ) {
+            return s;
+          }
           return {
             ...s,
             effectId: nextEffectId,
-            agentWorking: nextAgentWorking,
+            agentWorking: false,
             restoreCommand: nextRestoreCommand,
             processTag: null,
           };
+        }),
+      );
+      return;
+    }
+
+    // If this session already supports OSC lifecycle events, ignore input-based command
+    // detection to avoid double-firing and idle-timer races.
+    if (commandLifecycleSessionsRef.current.has(id)) return;
+    if (!trimmed) return;
+
+    const effect = detectProcessEffect({ command: trimmed, name: null });
+    const nextEffectId = effect?.id ?? null;
+    clearAgentIdleTimer(id);
+    setSessions((prev) =>
+      prev.map((s) => {
+        if (s.id !== id) return s;
+        const nextRestoreCommand = effect && !s.persistent ? trimmed : null;
+        if (s.effectId === nextEffectId && (s.restoreCommand ?? null) === nextRestoreCommand && !s.agentWorking)
+          return s;
+        return {
+          ...s,
+          effectId: nextEffectId,
+          agentWorking: false,
+          restoreCommand: nextRestoreCommand,
+          processTag: null,
+        };
       }),
     );
   }
@@ -3332,22 +3612,24 @@ export default function App() {
 	      };
 
 	      // Set up event listeners FIRST, before creating any sessions
-	      const unlistenOutput = await listen<PtyOutput>("pty-output", (event) => {
-	        if (cancelled) return;
-	        const { id, data } = event.payload;
+			      const unlistenOutput = await listen<PtyOutput>("pty-output", (event) => {
+			        if (cancelled) return;
+			        const { id, data } = event.payload as { id: string; data?: unknown };
+              const text = coercePtyDataToString(data);
+              if (!text) return;
 
-        // Ignore events for sessions being closed
-        if (closingSessions.current.has(id)) return;
+		        // Ignore events for sessions being closed
+		        if (closingSessions.current.has(id)) return;
 
-	        markAgentWorkingFromOutput(id);
+			        markAgentWorkingFromOutput(id, text);
 
-		        const entry = registry.current.get(id);
-		        if (entry && isTerminalRendererReady(entry.term)) {
-		          entry.term.write(data);
-		          return;
-		        }
-		        {
-		          // Buffer the data - the terminal will catch up
+			        const entry = registry.current.get(id);
+			        if (entry && isTerminalRendererReady(entry.term)) {
+			          entry.term.write(text);
+			          return;
+			        }
+			        {
+			          // Buffer the data - the terminal will catch up
 		          if (
 		            !pendingData.current.has(id) &&
 		            pendingData.current.size >= MAX_PENDING_SESSIONS
@@ -3355,11 +3637,11 @@ export default function App() {
             const oldest = pendingData.current.keys().next().value as string | undefined;
             if (oldest) pendingData.current.delete(oldest);
           }
-          const buffer = pendingData.current.get(id) || [];
-          buffer.push(data);
-          if (buffer.length > MAX_PENDING_CHUNKS_PER_SESSION) {
-            buffer.splice(0, buffer.length - MAX_PENDING_CHUNKS_PER_SESSION);
-	          }
+	          const buffer = pendingData.current.get(id) || [];
+	          buffer.push(text);
+	          if (buffer.length > MAX_PENDING_CHUNKS_PER_SESSION) {
+	            buffer.splice(0, buffer.length - MAX_PENDING_CHUNKS_PER_SESSION);
+		          }
 	          pendingData.current.set(id, buffer);
 	        }
 	      });
@@ -3668,24 +3950,27 @@ export default function App() {
         return;
       }
 
-      if (restored.length === 0) {
-        let first: Session;
-        try {
-          const basePath = projectById.get(activeProjectId)?.basePath ?? resolvedHome ?? null;
-          const createdRaw = await createSession({
-            projectId: activeProjectId,
-            cwd: basePath,
-            envVars: envVarsForProject(activeProjectId),
-          });
-          first = applyPendingExit(createdRaw);
-        } catch (err) {
-          if (!cancelled) reportError("Failed to create session", err);
-          return;
-        }
-        if (cancelled) {
-          await closeSession(first.id).catch(() => {});
-          return;
-        }
+	      if (restored.length === 0) {
+	        let first: Session;
+	        try {
+	          const basePath = projectById.get(activeProjectId)?.basePath ?? resolvedHome ?? null;
+	          const createdRaw = await createSession({
+	            projectId: activeProjectId,
+	            cwd: basePath,
+	            envVars: envVarsForProject(activeProjectId),
+	          });
+	          first = applyPendingExit(createdRaw);
+	        } catch (err) {
+	          if (!cancelled) reportError("Failed to create session", err);
+	          setSessions([]);
+	          setActiveId(null);
+	          setHydrated(true);
+	          return;
+	        }
+	        if (cancelled) {
+	          await closeSession(first.id).catch(() => {});
+	          return;
+	        }
         setSessions([first]);
         setActiveId(first.id);
         setHydrated(true);
@@ -3714,8 +3999,12 @@ export default function App() {
       setActiveId(active ? active.id : null);
       setHydrated(true);
     };
-
-    setup();
+	
+	    void setup().catch((err) => {
+	      if (cancelled) return;
+	      reportError("Startup failed", err);
+	      setHydrated(true);
+	    });
 
     return () => {
       cancelled = true;
@@ -4056,10 +4345,9 @@ export default function App() {
         envVars: envVarsForProjectId(activeProjectId, projects, environments),
       });
       const created = applyPendingExit(createdRaw);
-      const next = created.effectId ? { ...created, agentWorking: true } : created;
+      const next = created;
       setSessions((prev) => [...prev, next]);
       setActiveId(next.id);
-      if (next.effectId) scheduleAgentIdle(next.id, next.effectId);
 
       const commandLine = (preset.command ?? "").trim();
       if (commandLine) {
@@ -4629,16 +4917,17 @@ export default function App() {
                     key={s.id}
                     className={`terminalContainer ${s.id === activeId ? "" : "terminalHidden"}`}
                   >
-                    <SessionTerminal
-                      id={s.id}
-                      active={s.id === activeId}
-                      readOnly={Boolean(s.exited || s.closing)}
-                      persistent={s.persistent}
-                      onCwdChange={onCwdChange}
-                      onCommandChange={onCommandChange}
-                      registry={registry}
-                      pendingData={pendingData}
-                    />
+	                    <SessionTerminal
+	                      id={s.id}
+	                      active={s.id === activeId}
+	                      readOnly={Boolean(s.exited || s.closing)}
+	                      persistent={s.persistent}
+	                      onCwdChange={onCwdChange}
+	                      onCommandChange={onCommandChange}
+	                      onResize={onSessionResize}
+	                      registry={registry}
+	                      pendingData={pendingData}
+	                    />
                   </div>
                 ))}
               </div>
@@ -4726,6 +5015,7 @@ export default function App() {
 	                    }
 	                    activeFilePath={activeWorkspaceView.codeEditorActiveFilePath}
 	                    onSelectFile={handleSelectWorkspaceFile}
+                      onOpenTerminalAtPath={handleOpenTerminalAtPath}
                       onPathRenamed={handleRenameWorkspacePath}
                       onPathDeleted={handleDeleteWorkspacePath}
 	                    onClose={() =>
