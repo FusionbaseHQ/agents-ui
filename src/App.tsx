@@ -16,7 +16,7 @@ import { ProjectsSection } from "./components/ProjectsSection";
 import { QuickPromptsSection } from "./components/QuickPromptsSection";
 import { SessionsSection } from "./components/SessionsSection";
 import { Icon } from "./components/Icon";
-import { FileExplorerPanel } from "./components/FileExplorerPanel";
+import { FileExplorerPanel, type FileExplorerPersistedState } from "./components/FileExplorerPanel";
 import type {
   CodeEditorFsEvent,
   CodeEditorOpenFileRequest,
@@ -83,6 +83,7 @@ type WorkspaceView = {
   projectId: string;
   fileExplorerOpen: boolean;
   fileExplorerRootDir: string | null;
+  fileExplorerPersistedState: FileExplorerPersistedState | null;
   codeEditorOpen: boolean;
   codeEditorRootDir: string | null;
   openFileRequest: CodeEditorOpenFileRequest | null;
@@ -882,6 +883,7 @@ export default function App() {
         projectId,
         fileExplorerOpen: true,
         fileExplorerRootDir: null,
+        fileExplorerPersistedState: null,
         codeEditorOpen: false,
         codeEditorRootDir: null,
         openFileRequest: null,
@@ -899,8 +901,15 @@ export default function App() {
     const active = sessions.find((s) => s.id === activeId) ?? null;
     if (!active) return activeProjectId;
     const isSsh = isSshCommandLine(active.launchCommand ?? active.restoreCommand ?? null);
-    if (isSsh) return `ssh:${active.persistId}`;
-    return activeProjectId;
+    if (isSsh) {
+      const target =
+        active.sshTarget?.trim() ||
+        sshTargetFromCommandLine(active.launchCommand ?? active.restoreCommand ?? null) ||
+        "";
+      if (target) return `ssh:${active.projectId}:${target}`;
+      return `ssh:${active.projectId}:${active.persistId}`;
+    }
+    return active.projectId;
   }, [activeId, activeProjectId, sessions]);
 
   const activeWorkspaceView = useMemo(() => {
@@ -5013,9 +5022,16 @@ export default function App() {
 	                        (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
 	                      ).trim()
 	                    }
+                      persistedState={activeWorkspaceView.fileExplorerPersistedState}
 	                    activeFilePath={activeWorkspaceView.codeEditorActiveFilePath}
 	                    onSelectFile={handleSelectWorkspaceFile}
                       onOpenTerminalAtPath={handleOpenTerminalAtPath}
+                      onPersistState={(state) =>
+                        updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
+                          ...prev,
+                          fileExplorerPersistedState: state,
+                        }))
+                      }
                       onPathRenamed={handleRenameWorkspacePath}
                       onPathDeleted={handleDeleteWorkspacePath}
 	                    onClose={() =>

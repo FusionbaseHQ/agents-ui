@@ -25,6 +25,25 @@ type DirectoryState = {
   error: string | null;
 };
 
+export type FileExplorerPersistedEntry = {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size: number;
+};
+
+export type FileExplorerPersistedDirState = {
+  entries: FileExplorerPersistedEntry[];
+  error: string | null;
+};
+
+export type FileExplorerPersistedState = {
+  root: string;
+  expandedDirs: string[];
+  dirStateByPath: Record<string, FileExplorerPersistedDirState>;
+  scrollTop: number;
+};
+
 type VisibleItem =
   | { type: "entry"; entry: FsEntry; depth: number }
   | { type: "loading"; path: string; depth: number }
@@ -118,9 +137,11 @@ export function FileExplorerPanel({
   provider,
   sshTarget,
   rootDir,
+  persistedState,
   activeFilePath,
   onSelectFile,
   onOpenTerminalAtPath,
+  onPersistState,
   onClose,
   onPathRenamed,
   onPathDeleted,
@@ -129,9 +150,11 @@ export function FileExplorerPanel({
   provider: "local" | "ssh";
   sshTarget?: string | null;
   rootDir: string;
+  persistedState?: FileExplorerPersistedState | null;
   activeFilePath: string | null;
   onSelectFile: (path: string) => void;
   onOpenTerminalAtPath?: (path: string, provider: "local" | "ssh", sshTarget: string | null) => void;
+  onPersistState?: (state: FileExplorerPersistedState) => void;
   onClose: () => void;
   onPathRenamed?: (fromPath: string, toPath: string) => void;
   onPathDeleted?: (path: string) => void;
@@ -176,6 +199,83 @@ export function FileExplorerPanel({
   const dragAttemptSeqRef = React.useRef(0);
   const dropRafRef = React.useRef<number | null>(null);
   const lastDropPosRef = React.useRef<{ x: number; y: number } | null>(null);
+
+  const expandedDirsRef = React.useRef(expandedDirs);
+  React.useLayoutEffect(() => {
+    expandedDirsRef.current = expandedDirs;
+  }, [expandedDirs]);
+
+  const dirStateByPathRef = React.useRef(dirStateByPath);
+  React.useLayoutEffect(() => {
+    dirStateByPathRef.current = dirStateByPath;
+  }, [dirStateByPath]);
+
+  const scrollTopRef = React.useRef(scrollTop);
+  React.useLayoutEffect(() => {
+    scrollTopRef.current = scrollTop;
+  }, [scrollTop]);
+
+  const rootRef = React.useRef(root);
+  React.useLayoutEffect(() => {
+    rootRef.current = root;
+  }, [root]);
+
+  const onPersistStateRef = React.useRef(onPersistState);
+  React.useEffect(() => {
+    onPersistStateRef.current = onPersistState;
+  }, [onPersistState]);
+
+  const persistStateNow = React.useCallback(() => {
+    const persist = onPersistStateRef.current;
+    if (!persist) return;
+    try {
+      const currentRoot = rootRef.current;
+      const expanded = Array.from(expandedDirsRef.current.values());
+      const states = dirStateByPathRef.current;
+      const persistedStates: Record<string, FileExplorerPersistedDirState> = {};
+      for (const [path, state] of Object.entries(states)) {
+        if (!state) continue;
+        if (state.loading) continue;
+        persistedStates[path] = {
+          entries: state.entries as unknown as FileExplorerPersistedEntry[],
+          error: state.error ?? null,
+        };
+      }
+      persist({
+        root: currentRoot,
+        expandedDirs: expanded,
+        dirStateByPath: persistedStates,
+        scrollTop: scrollTopRef.current,
+      });
+    } catch {
+      // Best-effort.
+    }
+  }, []);
+
+  const persistTimerRef = React.useRef<number | null>(null);
+  const schedulePersist = React.useCallback(() => {
+    if (!onPersistStateRef.current) return;
+    if (persistTimerRef.current !== null) window.clearTimeout(persistTimerRef.current);
+    persistTimerRef.current = window.setTimeout(() => {
+      persistTimerRef.current = null;
+      persistStateNow();
+    }, 250);
+  }, [persistStateNow]);
+
+  React.useEffect(() => {
+    if (!isOpen) return;
+    schedulePersist();
+  }, [dirStateByPath, expandedDirs, isOpen, root, schedulePersist, scrollTop]);
+
+  React.useLayoutEffect(() => {
+    return () => {
+      if (persistTimerRef.current !== null) {
+        window.clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+      }
+      persistStateNow();
+    };
+  }, [persistStateNow]);
 
   const loadDirectory = React.useCallback(
     async (path: string) => {
@@ -230,23 +330,59 @@ export function FileExplorerPanel({
     return () => el.removeEventListener("scroll", onScroll);
   }, []);
 
+  const restoredRef = React.useRef(false);
+  React.useEffect(() => {
+    restoredRef.current = false;
+  }, [root]);
+
   React.useEffect(() => {
     if (!isOpen) return;
-    setExpandedDirs(new Set([root]));
-    setDirStateByPath({});
+    if (restoredRef.current) return;
     setContextMenu(null);
     setRenameTarget(null);
     setDeleteTarget(null);
     setDragDropActive(false);
     setDropTarget(null);
     setDragPreparing(null);
-    void loadDirectory(root);
-  }, [isOpen, loadDirectory, root]);
+    const normalizedPersistedRoot = persistedState?.root ? normalizePath(persistedState.root) : "";
+    if (persistedState && normalizedPersistedRoot === root) {
+      const nextExpanded = new Set<string>([root]);
+      for (const raw of persistedState.expandedDirs ?? []) {
+        const normalized = normalizePath(raw);
+        if (normalized) nextExpanded.add(normalized);
+      }
+      setExpandedDirs(nextExpanded);
 
-  React.useEffect(() => {
+      const nextDirState: Record<string, DirectoryState> = {};
+      for (const [path, value] of Object.entries(persistedState.dirStateByPath ?? {})) {
+        const normalized = normalizePath(path);
+        if (!normalized) continue;
+        const entries = Array.isArray(value.entries) ? (value.entries as unknown as FsEntry[]) : [];
+        nextDirState[normalized] = { entries, loading: false, error: value.error ?? null };
+      }
+      setDirStateByPath(nextDirState);
+
+      const nextScrollTop = Number.isFinite(persistedState.scrollTop) ? Math.max(0, persistedState.scrollTop) : 0;
+      setScrollTop(nextScrollTop);
+      if (listRef.current) listRef.current.scrollTop = nextScrollTop;
+
+      if (!nextDirState[root] || nextDirState[root]?.error) void loadDirectory(root);
+      for (const dirPath of nextExpanded) {
+        if (dirPath === root) continue;
+        const state = nextDirState[dirPath];
+        if (!state || state.error) void loadDirectory(dirPath);
+      }
+      restoredRef.current = true;
+      return;
+    }
+
+    setExpandedDirs(new Set([root]));
+    setDirStateByPath({});
     setScrollTop(0);
     if (listRef.current) listRef.current.scrollTop = 0;
-  }, [isOpen, root]);
+    void loadDirectory(root);
+    restoredRef.current = true;
+  }, [isOpen, loadDirectory, persistedState, root]);
 
   React.useEffect(() => {
     if (!contextMenu) return;
