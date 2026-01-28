@@ -42,6 +42,7 @@ struct PtySession {
     writer: Box<dyn Write + Send>,
     child: Box<dyn portable_pty::Child + Send>,
     recording: Option<SessionRecording>,
+    closing: bool,
 }
 
 struct SessionRecording {
@@ -807,7 +808,9 @@ fn record_user_input(rec: &mut SessionRecording, data: &str) -> Result<(), Strin
         || rec.unflushed_bytes >= 16 * 1024
         || rec.last_flush.elapsed().as_millis() >= 1500;
     if should_flush {
-        rec.writer.flush().ok();
+        rec.writer
+            .flush()
+            .map_err(|e| format!("flush failed: {e}"))?;
         rec.last_flush = Instant::now();
         rec.unflushed_bytes = 0;
     }
@@ -1571,6 +1574,7 @@ pub fn create_session(
             writer,
             child,
             recording: None,
+            closing: false,
         },
     );
     drop(sessions);
@@ -1709,7 +1713,7 @@ pub fn start_session_recording(
         .write_all(json.as_bytes())
         .map_err(|e| format!("write failed: {e}"))?;
     writer.write_all(b"\n").map_err(|e| format!("write failed: {e}"))?;
-    writer.flush().ok();
+    writer.flush().map_err(|e| format!("flush failed: {e}"))?;
 
     s.recording = Some(SessionRecording {
         id: safe_id.clone(),
@@ -1737,7 +1741,7 @@ pub fn stop_session_recording(state: State<'_, AppState>, id: String) -> Result<
         Some(r) => r,
         None => return Ok(None),
     };
-    rec.writer.flush().ok();
+    rec.writer.flush().map_err(|e| format!("flush failed: {e}"))?;
     Ok(Some(rec.id))
 }
 
@@ -1754,6 +1758,9 @@ pub fn write_to_session(
         .lock()
         .map_err(|_| "state poisoned")?;
     let s = sessions.get_mut(&id).ok_or("unknown session")?;
+    if s.closing {
+        return Ok(());
+    }
 
     s.writer
         .write_all(data.as_bytes())
@@ -1789,6 +1796,9 @@ pub fn resize_session(
         .lock()
         .map_err(|_| "state poisoned")?;
     let s = sessions.get(&id).ok_or("unknown session")?;
+    if s.closing {
+        return Ok(());
+    }
     s.master
         .resize(PtySize {
             rows,
@@ -1802,25 +1812,20 @@ pub fn resize_session(
 
 #[tauri::command]
 pub fn close_session(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let session = {
-        let mut sessions = state
-            .inner
-            .sessions
-            .lock()
-            .map_err(|_| "state poisoned")?;
-        sessions.remove(&id)
-    };
-
-    let Some(session) = session else {
+    let mut sessions = state
+        .inner
+        .sessions
+        .lock()
+        .map_err(|_| "state poisoned")?;
+    let Some(session) = sessions.get_mut(&id) else {
         return Ok(());
     };
 
-    let PtySession { mut child, .. } = session;
-
-    let _ = child.kill();
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
+    if session.closing {
+        return Ok(());
+    }
+    session.closing = true;
+    let _ = session.child.kill();
     Ok(())
 }
 

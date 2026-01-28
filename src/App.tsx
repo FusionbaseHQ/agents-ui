@@ -118,6 +118,7 @@ const STORAGE_ACTIVE_SESSION_BY_PROJECT_KEY = "agents-ui-active-session-by-proje
 const STORAGE_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT_KEY = "agents-ui-sidebar-projects-list-max-height-v1";
 const STORAGE_WORKSPACE_EDITOR_WIDTH_KEY = "agents-ui-workspace-editor-width-v1";
 const STORAGE_WORKSPACE_FILE_TREE_WIDTH_KEY = "agents-ui-workspace-file-tree-width-v1";
+const STORAGE_WORKSPACE_VIEW_BY_KEY = "agents-ui-workspace-view-by-key-v1";
 const STORAGE_RECENT_SESSIONS_KEY = "agents-ui-recent-sessions-v1";
 
 const MAX_PENDING_SESSIONS = 32;
@@ -619,6 +620,191 @@ function loadLegacyProjectState(): { projects: Project[]; activeProjectId: strin
   return { projects, activeProjectId };
 }
 
+type WorkspaceViewStorageV1 = {
+  schemaVersion: 1;
+  views: Record<string, StoredWorkspaceViewV1>;
+};
+
+type StoredWorkspaceViewV1 = {
+  projectId: string;
+  fileExplorerOpen?: boolean;
+  fileExplorerRootDir?: string | null;
+  fileExplorerPersistedState?: FileExplorerPersistedState | null;
+  codeEditorOpen?: boolean;
+  codeEditorRootDir?: string | null;
+  codeEditorActiveFilePath?: string | null;
+  codeEditorPersistedState?: CodeEditorPersistedState | null;
+};
+
+function projectIdFromWorkspaceKey(workspaceKey: string): string | null {
+  const key = workspaceKey.trim();
+  if (!key) return null;
+  if (!key.startsWith("ssh:")) return key;
+  const rest = key.slice("ssh:".length);
+  const idx = rest.indexOf(":");
+  if (idx <= 0) return null;
+  return rest.slice(0, idx);
+}
+
+function coerceFileExplorerPersistedState(
+  value: unknown,
+  rootOverride: string | null,
+): FileExplorerPersistedState | null {
+  if (!value || typeof value !== "object") return null;
+  const rec = value as Record<string, unknown>;
+  const root =
+    (typeof rootOverride === "string" && rootOverride.trim()) ||
+    (typeof rec.root === "string" && rec.root.trim()) ||
+    "";
+  if (!root) return null;
+
+  const expandedDirs = Array.isArray(rec.expandedDirs)
+    ? rec.expandedDirs.filter((x): x is string => typeof x === "string").slice(0, 400)
+    : [];
+
+  const scrollTop =
+    typeof rec.scrollTop === "number" && Number.isFinite(rec.scrollTop) ? Math.max(0, rec.scrollTop) : 0;
+
+  return { root, expandedDirs, dirStateByPath: {}, scrollTop };
+}
+
+function coerceCodeEditorPersistedState(value: unknown): CodeEditorPersistedState | null {
+  if (!value || typeof value !== "object") return null;
+  const rec = value as Record<string, unknown>;
+  const rawTabs = rec.tabs;
+  if (!Array.isArray(rawTabs)) return null;
+
+  const tabs = rawTabs
+    .filter((t): t is { path: unknown } => Boolean(t) && typeof t === "object" && "path" in (t as object))
+    .map((t) => (typeof t.path === "string" ? t.path.trim() : ""))
+    .filter((p) => Boolean(p))
+    .slice(0, 40)
+    .map((path) => ({ path, dirty: false, content: null }));
+
+  if (tabs.length === 0) return null;
+
+  const desiredActive = typeof rec.activePath === "string" ? rec.activePath.trim() : "";
+  const activePath =
+    (desiredActive && tabs.some((t) => t.path === desiredActive) && desiredActive) || tabs[0]?.path || null;
+
+  return { tabs, activePath };
+}
+
+function sanitizeFileExplorerPersistedStateForStorage(
+  state: FileExplorerPersistedState | null,
+  rootOverride: string | null,
+): FileExplorerPersistedState | null {
+  if (!state) return null;
+  return coerceFileExplorerPersistedState(state, rootOverride);
+}
+
+function sanitizeCodeEditorPersistedStateForStorage(
+  state: CodeEditorPersistedState | null,
+): CodeEditorPersistedState | null {
+  if (!state) return null;
+  return coerceCodeEditorPersistedState(state);
+}
+
+function shouldPersistWorkspaceView(view: WorkspaceView): boolean {
+  if (!view.fileExplorerOpen) return true;
+  if (view.fileExplorerRootDir) return true;
+  if (view.fileExplorerPersistedState) return true;
+  if (view.codeEditorOpen) return true;
+  if (view.codeEditorRootDir) return true;
+  if (view.codeEditorPersistedState) return true;
+  if (view.codeEditorActiveFilePath) return true;
+  return false;
+}
+
+function loadWorkspaceViewStorageV1(): WorkspaceViewStorageV1 | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_WORKSPACE_VIEW_BY_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    if ((parsed as { schemaVersion?: unknown }).schemaVersion !== 1) return null;
+
+    const viewsRaw = (parsed as { views?: unknown }).views;
+    if (!viewsRaw || typeof viewsRaw !== "object") return null;
+
+    const out: Record<string, StoredWorkspaceViewV1> = {};
+    for (const [workspaceKey, value] of Object.entries(viewsRaw as Record<string, unknown>)) {
+      if (!workspaceKey || !value || typeof value !== "object") continue;
+      const rec = value as Record<string, unknown>;
+      const projectId =
+        (typeof rec.projectId === "string" && rec.projectId.trim()) || projectIdFromWorkspaceKey(workspaceKey);
+      if (!projectId) continue;
+
+      const fileExplorerRootDir =
+        rec.fileExplorerRootDir === null || typeof rec.fileExplorerRootDir === "string"
+          ? (rec.fileExplorerRootDir as string | null)
+          : null;
+      const codeEditorRootDir =
+        rec.codeEditorRootDir === null || typeof rec.codeEditorRootDir === "string"
+          ? (rec.codeEditorRootDir as string | null)
+          : null;
+
+      out[workspaceKey] = {
+        projectId,
+        fileExplorerOpen: typeof rec.fileExplorerOpen === "boolean" ? rec.fileExplorerOpen : undefined,
+        fileExplorerRootDir,
+        fileExplorerPersistedState: coerceFileExplorerPersistedState(
+          rec.fileExplorerPersistedState,
+          fileExplorerRootDir ?? codeEditorRootDir,
+        ),
+        codeEditorOpen: typeof rec.codeEditorOpen === "boolean" ? rec.codeEditorOpen : undefined,
+        codeEditorRootDir,
+        codeEditorActiveFilePath:
+          rec.codeEditorActiveFilePath === null || typeof rec.codeEditorActiveFilePath === "string"
+            ? (rec.codeEditorActiveFilePath as string | null)
+            : null,
+        codeEditorPersistedState: coerceCodeEditorPersistedState(rec.codeEditorPersistedState),
+      };
+    }
+
+    return { schemaVersion: 1, views: out };
+  } catch {
+    return null;
+  }
+}
+
+function buildWorkspaceViewStorageV1(
+  workspaceViewByKey: Record<string, WorkspaceView>,
+  validProjectIds: Set<string>,
+): WorkspaceViewStorageV1 {
+  const entries: Array<[string, StoredWorkspaceViewV1]> = [];
+  for (const [workspaceKey, view] of Object.entries(workspaceViewByKey)) {
+    if (!view) continue;
+    if (!shouldPersistWorkspaceView(view)) continue;
+
+    const projectId = projectIdFromWorkspaceKey(workspaceKey) ?? view.projectId;
+    if (!projectId || !validProjectIds.has(projectId)) continue;
+
+    const rootOverride = view.fileExplorerRootDir ?? view.codeEditorRootDir ?? null;
+    entries.push([
+      workspaceKey,
+      {
+        projectId,
+        fileExplorerOpen: view.fileExplorerOpen,
+        fileExplorerRootDir: view.fileExplorerRootDir ?? null,
+        fileExplorerPersistedState: sanitizeFileExplorerPersistedStateForStorage(
+          view.fileExplorerPersistedState,
+          rootOverride,
+        ),
+        codeEditorOpen: view.codeEditorOpen,
+        codeEditorRootDir: view.codeEditorRootDir ?? null,
+        codeEditorActiveFilePath: view.codeEditorActiveFilePath ?? null,
+        codeEditorPersistedState: sanitizeCodeEditorPersistedStateForStorage(view.codeEditorPersistedState),
+      },
+    ]);
+  }
+
+  entries.sort(([a], [b]) => a.localeCompare(b));
+  if (entries.length > 200) entries.length = 200;
+
+  return { schemaVersion: 1, views: Object.fromEntries(entries) };
+}
+
 async function createSession(input: {
   projectId: string;
   name?: string;
@@ -1081,6 +1267,8 @@ export default function App() {
   const homeDirRef = useRef<string | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const pendingSaveRef = useRef<PersistedStateV1 | null>(null);
+  const workspaceViewSaveTimerRef = useRef<number | null>(null);
+  const pendingWorkspaceViewSaveRef = useRef<WorkspaceViewStorageV1 | null>(null);
   const agentIdleTimersRef = useRef<Map<string, number>>(new Map());
   const commandLifecycleSessionsRef = useRef<Set<string>>(new Set());
   const lastResizeAtRef = useRef<Map<string, number>>(new Map());
@@ -1721,6 +1909,27 @@ export default function App() {
         });
       }, 400);
   }, [projects, activeProjectId, activeSessionByProject, sessions, prompts, environments, assets, assetSettings, agentShortcutIds, secureStorageMode, hydrated, persistenceDisabledReason]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    if (workspaceViewSaveTimerRef.current !== null) {
+      window.clearTimeout(workspaceViewSaveTimerRef.current);
+    }
+
+    const validProjectIds = new Set(projects.map((p) => p.id));
+    pendingWorkspaceViewSaveRef.current = buildWorkspaceViewStorageV1(workspaceViewByKey, validProjectIds);
+
+    workspaceViewSaveTimerRef.current = window.setTimeout(() => {
+      workspaceViewSaveTimerRef.current = null;
+      const state = pendingWorkspaceViewSaveRef.current;
+      if (!state) return;
+      try {
+        localStorage.setItem(STORAGE_WORKSPACE_VIEW_BY_KEY, JSON.stringify(state));
+      } catch {
+        // Best-effort.
+      }
+    }, 500);
+  }, [hydrated, projects, workspaceViewByKey]);
 
   useEffect(() => {
     if (!hydrated) return;
@@ -3541,6 +3750,7 @@ export default function App() {
 
     for (const id of idsToClose) {
       clearAgentIdleTimer(id);
+      lastResizeAtRef.current.delete(id);
       if (!closingSessions.current.has(id)) {
         const timeout = window.setTimeout(() => {
           closingSessions.current.delete(id);
@@ -3646,14 +3856,16 @@ export default function App() {
             const oldest = pendingData.current.keys().next().value as string | undefined;
             if (oldest) pendingData.current.delete(oldest);
           }
-	          const buffer = pendingData.current.get(id) || [];
-	          buffer.push(text);
-	          if (buffer.length > MAX_PENDING_CHUNKS_PER_SESSION) {
-	            buffer.splice(0, buffer.length - MAX_PENDING_CHUNKS_PER_SESSION);
-		          }
-	          pendingData.current.set(id, buffer);
-	        }
-	      });
+		          const buffer = pendingData.current.get(id) || [];
+		          buffer.push(text);
+		          if (buffer.length > MAX_PENDING_CHUNKS_PER_SESSION) {
+		            buffer.splice(0, buffer.length - MAX_PENDING_CHUNKS_PER_SESSION);
+			          }
+		          // Maintain LRU order: most recently touched sessions go to the end.
+		          pendingData.current.delete(id);
+		          pendingData.current.set(id, buffer);
+		        }
+		      });
       unlisteners.push(unlistenOutput);
 
       const unlistenExit = await listen<PtyExit>("pty-exit", (event) => {
@@ -3661,6 +3873,7 @@ export default function App() {
         const { id, exit_code } = event.payload;
 
         clearAgentIdleTimer(id);
+        lastResizeAtRef.current.delete(id);
 
         const timeout = closingSessions.current.get(id);
         if (timeout !== undefined) {
@@ -3720,14 +3933,15 @@ export default function App() {
 
       const startupFlags = await invoke<StartupFlags>("get_startup_flags").catch(() => null);
       if (startupFlags?.clearData) {
-        try {
-          localStorage.removeItem(STORAGE_PROJECTS_KEY);
-          localStorage.removeItem(STORAGE_ACTIVE_PROJECT_KEY);
-          localStorage.removeItem(STORAGE_SESSIONS_KEY);
-          localStorage.removeItem(STORAGE_ACTIVE_SESSION_BY_PROJECT_KEY);
-        } catch {
-          // Best-effort: localStorage may be unavailable in some contexts.
-        }
+	        try {
+	          localStorage.removeItem(STORAGE_PROJECTS_KEY);
+	          localStorage.removeItem(STORAGE_ACTIVE_PROJECT_KEY);
+	          localStorage.removeItem(STORAGE_SESSIONS_KEY);
+	          localStorage.removeItem(STORAGE_ACTIVE_SESSION_BY_PROJECT_KEY);
+	          localStorage.removeItem(STORAGE_WORKSPACE_VIEW_BY_KEY);
+	        } catch {
+	          // Best-effort: localStorage may be unavailable in some contexts.
+	        }
         showNotice("Cleared saved app data for a fresh start.", 8000);
       }
 
@@ -3841,6 +4055,45 @@ export default function App() {
       setActiveProjectId(activeProjectId);
       activeProjectIdRef.current = activeProjectId;
       setActiveSessionByProject(activeSessionByProject);
+
+      const workspaceStorage = loadWorkspaceViewStorageV1();
+      if (workspaceStorage?.schemaVersion === 1) {
+        const validProjectIds = new Set(state.projects.map((p) => p.id));
+        const nextWorkspaceViews: Record<string, WorkspaceView> = {};
+        for (const [workspaceKey, stored] of Object.entries(workspaceStorage.views)) {
+          const projectId = projectIdFromWorkspaceKey(workspaceKey) ?? stored.projectId;
+          if (!projectId || !validProjectIds.has(projectId)) continue;
+
+          const base = createInitialWorkspaceView(projectId);
+          const fileExplorerRootDir = stored.fileExplorerRootDir ?? base.fileExplorerRootDir;
+          const codeEditorRootDir = stored.codeEditorRootDir ?? base.codeEditorRootDir;
+          const rootOverride = fileExplorerRootDir ?? codeEditorRootDir ?? null;
+
+          const codeEditorPersistedState = coerceCodeEditorPersistedState(stored.codeEditorPersistedState);
+          const codeEditorActiveFilePath =
+            stored.codeEditorActiveFilePath ?? codeEditorPersistedState?.activePath ?? base.codeEditorActiveFilePath;
+
+          nextWorkspaceViews[workspaceKey] = {
+            ...base,
+            projectId,
+            fileExplorerOpen:
+              typeof stored.fileExplorerOpen === "boolean" ? stored.fileExplorerOpen : base.fileExplorerOpen,
+            fileExplorerRootDir,
+            fileExplorerPersistedState: coerceFileExplorerPersistedState(
+              stored.fileExplorerPersistedState,
+              rootOverride,
+            ),
+            codeEditorOpen: typeof stored.codeEditorOpen === "boolean" ? stored.codeEditorOpen : base.codeEditorOpen,
+            codeEditorRootDir,
+            codeEditorActiveFilePath,
+            codeEditorPersistedState,
+            openFileRequest: null,
+            codeEditorFsEvent: null,
+          };
+        }
+        setWorkspaceViewByKey(nextWorkspaceViews);
+      }
+
       const loadedSecureStorageMode =
         (state as { secureStorageMode?: SecureStorageMode | null }).secureStorageMode ?? metaMode;
       setSecureStorageMode(loadedSecureStorageMode ?? null);
@@ -4015,14 +4268,28 @@ export default function App() {
 	      setHydrated(true);
 	    });
 
-    return () => {
-      cancelled = true;
-      unlisteners.forEach(fn => fn());
-      for (const timeout of agentIdleTimersRef.current.values()) {
-        window.clearTimeout(timeout);
-      }
-      agentIdleTimersRef.current.clear();
-      for (const id of sessionIdsRef.current) {
+	    return () => {
+	      cancelled = true;
+	      unlisteners.forEach(fn => fn());
+	      if (saveTimerRef.current !== null) {
+	        window.clearTimeout(saveTimerRef.current);
+	        saveTimerRef.current = null;
+	      }
+	      pendingSaveRef.current = null;
+	      if (workspaceViewSaveTimerRef.current !== null) {
+	        window.clearTimeout(workspaceViewSaveTimerRef.current);
+	        workspaceViewSaveTimerRef.current = null;
+	      }
+	      pendingWorkspaceViewSaveRef.current = null;
+	      for (const timeout of closingSessions.current.values()) {
+	        window.clearTimeout(timeout);
+	      }
+	      closingSessions.current.clear();
+	      for (const timeout of agentIdleTimersRef.current.values()) {
+	        window.clearTimeout(timeout);
+	      }
+	      agentIdleTimersRef.current.clear();
+	      for (const id of sessionIdsRef.current) {
         const s = sessionsRef.current.find((x) => x.id === id) ?? null;
         if (s?.persistent && !s.exited) void detachSession(id).catch(() => {});
         else void closeSession(id).catch(() => {});
@@ -4171,6 +4438,7 @@ export default function App() {
 
   async function onClose(id: string) {
     clearAgentIdleTimer(id);
+    lastResizeAtRef.current.delete(id);
     const session = sessionsRef.current.find((s) => s.id === id) ?? null;
     const wasPersistent = Boolean(session?.persistent && !session?.exited);
     if (session?.recordingActive) {

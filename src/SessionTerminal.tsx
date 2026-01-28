@@ -101,6 +101,8 @@ export default function SessionTerminal(props: {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const resizeRafRef = useRef<number | null>(null);
+  const resizeTimeoutRef = useRef<number | null>(null);
+  const resizeRetryCountRef = useRef(0);
   const lastSizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const zellijAutoScrollRef = useRef<{
     active: boolean;
@@ -108,9 +110,21 @@ export default function SessionTerminal(props: {
   }>({ active: false, wheelRemainder: 0 });
   const commandBufferRef = useRef<string>("");
 
+  const onCwdChangeRef = useRef(props.onCwdChange);
+  onCwdChangeRef.current = props.onCwdChange;
+  const onCommandChangeRef = useRef(props.onCommandChange);
+  onCommandChangeRef.current = props.onCommandChange;
+  const onResizeRef = useRef(props.onResize);
+  onResizeRef.current = props.onResize;
+  const onUserEnterRef = useRef(props.onUserEnter);
+  onUserEnterRef.current = props.onUserEnter;
+
   useEffect(() => {
     if (!containerRef.current) return;
     if (termRef.current) return;
+
+    const container = containerRef.current;
+    if (!container) return;
 
     const term = new Terminal({
       allowProposedApi: true,
@@ -129,7 +143,7 @@ export default function SessionTerminal(props: {
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
-    term.open(containerRef.current);
+    term.open(container);
     patchXtermRenderServiceDimensions(term);
 
     if (props.persistent) {
@@ -216,7 +230,7 @@ export default function SessionTerminal(props: {
         for (const line of submitted) {
           const trimmed = line.trim();
           if (!trimmed) continue;
-          props.onCommandChange?.(props.id, trimmed, "input");
+          onCommandChangeRef.current?.(props.id, trimmed, "input");
         }
       };
 
@@ -295,7 +309,7 @@ export default function SessionTerminal(props: {
           void invoke("write_to_session", { id: props.id, data, source: "user" }).catch(() => {});
         }
         if (data.includes("\r") || data.includes("\n")) {
-          props.onUserEnter?.(props.id);
+          onUserEnterRef.current?.(props.id);
         }
         ingestUserInputForCommandDetection(data);
       });
@@ -316,7 +330,7 @@ export default function SessionTerminal(props: {
       term.onData((data) => {
         void invoke("write_to_session", { id: props.id, data, source: "user" }).catch(() => {});
         if (data.includes("\r") || data.includes("\n")) {
-          props.onUserEnter?.(props.id);
+          onUserEnterRef.current?.(props.id);
         }
       });
     }
@@ -328,10 +342,10 @@ export default function SessionTerminal(props: {
     const reportCwd = (cwd: string) => {
       const trimmed = cwd.trim();
       if (!trimmed) return;
-      props.onCwdChange?.(props.id, trimmed);
+      onCwdChangeRef.current?.(props.id, trimmed);
     };
     const reportCommand = (commandLine: string) => {
-      props.onCommandChange?.(props.id, commandLine, "osc");
+      onCommandChangeRef.current?.(props.id, commandLine, "osc");
     };
 
     const parseFileUrlPath = (data: string): string | null => {
@@ -347,14 +361,14 @@ export default function SessionTerminal(props: {
       }
     };
 
-    if (term.parser) {
-      oscDisposables.push(
-        term.parser.registerOscHandler(7, (data) => {
-          const path = parseFileUrlPath(data);
-          if (path) reportCwd(path);
-          return true;
-        }),
-      );
+	    if (term.parser) {
+	      oscDisposables.push(
+	        term.parser.registerOscHandler(7, (data) => {
+	          const path = parseFileUrlPath(data);
+	          if (path) reportCwd(path);
+	          return true;
+	        }),
+	      );
       oscDisposables.push(
         term.parser.registerOscHandler(1337, (data) => {
           const cwdPrefix = "CurrentDir=";
@@ -375,46 +389,63 @@ export default function SessionTerminal(props: {
         }),
       );
 
-      // keep zellij's alternate screen behavior intact
-    }
+	      // keep zellij's alternate screen behavior intact
+	    }
 
-	    const scheduleResize = () => {
+	    function scheduleResize() {
 	      if (resizeRafRef.current !== null) return;
-	      resizeRafRef.current = window.requestAnimationFrame(() => {
-	        resizeRafRef.current = null;
-	        sendResize();
-	      });
-	    };
+	      if (resizeTimeoutRef.current !== null) return;
 
-		    const sendResize = () => {
-		      const term = termRef.current;
-		      const fit = fitRef.current;
-		      const container = containerRef.current;
+	      const attempts = resizeRetryCountRef.current;
+	      if (attempts < 5) {
+	        resizeRafRef.current = window.requestAnimationFrame(() => {
+	          resizeRafRef.current = null;
+	          sendResize();
+	        });
+	        return;
+	      }
+
+	      const exp = Math.min(attempts - 5, 6);
+	      const delay = Math.min(500, 16 * 2 ** exp);
+	      resizeTimeoutRef.current = window.setTimeout(() => {
+	        resizeTimeoutRef.current = null;
+	        sendResize();
+	      }, delay);
+	    }
+
+	    function sendResize() {
+	      const term = termRef.current;
+	      const fit = fitRef.current;
 	      if (!term || !fit) return;
 	      if (!term.element) return;
-	      if (!container) return;
 	      const rect = container.getBoundingClientRect();
 	      if (rect.width === 0 || rect.height === 0) return;
+
 	      if (!isXtermRendererReady(term)) {
+	        resizeRetryCountRef.current += 1;
 	        scheduleResize();
 	        return;
 	      }
+
 	      try {
 	        fit.fit();
 	      } catch {
+	        resizeRetryCountRef.current += 1;
 	        scheduleResize();
 	        return;
 	      }
-		      const { cols, rows } = term;
-		      const last = lastSizeRef.current;
-		      if (last && last.cols === cols && last.rows === rows) return;
-		      lastSizeRef.current = { cols, rows };
-          props.onResize?.(props.id, { cols, rows });
-		      void invoke("resize_session", { id: props.id, cols, rows }).catch(() => {});
-		    };
 
-	    // Register BEFORE flushing to avoid race with incoming events
-	    props.registry.current.set(props.id, { term, fit });
+	      resizeRetryCountRef.current = 0;
+	      const { cols, rows } = term;
+	      const last = lastSizeRef.current;
+	      if (last && last.cols === cols && last.rows === rows) return;
+	      lastSizeRef.current = { cols, rows };
+	      onResizeRef.current?.(props.id, { cols, rows });
+	      void invoke("resize_session", { id: props.id, cols, rows }).catch(() => {});
+	    }
+
+		    // Register BEFORE flushing to avoid race with incoming events
+		    props.registry.current.set(props.id, { term, fit });
 
 	    // Flush any buffered data that arrived before we were ready (but wait for renderer readiness)
 	    const flushPending = (attemptsLeft: number) => {
@@ -449,11 +480,11 @@ export default function SessionTerminal(props: {
 	    };
 	    flushPending(20);
 
-	    // Create ResizeObserver inside useEffect for proper cleanup
-	    const resizeObserver = new ResizeObserver(() => scheduleResize());
+		    // Create ResizeObserver inside useEffect for proper cleanup
+		    const resizeObserver = new ResizeObserver(() => scheduleResize());
 
-	    resizeObserver.observe(containerRef.current);
-	    scheduleResize();
+		    resizeObserver.observe(container);
+		    scheduleResize();
 
     let wheelCleanup: (() => void) | null = null;
     if (props.persistent) {
@@ -497,30 +528,35 @@ export default function SessionTerminal(props: {
         }
       };
 
-      containerRef.current.addEventListener("wheel", wheelListener, {
-        passive: false,
-        capture: true,
-      });
-      wheelCleanup = () => {
-        containerRef.current?.removeEventListener("wheel", wheelListener, true);
-      };
-    }
+	      container.addEventListener("wheel", wheelListener, {
+	        passive: false,
+	        capture: true,
+	      });
+	      wheelCleanup = () => {
+	        container.removeEventListener("wheel", wheelListener, true);
+	      };
+	    }
 
-    return () => {
-      resizeObserver.disconnect();
-      if (resizeRafRef.current !== null) {
-        window.cancelAnimationFrame(resizeRafRef.current);
-      }
-      for (const d of oscDisposables) d.dispose();
-      props.registry.current.delete(props.id);
-      props.pendingData.current.delete(props.id);
-      wheelCleanup?.();
-      term.dispose();
-      termRef.current = null;
-      fitRef.current = null;
-      resizeRafRef.current = null;
-    };
-  }, [props.id, props.registry, props.pendingData, props.onResize]);
+	    return () => {
+	      resizeObserver.disconnect();
+	      if (resizeRafRef.current !== null) {
+	        window.cancelAnimationFrame(resizeRafRef.current);
+	      }
+	      if (resizeTimeoutRef.current !== null) {
+	        window.clearTimeout(resizeTimeoutRef.current);
+	      }
+	      for (const d of oscDisposables) d.dispose();
+	      props.registry.current.delete(props.id);
+	      props.pendingData.current.delete(props.id);
+	      wheelCleanup?.();
+	      term.dispose();
+	      termRef.current = null;
+	      fitRef.current = null;
+	      resizeRafRef.current = null;
+	      resizeTimeoutRef.current = null;
+	      resizeRetryCountRef.current = 0;
+	    };
+	  }, [props.id, props.persistent, props.registry, props.pendingData]);
 
   useEffect(() => {
     if (!props.active) return;
