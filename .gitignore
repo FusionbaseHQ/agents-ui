@@ -23,3 +23,5 @@ src-tauri/.tauri/
 
 # Local agent configs
 .claude/
+
+AGENTS.md
