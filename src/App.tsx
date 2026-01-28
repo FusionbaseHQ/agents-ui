@@ -1074,12 +1074,9 @@ export default function App() {
     if (!session.effectId || session.exited || session.closing) return;
 
     // Persistent sessions (zellij) can emit background output even when "idle".
-    // Shell sessions can also keep producing output after an agent exits.
-    // Only treat PTY output as "agent activity" when:
-    // - the session was launched as a one-off command, OR
-    // - the session is already marked as working (i.e. we explicitly started/detected an agent).
-    if (session.persistent) return;
-    if (!session.launchCommand && !session.agentWorking) return;
+    // Avoid re-activating a background persistent session unless it's already marked working
+    // (or it's the visible active tab).
+    if (session.persistent && !session.agentWorking && activeIdRef.current !== id) return;
 
     if (!session.agentWorking) {
       setSessions((prev) =>

@@ -3,7 +3,6 @@ import React, { useEffect, useRef } from "react";
 import { Terminal } from "xterm";
 import { FitAddon } from "xterm-addon-fit";
 import type { PendingDataBuffer } from "./App";
-import { detectProcessEffect } from "./processEffects";
 
 export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon }>;
 
@@ -216,8 +215,7 @@ export default function SessionTerminal(props: {
         for (const line of submitted) {
           const trimmed = line.trim();
           if (!trimmed) continue;
-          const effect = detectProcessEffect({ command: trimmed, name: null });
-          if (effect) props.onCommandChange?.(props.id, trimmed);
+          props.onCommandChange?.(props.id, trimmed);
         }
       };
 
