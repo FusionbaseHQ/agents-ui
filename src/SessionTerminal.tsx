@@ -2,9 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import React, { useEffect, useRef } from "react";
 import { Terminal } from "xterm";
 import { FitAddon } from "xterm-addon-fit";
-import type { PendingDataBuffer } from "./App";
 
 export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon }>;
+export type PendingDataBuffer = Map<string, string[]>;
 
 type RenderDimension = { width: number; height: number };
 type RenderDimensionsFallback = {
@@ -85,7 +85,7 @@ async function copyToClipboard(text: string): Promise<boolean> {
   }
 }
 
-export default function SessionTerminal(props: {
+type SessionTerminalProps = {
   id: string;
   active: boolean;
   readOnly: boolean;
@@ -96,7 +96,9 @@ export default function SessionTerminal(props: {
   onUserEnter?: (id: string) => void;
   registry: React.MutableRefObject<TerminalRegistry>;
   pendingData: React.MutableRefObject<PendingDataBuffer>;
-}) {
+};
+
+function SessionTerminal(props: SessionTerminalProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -620,3 +622,5 @@ export default function SessionTerminal(props: {
 
   return <div ref={containerRef} style={{ height: "100%", width: "100%" }} />;
 }
+
+export default React.memo(SessionTerminal);

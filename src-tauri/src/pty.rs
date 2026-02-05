@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State, WebviewWindow};
 
 const AGENTS_UI_ZELLIJ_PREFIX: &str = "agents-ui-";
@@ -1579,8 +1580,13 @@ pub fn create_session(
     );
     drop(sessions);
 
-    let id_for_thread = id.clone();
-    let state_for_thread = state.inner().clone();
+    let id_for_reader = id.clone();
+    let id_for_emitter = id.clone();
+    let state_for_emitter = state.inner().clone();
+    let (tx, rx) = mpsc::channel::<String>();
+
+    // Reader thread: reads from PTY, decodes UTF-8, sends strings to channel.
+    // Blocking reader.read() is isolated here so the emitter can flush on timeout.
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         let mut utf8_carry: Vec<u8> = Vec::new();
@@ -1590,34 +1596,67 @@ pub fn create_session(
                 Ok(n) => {
                     let data = decode_utf8_stream(&mut utf8_carry, &buf[..n]);
                     if !data.is_empty() {
-                        let _ = window.emit(
-                            "pty-output",
-                            PtyOutput {
-                                id: id_for_thread.clone(),
-                                data,
-                            },
-                        );
+                        if tx.send(data).is_err() {
+                            break;
+                        }
                     }
                 }
                 Err(_) => break,
             }
         }
-
         if !utf8_carry.is_empty() {
             let data = String::from_utf8_lossy(&utf8_carry).to_string();
             if !data.is_empty() {
-                let _ = window.emit(
-                    "pty-output",
-                    PtyOutput {
-                        id: id_for_thread.clone(),
-                        data,
-                    },
-                );
+                let _ = tx.send(data);
+            }
+        }
+        // tx dropped here → emitter receives Disconnected
+    });
+
+    // Emitter thread: buffers received strings and emits batched pty-output events.
+    // recv_timeout ensures the buffer is flushed even when the reader blocks on I/O.
+    std::thread::spawn(move || {
+        const OUTPUT_EMIT_BYTES: usize = 16 * 1024;
+        const OUTPUT_EMIT_INTERVAL: Duration = Duration::from_millis(8);
+
+        let mut output_buffer = String::new();
+        let mut last_emit_at = Instant::now();
+
+        let emit_buffered_output = |buffer: &mut String, emit_at: &mut Instant| {
+            if buffer.is_empty() {
+                return;
+            }
+            let data = std::mem::take(buffer);
+            let _ = window.emit(
+                "pty-output",
+                PtyOutput {
+                    id: id_for_emitter.clone(),
+                    data,
+                },
+            );
+            *emit_at = Instant::now();
+        };
+
+        loop {
+            match rx.recv_timeout(OUTPUT_EMIT_INTERVAL) {
+                Ok(data) => {
+                    output_buffer.push_str(&data);
+                    if output_buffer.len() >= OUTPUT_EMIT_BYTES {
+                        emit_buffered_output(&mut output_buffer, &mut last_emit_at);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    emit_buffered_output(&mut output_buffer, &mut last_emit_at);
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    emit_buffered_output(&mut output_buffer, &mut last_emit_at);
+                    break;
+                }
             }
         }
 
-        let session = match state_for_thread.inner.sessions.lock() {
-            Ok(mut sessions) => sessions.remove(&id_for_thread),
+        let session = match state_for_emitter.inner.sessions.lock() {
+            Ok(mut sessions) => sessions.remove(&id_for_reader),
             Err(_) => None,
         };
 
@@ -1627,7 +1666,7 @@ pub fn create_session(
         let _ = window.emit(
             "pty-exit",
             PtyExit {
-                id: id_for_thread,
+                id: id_for_reader,
                 exit_code,
             },
         );
