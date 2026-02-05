@@ -18,7 +18,7 @@ type QuickPromptsSectionProps = {
   onOpenPromptsPanel: () => void;
 };
 
-export function QuickPromptsSection({
+export const QuickPromptsSection = React.memo(function QuickPromptsSection({
   prompts,
   activeSessionId,
   onSendPrompt,
@@ -61,4 +61,4 @@ export function QuickPromptsSection({
       </div>
     </>
   );
-}
+});

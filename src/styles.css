@@ -801,9 +801,9 @@ body {
   justify-content: space-between;
   padding: 0 12px;
   border-bottom: 1px solid var(--border-subtle);
-  background: rgba(6, 9, 15, 0.75);
-  backdrop-filter: blur(20px) saturate(180%);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  background: rgba(6, 9, 15, 0.88);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
 }
 
 .topbarRight {

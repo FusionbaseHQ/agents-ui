@@ -28,6 +28,107 @@ type Session = {
   exitCode?: number | null;
 };
 
+type SessionItemProps = {
+  session: Session;
+  isActive: boolean;
+  onSelectSession: (sessionId: string) => void;
+  onCloseSession: (sessionId: string) => void;
+};
+
+const SessionItem = React.memo(function SessionItem({
+  session: s,
+  isActive,
+  onSelectSession,
+  onCloseSession,
+}: SessionItemProps) {
+  const isExited = Boolean(s.exited);
+  const isClosing = Boolean(s.closing);
+  const effect = getProcessEffectById(s.effectId);
+  const chipLabel = effect?.label ?? s.processTag ?? null;
+  const hasAgentIcon = Boolean(effect?.iconSrc);
+  const isWorking = Boolean(effect && s.agentWorking && !isExited && !isClosing);
+  const isRecording = Boolean(s.recordingActive && !isExited && !isClosing);
+  const launchOrRestore =
+    s.launchCommand ??
+    (s.restoreCommand?.trim() ? s.restoreCommand.trim() : null) ??
+    null;
+  const isSsh = isSshCommand(launchOrRestore);
+  const isPersistent = Boolean(s.persistent);
+  const isSshType = isSsh && !isPersistent;
+  const isDefaultType = !isPersistent && !isSshType;
+  const chipClass = effect
+    ? `chip chip-${effect.id}`
+    : isSshType
+      ? "chip chip-ssh"
+      : "chip";
+  const showChipLabel =
+    Boolean(chipLabel) &&
+    !hasAgentIcon &&
+    !(isSshType && (chipLabel ?? "").trim().toLowerCase() === "ssh");
+
+  return (
+    <div
+      className={`sessionItem ${isActive ? "sessionItemActive" : ""} ${
+        isExited ? "sessionItemExited" : ""
+      } ${isClosing ? "sessionItemClosing" : ""} ${
+        isSshType ? "sessionItemSsh" : ""
+      } ${isPersistent ? "sessionItemPersistent" : ""} ${
+        isDefaultType ? "sessionItemDefault" : ""
+      }`}
+      onClick={() => onSelectSession(s.id)}
+    >
+      <div className={`dot ${isActive ? "dotActive" : ""}`} />
+      <div className="sessionMeta">
+        <div className="sessionName">
+          {hasAgentIcon && chipLabel && effect?.iconSrc && (
+            <span className={`agentBadge chip-${effect.id}`} title={chipLabel}>
+              <img className="agentIcon" src={effect.iconSrc} alt={chipLabel} />
+              {isWorking && (
+                <span className="chipActivity agentBadgeDot" aria-label="Working" />
+              )}
+            </span>
+          )}
+          <span className="sessionNameText">{s.name}</span>
+          {showChipLabel && chipLabel && (
+            <span className={chipClass} title={chipLabel}>
+              <span className="chipLabel">{chipLabel}</span>
+              {isWorking && <span className="chipActivity" aria-label="Working" />}
+            </span>
+          )}
+          {isRecording && <span className="recordingDot" title="Recording" />}
+          {isClosing ? (
+            <span className="sessionStatus">closing…</span>
+          ) : isExited ? (
+            <span className="sessionStatus">
+              exited{s.exitCode != null ? ` ${s.exitCode}` : ""}
+            </span>
+          ) : null}
+        </div>
+        <div className="sessionCmd">
+          {(() => {
+            const parts: string[] = [];
+            if (s.cwd) parts.push(shortenPathSmart(s.cwd, 44));
+            if (launchOrRestore) parts.push(launchOrRestore);
+            if (!parts.length) parts.push(s.command);
+            return parts.join(" • ");
+          })()}
+        </div>
+      </div>
+      <button
+        className="closeBtn"
+        disabled={isClosing}
+        onClick={(e) => {
+          e.stopPropagation();
+          onCloseSession(s.id);
+        }}
+        title="Close session"
+      >
+        ×
+      </button>
+    </div>
+  );
+});
+
 type SessionsSectionProps = {
   agentShortcuts: ProcessEffect[];
   sessions: Session[];
@@ -41,7 +142,7 @@ type SessionsSectionProps = {
   onOpenSshManager: () => void;
 };
 
-export function SessionsSection({
+export const SessionsSection = React.memo(function SessionsSection({
   agentShortcuts,
   sessions,
   activeSessionId,
@@ -223,97 +324,17 @@ export function SessionsSection({
         {sessions.length === 0 ? (
           <div className="empty">No sessions in this project.</div>
         ) : (
-          sessions.map((s) => {
-            const isActive = s.id === activeSessionId;
-            const isExited = Boolean(s.exited);
-            const isClosing = Boolean(s.closing);
-            const effect = getProcessEffectById(s.effectId);
-            const chipLabel = effect?.label ?? s.processTag ?? null;
-            const hasAgentIcon = Boolean(effect?.iconSrc);
-            const isWorking = Boolean(effect && s.agentWorking && !isExited && !isClosing);
-            const isRecording = Boolean(s.recordingActive && !isExited && !isClosing);
-            const launchOrRestore =
-              s.launchCommand ??
-              (s.restoreCommand?.trim() ? s.restoreCommand.trim() : null) ??
-              null;
-            const isSsh = isSshCommand(launchOrRestore);
-            const isPersistent = Boolean(s.persistent);
-            const isSshType = isSsh && !isPersistent;
-            const isDefaultType = !isPersistent && !isSshType;
-            const chipClass = effect
-              ? `chip chip-${effect.id}`
-              : isSshType
-                ? "chip chip-ssh"
-                : "chip";
-            const showChipLabel =
-              Boolean(chipLabel) &&
-              !hasAgentIcon &&
-              !(isSshType && (chipLabel ?? "").trim().toLowerCase() === "ssh");
-            return (
-              <div
-                key={s.id}
-                className={`sessionItem ${isActive ? "sessionItemActive" : ""} ${
-                  isExited ? "sessionItemExited" : ""
-                } ${isClosing ? "sessionItemClosing" : ""} ${
-                  isSshType ? "sessionItemSsh" : ""
-                } ${isPersistent ? "sessionItemPersistent" : ""} ${
-                  isDefaultType ? "sessionItemDefault" : ""
-                }`}
-                onClick={() => onSelectSession(s.id)}
-              >
-                <div className={`dot ${isActive ? "dotActive" : ""}`} />
-                <div className="sessionMeta">
-                  <div className="sessionName">
-                    {hasAgentIcon && chipLabel && effect?.iconSrc && (
-                      <span className={`agentBadge chip-${effect.id}`} title={chipLabel}>
-                        <img className="agentIcon" src={effect.iconSrc} alt={chipLabel} />
-                        {isWorking && (
-                          <span className="chipActivity agentBadgeDot" aria-label="Working" />
-                        )}
-                      </span>
-                    )}
-                    <span className="sessionNameText">{s.name}</span>
-                    {showChipLabel && chipLabel && (
-                      <span className={chipClass} title={chipLabel}>
-                        <span className="chipLabel">{chipLabel}</span>
-                        {isWorking && <span className="chipActivity" aria-label="Working" />}
-                      </span>
-                    )}
-                    {isRecording && <span className="recordingDot" title="Recording" />}
-                    {isClosing ? (
-                      <span className="sessionStatus">closing…</span>
-                    ) : isExited ? (
-                      <span className="sessionStatus">
-                        exited{s.exitCode != null ? ` ${s.exitCode}` : ""}
-                      </span>
-                    ) : null}
-                  </div>
-                  <div className="sessionCmd">
-                    {(() => {
-                      const parts: string[] = [];
-                      if (s.cwd) parts.push(shortenPathSmart(s.cwd, 44));
-                      if (launchOrRestore) parts.push(launchOrRestore);
-                      if (!parts.length) parts.push(s.command);
-                      return parts.join(" • ");
-                    })()}
-                  </div>
-                </div>
-                <button
-                  className="closeBtn"
-                  disabled={isClosing}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onCloseSession(s.id);
-                  }}
-                  title="Close session"
-                >
-                  ×
-                </button>
-              </div>
-            );
-          })
+          sessions.map((s) => (
+            <SessionItem
+              key={s.id}
+              session={s}
+              isActive={s.id === activeSessionId}
+              onSelectSession={onSelectSession}
+              onCloseSession={onCloseSession}
+            />
+          ))
         )}
       </div>
     </>
   );
-}
+});

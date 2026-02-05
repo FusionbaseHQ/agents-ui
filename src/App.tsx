@@ -2,12 +2,13 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { homeDir } from "@tauri-apps/api/path";
 import React, { useEffect, useMemo, useRef, useState, useCallback, useLayoutEffect } from "react";
-import SessionTerminal, { TerminalRegistry } from "./SessionTerminal";
+import { type PendingDataBuffer, type TerminalRegistry } from "./SessionTerminal";
 import {
   commandTagFromCommandLine,
   detectProcessEffect,
   getProcessEffectById,
   PROCESS_EFFECTS,
+  type ProcessEffect,
 } from "./processEffects";
 import { shortenPathSmart } from "./pathDisplay";
 import { SlidePanel } from "./SlidePanel";
@@ -15,6 +16,7 @@ import { CommandPalette } from "./CommandPalette";
 import { ProjectsSection } from "./components/ProjectsSection";
 import { QuickPromptsSection } from "./components/QuickPromptsSection";
 import { SessionsSection } from "./components/SessionsSection";
+import { TerminalPane, type TerminalPaneSession } from "./components/TerminalPane";
 import { Icon } from "./components/Icon";
 import { FileExplorerPanel, type FileExplorerPersistedState } from "./components/FileExplorerPanel";
 import type {
@@ -107,9 +109,7 @@ type TrayMenuEventPayload = {
 };
 type RecentSessionKey = { projectId: string; persistId: string };
 type TrayRecentSession = { label: string; projectId: string; persistId: string };
-
-// Buffer for data that arrives before terminal is ready
-export type PendingDataBuffer = Map<string, string[]>;
+type OutputQueueBySession = Map<string, string[]>;
 
 const STORAGE_PROJECTS_KEY = "agents-ui-projects";
 const STORAGE_ACTIVE_PROJECT_KEY = "agents-ui-active-project-id";
@@ -526,6 +526,47 @@ type RecordingIndexEntry = {
   recordingId: string;
   meta: RecordingMeta | null;
 };
+
+function toPersistedSession(session: Session): PersistedSession {
+  return {
+    persistId: session.persistId,
+    projectId: session.projectId,
+    name: session.name,
+    launchCommand: session.launchCommand,
+    restoreCommand: session.restoreCommand ?? null,
+    sshTarget: session.sshTarget ?? null,
+    sshRootDir: session.sshRootDir ?? null,
+    lastRecordingId: session.lastRecordingId ?? null,
+    cwd: session.cwd,
+    persistent: session.persistent,
+    createdAt: session.createdAt,
+  };
+}
+
+function persistedSessionEquals(a: PersistedSession, b: PersistedSession): boolean {
+  return (
+    a.persistId === b.persistId &&
+    a.projectId === b.projectId &&
+    a.name === b.name &&
+    a.launchCommand === b.launchCommand &&
+    (a.restoreCommand ?? null) === (b.restoreCommand ?? null) &&
+    (a.sshTarget ?? null) === (b.sshTarget ?? null) &&
+    (a.sshRootDir ?? null) === (b.sshRootDir ?? null) &&
+    (a.lastRecordingId ?? null) === (b.lastRecordingId ?? null) &&
+    a.cwd === b.cwd &&
+    Boolean(a.persistent) === Boolean(b.persistent) &&
+    a.createdAt === b.createdAt
+  );
+}
+
+function persistedSessionsEqual(a: PersistedSession[], b: PersistedSession[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (!persistedSessionEquals(a[i], b[i])) return false;
+  }
+  return true;
+}
 
 function loadLegacyPersistedSessions(): PersistedSession[] {
   try {
@@ -1251,10 +1292,16 @@ export default function App() {
 
   const registry = useRef<TerminalRegistry>(new Map());
   const pendingData = useRef<PendingDataBuffer>(new Map());
+  const outputQueueRef = useRef<OutputQueueBySession>(new Map());
+  const outputFlushRafRef = useRef<number | null>(null);
+  const outputFlushTimerRef = useRef<number | null>(null);
   const pendingExitCodes = useRef<Map<string, number | null>>(new Map());
   const closingSessions = useRef<Map<string, number>>(new Map());
   const sessionIdsRef = useRef<string[]>([]);
   const sessionsRef = useRef<Session[]>([]);
+  const sessionByIdRef = useRef<Map<string, Session>>(new Map());
+  const pendingAgentWorkingRef = useRef<Set<string>>(new Set());
+  const hydratedRef = useRef<boolean>(hydrated);
   const activeIdRef = useRef<string | null>(null);
   const activeProjectIdRef = useRef<string>(activeProjectId);
   const lastActiveByProject = useRef<Map<string, string>>(new Map());
@@ -1270,6 +1317,8 @@ export default function App() {
   const workspaceViewSaveTimerRef = useRef<number | null>(null);
   const pendingWorkspaceViewSaveRef = useRef<WorkspaceViewStorageV1 | null>(null);
   const agentIdleTimersRef = useRef<Map<string, number>>(new Map());
+  const agentWorkingMapRef = useRef<Map<string, boolean>>(new Map());
+  const agentWorkingSyncTimerRef = useRef<number | null>(null);
   const commandLifecycleSessionsRef = useRef<Set<string>>(new Set());
   const lastResizeAtRef = useRef<Map<string, number>>(new Map());
 
@@ -1287,31 +1336,46 @@ export default function App() {
     };
   }, []);
 
-  function clearAgentIdleTimer(id: string) {
+  const clearAgentIdleTimer = useCallback((id: string) => {
     const existing = agentIdleTimersRef.current.get(id);
     if (existing !== undefined) {
       window.clearTimeout(existing);
       agentIdleTimersRef.current.delete(id);
     }
-  }
+  }, []);
 
-  function scheduleAgentIdle(id: string, effectId: string | null) {
+  const syncAgentWorkingToState = useCallback(() => {
+    agentWorkingSyncTimerRef.current = null;
+    const map = agentWorkingMapRef.current;
+    setSessions((prev) => {
+      let changed = false;
+      const next = prev.map((s) => {
+        const desired = map.get(s.id);
+        if (desired === undefined || desired === Boolean(s.agentWorking)) return s;
+        changed = true;
+        return { ...s, agentWorking: desired };
+      });
+      return changed ? next : prev;
+    });
+  }, []);
+
+  const scheduleAgentWorkingSync = useCallback(() => {
+    if (agentWorkingSyncTimerRef.current !== null) return;
+    agentWorkingSyncTimerRef.current = window.setTimeout(syncAgentWorkingToState, 500);
+  }, [syncAgentWorkingToState]);
+
+  const scheduleAgentIdle = useCallback((id: string, effectId: string | null) => {
     clearAgentIdleTimer(id);
     if (!effectId) return;
     const effect = getProcessEffectById(effectId);
     const idleAfterMs = effect?.idleAfterMs ?? 2000;
     const timeout = window.setTimeout(() => {
       agentIdleTimersRef.current.delete(id);
-      setSessions((prev) =>
-        prev.map((s) => {
-          if (s.id !== id) return s;
-          if (!s.agentWorking) return s;
-          return { ...s, agentWorking: false };
-        }),
-      );
+      agentWorkingMapRef.current.set(id, false);
+      scheduleAgentWorkingSync();
     }, idleAfterMs);
     agentIdleTimersRef.current.set(id, timeout);
-  }
+  }, [clearAgentIdleTimer, scheduleAgentWorkingSync]);
 
   const RESIZE_OUTPUT_SUPPRESS_MS = 900;
 
@@ -1333,6 +1397,60 @@ export default function App() {
     }
     return null;
   };
+
+  const pushPendingData = useCallback((id: string, text: string) => {
+    if (!pendingData.current.has(id) && pendingData.current.size >= MAX_PENDING_SESSIONS) {
+      const oldest = pendingData.current.keys().next().value as string | undefined;
+      if (oldest) pendingData.current.delete(oldest);
+    }
+    const buffer = pendingData.current.get(id) || [];
+    buffer.push(text);
+    if (buffer.length > MAX_PENDING_CHUNKS_PER_SESSION) {
+      buffer.splice(0, buffer.length - MAX_PENDING_CHUNKS_PER_SESSION);
+    }
+    pendingData.current.delete(id);
+    pendingData.current.set(id, buffer);
+  }, []);
+
+  const flushQueuedOutput = useCallback(() => {
+    if (outputQueueRef.current.size === 0) return;
+    const queue = outputQueueRef.current;
+    outputQueueRef.current = new Map();
+
+    for (const [id, chunks] of queue) {
+      if (closingSessions.current.has(id)) continue;
+      if (!chunks.length) continue;
+      const text = chunks.length === 1 ? chunks[0] : chunks.join("");
+      const entry = registry.current.get(id);
+      if (entry) {
+        // Write directly — xterm 5 buffers internally before renderer is ready.
+        // Gating on isTerminalRendererReady caused a race: the flush RAF fires
+        // before the renderer-init RAF, data goes to pendingData, and flushPending
+        // (which only runs once at mount) has already returned.
+        entry.term.write(text);
+        continue;
+      }
+      pushPendingData(id, text);
+    }
+  }, [pushPendingData]);
+
+  const scheduleOutputFlush = useCallback(() => {
+    if (outputFlushRafRef.current !== null || outputFlushTimerRef.current !== null) return;
+    const flush = () => {
+      if (outputFlushRafRef.current !== null) {
+        window.cancelAnimationFrame(outputFlushRafRef.current);
+      }
+      if (outputFlushTimerRef.current !== null) {
+        window.clearTimeout(outputFlushTimerRef.current);
+      }
+      outputFlushRafRef.current = null;
+      outputFlushTimerRef.current = null;
+      flushQueuedOutput();
+    };
+
+    outputFlushRafRef.current = window.requestAnimationFrame(flush);
+    outputFlushTimerRef.current = window.setTimeout(flush, 20);
+  }, [flushQueuedOutput]);
 
   const skipEscapeSequence = (data: string, start: number): number => {
     const next = data[start];
@@ -1397,7 +1515,8 @@ export default function App() {
   };
 
   function markAgentWorkingFromOutput(id: string, data: string) {
-    const session = sessionsRef.current.find((s) => s.id === id);
+    if (!hydratedRef.current) return;
+    const session = sessionByIdRef.current.get(id);
     if (!session) return;
     if (!session.effectId || session.exited || session.closing) return;
 
@@ -1412,10 +1531,12 @@ export default function App() {
     // Persistent sessions (zellij) can emit background output even when "idle".
     // Avoid re-activating a background persistent session unless it's already marked working
     // (or it's the visible active tab).
-    if (session.persistent && !session.agentWorking && activeIdRef.current !== id) return;
+    const currentWorking = agentWorkingMapRef.current.get(id) ?? Boolean(session.agentWorking);
+    if (session.persistent && !currentWorking && activeIdRef.current !== id) return;
 
-    if (!session.agentWorking) {
-      setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, agentWorking: true } : s)));
+    if (!currentWorking) {
+      agentWorkingMapRef.current.set(id, true);
+      scheduleAgentWorkingSync();
     }
     scheduleAgentIdle(id, session.effectId);
   }
@@ -1820,11 +1941,16 @@ export default function App() {
   useEffect(() => {
     sessionIdsRef.current = sessions.map((s) => s.id);
     sessionsRef.current = sessions;
+    sessionByIdRef.current = new Map(sessions.map((session) => [session.id, session]));
   }, [sessions]);
 
   useEffect(() => {
     activeIdRef.current = activeId;
   }, [activeId]);
+
+  useEffect(() => {
+    hydratedRef.current = hydrated;
+  }, [hydrated]);
 
   useEffect(() => {
     activeProjectIdRef.current = activeProjectId;
@@ -1854,28 +1980,48 @@ export default function App() {
     });
   }, [projects]);
 
+  const persistedSessionsRef = useRef<PersistedSession[]>([]);
+  const persistedSessions = useMemo<PersistedSession[]>(() => {
+    const next = sessions
+      .filter((session) => !session.closing)
+      .map(toPersistedSession)
+      .sort((a, b) => a.createdAt - b.createdAt);
+    const prev = persistedSessionsRef.current;
+    if (persistedSessionsEqual(prev, next)) return prev;
+    persistedSessionsRef.current = next;
+    return next;
+  }, [sessions]);
+
+  const terminalPaneSessionsRef = useRef<TerminalPaneSession[]>([]);
+  const terminalPaneSessions = useMemo<TerminalPaneSession[]>(() => {
+    const next = sessions.map((s) => ({
+      id: s.id,
+      persistent: s.persistent,
+      exited: Boolean(s.exited),
+      closing: Boolean(s.closing),
+    }));
+    const prev = terminalPaneSessionsRef.current;
+    if (
+      prev.length === next.length &&
+      prev.every(
+        (p, i) =>
+          p.id === next[i].id &&
+          p.persistent === next[i].persistent &&
+          p.exited === next[i].exited &&
+          p.closing === next[i].closing,
+      )
+    ) {
+      return prev;
+    }
+    terminalPaneSessionsRef.current = next;
+    return next;
+  }, [sessions]);
+
   useEffect(() => {
     if (!hydrated || persistenceDisabledReason) return;
     if (saveTimerRef.current !== null) {
       window.clearTimeout(saveTimerRef.current);
     }
-
-    const persistedSessions: PersistedSession[] = sessions
-      .filter((s) => !s.closing)
-      .map((s) => ({
-        persistId: s.persistId,
-        projectId: s.projectId,
-        name: s.name,
-        launchCommand: s.launchCommand,
-        restoreCommand: s.restoreCommand ?? null,
-        sshTarget: s.sshTarget ?? null,
-        sshRootDir: s.sshRootDir ?? null,
-        lastRecordingId: s.lastRecordingId ?? null,
-        cwd: s.cwd,
-        persistent: s.persistent,
-        createdAt: s.createdAt,
-      }))
-      .sort((a, b) => a.createdAt - b.createdAt);
 
     pendingSaveRef.current = {
       schemaVersion: 1,
@@ -1908,7 +2054,7 @@ export default function App() {
           reportError("Failed to save state", err);
         });
       }, 400);
-  }, [projects, activeProjectId, activeSessionByProject, sessions, prompts, environments, assets, assetSettings, agentShortcutIds, secureStorageMode, hydrated, persistenceDisabledReason]);
+  }, [projects, activeProjectId, activeSessionByProject, persistedSessions, prompts, environments, assets, assetSettings, agentShortcutIds, secureStorageMode, hydrated, persistenceDisabledReason]);
 
   useEffect(() => {
     if (!hydrated) return;
@@ -1981,13 +2127,21 @@ export default function App() {
   }, [hydrated, projects]);
 
   const trayStatus = useMemo(() => {
-    const workingCount = sessions.filter(
-      (s) => Boolean(s.effectId) && Boolean(s.agentWorking) && !s.exited && !s.closing,
-    ).length;
-    const sessionsOpen = sessions.filter((s) => !s.exited && !s.closing).length;
-    const recordingCount = sessions.filter(
-      (s) => Boolean(s.recordingActive) && !s.exited && !s.closing,
-    ).length;
+    let workingCount = 0;
+    let sessionsOpen = 0;
+    let recordingCount = 0;
+
+    for (const session of sessions) {
+      if (session.exited || session.closing) continue;
+      sessionsOpen += 1;
+      if (session.effectId && session.agentWorking) {
+        workingCount += 1;
+      }
+      if (session.recordingActive) {
+        recordingCount += 1;
+      }
+    }
+
     return {
       workingCount,
       sessionsOpen,
@@ -1998,18 +2152,25 @@ export default function App() {
   }, [active?.name, activeProject?.title, sessions]);
 
   const lastTrayStatusRef = useRef<string | null>(null);
+  const trayStatusTimerRef = useRef<number | null>(null);
   useEffect(() => {
     if (!hydrated) return;
     const key = JSON.stringify(trayStatus);
     if (lastTrayStatusRef.current === key) return;
     lastTrayStatusRef.current = key;
-    void invoke("set_tray_status", {
-      workingCount: trayStatus.workingCount,
-      sessionsOpen: trayStatus.sessionsOpen,
-      activeProject: trayStatus.activeProject,
-      activeSession: trayStatus.activeSession,
-      recordingCount: trayStatus.recordingCount,
-    }).catch(() => {});
+    if (trayStatusTimerRef.current !== null) {
+      window.clearTimeout(trayStatusTimerRef.current);
+    }
+    trayStatusTimerRef.current = window.setTimeout(() => {
+      trayStatusTimerRef.current = null;
+      void invoke("set_tray_status", {
+        workingCount: trayStatus.workingCount,
+        sessionsOpen: trayStatus.sessionsOpen,
+        activeProject: trayStatus.activeProject,
+        activeSession: trayStatus.activeSession,
+        recordingCount: trayStatus.recordingCount,
+      }).catch(() => {});
+    }, 250);
   }, [trayStatus, hydrated]);
 
   const trayRecentSessions = useMemo<TrayRecentSession[]>(() => {
@@ -2472,6 +2633,10 @@ export default function App() {
       if (noticeTimerRef.current !== null) {
         window.clearTimeout(noticeTimerRef.current);
         noticeTimerRef.current = null;
+      }
+      if (trayStatusTimerRef.current !== null) {
+        window.clearTimeout(trayStatusTimerRef.current);
+        trayStatusTimerRef.current = null;
       }
     };
   }, []);
@@ -3521,11 +3686,11 @@ export default function App() {
     void loadPathPicker(initial);
   }
 
-  const onSessionResize = useCallback((id: string) => {
+  const onSessionResize = useCallback((id: string, _size: { cols: number; rows: number }) => {
     lastResizeAtRef.current.set(id, Date.now());
   }, []);
 
-  function onCwdChange(id: string, cwd: string) {
+  const onCwdChange = useCallback((id: string, cwd: string) => {
     const trimmed = cwd.trim();
     if (!trimmed) return;
 
@@ -3542,9 +3707,9 @@ export default function App() {
         return { ...s, cwd: nextCwd, effectId: null, agentWorking: false, processTag: null };
       }),
     );
-  }
+  }, [clearAgentIdleTimer]);
 
-  function onCommandChange(id: string, commandLine: string, source: "osc" | "input" = "input") {
+  const onCommandChange = useCallback((id: string, commandLine: string, source: "osc" | "input" = "input") => {
     const trimmed = commandLine.trim();
 
     if (source === "osc") {
@@ -3613,7 +3778,7 @@ export default function App() {
         };
       }),
     );
-  }
+  }, [clearAgentIdleTimer]);
 
   function pickActiveSessionId(projectId: string): string | null {
     const sessions = sessionsRef.current;
@@ -3817,19 +3982,6 @@ export default function App() {
     const unlisteners: Array<() => void> = [];
 
 	    const setup = async () => {
-	      const isTerminalRendererReady = (term: unknown): boolean => {
-	        try {
-	          const anyTerm = term as any;
-	          const core = anyTerm?._core;
-	          const renderService = core?._renderService;
-	          const rendererRef = renderService?._renderer;
-	          const renderer = rendererRef?.value ?? rendererRef?._value ?? null;
-	          return Boolean(renderer && renderer.dimensions);
-	        } catch {
-	          return false;
-	        }
-	      };
-
 	      // Set up event listeners FIRST, before creating any sessions
 			      const unlistenOutput = await listen<PtyOutput>("pty-output", (event) => {
 			        if (cancelled) return;
@@ -3841,30 +3993,16 @@ export default function App() {
 		        if (closingSessions.current.has(id)) return;
 
 			        markAgentWorkingFromOutput(id, text);
-
-			        const entry = registry.current.get(id);
-			        if (entry && isTerminalRendererReady(entry.term)) {
-			          entry.term.write(text);
-			          return;
-			        }
-			        {
-			          // Buffer the data - the terminal will catch up
-		          if (
-		            !pendingData.current.has(id) &&
-		            pendingData.current.size >= MAX_PENDING_SESSIONS
-          ) {
-            const oldest = pendingData.current.keys().next().value as string | undefined;
-            if (oldest) pendingData.current.delete(oldest);
-          }
-		          const buffer = pendingData.current.get(id) || [];
-		          buffer.push(text);
-		          if (buffer.length > MAX_PENDING_CHUNKS_PER_SESSION) {
-		            buffer.splice(0, buffer.length - MAX_PENDING_CHUNKS_PER_SESSION);
-			          }
-		          // Maintain LRU order: most recently touched sessions go to the end.
-		          pendingData.current.delete(id);
-		          pendingData.current.set(id, buffer);
-		        }
+              const queue = outputQueueRef.current.get(id) ?? [];
+              if (queue.length === 0) {
+                queue.push(text);
+              } else if (queue.length >= 64) {
+                queue[queue.length - 1] += text;
+              } else {
+                queue.push(text);
+              }
+              outputQueueRef.current.set(id, queue);
+              scheduleOutputFlush();
 		      });
       unlisteners.push(unlistenOutput);
 
@@ -4271,6 +4409,21 @@ export default function App() {
 	    return () => {
 	      cancelled = true;
 	      unlisteners.forEach(fn => fn());
+        if (outputFlushRafRef.current !== null) {
+          window.cancelAnimationFrame(outputFlushRafRef.current);
+          outputFlushRafRef.current = null;
+        }
+        if (outputFlushTimerRef.current !== null) {
+          window.clearTimeout(outputFlushTimerRef.current);
+          outputFlushTimerRef.current = null;
+        }
+        outputQueueRef.current.clear();
+        pendingAgentWorkingRef.current.clear();
+        if (agentWorkingSyncTimerRef.current !== null) {
+          window.clearTimeout(agentWorkingSyncTimerRef.current);
+          agentWorkingSyncTimerRef.current = null;
+        }
+        agentWorkingMapRef.current.clear();
 	      if (saveTimerRef.current !== null) {
 	        window.clearTimeout(saveTimerRef.current);
 	        saveTimerRef.current = null;
@@ -4880,6 +5033,104 @@ export default function App() {
 	    [computeProjectsListMaxHeightLimit, persistProjectsListMaxHeight, projectsListMaxHeight],
 	  );
 
+  // -- Stable callback props for memoized sidebar sections --
+
+  const handleCloseSession = useCallback(
+    (id: string) => void onClose(id),
+    // onClose reads from refs/state setters internally; safe with []
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  const handleQuickStartFromSidebar = useCallback(
+    (effect: ProcessEffect) =>
+      void quickStart({
+        id: effect.id,
+        title: effect.label,
+        command: effect.matchCommands[0] ?? effect.label,
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  const handleOpenNewSession = useCallback(() => {
+    setProjectOpen(false);
+    setNewOpen(true);
+  }, []);
+
+  const handleOpenPersistentSessions = useCallback(() => {
+    setPersistentSessionsOpen(true);
+    void refreshPersistentSessions();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleOpenSshManager = useCallback(() => {
+    setProjectOpen(false);
+    setNewOpen(false);
+    setSshManagerOpen(true);
+  }, []);
+
+  const handleOpenAgentShortcuts = useCallback(() => setAgentShortcutsOpen(true), []);
+
+  const handleDeleteProject = useCallback(() => setConfirmDeleteProjectOpen(true), []);
+
+  const handleSendPromptToActive = useCallback(
+    (prompt: Prompt) => void sendPromptToActive(prompt, "send"),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  const handleOpenPromptsPanel = useCallback(() => {
+    setSlidePanelTab("prompts");
+    setSlidePanelOpen(true);
+  }, []);
+
+  // -- Ref-stable projectSessions for SessionsSection --
+
+  const projectSessionsRef = useRef<Session[]>([]);
+  const stableProjectSessions = useMemo(() => {
+    const next = projectSessions;
+    const prev = projectSessionsRef.current;
+    if (
+      prev.length === next.length &&
+      prev.every((p, i) => p === next[i])
+    ) {
+      return prev;
+    }
+    projectSessionsRef.current = next;
+    return next;
+  }, [projectSessions]);
+
+  // -- Ref-stable Maps for ProjectsSection --
+
+  const sessionCountByProjectRef = useRef<Map<string, number>>(new Map());
+  const stableSessionCountByProject = useMemo(() => {
+    const next = sessionCountByProject;
+    const prev = sessionCountByProjectRef.current;
+    if (
+      prev.size === next.size &&
+      [...next].every(([k, v]) => prev.get(k) === v)
+    ) {
+      return prev;
+    }
+    sessionCountByProjectRef.current = next;
+    return next;
+  }, [sessionCountByProject]);
+
+  const workingAgentCountByProjectRef = useRef<Map<string, number>>(new Map());
+  const stableWorkingAgentCountByProject = useMemo(() => {
+    const next = workingAgentCountByProject;
+    const prev = workingAgentCountByProjectRef.current;
+    if (
+      prev.size === next.size &&
+      [...next].every(([k, v]) => prev.get(k) === v)
+    ) {
+      return prev;
+    }
+    workingAgentCountByProjectRef.current = next;
+    return next;
+  }, [workingAgentCountByProject]);
+
   return (
     <div className="app">
       <aside
@@ -4894,11 +5145,11 @@ export default function App() {
           activeProjectId={activeProjectId}
           activeProject={activeProject}
           environments={environments}
-          sessionCountByProject={sessionCountByProject}
-          workingAgentCountByProject={workingAgentCountByProject}
+          sessionCountByProject={stableSessionCountByProject}
+          workingAgentCountByProject={stableWorkingAgentCountByProject}
           onNewProject={openNewProject}
           onProjectSettings={openRenameProject}
-          onDeleteProject={() => setConfirmDeleteProjectOpen(true)}
+          onDeleteProject={handleDeleteProject}
           onSelectProject={selectProject}
           onOpenProjectSettings={openProjectSettings}
           onMoveProject={moveProject}
@@ -4907,12 +5158,9 @@ export default function App() {
         <QuickPromptsSection
           prompts={prompts}
           activeSessionId={activeId}
-          onSendPrompt={(prompt) => void sendPromptToActive(prompt, "send")}
+          onSendPrompt={handleSendPromptToActive}
           onEditPrompt={openPromptEditor}
-          onOpenPromptsPanel={() => {
-            setSlidePanelTab("prompts");
-            setSlidePanelOpen(true);
-          }}
+          onOpenPromptsPanel={handleOpenPromptsPanel}
         />
 
         <div
@@ -4932,31 +5180,15 @@ export default function App() {
 
         <SessionsSection
           agentShortcuts={agentShortcuts}
-          sessions={projectSessions}
+          sessions={stableProjectSessions}
           activeSessionId={activeId}
           onSelectSession={setActiveId}
-          onCloseSession={(id) => void onClose(id)}
-          onQuickStart={(effect) =>
-            void quickStart({
-              id: effect.id,
-              title: effect.label,
-              command: effect.matchCommands[0] ?? effect.label,
-            })
-          }
-          onOpenNewSession={() => {
-            setProjectOpen(false);
-            setNewOpen(true);
-          }}
-          onOpenPersistentSessions={() => {
-            setPersistentSessionsOpen(true);
-            void refreshPersistentSessions();
-          }}
-          onOpenSshManager={() => {
-            setProjectOpen(false);
-            setNewOpen(false);
-            setSshManagerOpen(true);
-          }}
-          onOpenAgentShortcuts={() => setAgentShortcutsOpen(true)}
+          onCloseSession={handleCloseSession}
+          onQuickStart={handleQuickStartFromSidebar}
+          onOpenNewSession={handleOpenNewSession}
+          onOpenPersistentSessions={handleOpenPersistentSessions}
+          onOpenSshManager={handleOpenSshManager}
+          onOpenAgentShortcuts={handleOpenAgentShortcuts}
         />
       </aside>
 
@@ -5188,26 +5420,15 @@ export default function App() {
 	                } as React.CSSProperties
 	              }
 	            >
-              <div className="terminalPane" aria-label="Terminal">
-                {sessions.map((s) => (
-                  <div
-                    key={s.id}
-                    className={`terminalContainer ${s.id === activeId ? "" : "terminalHidden"}`}
-                  >
-	                    <SessionTerminal
-	                      id={s.id}
-	                      active={s.id === activeId}
-	                      readOnly={Boolean(s.exited || s.closing)}
-	                      persistent={s.persistent}
-	                      onCwdChange={onCwdChange}
-	                      onCommandChange={onCommandChange}
-	                      onResize={onSessionResize}
-	                      registry={registry}
-	                      pendingData={pendingData}
-	                    />
-                  </div>
-                ))}
-              </div>
+              <TerminalPane
+                sessions={terminalPaneSessions}
+                activeId={activeId}
+                onCwdChange={onCwdChange}
+                onCommandChange={onCommandChange}
+                onSessionResize={onSessionResize}
+                registry={registry}
+                pendingData={pendingData}
+              />
 
 	              {activeWorkspaceView.codeEditorOpen &&
 	              (
@@ -6679,7 +6900,7 @@ export default function App() {
       </main>
 
       {/* Command Palette */}
-      <CommandPalette
+      {commandPaletteOpen && <CommandPalette
         isOpen={commandPaletteOpen}
         onClose={() => setCommandPaletteOpen(false)}
         prompts={prompts}
@@ -6716,7 +6937,7 @@ export default function App() {
           setSlidePanelTab("assets");
           setSlidePanelOpen(true);
         }}
-      />
+      />}
     </div>
   );
 }

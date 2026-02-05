@@ -28,7 +28,7 @@ type ProjectsSectionProps = {
   onMoveProject: (projectId: string, targetProjectId: string, position: "before" | "after") => void;
 };
 
-export function ProjectsSection({
+export const ProjectsSection = React.memo(function ProjectsSection({
   projects,
   activeProjectId,
   activeProject,
@@ -340,4 +340,4 @@ export function ProjectsSection({
       </div>
     </>
   );
-}
+});
