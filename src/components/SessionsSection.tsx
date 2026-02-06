@@ -21,7 +21,6 @@ type Session = {
   persistent?: boolean;
   effectId?: string | null;
   processTag?: string | null;
-  agentWorking?: boolean;
   recordingActive?: boolean;
   exited?: boolean;
   closing?: boolean;
@@ -31,6 +30,7 @@ type Session = {
 type SessionItemProps = {
   session: Session;
   isActive: boolean;
+  isAgentWorking: boolean;
   onSelectSession: (sessionId: string) => void;
   onCloseSession: (sessionId: string) => void;
 };
@@ -38,6 +38,7 @@ type SessionItemProps = {
 const SessionItem = React.memo(function SessionItem({
   session: s,
   isActive,
+  isAgentWorking,
   onSelectSession,
   onCloseSession,
 }: SessionItemProps) {
@@ -46,7 +47,7 @@ const SessionItem = React.memo(function SessionItem({
   const effect = getProcessEffectById(s.effectId);
   const chipLabel = effect?.label ?? s.processTag ?? null;
   const hasAgentIcon = Boolean(effect?.iconSrc);
-  const isWorking = Boolean(effect && s.agentWorking && !isExited && !isClosing);
+  const isWorking = Boolean(effect && isAgentWorking && !isExited && !isClosing);
   const isRecording = Boolean(s.recordingActive && !isExited && !isClosing);
   const launchOrRestore =
     s.launchCommand ??
@@ -132,6 +133,7 @@ const SessionItem = React.memo(function SessionItem({
 type SessionsSectionProps = {
   agentShortcuts: ProcessEffect[];
   sessions: Session[];
+  agentWorkingIds: ReadonlySet<string>;
   activeSessionId: string | null;
   onSelectSession: (sessionId: string) => void;
   onCloseSession: (sessionId: string) => void;
@@ -145,6 +147,7 @@ type SessionsSectionProps = {
 export const SessionsSection = React.memo(function SessionsSection({
   agentShortcuts,
   sessions,
+  agentWorkingIds,
   activeSessionId,
   onSelectSession,
   onCloseSession,
@@ -329,6 +332,7 @@ export const SessionsSection = React.memo(function SessionsSection({
               key={s.id}
               session={s}
               isActive={s.id === activeSessionId}
+              isAgentWorking={agentWorkingIds.has(s.id)}
               onSelectSession={onSelectSession}
               onCloseSession={onCloseSession}
             />

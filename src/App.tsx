@@ -74,7 +74,6 @@ type Session = SessionInfo & {
   recordingActive?: boolean;
   cwd: string | null;
   effectId?: string | null;
-  agentWorking?: boolean;
   processTag?: string | null;
   exited?: boolean;
   closing?: boolean;
@@ -135,6 +134,8 @@ const DEFAULT_WORKSPACE_FILE_TREE_WIDTH = 320;
 const MIN_WORKSPACE_TERMINAL_WIDTH = 160;
 const MIN_WORKSPACE_EDITOR_WIDTH = 260;
 const MIN_WORKSPACE_FILE_TREE_WIDTH = 200;
+
+const EMPTY_STRING_SET: ReadonlySet<string> = new Set();
 
 function makeId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -916,6 +917,7 @@ export default function App() {
   const [activeSessionByProject, setActiveSessionByProject] = useState<Record<string, string>>({});
 
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [agentWorkingIds, setAgentWorkingIds] = useState<ReadonlySet<string>>(EMPTY_STRING_SET);
   const [prompts, setPrompts] = useState<Prompt[]>([]);
   const [environments, setEnvironments] = useState<EnvironmentConfig[]>([]);
   const [assets, setAssets] = useState<AssetTemplate[]>([]);
@@ -1350,15 +1352,19 @@ export default function App() {
   const syncAgentWorkingToState = useCallback(() => {
     agentWorkingSyncTimerRef.current = null;
     const map = agentWorkingMapRef.current;
-    setSessions((prev) => {
-      let changed = false;
-      const next = prev.map((s) => {
-        const desired = map.get(s.id);
-        if (desired === undefined || desired === Boolean(s.agentWorking)) return s;
-        changed = true;
-        return { ...s, agentWorking: desired };
-      });
-      return changed ? next : prev;
+    const nextIds = new Set<string>();
+    for (const [id, working] of map) {
+      if (working) nextIds.add(id);
+    }
+    setAgentWorkingIds((prev) => {
+      if (prev.size === nextIds.size) {
+        let same = true;
+        for (const id of nextIds) {
+          if (!prev.has(id)) { same = false; break; }
+        }
+        if (same) return prev;
+      }
+      return nextIds;
     });
   }, []);
 
@@ -1534,7 +1540,7 @@ export default function App() {
     // Persistent sessions (zellij) can emit background output even when "idle".
     // Avoid re-activating a background persistent session unless it's already marked working
     // (or it's the visible active tab).
-    const currentWorking = agentWorkingMapRef.current.get(id) ?? Boolean(session.agentWorking);
+    const currentWorking = agentWorkingMapRef.current.get(id) ?? false;
     if (session.persistent && !currentWorking && activeIdRef.current !== id) return;
 
     if (!currentWorking) {
@@ -1805,11 +1811,11 @@ export default function App() {
     for (const s of sessions) {
       if (!s.effectId) continue;
       if (s.exited || s.closing) continue;
-      if (!s.agentWorking) continue;
+      if (!agentWorkingIds.has(s.id)) continue;
       counts.set(s.projectId, (counts.get(s.projectId) ?? 0) + 1);
     }
     return counts;
-  }, [sessions]);
+  }, [sessions, agentWorkingIds]);
 
   const persistentSessionItems = useMemo<PersistentSessionsModalItem[]>(() => {
     if (!persistentSessions.length) return [];
@@ -1845,11 +1851,11 @@ export default function App() {
     const pending = pendingExitCodes.current.get(session.id);
     if (pending === undefined) return session;
     pendingExitCodes.current.delete(session.id);
+    agentWorkingMapRef.current.set(session.id, false);
     return {
       ...session,
       exited: true,
       exitCode: pending,
-      agentWorking: false,
       recordingActive: false,
     };
   }, []);
@@ -2145,7 +2151,7 @@ export default function App() {
     for (const session of sessions) {
       if (session.exited || session.closing) continue;
       sessionsOpen += 1;
-      if (session.effectId && session.agentWorking) {
+      if (session.effectId && agentWorkingIds.has(session.id)) {
         workingCount += 1;
       }
       if (session.recordingActive) {
@@ -2160,7 +2166,7 @@ export default function App() {
       activeProject: activeProject?.title ?? null,
       activeSession: active?.name ?? null,
     };
-  }, [active?.name, activeProject?.title, sessions]);
+  }, [active?.name, activeProject?.title, sessions, agentWorkingIds]);
 
   const lastTrayStatusRef = useRef<string | null>(null);
   const trayStatusTimerRef = useRef<number | null>(null);
@@ -3712,16 +3718,18 @@ export default function App() {
     // definitive "command finished / prompt returned" signal to clear any lingering activity.
     commandLifecycleSessionsRef.current.add(id);
     clearAgentIdleTimer(id);
+    agentWorkingMapRef.current.set(id, false);
+    scheduleAgentWorkingSync();
 
     setSessions((prev) =>
       prev.map((s) => {
         if (s.id !== id) return s;
         const nextCwd = s.cwd !== trimmed ? trimmed : s.cwd;
-        if (nextCwd === s.cwd && !s.agentWorking && !s.effectId) return s;
-        return { ...s, cwd: nextCwd, effectId: null, agentWorking: false, processTag: null };
+        if (nextCwd === s.cwd && !s.effectId) return s;
+        return { ...s, cwd: nextCwd, effectId: null, processTag: null };
       }),
     );
-  }, [clearAgentIdleTimer]);
+  }, [clearAgentIdleTimer, scheduleAgentWorkingSync]);
 
   const onCommandChange = useCallback((id: string, commandLine: string, source: "osc" | "input" = "input") => {
     const trimmed = commandLine.trim();
@@ -3733,11 +3741,13 @@ export default function App() {
       // Treat this as "no foreground command running" (back at prompt).
       if (!trimmed) {
         clearAgentIdleTimer(id);
+        agentWorkingMapRef.current.set(id, false);
+        scheduleAgentWorkingSync();
         setSessions((prev) =>
           prev.map((s) => {
             if (s.id !== id) return s;
-            if (!s.effectId && !s.agentWorking) return s;
-            return { ...s, effectId: null, agentWorking: false, processTag: null };
+            if (!s.effectId) return s;
+            return { ...s, effectId: null, processTag: null };
           }),
         );
         return;
@@ -3746,21 +3756,21 @@ export default function App() {
       const effect = detectProcessEffect({ command: trimmed, name: null });
       const nextEffectId = effect?.id ?? null;
       clearAgentIdleTimer(id);
+      agentWorkingMapRef.current.set(id, false);
+      scheduleAgentWorkingSync();
       setSessions((prev) =>
         prev.map((s) => {
           if (s.id !== id) return s;
           const nextRestoreCommand = effect && !s.persistent ? trimmed : null;
           if (
             s.effectId === nextEffectId &&
-            (s.restoreCommand ?? null) === nextRestoreCommand &&
-            !s.agentWorking
+            (s.restoreCommand ?? null) === nextRestoreCommand
           ) {
             return s;
           }
           return {
             ...s,
             effectId: nextEffectId,
-            agentWorking: false,
             restoreCommand: nextRestoreCommand,
             processTag: null,
           };
@@ -3777,22 +3787,23 @@ export default function App() {
     const effect = detectProcessEffect({ command: trimmed, name: null });
     const nextEffectId = effect?.id ?? null;
     clearAgentIdleTimer(id);
+    agentWorkingMapRef.current.set(id, false);
+    scheduleAgentWorkingSync();
     setSessions((prev) =>
       prev.map((s) => {
         if (s.id !== id) return s;
         const nextRestoreCommand = effect && !s.persistent ? trimmed : null;
-        if (s.effectId === nextEffectId && (s.restoreCommand ?? null) === nextRestoreCommand && !s.agentWorking)
+        if (s.effectId === nextEffectId && (s.restoreCommand ?? null) === nextRestoreCommand)
           return s;
         return {
           ...s,
           effectId: nextEffectId,
-          agentWorking: false,
           restoreCommand: nextRestoreCommand,
           processTag: null,
         };
       }),
     );
-  }, [clearAgentIdleTimer]);
+  }, [clearAgentIdleTimer, scheduleAgentWorkingSync]);
 
   function pickActiveSessionId(projectId: string): string | null {
     const sessions = sessionsRef.current;
@@ -4028,6 +4039,7 @@ export default function App() {
         const { id, exit_code } = event.payload;
 
         clearAgentIdleTimer(id);
+        agentWorkingMapRef.current.set(id, false);
         lastResizeAtRef.current.delete(id);
 
         const timeout = closingSessions.current.get(id);
@@ -4046,7 +4058,6 @@ export default function App() {
               ...s,
               exited: true,
               exitCode: exit_code ?? null,
-              agentWorking: false,
               recordingActive: false,
             };
           });
@@ -4441,6 +4452,7 @@ export default function App() {
           agentWorkingSyncTimerRef.current = null;
         }
         agentWorkingMapRef.current.clear();
+        setAgentWorkingIds(EMPTY_STRING_SET);
 	      if (saveTimerRef.current !== null) {
 	        window.clearTimeout(saveTimerRef.current);
 	        saveTimerRef.current = null;
@@ -5197,6 +5209,7 @@ export default function App() {
       <SessionsSection
         agentShortcuts={agentShortcuts}
         sessions={stableProjectSessions}
+        agentWorkingIds={agentWorkingIds}
         activeSessionId={activeId}
         onSelectSession={setActiveId}
         onCloseSession={handleCloseSession}
@@ -5210,7 +5223,7 @@ export default function App() {
   ), [
     projects, activeProjectId, activeProject, environments,
     stableSessionCountByProject, stableWorkingAgentCountByProject,
-    prompts, agentShortcuts, stableProjectSessions,
+    prompts, agentShortcuts, stableProjectSessions, agentWorkingIds,
     activeId, projectsListMaxHeight,
     selectProject, moveProject, openNewProject, openRenameProject,
     openProjectSettings, handleDeleteProject,
