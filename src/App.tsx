@@ -1306,6 +1306,7 @@ export default function App() {
   const hydratedRef = useRef<boolean>(hydrated);
   const activeIdRef = useRef<string | null>(null);
   const projectsRef = useRef<Project[]>(projects);
+  const projectByIdRef = useRef<Map<string, Project>>(new Map());
   const activeProjectIdRef = useRef<string>(activeProjectId);
   const lastActiveByProject = useRef<Map<string, string>>(new Map());
   const newNameRef = useRef<HTMLInputElement | null>(null);
@@ -1646,7 +1647,7 @@ export default function App() {
   const handleSelectWorkspaceFile = useCallback(
     (path: string) => {
       updateActiveWorkspaceView((prev) => {
-        const project = projects.find((p) => p.id === activeProjectId) ?? null;
+        const project = projectByIdRef.current.get(activeProjectId) ?? null;
         const root = (
           prev.codeEditorRootDir ??
           prev.fileExplorerRootDir ??
@@ -1798,33 +1799,30 @@ export default function App() {
     [sessions, activeProjectId],
   );
 
-  const sessionCountByProject = useMemo(() => {
-    const counts = new Map<string, number>();
+  const { sessionCountByProject, workingAgentCountByProject } = useMemo(() => {
+    const sessionCounts = new Map<string, number>();
+    const workingCounts = new Map<string, number>();
     for (const s of sessions) {
-      counts.set(s.projectId, (counts.get(s.projectId) ?? 0) + 1);
+      sessionCounts.set(s.projectId, (sessionCounts.get(s.projectId) ?? 0) + 1);
+      if (s.effectId && !s.exited && !s.closing && agentWorkingIds.has(s.id)) {
+        workingCounts.set(s.projectId, (workingCounts.get(s.projectId) ?? 0) + 1);
+      }
     }
-    return counts;
-  }, [sessions]);
-
-  const workingAgentCountByProject = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const s of sessions) {
-      if (!s.effectId) continue;
-      if (s.exited || s.closing) continue;
-      if (!agentWorkingIds.has(s.id)) continue;
-      counts.set(s.projectId, (counts.get(s.projectId) ?? 0) + 1);
-    }
-    return counts;
+    return { sessionCountByProject: sessionCounts, workingAgentCountByProject: workingCounts };
   }, [sessions, agentWorkingIds]);
 
   const persistentSessionItems = useMemo<PersistentSessionsModalItem[]>(() => {
     if (!persistentSessions.length) return [];
     const projectTitleById = new Map(projects.map((p) => [p.id, p.title]));
+    const activeByPersistId = new Map<string, Session>();
+    for (const s of sessions) {
+      if (s.exited || s.closing) continue;
+      if (!activeByPersistId.has(s.persistId)) activeByPersistId.set(s.persistId, s);
+    }
     const out: PersistentSessionsModalItem[] = [];
 
     for (const ps of persistentSessions) {
-      const activeSession =
-        sessions.find((s) => s.persistId === ps.persistId && !s.exited && !s.closing) ?? null;
+      const activeSession = activeByPersistId.get(ps.persistId) ?? null;
       const openInUi = Boolean(activeSession);
       const projectTitle = activeSession ? projectTitleById.get(activeSession.projectId) ?? null : null;
       const label = activeSession
@@ -1963,6 +1961,7 @@ export default function App() {
 
   useEffect(() => {
     projectsRef.current = projects;
+    projectByIdRef.current = new Map(projects.map((p) => [p.id, p]));
   }, [projects]);
 
   useEffect(() => {
@@ -1975,7 +1974,7 @@ export default function App() {
 
   useEffect(() => {
     if (!activeId) return;
-    const s = sessions.find((s) => s.id === activeId);
+    const s = sessionByIdRef.current.get(activeId);
     if (!s) return;
     lastActiveByProject.current.set(s.projectId, s.id);
     setActiveSessionByProject((prev) => {
@@ -3349,7 +3348,7 @@ export default function App() {
     const projectId = activeProjectId;
 
     const activeSessionId = activeId;
-    const activeSession = activeSessionId ? sessions.find((s) => s.id === activeSessionId) ?? null : null;
+    const activeSession = activeSessionId ? sessionByIdRef.current.get(activeSessionId) ?? null : null;
 
     const defaultAgentId = agentShortcutIds[0] ?? null;
     const effect =
@@ -3545,7 +3544,7 @@ export default function App() {
 
     const enabledProject =
       assetsEnabledOverride ??
-      (projects.find((p) => p.id === projectId)?.assetsEnabled ?? true);
+      (projectByIdRef.current.get(projectId)?.assetsEnabled ?? true);
     if (!enabledProject) return;
 
     const templates = assets.filter((a) => a.autoApply ?? true);
@@ -3808,7 +3807,7 @@ export default function App() {
   function pickActiveSessionId(projectId: string): string | null {
     const sessions = sessionsRef.current;
     const last = lastActiveByProject.current.get(projectId);
-    if (last && sessions.some((s) => s.id === last)) return last;
+    if (last && sessionByIdRef.current.has(last)) return last;
     const first = sessions.find((s) => s.projectId === projectId);
     return first ? first.id : null;
   }
@@ -3838,7 +3837,7 @@ export default function App() {
 
   const openNewProject = useCallback(() => {
     const activeSession = sessionByIdRef.current.get(activeIdRef.current ?? "");
-    const curProject = projectsRef.current.find((p) => p.id === activeProjectIdRef.current) ?? null;
+    const curProject = projectByIdRef.current.get(activeProjectIdRef.current ?? "") ?? null;
     setNewOpen(false);
     setProjectMode("new");
     setProjectTitle("");
@@ -3849,7 +3848,7 @@ export default function App() {
   }, []);
 
   const openProjectSettings = useCallback((projectId: string) => {
-    const project = projectsRef.current.find((p) => p.id === projectId);
+    const project = projectByIdRef.current.get(projectId);
     if (!project) return;
 
     setNewOpen(false);
@@ -3863,7 +3862,7 @@ export default function App() {
   }, []);
 
   const openRenameProject = useCallback(() => {
-    const curProject = projectsRef.current.find((p) => p.id === activeProjectIdRef.current) ?? null;
+    const curProject = projectByIdRef.current.get(activeProjectIdRef.current ?? "") ?? null;
     if (!curProject) return;
     openProjectSettings(curProject.id);
   }, [openProjectSettings]);
@@ -3934,7 +3933,7 @@ export default function App() {
   }
 
   async function deleteActiveProject() {
-    const project = projects.find((p) => p.id === activeProjectId);
+    const project = projectByIdRef.current.get(activeProjectId);
     if (!project) return;
 
     const idsToClose = sessionsRef.current
@@ -5136,11 +5135,12 @@ export default function App() {
   const stableSessionCountByProject = useMemo(() => {
     const next = sessionCountByProject;
     const prev = sessionCountByProjectRef.current;
-    if (
-      prev.size === next.size &&
-      [...next].every(([k, v]) => prev.get(k) === v)
-    ) {
-      return prev;
+    if (prev.size === next.size) {
+      let same = true;
+      for (const [k, v] of next) {
+        if (prev.get(k) !== v) { same = false; break; }
+      }
+      if (same) return prev;
     }
     sessionCountByProjectRef.current = next;
     return next;
@@ -5150,11 +5150,12 @@ export default function App() {
   const stableWorkingAgentCountByProject = useMemo(() => {
     const next = workingAgentCountByProject;
     const prev = workingAgentCountByProjectRef.current;
-    if (
-      prev.size === next.size &&
-      [...next].every(([k, v]) => prev.get(k) === v)
-    ) {
-      return prev;
+    if (prev.size === next.size) {
+      let same = true;
+      for (const [k, v] of next) {
+        if (prev.get(k) !== v) { same = false; break; }
+      }
+      if (same) return prev;
     }
     workingAgentCountByProjectRef.current = next;
     return next;

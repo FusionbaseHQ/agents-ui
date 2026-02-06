@@ -53,6 +53,7 @@ struct SessionRecording {
     last_flush: Instant,
     unflushed_bytes: usize,
     input_buffer: String,
+    json_buf: Vec<u8>,
     enc_key: Option<[u8; 32]>,
 }
 
@@ -702,14 +703,16 @@ fn write_recording_event(rec: &mut SessionRecording, t: u64, data: &str) -> Resu
         t,
         data,
     });
-    let json = serde_json::to_string(&line).map_err(|e| format!("serialize failed: {e}"))?;
+    rec.json_buf.clear();
+    serde_json::to_writer(&mut rec.json_buf, &line)
+        .map_err(|e| format!("serialize failed: {e}"))?;
     rec.writer
-        .write_all(json.as_bytes())
+        .write_all(&rec.json_buf)
         .map_err(|e| format!("write failed: {e}"))?;
     rec.writer
         .write_all(b"\n")
         .map_err(|e| format!("write failed: {e}"))?;
-    rec.unflushed_bytes += json.len() + 1;
+    rec.unflushed_bytes += rec.json_buf.len() + 1;
     Ok(())
 }
 
@@ -837,9 +840,47 @@ fn decode_utf8_stream(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
     if chunk.is_empty() {
         return String::new();
     }
+
+    // Fast path: no leftover bytes from previous call — validate chunk directly
+    // without copying into carry, avoiding re-validation of already-processed data.
+    if carry.is_empty() {
+        match std::str::from_utf8(chunk) {
+            Ok(s) => return s.to_string(),
+            Err(e) => {
+                let valid = e.valid_up_to();
+                let mut out = String::with_capacity(chunk.len());
+                if valid > 0 {
+                    out.push_str(unsafe { std::str::from_utf8_unchecked(&chunk[..valid]) });
+                }
+                match e.error_len() {
+                    None => {
+                        // Incomplete multi-byte at end — stash tail in carry
+                        carry.extend_from_slice(&chunk[valid..]);
+                        return out;
+                    }
+                    Some(len) => {
+                        out.push('\u{FFFD}');
+                        // Fall through to slow path for remaining bytes
+                        carry.extend_from_slice(&chunk[valid + len..]);
+                    }
+                }
+                if carry.is_empty() {
+                    return out;
+                }
+                // Remaining bytes after the error — process via slow path
+                let rest = std::mem::take(carry);
+                let tail = decode_utf8_stream(carry, &rest);
+                out.push_str(&tail);
+                return out;
+            }
+        }
+    }
+
+    // Slow path: carry has leftover bytes from a previous incomplete sequence.
+    // Typically only 1-3 bytes, so re-validating the full buffer is cheap.
     carry.extend_from_slice(chunk);
 
-    let mut out = String::new();
+    let mut out = String::with_capacity(carry.len());
     let mut idx = 0usize;
     while idx < carry.len() {
         match std::str::from_utf8(&carry[idx..]) {
@@ -859,7 +900,7 @@ fn decode_utf8_stream(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
                 match e.error_len() {
                     None => break,
                     Some(len) => {
-                        out.push('�');
+                        out.push('\u{FFFD}');
                         idx = (idx + len).min(carry.len());
                     }
                 }
@@ -1588,7 +1629,7 @@ pub fn create_session(
     // Reader thread: reads from PTY, decodes UTF-8, sends strings to channel.
     // Blocking reader.read() is isolated here so the emitter can flush on timeout.
     std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; 16384];
         let mut utf8_carry: Vec<u8> = Vec::new();
         loop {
             match reader.read(&mut buf) {
@@ -1617,7 +1658,7 @@ pub fn create_session(
     // recv_timeout ensures the buffer is flushed even when the reader blocks on I/O.
     std::thread::spawn(move || {
         const OUTPUT_EMIT_BYTES: usize = 16 * 1024;
-        const OUTPUT_EMIT_INTERVAL: Duration = Duration::from_millis(8);
+        const OUTPUT_EMIT_INTERVAL: Duration = Duration::from_millis(12);
 
         let mut output_buffer = String::new();
         let mut last_emit_at = Instant::now();
@@ -1761,6 +1802,7 @@ pub fn start_session_recording(
         last_flush: Instant::now(),
         unflushed_bytes: 0,
         input_buffer: String::new(),
+        json_buf: Vec::with_capacity(256),
         enc_key,
     });
 

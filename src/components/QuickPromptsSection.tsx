@@ -25,10 +25,14 @@ export const QuickPromptsSection = React.memo(function QuickPromptsSection({
   onEditPrompt,
   onOpenPromptsPanel,
 }: QuickPromptsSectionProps) {
-  const pinnedPrompts = prompts
-    .filter((p) => p.pinned)
-    .sort((a, b) => (a.pinOrder ?? 0) - (b.pinOrder ?? 0))
-    .slice(0, 5);
+  const pinnedPrompts = React.useMemo(
+    () =>
+      prompts
+        .filter((p) => p.pinned)
+        .sort((a, b) => (a.pinOrder ?? 0) - (b.pinOrder ?? 0))
+        .slice(0, 5),
+    [prompts],
+  );
 
   if (pinnedPrompts.length === 0) return null;
 

@@ -239,7 +239,7 @@ pub fn save_persisted_state(window: WebviewWindow, state: PersistedStateV1) -> R
         }
     }
 
-    let json = serde_json::to_string_pretty(&state).map_err(|e| format!("serialize failed: {e}"))?;
+    let json = serde_json::to_string(&state).map_err(|e| format!("serialize failed: {e}"))?;
 
     let mut file = fs::File::create(&tmp).map_err(|e| format!("write temp failed: {e}"))?;
     file.write_all(json.as_bytes())

@@ -30,7 +30,7 @@ type IconProps = {
   className?: string;
 };
 
-export function Icon({ name, size = 16, className }: IconProps) {
+export const Icon = React.memo(function Icon({ name, size = 16, className }: IconProps) {
   const common = {
     width: size,
     height: size,
@@ -220,4 +220,4 @@ export function Icon({ name, size = 16, className }: IconProps) {
     default:
       return null;
   }
-}
+});

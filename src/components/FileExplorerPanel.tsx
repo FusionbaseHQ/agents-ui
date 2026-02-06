@@ -132,6 +132,90 @@ async function copyToClipboard(text: string): Promise<boolean> {
   }
 }
 
+type FileRowProps = {
+  entry: FsEntry;
+  depth: number;
+  rowHeight: number;
+  isActive: boolean;
+  isContextTarget: boolean;
+  isExpanded: boolean;
+  isDropTarget: boolean;
+  isPreparing: boolean;
+  onToggleDir: (path: string) => void;
+  onSelectFile: (path: string) => void;
+  onContextMenu: (x: number, y: number, entry: FsEntry) => void;
+  onMouseDown: (e: React.MouseEvent, entry: FsEntry) => void;
+  onMouseMove: (e: React.MouseEvent) => void;
+  onMouseUp: () => void;
+};
+
+const FileRow = React.memo(function FileRow({
+  entry,
+  depth,
+  rowHeight,
+  isActive,
+  isContextTarget,
+  isExpanded,
+  isDropTarget,
+  isPreparing,
+  onToggleDir,
+  onSelectFile,
+  onContextMenu,
+  onMouseDown,
+  onMouseMove,
+  onMouseUp,
+}: FileRowProps) {
+  const indent = 12 + depth * 14;
+  let cn = "fileExplorerRow";
+  if (isActive) cn += " fileExplorerRowActive";
+  if (isContextTarget) cn += " fileExplorerRowContext";
+  if (isDropTarget) cn += " fileExplorerRowDropTarget";
+  if (isPreparing) cn += " fileExplorerRowPreparing";
+
+  return (
+    <button
+      key={entry.path}
+      type="button"
+      className={cn}
+      style={{ paddingLeft: indent, height: rowHeight }}
+      data-fs-entry-path={entry.path}
+      data-fs-entry-is-dir={entry.isDir ? "true" : "false"}
+      onMouseDown={(e) => onMouseDown(e, entry)}
+      onMouseMove={onMouseMove}
+      onMouseUp={onMouseUp}
+      onClick={() => {
+        if (entry.isDir) {
+          onToggleDir(entry.path);
+          return;
+        }
+        onSelectFile(entry.path);
+      }}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onContextMenu(e.clientX, e.clientY, entry);
+      }}
+      role="treeitem"
+      aria-expanded={entry.isDir ? isExpanded : undefined}
+      title={entry.path}
+    >
+      {entry.isDir ? (
+        <span className="fileExplorerDisclosure" aria-hidden="true">
+          {isExpanded ? "▾" : "▸"}
+        </span>
+      ) : (
+        <span className="fileExplorerDisclosure" aria-hidden="true">
+          {" "}
+        </span>
+      )}
+      <span className="fileExplorerIcon" aria-hidden="true">
+        <Icon name={entry.isDir ? "folder" : "file"} size={14} />
+      </span>
+      <span className="fileExplorerName">{entry.name}</span>
+    </button>
+  );
+});
+
 export function FileExplorerPanel({
   isOpen,
   provider,
@@ -528,10 +612,10 @@ export function FileExplorerPanel({
         next.add(path);
         return next;
       });
-      const state = dirStateByPath[path];
+      const state = dirStateByPathRef.current[path];
       if (!state || state.error) void loadDirectory(path);
     },
-    [dirStateByPath, loadDirectory],
+    [loadDirectory],
   );
 
   const refreshRoot = React.useCallback(() => {
@@ -845,6 +929,10 @@ export function FileExplorerPanel({
     mouseDownRef.current = null;
   }, []);
 
+  const handleContextMenuOpen = React.useCallback((x: number, y: number, entry: FsEntry) => {
+    setContextMenu({ x, y, entry });
+  }, []);
+
   // Global mouse up listener to handle mouse release outside the component
   React.useEffect(() => {
     const handleGlobalMouseUp = () => {
@@ -1027,61 +1115,24 @@ export function FileExplorerPanel({
                   }
 
                   const entry = item.entry;
-                  const isActive = Boolean(activeNorm && activeNorm === normalizePath(entry.path));
-                  const isContextTarget = Boolean(contextNorm && contextNorm === normalizePath(entry.path));
-                  const isExpanded = entry.isDir && expandedDirs.has(entry.path);
-                  const isDropTarget = dropTarget === entry.path;
-                  const isPreparing = dragPreparing === entry.path;
-                  const indent = 12 + item.depth * 14;
                   return (
-                    <button
+                    <FileRow
                       key={entry.path}
-                      type="button"
-                      className={[
-                        "fileExplorerRow",
-                        isActive ? "fileExplorerRowActive" : "",
-                        isContextTarget ? "fileExplorerRowContext" : "",
-                        isDropTarget ? "fileExplorerRowDropTarget" : "",
-                        isPreparing ? "fileExplorerRowPreparing" : "",
-                      ]
-                        .filter(Boolean)
-                        .join(" ")}
-                      style={{ paddingLeft: indent, height: rowHeight }}
-                      data-fs-entry-path={entry.path}
-                      data-fs-entry-is-dir={entry.isDir ? "true" : "false"}
-                      onMouseDown={(e) => handleMouseDown(e, entry)}
+                      entry={entry}
+                      depth={item.depth}
+                      rowHeight={rowHeight}
+                      isActive={Boolean(activeNorm && activeNorm === entry.path)}
+                      isContextTarget={Boolean(contextNorm && contextNorm === entry.path)}
+                      isExpanded={entry.isDir && expandedDirs.has(entry.path)}
+                      isDropTarget={dropTarget === entry.path}
+                      isPreparing={dragPreparing === entry.path}
+                      onToggleDir={toggleDir}
+                      onSelectFile={onSelectFile}
+                      onContextMenu={handleContextMenuOpen}
+                      onMouseDown={handleMouseDown}
                       onMouseMove={handleMouseMove}
                       onMouseUp={handleMouseUp}
-                      onClick={() => {
-                        if (entry.isDir) {
-                          toggleDir(entry.path);
-                          return;
-                        }
-                        onSelectFile(entry.path);
-                      }}
-                      onContextMenu={(e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        setContextMenu({ x: e.clientX, y: e.clientY, entry });
-                      }}
-                      role="treeitem"
-                      aria-expanded={entry.isDir ? isExpanded : undefined}
-                      title={entry.path}
-                    >
-                      {entry.isDir ? (
-                        <span className="fileExplorerDisclosure" aria-hidden="true">
-                          {isExpanded ? "▾" : "▸"}
-                        </span>
-                      ) : (
-                        <span className="fileExplorerDisclosure" aria-hidden="true">
-                          {" "}
-                        </span>
-                      )}
-                      <span className="fileExplorerIcon" aria-hidden="true">
-                        <Icon name={entry.isDir ? "folder" : "file"} size={14} />
-                      </span>
-                      <span className="fileExplorerName">{entry.name}</span>
-                    </button>
+                    />
                   );
                 })}
               </div>

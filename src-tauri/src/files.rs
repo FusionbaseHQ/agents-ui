@@ -86,14 +86,19 @@ pub fn list_fs_entries(root: String, path: String) -> Result<Vec<FsEntry>, Strin
         });
     }
 
-    entries.sort_by(|a, b| {
+    // Pre-compute lowercase names to avoid O(n log n) string allocations during sort.
+    let mut sortable: Vec<(String, FsEntry)> = entries
+        .into_iter()
+        .map(|e| (e.name.to_lowercase(), e))
+        .collect();
+    sortable.sort_by(|(ka, a), (kb, b)| {
         match (a.is_dir, b.is_dir) {
-            (true, false) => return std::cmp::Ordering::Less,
-            (false, true) => return std::cmp::Ordering::Greater,
-            _ => {}
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => ka.cmp(kb),
         }
-        a.name.to_lowercase().cmp(&b.name.to_lowercase())
     });
+    let entries: Vec<FsEntry> = sortable.into_iter().map(|(_, e)| e).collect();
 
     Ok(entries)
 }
