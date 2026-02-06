@@ -1,34 +1,46 @@
-import React from "react";
+import React, { useState, useEffect, useCallback } from "react";
 
 type DirectoryEntry = { name: string; path: string };
 type DirectoryListing = { path: string; parent: string | null; entries: DirectoryEntry[] };
 
 type PathPickerModalProps = {
-  isOpen: boolean;
-  listing: DirectoryListing | null;
-  input: string;
+  initialPath: string | null;
   placeholder: string;
-  loading: boolean;
-  error: string | null;
-  onInputChange: (value: string) => void;
-  onLoad: (path: string | null) => void;
+  loadDirectory: (path: string | null) => Promise<DirectoryListing>;
   onClose: () => void;
-  onSelect: () => void;
+  onSelect: (path: string) => void;
 };
 
 export function PathPickerModal({
-  isOpen,
-  listing,
-  input,
+  initialPath,
   placeholder,
-  loading,
-  error,
-  onInputChange,
-  onLoad,
+  loadDirectory,
   onClose,
   onSelect,
 }: PathPickerModalProps) {
-  if (!isOpen) return null;
+  const [listing, setListing] = useState<DirectoryListing | null>(null);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async (path: string | null) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await loadDirectory(path);
+      setListing(result);
+      setInput(result.path);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [loadDirectory]);
+
+  useEffect(() => {
+    void load(initialPath);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div className="modalBackdrop" onClick={onClose}>
@@ -37,7 +49,7 @@ export function PathPickerModal({
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            onLoad(input.trim() || null);
+            void load(input.trim() || null);
           }}
         >
           <div className="pathPickerHeader">
@@ -45,7 +57,7 @@ export function PathPickerModal({
               type="button"
               className="btn"
               disabled={!listing?.parent || loading}
-              onClick={() => onLoad(listing?.parent ?? null)}
+              onClick={() => void load(listing?.parent ?? null)}
               title="Up"
             >
               Up
@@ -53,7 +65,7 @@ export function PathPickerModal({
             <input
               className="input"
               value={input}
-              onChange={(e) => onInputChange(e.target.value)}
+              onChange={(e) => setInput(e.target.value)}
               placeholder={placeholder}
             />
             <button type="submit" className="btn" disabled={loading}>
@@ -79,7 +91,7 @@ export function PathPickerModal({
                 key={e.path}
                 type="button"
                 className="pathPickerItem"
-                onClick={() => onLoad(e.path)}
+                onClick={() => void load(e.path)}
                 title={e.path}
               >
                 {e.name}
@@ -92,7 +104,12 @@ export function PathPickerModal({
           <button type="button" className="btn" onClick={onClose}>
             Cancel
           </button>
-          <button type="button" className="btn" disabled={!listing} onClick={onSelect}>
+          <button
+            type="button"
+            className="btn"
+            disabled={!listing}
+            onClick={() => listing && onSelect(listing.path)}
+          >
             Select
           </button>
         </div>
@@ -100,4 +117,3 @@ export function PathPickerModal({
     </div>
   );
 }
-

@@ -67,7 +67,7 @@ pub struct SessionInfo {
 
 #[derive(Serialize, Clone)]
 struct PtyOutput {
-    id: String,
+    id: Arc<str>,
     data: String,
 }
 
@@ -1622,7 +1622,7 @@ pub fn create_session(
     drop(sessions);
 
     let id_for_reader = id.clone();
-    let id_for_emitter = id.clone();
+    let id_for_emitter: Arc<str> = Arc::from(id.as_str());
     let state_for_emitter = state.inner().clone();
     let (tx, rx) = mpsc::channel::<String>();
 
@@ -1657,7 +1657,7 @@ pub fn create_session(
     // Emitter thread: buffers received strings and emits batched pty-output events.
     // recv_timeout ensures the buffer is flushed even when the reader blocks on I/O.
     std::thread::spawn(move || {
-        const OUTPUT_EMIT_BYTES: usize = 16 * 1024;
+        const OUTPUT_EMIT_BYTES: usize = 32 * 1024;
         const OUTPUT_EMIT_INTERVAL: Duration = Duration::from_millis(12);
 
         let mut output_buffer = String::new();

@@ -1,4 +1,4 @@
-import React, { useMemo } from "react";
+import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { Icon } from "../Icon";
 
 export type SshHostEntry = {
@@ -19,6 +19,15 @@ export type SshForward = {
   destinationPort: string;
 };
 
+export type SshConnectData = {
+  host: string;
+  persistent: boolean;
+  forwardOnly: boolean;
+  exitOnForwardFailure: boolean;
+  forwards: SshForward[];
+  command: string;
+};
+
 function formatHostDetails(entry: SshHostEntry): string | null {
   const hostName = entry.hostName?.trim() || null;
   const user = entry.user?.trim() || null;
@@ -30,62 +39,168 @@ function formatHostDetails(entry: SshHostEntry): string | null {
   return parts.length ? parts.join("") : null;
 }
 
+function sshForwardFlag(type: SshForwardType): "-L" | "-R" | "-D" {
+  if (type === "remote") return "-R";
+  if (type === "dynamic") return "-D";
+  return "-L";
+}
+
+function sshForwardSpec(f: SshForward): string | null {
+  const listenPort = f.listenPort.trim();
+  if (!listenPort) return null;
+  const bind = f.bindAddress.trim();
+  if (f.type === "dynamic") {
+    return bind ? `${bind}:${listenPort}` : listenPort;
+  }
+  const destHost = f.destinationHost.trim() || "localhost";
+  const destPort = f.destinationPort.trim();
+  if (!destPort) return null;
+  const prefix = bind ? `${bind}:${listenPort}` : listenPort;
+  return `${prefix}:${destHost}:${destPort}`;
+}
+
+function buildSshCommand(input: {
+  host: string;
+  forwards: SshForward[];
+  exitOnForwardFailure: boolean;
+  forwardOnly: boolean;
+}): string | null {
+  const host = input.host.trim();
+  if (!host) return null;
+
+  const args: string[] = ["ssh"];
+  if (input.exitOnForwardFailure && input.forwards.length > 0) {
+    args.push("-o", "ExitOnForwardFailure=yes");
+  }
+  if (input.forwardOnly) {
+    args.push("-N");
+  }
+  for (const f of input.forwards) {
+    const spec = sshForwardSpec(f);
+    if (!spec) return null;
+    args.push(sshForwardFlag(f.type), spec);
+  }
+  args.push(host);
+
+  return args.join(" ");
+}
+
+function parsePort(value: string): number | null {
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const num = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(num) || num < 1 || num > 65535) return null;
+  return num;
+}
+
+let nextForwardId = 1;
+function makeForwardId(): string {
+  return `fwd-${nextForwardId++}-${Date.now()}`;
+}
+
 type SshManagerModalProps = {
-  isOpen: boolean;
   hosts: SshHostEntry[];
   hostsLoading: boolean;
   hostsError: string | null;
   onRefreshHosts: () => void;
-
-  host: string;
-  hostInputRef: React.RefObject<HTMLInputElement>;
-  onChangeHost: (value: string) => void;
-
-  persistent: boolean;
-  onChangePersistent: (value: boolean) => void;
-  forwardOnly: boolean;
-  onChangeForwardOnly: (value: boolean) => void;
-  exitOnForwardFailure: boolean;
-  onChangeExitOnForwardFailure: (value: boolean) => void;
-
-  forwards: SshForward[];
-  onAddForward: () => void;
-  onRemoveForward: (id: string) => void;
-  onUpdateForward: (id: string, patch: Partial<SshForward>) => void;
-
-  commandPreview: string | null;
-  onCopyCommand: () => void;
-
-  error: string | null;
+  onCopyToClipboard: (text: string) => void;
   onClose: () => void;
-  onConnect: () => void;
+  onConnect: (data: SshConnectData) => Promise<void>;
 };
 
 export function SshManagerModal({
-  isOpen,
   hosts,
   hostsLoading,
   hostsError,
   onRefreshHosts,
-  host,
-  hostInputRef,
-  onChangeHost,
-  persistent,
-  onChangePersistent,
-  forwardOnly,
-  onChangeForwardOnly,
-  exitOnForwardFailure,
-  onChangeExitOnForwardFailure,
-  forwards,
-  onAddForward,
-  onRemoveForward,
-  onUpdateForward,
-  commandPreview,
-  onCopyCommand,
-  error,
+  onCopyToClipboard,
   onClose,
   onConnect,
 }: SshManagerModalProps) {
+  const [host, setHost] = useState("");
+  const [persistent, setPersistent] = useState(false);
+  const [forwardOnly, setForwardOnly] = useState(false);
+  const [exitOnForwardFailure, setExitOnForwardFailure] = useState(true);
+  const [forwards, setForwards] = useState<SshForward[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+  const hostInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const t = window.setTimeout(() => hostInputRef.current?.focus(), 0);
+    return () => clearTimeout(t);
+  }, []);
+
+  const commandPreview = useMemo(() => {
+    return buildSshCommand({ host, forwards, exitOnForwardFailure, forwardOnly });
+  }, [host, forwards, exitOnForwardFailure, forwardOnly]);
+
+  const addForward = useCallback(() => {
+    setForwards((prev) => [
+      ...prev,
+      {
+        id: makeForwardId(),
+        type: "local",
+        bindAddress: "",
+        listenPort: "",
+        destinationHost: "localhost",
+        destinationPort: "",
+      },
+    ]);
+  }, []);
+
+  const removeForward = useCallback((id: string) => {
+    setForwards((prev) => prev.filter((f) => f.id !== id));
+  }, []);
+
+  const updateForward = useCallback((id: string, patch: Partial<SshForward>) => {
+    setForwards((prev) => prev.map((f) => (f.id === id ? { ...f, ...patch } : f)));
+  }, []);
+
+  const handleConnect = async () => {
+    setError(null);
+
+    const target = host.trim();
+    if (!target) {
+      setError("Pick an SSH host.");
+      return;
+    }
+
+    for (const [idx, f] of forwards.entries()) {
+      const listenPort = parsePort(f.listenPort);
+      if (!listenPort) {
+        setError(`Forward #${idx + 1}: invalid listen port.`);
+        return;
+      }
+      if (f.type !== "dynamic") {
+        if (!f.destinationHost.trim()) {
+          setError(`Forward #${idx + 1}: destination host is required.`);
+          return;
+        }
+        const destPort = parsePort(f.destinationPort);
+        if (!destPort) {
+          setError(`Forward #${idx + 1}: invalid destination port.`);
+          return;
+        }
+      }
+    }
+
+    const command = commandPreview;
+    if (!command) {
+      setError("Invalid SSH configuration.");
+      return;
+    }
+
+    setConnecting(true);
+    try {
+      await onConnect({ host: target, persistent, forwardOnly, exitOnForwardFailure, forwards, command });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setConnecting(false);
+    }
+  };
+
   const selectedHost = useMemo(() => {
     const needle = host.trim();
     if (!needle) return null;
@@ -123,8 +238,6 @@ export function SshManagerModal({
 
   const hostQuery = host.trim();
 
-  if (!isOpen) return null;
-
   return (
     <div className="modalBackdrop" onClick={onClose}>
       <div className="modal sshModal" onClick={(e) => e.stopPropagation()}>
@@ -143,7 +256,7 @@ export function SshManagerModal({
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            onConnect();
+            void handleConnect();
           }}
         >
           <div className="formRow">
@@ -153,7 +266,7 @@ export function SshManagerModal({
                 ref={hostInputRef}
                 className="input"
                 value={host}
-                onChange={(e) => onChangeHost(e.target.value)}
+                onChange={(e) => setHost(e.target.value)}
                 placeholder="Start typing an SSH host…"
                 list="ssh-hosts"
                 autoCapitalize="off"
@@ -201,7 +314,7 @@ export function SshManagerModal({
                           key={h.alias}
                           type="button"
                           className={`sshHostItem ${isSelected ? "sshHostItemActive" : ""}`}
-                          onClick={() => onChangeHost(h.alias)}
+                          onClick={() => setHost(h.alias)}
                           title={meta ? `${h.alias}\n${meta}` : h.alias}
                         >
                           <div className="sshHostItemMain">
@@ -238,7 +351,7 @@ export function SshManagerModal({
                 <input
                   type="checkbox"
                   checked={persistent}
-                  onChange={(e) => onChangePersistent(e.target.checked)}
+                  onChange={(e) => setPersistent(e.target.checked)}
                 />
                 Persistent terminal (zellij)
               </label>
@@ -246,7 +359,7 @@ export function SshManagerModal({
                 <input
                   type="checkbox"
                   checked={exitOnForwardFailure}
-                  onChange={(e) => onChangeExitOnForwardFailure(e.target.checked)}
+                  onChange={(e) => setExitOnForwardFailure(e.target.checked)}
                 />
                 Exit on forward failure (<code>ExitOnForwardFailure</code>)
               </label>
@@ -254,7 +367,7 @@ export function SshManagerModal({
                 <input
                   type="checkbox"
                   checked={forwardOnly}
-                  onChange={(e) => onChangeForwardOnly(e.target.checked)}
+                  onChange={(e) => setForwardOnly(e.target.checked)}
                 />
                 Port forwarding only (no shell, <code>-N</code>)
               </label>
@@ -277,7 +390,7 @@ export function SshManagerModal({
                       className="input sshForwardType"
                       value={f.type}
                       onChange={(e) =>
-                        onUpdateForward(f.id, { type: e.target.value as SshForwardType })
+                        updateForward(f.id, { type: e.target.value as SshForwardType })
                       }
                       aria-label="Forward type"
                     >
@@ -289,7 +402,7 @@ export function SshManagerModal({
                     <input
                       className="input sshForwardBind"
                       value={f.bindAddress}
-                      onChange={(e) => onUpdateForward(f.id, { bindAddress: e.target.value })}
+                      onChange={(e) => updateForward(f.id, { bindAddress: e.target.value })}
                       placeholder="Bind (opt)"
                       aria-label="Bind address (optional)"
                     />
@@ -297,7 +410,7 @@ export function SshManagerModal({
                     <input
                       className="input sshForwardPort"
                       value={f.listenPort}
-                      onChange={(e) => onUpdateForward(f.id, { listenPort: e.target.value })}
+                      onChange={(e) => updateForward(f.id, { listenPort: e.target.value })}
                       placeholder="Port"
                       inputMode="numeric"
                       aria-label="Listen port"
@@ -310,14 +423,14 @@ export function SshManagerModal({
                         <input
                           className="input sshForwardDestHost"
                           value={f.destinationHost}
-                          onChange={(e) => onUpdateForward(f.id, { destinationHost: e.target.value })}
+                          onChange={(e) => updateForward(f.id, { destinationHost: e.target.value })}
                           placeholder="Dest host"
                           aria-label="Destination host"
                         />
                         <input
                           className="input sshForwardPort"
                           value={f.destinationPort}
-                          onChange={(e) => onUpdateForward(f.id, { destinationPort: e.target.value })}
+                          onChange={(e) => updateForward(f.id, { destinationPort: e.target.value })}
                           placeholder="Dest port"
                           inputMode="numeric"
                           aria-label="Destination port"
@@ -328,7 +441,7 @@ export function SshManagerModal({
                     <button
                       type="button"
                       className="btnSmall btnDanger sshForwardRemove"
-                      onClick={() => onRemoveForward(f.id)}
+                      onClick={() => removeForward(f.id)}
                       title="Remove forward"
                     >
                       Remove
@@ -339,7 +452,7 @@ export function SshManagerModal({
             )}
 
             <div className="sshForwardActions">
-              <button type="button" className="btnSmall" onClick={onAddForward}>
+              <button type="button" className="btnSmall" onClick={addForward}>
                 + Add forward
               </button>
             </div>
@@ -356,7 +469,7 @@ export function SshManagerModal({
                   type="button"
                   className="btnSmall"
                   disabled={!commandPreview}
-                  onClick={onCopyCommand}
+                  onClick={() => commandPreview && onCopyToClipboard(commandPreview)}
                   title={commandPreview ? "Copy command to clipboard" : "Nothing to copy yet"}
                 >
                   Copy
@@ -372,10 +485,10 @@ export function SshManagerModal({
           )}
 
           <div className="modalActions">
-            <button type="button" className="btn" onClick={onClose}>
+            <button type="button" className="btn" onClick={onClose} disabled={connecting}>
               Cancel
             </button>
-            <button type="submit" className="btn btnPrimary">
+            <button type="submit" className="btn btnPrimary" disabled={connecting}>
               Connect
             </button>
           </div>

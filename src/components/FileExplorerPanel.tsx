@@ -197,7 +197,7 @@ const FileRow = React.memo(function FileRow({
       }}
       role="treeitem"
       aria-expanded={entry.isDir ? isExpanded : undefined}
-      title={entry.path}
+      title={shortenPathSmart(entry.path, 200)}
     >
       {entry.isDir ? (
         <span className="fileExplorerDisclosure" aria-hidden="true">
@@ -1049,7 +1049,7 @@ export function FileExplorerPanel({
       <div className="fileExplorerHeader">
         <div className="fileExplorerTitle">
           <span>Files</span>
-          <span className="fileExplorerPath" title={rootDir}>
+          <span className="fileExplorerPath" title={shortenPathSmart(rootDir, 120)}>
             {shortenPathSmart(rootDir, 46)}
           </span>
         </div>

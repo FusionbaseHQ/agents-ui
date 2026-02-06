@@ -25,12 +25,12 @@ import type {
   CodeEditorPersistedState,
 } from "./components/CodeEditorPanel";
 import { AgentShortcutsModal } from "./components/AgentShortcutsModal";
-import { NewSessionModal } from "./components/modals/NewSessionModal";
+import { NewSessionModal, type NewSessionModalHandle, type NewSessionSubmitData } from "./components/modals/NewSessionModal";
 import {
   PersistentSessionsModal,
   type PersistentSessionsModalItem,
 } from "./components/modals/PersistentSessionsModal";
-import { ProjectModal } from "./components/modals/ProjectModal";
+import { ProjectModal, type ProjectModalHandle, type ProjectSubmitData } from "./components/modals/ProjectModal";
 import { ConfirmDeleteProjectModal } from "./components/modals/ConfirmDeleteProjectModal";
 import { ConfirmDeleteRecordingModal } from "./components/modals/ConfirmDeleteRecordingModal";
 import { ApplyAssetModal } from "./components/modals/ApplyAssetModal";
@@ -39,8 +39,7 @@ import { PathPickerModal } from "./components/modals/PathPickerModal";
 import { UpdateModal, UpdateCheckState } from "./components/modals/UpdateModal";
 import {
   SshManagerModal,
-  type SshForward,
-  type SshForwardType,
+  type SshConnectData,
   type SshHostEntry,
 } from "./components/modals/SshManagerModal";
 
@@ -236,63 +235,6 @@ async function copyToClipboard(text: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-function parsePort(value: string): number | null {
-  const trimmed = value.trim();
-  if (!/^\d+$/.test(trimmed)) return null;
-  const num = Number.parseInt(trimmed, 10);
-  if (!Number.isFinite(num) || num < 1 || num > 65535) return null;
-  return num;
-}
-
-function sshForwardFlag(type: SshForwardType): "-L" | "-R" | "-D" {
-  if (type === "remote") return "-R";
-  if (type === "dynamic") return "-D";
-  return "-L";
-}
-
-function sshForwardSpec(f: SshForward): string | null {
-  const listenPort = parsePort(f.listenPort);
-  if (!listenPort) return null;
-
-  const bind = f.bindAddress.trim();
-  if (f.type === "dynamic") {
-    return bind ? `${bind}:${listenPort}` : `${listenPort}`;
-  }
-
-  const destHost = f.destinationHost.trim();
-  const destPort = parsePort(f.destinationPort);
-  if (!destHost || !destPort) return null;
-
-  const prefix = bind ? `${bind}:${listenPort}` : `${listenPort}`;
-  return `${prefix}:${destHost}:${destPort}`;
-}
-
-function buildSshCommand(input: {
-  host: string;
-  forwards: SshForward[];
-  exitOnForwardFailure: boolean;
-  forwardOnly: boolean;
-}): string | null {
-  const host = input.host.trim();
-  if (!host) return null;
-
-  const args: string[] = ["ssh"];
-  if (input.exitOnForwardFailure && input.forwards.length > 0) {
-    args.push("-o", "ExitOnForwardFailure=yes");
-  }
-  if (input.forwardOnly) {
-    args.push("-N");
-  }
-  for (const f of input.forwards) {
-    const spec = sshForwardSpec(f);
-    if (!spec) return null;
-    args.push(sshForwardFlag(f.type), spec);
-  }
-  args.push(host);
-
-  return args.join(" ");
 }
 
 function shellEscapePosix(value: string): string {
@@ -953,27 +895,11 @@ export default function App() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
   const [newOpen, setNewOpen] = useState(false);
-  const [newName, setNewName] = useState("");
-  const [newCommand, setNewCommand] = useState("");
-  const [newPersistent, setNewPersistent] = useState(false);
-  const [newCwd, setNewCwd] = useState("");
   const [sshManagerOpen, setSshManagerOpen] = useState(false);
   const [sshHosts, setSshHosts] = useState<SshHostEntry[]>([]);
   const [sshHostsLoading, setSshHostsLoading] = useState(false);
   const [sshHostsError, setSshHostsError] = useState<string | null>(null);
-  const [sshHost, setSshHost] = useState("");
-  const sshHostInputRef = useRef<HTMLInputElement>(null);
-  const [sshPersistent, setSshPersistent] = useState(false);
-  const [sshForwardOnly, setSshForwardOnly] = useState(false);
-  const [sshExitOnForwardFailure, setSshExitOnForwardFailure] = useState(true);
-  const [sshForwards, setSshForwards] = useState<SshForward[]>([]);
-  const [sshError, setSshError] = useState<string | null>(null);
   const [projectOpen, setProjectOpen] = useState(false);
-  const [projectMode, setProjectMode] = useState<"new" | "rename">("new");
-  const [projectTitle, setProjectTitle] = useState("");
-  const [projectBasePath, setProjectBasePath] = useState("");
-  const [projectEnvironmentId, setProjectEnvironmentId] = useState<string>("");
-  const [projectAssetsEnabled, setProjectAssetsEnabled] = useState(true);
   const [confirmDeleteProjectOpen, setConfirmDeleteProjectOpen] = useState(false);
   const [confirmDeleteRecordingId, setConfirmDeleteRecordingId] = useState<string | null>(null);
   const [confirmDeletePromptId, setConfirmDeletePromptId] = useState<string | null>(null);
@@ -981,10 +907,6 @@ export default function App() {
   const [confirmDeleteAssetId, setConfirmDeleteAssetId] = useState<string | null>(null);
   const [pathPickerOpen, setPathPickerOpen] = useState(false);
   const [pathPickerTarget, setPathPickerTarget] = useState<"project" | "session" | null>(null);
-  const [pathPickerListing, setPathPickerListing] = useState<DirectoryListing | null>(null);
-  const [pathPickerInput, setPathPickerInput] = useState("");
-  const [pathPickerLoading, setPathPickerLoading] = useState(false);
-  const [pathPickerError, setPathPickerError] = useState<string | null>(null);
   const [replayOpen, setReplayOpen] = useState(false);
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayError, setReplayError] = useState<string | null>(null);
@@ -1255,31 +1177,6 @@ export default function App() {
     ];
   }, [agentShortcutIds]);
 
-  const commandSuggestions = useMemo(() => {
-    const out: string[] = [];
-    const seen = new Set<string>();
-    const add = (raw: string | null | undefined) => {
-      const trimmed = (raw ?? "").trim();
-      if (!trimmed) return;
-      if (seen.has(trimmed)) return;
-      seen.add(trimmed);
-      out.push(trimmed);
-    };
-
-    sessions
-      .slice()
-      .sort((a, b) => b.createdAt - a.createdAt)
-      .forEach((s) => {
-        add(s.launchCommand ?? null);
-        add((s.restoreCommand ?? null) as string | null);
-      });
-
-    for (const preset of quickStarts) add(preset.command ?? null);
-    for (const effect of PROCESS_EFFECTS) for (const cmd of effect.matchCommands) add(cmd);
-
-    return out.slice(0, 50);
-  }, [sessions, quickStarts]);
-
   const agentShortcuts = useMemo(() => {
     const seen = new Set<string>();
     return agentShortcutIds
@@ -1309,12 +1206,14 @@ export default function App() {
   const projectByIdRef = useRef<Map<string, Project>>(new Map());
   const activeProjectIdRef = useRef<string>(activeProjectId);
   const lastActiveByProject = useRef<Map<string, string>>(new Map());
-  const newNameRef = useRef<HTMLInputElement | null>(null);
+  const newSessionModalRef = useRef<NewSessionModalHandle>(null);
+  const projectModalRef = useRef<ProjectModalHandle>(null);
+  const projectModalInitialRef = useRef({ mode: "new" as "new" | "rename", title: "", basePath: "", environmentId: "", assetsEnabled: true });
+  const pathPickerInitialPathRef = useRef<string | null>(null);
   const recordNameRef = useRef<HTMLInputElement | null>(null);
   const promptTitleRef = useRef<HTMLInputElement | null>(null);
   const envNameRef = useRef<HTMLInputElement | null>(null);
   const assetNameRef = useRef<HTMLInputElement | null>(null);
-  const projectTitleRef = useRef<HTMLInputElement | null>(null);
   const homeDirRef = useRef<string | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const pendingSaveRef = useRef<PersistedStateV1 | null>(null);
@@ -1322,6 +1221,33 @@ export default function App() {
   const pendingWorkspaceViewSaveRef = useRef<WorkspaceViewStorageV1 | null>(null);
   const agentIdleTimersRef = useRef<Map<string, number>>(new Map());
   const agentWorkingMapRef = useRef<Map<string, boolean>>(new Map());
+  const keyHandlerStateRef = useRef({
+    newOpen: false,
+    sshManagerOpen: false,
+    agentShortcutsOpen: false,
+    projectOpen: false,
+    pathPickerOpen: false,
+    confirmDeleteProjectOpen: false,
+    confirmDeleteRecordingId: null as string | null,
+    confirmDeletePromptId: null as string | null,
+    confirmDeleteEnvironmentId: null as string | null,
+    confirmDeleteAssetId: null as string | null,
+    applyAssetRequest: null as ApplyAssetRequest | null,
+    applyAssetApplying: false,
+    replayOpen: false,
+    recordPromptOpen: false,
+    recordingsOpen: false,
+    secureStorageSettingsOpen: false,
+    promptsOpen: false,
+    promptEditorOpen: false,
+    environmentsOpen: false,
+    environmentEditorOpen: false,
+    assetEditorOpen: false,
+    commandPaletteOpen: false,
+    slidePanelOpen: false,
+    slidePanelTab: "prompts" as string,
+    prompts: [] as Prompt[],
+  });
   const agentWorkingSyncTimerRef = useRef<number | null>(null);
   const commandLifecycleSessionsRef = useRef<Set<string>>(new Set());
   const secureStorageRetryingRef = useRef(false);
@@ -1667,7 +1593,7 @@ export default function App() {
         };
       });
     },
-    [active?.cwd, activeIsSsh, activeProjectId, projects, updateActiveWorkspaceView],
+    [active?.cwd, activeIsSsh, activeProjectId, updateActiveWorkspaceView],
   );
 
   const handleRenameWorkspacePath = useCallback(
@@ -1972,6 +1898,35 @@ export default function App() {
     secureStorageModeRef.current = secureStorageMode;
   }, [secureStorageMode]);
 
+  useLayoutEffect(() => {
+    const s = keyHandlerStateRef.current;
+    s.newOpen = newOpen;
+    s.sshManagerOpen = sshManagerOpen;
+    s.agentShortcutsOpen = agentShortcutsOpen;
+    s.projectOpen = projectOpen;
+    s.pathPickerOpen = pathPickerOpen;
+    s.confirmDeleteProjectOpen = confirmDeleteProjectOpen;
+    s.confirmDeleteRecordingId = confirmDeleteRecordingId;
+    s.confirmDeletePromptId = confirmDeletePromptId;
+    s.confirmDeleteEnvironmentId = confirmDeleteEnvironmentId;
+    s.confirmDeleteAssetId = confirmDeleteAssetId;
+    s.applyAssetRequest = applyAssetRequest;
+    s.applyAssetApplying = applyAssetApplying;
+    s.replayOpen = replayOpen;
+    s.recordPromptOpen = recordPromptOpen;
+    s.recordingsOpen = recordingsOpen;
+    s.secureStorageSettingsOpen = secureStorageSettingsOpen;
+    s.promptsOpen = promptsOpen;
+    s.promptEditorOpen = promptEditorOpen;
+    s.environmentsOpen = environmentsOpen;
+    s.environmentEditorOpen = environmentEditorOpen;
+    s.assetEditorOpen = assetEditorOpen;
+    s.commandPaletteOpen = commandPaletteOpen;
+    s.slidePanelOpen = slidePanelOpen;
+    s.slidePanelTab = slidePanelTab;
+    s.prompts = prompts;
+  });
+
   useEffect(() => {
     if (!activeId) return;
     const s = sessionByIdRef.current.get(activeId);
@@ -2007,6 +1962,30 @@ export default function App() {
     persistedSessionsRef.current = next;
     return next;
   }, [sessions]);
+
+  const commandSuggestions = useMemo(() => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const add = (raw: string | null | undefined) => {
+      const trimmed = (raw ?? "").trim();
+      if (!trimmed) return;
+      if (seen.has(trimmed)) return;
+      seen.add(trimmed);
+      out.push(trimmed);
+    };
+
+    [...persistedSessions]
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .forEach((s) => {
+        add(s.launchCommand ?? null);
+        add((s.restoreCommand ?? null) as string | null);
+      });
+
+    for (const preset of quickStarts) add(preset.command ?? null);
+    for (const effect of PROCESS_EFFECTS) for (const cmd of effect.matchCommands) add(cmd);
+
+    return out.slice(0, 50);
+  }, [persistedSessions, quickStarts]);
 
   const terminalPaneSessionsRef = useRef<TerminalPaneSession[]>([]);
   const terminalPaneSessions = useMemo<TerminalPaneSession[]>(() => {
@@ -2277,30 +2256,9 @@ export default function App() {
   }, [hydrated, pendingTrayAction, quickStart]);
 
   useEffect(() => {
-    if (!newOpen) return;
-    const base = activeProject?.basePath ?? homeDirRef.current ?? "";
-    setNewCwd(base);
-    setNewPersistent(false);
-    window.setTimeout(() => {
-      newNameRef.current?.focus();
-    }, 0);
-  }, [newOpen, activeProject?.basePath]);
-
-  useEffect(() => {
     if (!sshManagerOpen) return;
-    setSshError(null);
     void refreshSshHosts();
-    window.setTimeout(() => {
-      sshHostInputRef.current?.focus();
-    }, 0);
   }, [sshManagerOpen]);
-
-  useEffect(() => {
-    if (!projectOpen) return;
-    window.setTimeout(() => {
-      projectTitleRef.current?.focus();
-    }, 0);
-  }, [projectOpen]);
 
   useEffect(() => {
     if (!hydrated) return;
@@ -2320,6 +2278,17 @@ export default function App() {
   useEffect(() => {
     const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
     const onKeyDown = (e: KeyboardEvent) => {
+      const ks = keyHandlerStateRef.current;
+      const {
+        newOpen, sshManagerOpen, agentShortcutsOpen, projectOpen,
+        pathPickerOpen, confirmDeleteProjectOpen, confirmDeleteRecordingId,
+        confirmDeletePromptId, confirmDeleteEnvironmentId, confirmDeleteAssetId,
+        applyAssetRequest, replayOpen, recordPromptOpen, recordingsOpen,
+        secureStorageSettingsOpen, promptsOpen, promptEditorOpen,
+        environmentsOpen, environmentEditorOpen, assetEditorOpen,
+        commandPaletteOpen, slidePanelOpen, slidePanelTab, prompts,
+        applyAssetApplying,
+      } = ks;
       const modalOpen =
         newOpen ||
         sshManagerOpen ||
@@ -2618,31 +2587,8 @@ export default function App() {
 
 		    window.addEventListener("keydown", onKeyDown, true);
 		    return () => window.removeEventListener("keydown", onKeyDown, true);
-        }, [
-          newOpen,
-          agentShortcutsOpen,
-          projectOpen,
-          pathPickerOpen,
-          confirmDeleteProjectOpen,
-          confirmDeleteRecordingId,
-          confirmDeletePromptId,
-          confirmDeleteEnvironmentId,
-          confirmDeleteAssetId,
-          applyAssetRequest,
-          applyAssetApplying,
-          replayOpen,
-          recordPromptOpen,
-          recordingsOpen,
-          promptsOpen,
-          promptEditorOpen,
-          environmentsOpen,
-          environmentEditorOpen,
-          assetEditorOpen,
-          commandPaletteOpen,
-          slidePanelOpen,
-          slidePanelTab,
-          prompts,
-        ]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        }, []);
 
   useEffect(() => {
     return () => {
@@ -2839,20 +2785,10 @@ export default function App() {
     }
   }, [showNotice]);
 
-  const sshCommandPreview = useMemo(() => {
-    return buildSshCommand({
-      host: sshHost,
-      forwards: sshForwards,
-      exitOnForwardFailure: sshExitOnForwardFailure,
-      forwardOnly: sshForwardOnly,
-    });
-  }, [sshHost, sshForwards, sshExitOnForwardFailure, sshForwardOnly]);
-
-  async function copySshCommand() {
-    if (!sshCommandPreview) return;
-    const ok = await copyToClipboard(sshCommandPreview);
+  const handleCopySshCommand = useCallback(async (text: string) => {
+    const ok = await copyToClipboard(text);
     showNotice(ok ? "Copied SSH command" : "Could not copy SSH command");
-  }
+  }, []);
 
   const openExternal = useCallback(
     async (url: string) => {
@@ -3434,7 +3370,6 @@ export default function App() {
     setProjects((prev) =>
       prev.map((p) => (p.environmentId === id ? { ...p, environmentId: null } : p)),
     );
-    if (projectEnvironmentId === id) setProjectEnvironmentId("");
     showNotice(`Deleted environment "${label}"`);
   }
 
@@ -3685,24 +3620,15 @@ export default function App() {
     }
   }
 
-  async function loadPathPicker(path: string | null) {
-    setPathPickerLoading(true);
-    setPathPickerError(null);
-    try {
-      const listing = await invoke<DirectoryListing>("list_directories", { path });
-      setPathPickerListing(listing);
-      setPathPickerInput(listing.path);
-    } catch (err) {
-      setPathPickerError(formatError(err));
-    } finally {
-      setPathPickerLoading(false);
-    }
-  }
+  const loadDirectoryForPicker = useCallback(
+    (path: string | null) => invoke<DirectoryListing>("list_directories", { path }),
+    [],
+  );
 
   function openPathPicker(target: "project" | "session", initial: string | null) {
     setPathPickerTarget(target);
+    pathPickerInitialPathRef.current = initial;
     setPathPickerOpen(true);
-    void loadPathPicker(initial);
   }
 
   const onSessionResize = useCallback((id: string, _size: { cols: number; rows: number }) => {
@@ -3839,11 +3765,13 @@ export default function App() {
     const activeSession = sessionByIdRef.current.get(activeIdRef.current ?? "");
     const curProject = projectByIdRef.current.get(activeProjectIdRef.current ?? "") ?? null;
     setNewOpen(false);
-    setProjectMode("new");
-    setProjectTitle("");
-    setProjectBasePath(activeSession?.cwd ?? curProject?.basePath ?? homeDirRef.current ?? "");
-    setProjectEnvironmentId(curProject?.environmentId ?? "");
-    setProjectAssetsEnabled(curProject?.assetsEnabled ?? true);
+    projectModalInitialRef.current = {
+      mode: "new",
+      title: "",
+      basePath: activeSession?.cwd ?? curProject?.basePath ?? homeDirRef.current ?? "",
+      environmentId: curProject?.environmentId ?? "",
+      assetsEnabled: curProject?.assetsEnabled ?? true,
+    };
     setProjectOpen(true);
   }, []);
 
@@ -3852,13 +3780,14 @@ export default function App() {
     if (!project) return;
 
     setNewOpen(false);
-    setProjectMode("rename");
-    setProjectTitle(project.title);
-    setProjectBasePath(project.basePath ?? "");
-    setProjectEnvironmentId(project.environmentId ?? "");
-    setProjectAssetsEnabled(project.assetsEnabled ?? true);
+    projectModalInitialRef.current = {
+      mode: "rename",
+      title: project.title,
+      basePath: project.basePath ?? "",
+      environmentId: project.environmentId ?? "",
+      assetsEnabled: project.assetsEnabled ?? true,
+    };
     setProjectOpen(true);
-    window.setTimeout(() => projectTitleRef.current?.focus(), 0);
   }, []);
 
   const openRenameProject = useCallback(() => {
@@ -3867,13 +3796,12 @@ export default function App() {
     openProjectSettings(curProject.id);
   }, [openProjectSettings]);
 
-  async function onProjectSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    const title = projectTitle.trim();
+  async function onProjectSubmit(data: ProjectSubmitData) {
+    const title = data.title.trim();
     if (!title) return;
 
     const desiredBasePath =
-      projectBasePath.trim() || activeProject?.basePath || homeDirRef.current || "";
+      data.basePath.trim() || activeProject?.basePath || homeDirRef.current || "";
     const validatedBasePath = await invoke<string | null>("validate_directory", {
       path: desiredBasePath,
     }).catch(() => null);
@@ -3882,11 +3810,11 @@ export default function App() {
       return;
     }
 
-    const environmentId = projectEnvironmentId && environments.some((e) => e.id === projectEnvironmentId)
-      ? projectEnvironmentId
+    const environmentId = data.environmentId && environments.some((e) => e.id === data.environmentId)
+      ? data.environmentId
       : null;
 
-    if (projectMode === "rename") {
+    if (projectModalInitialRef.current.mode === "rename") {
       setProjects((prev) =>
         prev.map((p) =>
           p.id === activeProjectId
@@ -3895,7 +3823,7 @@ export default function App() {
                 title,
                 basePath: validatedBasePath,
                 environmentId,
-                assetsEnabled: projectAssetsEnabled,
+                assetsEnabled: data.assetsEnabled,
               }
             : p,
         ),
@@ -3910,14 +3838,14 @@ export default function App() {
       title,
       basePath: validatedBasePath,
       environmentId,
-      assetsEnabled: projectAssetsEnabled,
+      assetsEnabled: data.assetsEnabled,
     };
     setProjects((prev) => [...prev, project]);
     setProjectOpen(false);
     setActiveProjectId(id);
 
     try {
-      await ensureAutoAssets(validatedBasePath, id, projectAssetsEnabled);
+      await ensureAutoAssets(validatedBasePath, id, data.assetsEnabled);
       const createdRaw = await createSession({
         projectId: id,
         cwd: validatedBasePath,
@@ -4478,17 +4406,16 @@ export default function App() {
     };
   }, []);
 
-  async function onNewSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    const name = newName.trim() || undefined;
+  async function onNewSubmit(data: NewSessionSubmitData) {
+    const name = data.name.trim() || undefined;
     try {
-      const launchCommand = newCommand.trim() || null;
-      if (newPersistent && launchCommand) {
+      const launchCommand = data.command.trim() || null;
+      if (data.persistent && launchCommand) {
         setError("Persistent terminals require an empty command (run commands inside the terminal).");
         return;
       }
       const desiredCwd =
-        newCwd.trim() || activeProject?.basePath || homeDirRef.current || "";
+        data.cwd.trim() || activeProject?.basePath || homeDirRef.current || "";
       const validatedCwd = await invoke<string | null>("validate_directory", {
         path: desiredCwd,
       }).catch(() => null);
@@ -4501,7 +4428,7 @@ export default function App() {
         projectId: activeProjectId,
         name,
         launchCommand,
-        persistent: newPersistent,
+        persistent: data.persistent,
         cwd: validatedCwd,
         envVars: envVarsForProjectId(activeProjectId, projects, environments),
       });
@@ -4509,111 +4436,47 @@ export default function App() {
       setSessions((prev) => [...prev, s]);
       setActiveId(s.id);
       setNewOpen(false);
-      setNewName("");
-      setNewCommand("");
-      setNewPersistent(false);
-      setNewCwd("");
     } catch (err) {
       reportError("Failed to create session", err);
     }
   }
 
-  function addSshForward() {
-    setSshForwards((prev) => [
-      ...prev,
-      {
-        id: makeId(),
-        type: "local",
-        bindAddress: "",
-        listenPort: "",
-        destinationHost: "localhost",
-        destinationPort: "",
-      },
-    ]);
-  }
-
-  function removeSshForward(id: string) {
-    setSshForwards((prev) => prev.filter((f) => f.id !== id));
-  }
-
-  function updateSshForward(id: string, patch: Partial<SshForward>) {
-    setSshForwards((prev) => prev.map((f) => (f.id === id ? { ...f, ...patch } : f)));
-  }
-
-  async function onSshConnect() {
-    setSshError(null);
-
-    const target = sshHost.trim();
-    if (!target) {
-      setSshError("Pick an SSH host.");
-      return;
+  async function onSshConnect(data: SshConnectData) {
+    const desiredCwd = activeProject?.basePath ?? homeDirRef.current ?? "";
+    const validatedCwd = await invoke<string | null>("validate_directory", {
+      path: desiredCwd,
+    }).catch(() => null);
+    if (!validatedCwd) {
+      throw new Error("Working directory must be an existing folder.");
     }
 
-    for (const [idx, f] of sshForwards.entries()) {
-      const listenPort = parsePort(f.listenPort);
-      if (!listenPort) {
-        setSshError(`Forward #${idx + 1}: invalid listen port.`);
-        return;
-      }
-      if (f.type !== "dynamic") {
-        if (!f.destinationHost.trim()) {
-          setSshError(`Forward #${idx + 1}: destination host is required.`);
-          return;
+    await ensureAutoAssets(validatedCwd, activeProjectId);
+
+    const name = `ssh ${data.host}`;
+    const createdRaw = await createSession({
+      projectId: activeProjectId,
+      name,
+      launchCommand: data.persistent ? null : data.command,
+      restoreCommand: data.persistent ? data.command : null,
+      persistent: data.persistent,
+      cwd: validatedCwd,
+      envVars: envVarsForProjectId(activeProjectId, projects, environments),
+    });
+    const s = applyPendingExit(createdRaw);
+    setSessions((prev) => [...prev, s]);
+    setActiveId(s.id);
+    setSshManagerOpen(false);
+
+    if (data.persistent) {
+      void (async () => {
+        try {
+          await invoke("write_to_session", { id: s.id, data: data.command, source: "system" });
+          await sleep(30);
+          await invoke("write_to_session", { id: s.id, data: "\r", source: "system" });
+        } catch (err) {
+          reportError("Failed to start SSH inside persistent session", err);
         }
-        const destPort = parsePort(f.destinationPort);
-        if (!destPort) {
-          setSshError(`Forward #${idx + 1}: invalid destination port.`);
-          return;
-        }
-      }
-    }
-
-    const command = sshCommandPreview;
-    if (!command) {
-      setSshError("Invalid SSH configuration.");
-      return;
-    }
-
-    try {
-      const desiredCwd = activeProject?.basePath ?? homeDirRef.current ?? "";
-      const validatedCwd = await invoke<string | null>("validate_directory", {
-        path: desiredCwd,
-      }).catch(() => null);
-      if (!validatedCwd) {
-        setSshError("Working directory must be an existing folder.");
-        return;
-      }
-
-      await ensureAutoAssets(validatedCwd, activeProjectId);
-
-      const name = `ssh ${target}`;
-      const createdRaw = await createSession({
-        projectId: activeProjectId,
-        name,
-        launchCommand: sshPersistent ? null : command,
-        restoreCommand: sshPersistent ? command : null,
-        persistent: sshPersistent,
-        cwd: validatedCwd,
-        envVars: envVarsForProjectId(activeProjectId, projects, environments),
-      });
-      const s = applyPendingExit(createdRaw);
-      setSessions((prev) => [...prev, s]);
-      setActiveId(s.id);
-      setSshManagerOpen(false);
-
-      if (sshPersistent) {
-        void (async () => {
-          try {
-            await invoke("write_to_session", { id: s.id, data: command, source: "system" });
-            await sleep(30);
-            await invoke("write_to_session", { id: s.id, data: "\r", source: "system" });
-          } catch (err) {
-            reportError("Failed to start SSH inside persistent session", err);
-          }
-        })();
-      }
-    } catch (err) {
-      setSshError(formatError(err));
+      })();
     }
   }
 
@@ -5641,61 +5504,31 @@ export default function App() {
         <div className="terminalArea">
           {workspaceRowJsx}
 	
-	          {newOpen && <NewSessionModal
-	            isOpen={newOpen}
-	            projectTitle={activeProject?.title ?? null}
-            name={newName}
-            nameInputRef={newNameRef}
-            onChangeName={(value) => setNewName(normalizeSmartQuotes(value))}
-            command={newCommand}
-            onChangeCommand={(value) => setNewCommand(normalizeSmartQuotes(value))}
+          {newOpen && <NewSessionModal
+            ref={newSessionModalRef}
+            projectTitle={activeProject?.title ?? null}
             commandSuggestions={commandSuggestions}
-            persistent={newPersistent}
-            onChangePersistent={setNewPersistent}
-            cwd={newCwd}
-            onChangeCwd={(value) => setNewCwd(normalizeSmartQuotes(value))}
+            initialCwd={activeProject?.basePath ?? homeDirRef.current ?? ""}
             cwdPlaceholder={activeProject?.basePath ?? "~"}
-            onBrowseCwd={() =>
-              openPathPicker("session", newCwd.trim() || activeProject?.basePath || null)
+            onBrowseCwd={(currentCwd) =>
+              openPathPicker("session", currentCwd.trim() || activeProject?.basePath || null)
             }
             canUseProjectBase={Boolean(activeProject?.basePath)}
-            onUseProjectBase={() => setNewCwd(activeProject?.basePath ?? "")}
+            projectBasePath={activeProject?.basePath ?? null}
             canUseCurrentTab={Boolean(active?.cwd)}
-            onUseCurrentTab={() => setNewCwd(active?.cwd ?? "")}
-            onClose={() => {
-              setNewOpen(false);
-              setNewPersistent(false);
-            }}
+            currentTabCwd={active?.cwd ?? null}
+            onClose={() => setNewOpen(false)}
             onSubmit={onNewSubmit}
           />}
 
           {sshManagerOpen && <SshManagerModal
-            isOpen={sshManagerOpen}
             hosts={sshHosts}
             hostsLoading={sshHostsLoading}
             hostsError={sshHostsError}
             onRefreshHosts={() => void refreshSshHosts()}
-            host={sshHost}
-            hostInputRef={sshHostInputRef}
-            onChangeHost={setSshHost}
-            persistent={sshPersistent}
-            onChangePersistent={setSshPersistent}
-            forwardOnly={sshForwardOnly}
-            onChangeForwardOnly={setSshForwardOnly}
-            exitOnForwardFailure={sshExitOnForwardFailure}
-            onChangeExitOnForwardFailure={setSshExitOnForwardFailure}
-            forwards={sshForwards}
-            onAddForward={addSshForward}
-            onRemoveForward={removeSshForward}
-            onUpdateForward={updateSshForward}
-            commandPreview={sshCommandPreview}
-            onCopyCommand={() => void copySshCommand()}
-            error={sshError}
-            onClose={() => {
-              setSshManagerOpen(false);
-              setSshError(null);
-            }}
-            onConnect={() => void onSshConnect()}
+            onCopyToClipboard={(text) => void handleCopySshCommand(text)}
+            onClose={() => setSshManagerOpen(false)}
+            onConnect={onSshConnect}
           />}
 
           {persistentSessionsOpen && <PersistentSessionsModal
@@ -5747,27 +5580,22 @@ export default function App() {
           />}
 
           {projectOpen && <ProjectModal
-            isOpen={projectOpen}
-            mode={projectMode}
-            title={projectTitle}
-            titleInputRef={projectTitleRef}
-            onChangeTitle={(value) => setProjectTitle(normalizeSmartQuotes(value))}
-            basePath={projectBasePath}
-            onChangeBasePath={(value) => setProjectBasePath(normalizeSmartQuotes(value))}
+            ref={projectModalRef}
+            mode={projectModalInitialRef.current.mode}
+            initialTitle={projectModalInitialRef.current.title}
+            initialBasePath={projectModalInitialRef.current.basePath}
             basePathPlaceholder={homeDirRef.current ?? "~"}
-            onBrowseBasePath={() =>
-              openPathPicker("project", projectBasePath.trim() || activeProject?.basePath || null)
+            initialEnvironmentId={projectModalInitialRef.current.environmentId}
+            initialAssetsEnabled={projectModalInitialRef.current.assetsEnabled}
+            onBrowseBasePath={(currentBasePath) =>
+              openPathPicker("project", currentBasePath.trim() || activeProject?.basePath || null)
             }
             canUseCurrentTab={Boolean(active?.cwd)}
-            onUseCurrentTab={() => setProjectBasePath(active?.cwd ?? "")}
+            currentTabCwd={active?.cwd ?? null}
             canUseHome={Boolean(homeDirRef.current)}
-            onUseHome={() => setProjectBasePath(homeDirRef.current ?? "")}
+            homeDir={homeDirRef.current}
             environments={environments}
-            selectedEnvironmentId={projectEnvironmentId}
-            onChangeEnvironmentId={setProjectEnvironmentId}
             onOpenEnvironments={() => setEnvironmentsOpen(true)}
-            assetsEnabled={projectAssetsEnabled}
-            onChangeAssetsEnabled={setProjectAssetsEnabled}
             onClose={() => setProjectOpen(false)}
             onSubmit={onProjectSubmit}
           />}
@@ -5862,23 +5690,16 @@ export default function App() {
           />}
 
           {pathPickerOpen && <PathPickerModal
-            isOpen={pathPickerOpen}
-            listing={pathPickerListing}
-            input={pathPickerInput}
+            initialPath={pathPickerInitialPathRef.current}
             placeholder={homeDirRef.current ?? "~"}
-            loading={pathPickerLoading}
-            error={pathPickerError}
-            onInputChange={setPathPickerInput}
-            onLoad={(path) => void loadPathPicker(path)}
+            loadDirectory={loadDirectoryForPicker}
             onClose={() => {
               setPathPickerOpen(false);
               setPathPickerTarget(null);
             }}
-            onSelect={() => {
-              const selected = pathPickerListing?.path;
-              if (!selected) return;
-              if (pathPickerTarget === "project") setProjectBasePath(selected);
-              if (pathPickerTarget === "session") setNewCwd(selected);
+            onSelect={(selectedPath) => {
+              if (pathPickerTarget === "project") projectModalRef.current?.setBasePath(selectedPath);
+              if (pathPickerTarget === "session") newSessionModalRef.current?.setCwd(selectedPath);
               setPathPickerOpen(false);
               setPathPickerTarget(null);
             }}

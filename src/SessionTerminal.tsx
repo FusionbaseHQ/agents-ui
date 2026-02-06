@@ -105,7 +105,12 @@ function SessionTerminal(props: SessionTerminalProps) {
   const resizeRafRef = useRef<number | null>(null);
   const resizeTimeoutRef = useRef<number | null>(null);
   const resizeRetryCountRef = useRef(0);
+  const resizeCooldownRef = useRef(false);
+  const resizeCooldownTimerRef = useRef<number | null>(null);
   const lastSizeRef = useRef<{ cols: number; rows: number } | null>(null);
+  const activeRef = useRef(props.active);
+  activeRef.current = props.active;
+  const needsResizeRef = useRef(false);
   const zellijAutoScrollRef = useRef<{
     active: boolean;
     wheelRemainder: number;
@@ -395,8 +400,13 @@ function SessionTerminal(props: SessionTerminalProps) {
 	    }
 
 	    function scheduleResize() {
+	      if (!activeRef.current) {
+	        needsResizeRef.current = true;
+	        return;
+	      }
 	      if (resizeRafRef.current !== null) return;
 	      if (resizeTimeoutRef.current !== null) return;
+	      if (resizeCooldownRef.current) return;
 
 	      const attempts = resizeRetryCountRef.current;
 	      if (attempts < 5) {
@@ -444,6 +454,14 @@ function SessionTerminal(props: SessionTerminalProps) {
 	      lastSizeRef.current = { cols, rows };
 	      onResizeRef.current?.(props.id, { cols, rows });
 	      void invoke("resize_session", { id: props.id, cols, rows }).catch(() => {});
+
+	      // Cooldown: prevent rapid-fire resize during continuous window drag
+	      resizeCooldownRef.current = true;
+	      resizeCooldownTimerRef.current = window.setTimeout(() => {
+	        resizeCooldownTimerRef.current = null;
+	        resizeCooldownRef.current = false;
+	        scheduleResize();
+	      }, 80);
 	    }
 
 		    // Register BEFORE flushing to avoid race with incoming events
@@ -557,11 +575,17 @@ function SessionTerminal(props: SessionTerminalProps) {
 	      resizeRafRef.current = null;
 	      resizeTimeoutRef.current = null;
 	      resizeRetryCountRef.current = 0;
+	      if (resizeCooldownTimerRef.current !== null) {
+	        window.clearTimeout(resizeCooldownTimerRef.current);
+	        resizeCooldownTimerRef.current = null;
+	      }
+	      resizeCooldownRef.current = false;
 	    };
 	  }, [props.id, props.persistent, props.registry, props.pendingData]);
 
   useEffect(() => {
     if (!props.active) return;
+    needsResizeRef.current = false;
     const term = termRef.current;
     const fit = fitRef.current;
     const container = containerRef.current;
