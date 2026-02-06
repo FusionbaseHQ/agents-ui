@@ -1303,6 +1303,7 @@ export default function App() {
   const pendingAgentWorkingRef = useRef<Set<string>>(new Set());
   const hydratedRef = useRef<boolean>(hydrated);
   const activeIdRef = useRef<string | null>(null);
+  const projectsRef = useRef<Project[]>(projects);
   const activeProjectIdRef = useRef<string>(activeProjectId);
   const lastActiveByProject = useRef<Map<string, string>>(new Map());
   const newNameRef = useRef<HTMLInputElement | null>(null);
@@ -1320,6 +1321,8 @@ export default function App() {
   const agentWorkingMapRef = useRef<Map<string, boolean>>(new Map());
   const agentWorkingSyncTimerRef = useRef<number | null>(null);
   const commandLifecycleSessionsRef = useRef<Set<string>>(new Set());
+  const secureStorageRetryingRef = useRef(false);
+  const secureStorageModeRef = useRef(secureStorageMode);
   const lastResizeAtRef = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
@@ -1953,8 +1956,16 @@ export default function App() {
   }, [hydrated]);
 
   useEffect(() => {
+    projectsRef.current = projects;
+  }, [projects]);
+
+  useEffect(() => {
     activeProjectIdRef.current = activeProjectId;
   }, [activeProjectId]);
+
+  useEffect(() => {
+    secureStorageModeRef.current = secureStorageMode;
+  }, [secureStorageMode]);
 
   useEffect(() => {
     if (!activeId) return;
@@ -2651,9 +2662,9 @@ export default function App() {
     }
   }
 
-  function reportError(prefix: string, err: unknown) {
+  const reportError = useCallback((prefix: string, err: unknown) => {
     setError(`${prefix}: ${formatError(err)}`);
-  }
+  }, []);
 
   const reportErrorRef = useRef(reportError);
   useEffect(() => {
@@ -2675,15 +2686,15 @@ export default function App() {
     };
   }, []);
 
-  function dismissNotice() {
+  const dismissNotice = useCallback(() => {
     setNotice(null);
     if (noticeTimerRef.current !== null) {
       window.clearTimeout(noticeTimerRef.current);
       noticeTimerRef.current = null;
     }
-  }
+  }, []);
 
-  function showNotice(message: string, timeoutMs = 4500) {
+  const showNotice = useCallback((message: string, timeoutMs = 4500) => {
     setNotice(message);
     if (noticeTimerRef.current !== null) {
       window.clearTimeout(noticeTimerRef.current);
@@ -2692,7 +2703,7 @@ export default function App() {
       noticeTimerRef.current = null;
       setNotice(null);
     }, timeoutMs);
-  }
+  }, []);
 
   function openSecureStorageSettings() {
     setSecureStorageSettingsError(null);
@@ -2795,11 +2806,12 @@ export default function App() {
     }
   }
 
-  async function retrySecureStorage() {
-    if (secureStorageRetrying) return;
+  const retrySecureStorage = useCallback(async () => {
+    if (secureStorageRetryingRef.current) return;
+    secureStorageRetryingRef.current = true;
     setSecureStorageRetrying(true);
     showNotice(
-      "macOS Keychain access is needed to decrypt/encrypt your environments + recordings. Choose “Always Allow” to avoid future prompts.",
+      "macOS Keychain access is needed to decrypt/encrypt your environments + recordings. Choose \u201CAlways Allow\u201D to avoid future prompts.",
       20000,
     );
     await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
@@ -2815,11 +2827,12 @@ export default function App() {
 
       showNotice("Secure storage unlocked.", 7000);
     } catch (err) {
-      setPersistenceDisabledReason(`Secure storage is locked (changes won’t be saved): ${formatError(err)}`);
+      setPersistenceDisabledReason(`Secure storage is locked (changes won't be saved): ${formatError(err)}`);
     } finally {
+      secureStorageRetryingRef.current = false;
       setSecureStorageRetrying(false);
     }
-  }
+  }, [showNotice]);
 
   const sshCommandPreview = useMemo(() => {
     return buildSshCommand({
@@ -3035,7 +3048,7 @@ export default function App() {
     return () => window.cancelAnimationFrame(raf);
   }, [replayShowAll, replayIndex, replayFlowExpanded]);
 
-  async function refreshRecordings() {
+  const refreshRecordings = useCallback(async () => {
     setRecordingsLoading(true);
     setRecordingsError(null);
     try {
@@ -3046,7 +3059,7 @@ export default function App() {
     } finally {
       setRecordingsLoading(false);
     }
-  }
+  }, []);
 
   async function refreshPersistentSessions() {
     setPersistentSessionsLoading(true);
@@ -3081,14 +3094,14 @@ export default function App() {
     return `${base} ${when}`;
   }
 
-  function openRecordPrompt(sessionId: string) {
+  const openRecordPrompt = useCallback((sessionId: string) => {
     const s = sessionsRef.current.find((s) => s.id === sessionId);
     if (!s) return;
     setRecordPromptSessionId(sessionId);
     setRecordPromptName(defaultRecordingName(s));
     setRecordPromptOpen(true);
     window.setTimeout(() => recordNameRef.current?.focus(), 0);
-  }
+  }, []);
 
   function closeRecordPrompt() {
     setRecordPromptOpen(false);
@@ -3132,7 +3145,7 @@ export default function App() {
     }
   }
 
-  async function stopRecording(sessionId: string) {
+  const stopRecording = useCallback(async (sessionId: string) => {
     const s = sessionsRef.current.find((s) => s.id === sessionId);
     if (!s) return;
     if (!s.recordingActive) return;
@@ -3146,7 +3159,7 @@ export default function App() {
         prev.map((x) => (x.id === sessionId ? { ...x, recordingActive: false } : x)),
       );
     }
-  }
+  }, [reportError]);
 
   function closeReplayModal() {
     setReplayOpen(false);
@@ -3160,7 +3173,7 @@ export default function App() {
     setReplayFlowExpanded({});
   }
 
-  async function openReplay(recordingId: string, mode: "step" | "all" = "step") {
+  const openReplay = useCallback(async (recordingId: string, mode: "step" | "all" = "step") => {
     setReplayOpen(true);
     setReplayLoading(true);
     setReplayError(null);
@@ -3174,7 +3187,7 @@ export default function App() {
     try {
       const rec = await invoke<LoadedRecording>("load_recording", {
         recordingId,
-        decrypt: secureStorageMode === "keychain",
+        decrypt: secureStorageModeRef.current === "keychain",
       });
       setReplayRecording(rec);
       setReplaySteps(splitRecordingIntoSteps(rec.events));
@@ -3183,12 +3196,13 @@ export default function App() {
     } finally {
       setReplayLoading(false);
     }
-  }
+  }, []);
 
-  async function openReplayForActive() {
-    if (!active?.lastRecordingId) return;
-    await openReplay(active.lastRecordingId);
-  }
+  const openReplayForActive = useCallback(async () => {
+    const activeSession = sessionByIdRef.current.get(activeIdRef.current ?? "");
+    if (!activeSession?.lastRecordingId) return;
+    await openReplay(activeSession.lastRecordingId);
+  }, [openReplay]);
 
   function requestDeleteRecording(recordingId: string) {
     setRecordingsOpen(false);
@@ -3215,14 +3229,14 @@ export default function App() {
     }
   }
 
-  function openPromptEditor(prompt?: Prompt) {
+  const openPromptEditor = useCallback((prompt?: Prompt) => {
     setPromptsOpen(false);
     setPromptEditorId(prompt?.id ?? null);
     setPromptEditorTitle(prompt?.title ?? "");
     setPromptEditorContent(prompt?.content ?? "");
     setPromptEditorOpen(true);
     window.setTimeout(() => promptTitleRef.current?.focus(), 0);
-  }
+  }, []);
 
   function closePromptEditor() {
     setPromptEditorOpen(false);
@@ -3788,12 +3802,12 @@ export default function App() {
     return first ? first.id : null;
   }
 
-  function selectProject(projectId: string) {
+  const selectProject = useCallback((projectId: string) => {
     setActiveProjectId(projectId);
     setActiveId(pickActiveSessionId(projectId));
-  }
+  }, []);
 
-  function moveProject(projectId: string, targetProjectId: string, position: "before" | "after") {
+  const moveProject = useCallback((projectId: string, targetProjectId: string, position: "before" | "after") => {
     setProjects((prev) => {
       if (projectId === targetProjectId) return prev;
       const project = prev.find((p) => p.id === projectId);
@@ -3809,20 +3823,22 @@ export default function App() {
         prev.length === next.length && prev.every((p, index) => p.id === next[index]?.id);
       return unchanged ? prev : next;
     });
-  }
+  }, []);
 
-  function openNewProject() {
+  const openNewProject = useCallback(() => {
+    const activeSession = sessionByIdRef.current.get(activeIdRef.current ?? "");
+    const curProject = projectsRef.current.find((p) => p.id === activeProjectIdRef.current) ?? null;
     setNewOpen(false);
     setProjectMode("new");
     setProjectTitle("");
-    setProjectBasePath(active?.cwd ?? activeProject?.basePath ?? homeDirRef.current ?? "");
-    setProjectEnvironmentId(activeProject?.environmentId ?? "");
-    setProjectAssetsEnabled(activeProject?.assetsEnabled ?? true);
+    setProjectBasePath(activeSession?.cwd ?? curProject?.basePath ?? homeDirRef.current ?? "");
+    setProjectEnvironmentId(curProject?.environmentId ?? "");
+    setProjectAssetsEnabled(curProject?.assetsEnabled ?? true);
     setProjectOpen(true);
-  }
+  }, []);
 
-  function openProjectSettings(projectId: string) {
-    const project = projects.find((p) => p.id === projectId);
+  const openProjectSettings = useCallback((projectId: string) => {
+    const project = projectsRef.current.find((p) => p.id === projectId);
     if (!project) return;
 
     setNewOpen(false);
@@ -3833,12 +3849,13 @@ export default function App() {
     setProjectAssetsEnabled(project.assetsEnabled ?? true);
     setProjectOpen(true);
     window.setTimeout(() => projectTitleRef.current?.focus(), 0);
-  }
+  }, []);
 
-  function openRenameProject() {
-    if (!activeProject) return;
-    openProjectSettings(activeProject.id);
-  }
+  const openRenameProject = useCallback(() => {
+    const curProject = projectsRef.current.find((p) => p.id === activeProjectIdRef.current) ?? null;
+    if (!curProject) return;
+    openProjectSettings(curProject.id);
+  }, [openProjectSettings]);
 
   async function onProjectSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -5131,446 +5148,486 @@ export default function App() {
     return next;
   }, [workingAgentCountByProject]);
 
-  return (
-    <div className="app">
-      <aside
-        className="sidebar"
-        ref={sidebarRef}
-        style={
-          { ["--projectsListMaxHeight" as any]: `${projectsListMaxHeight}px` } as React.CSSProperties
-        }
-      >
-        <ProjectsSection
-          projects={projects}
-          activeProjectId={activeProjectId}
-          activeProject={activeProject}
-          environments={environments}
-          sessionCountByProject={stableSessionCountByProject}
-          workingAgentCountByProject={stableWorkingAgentCountByProject}
-          onNewProject={openNewProject}
-          onProjectSettings={openRenameProject}
-          onDeleteProject={handleDeleteProject}
-          onSelectProject={selectProject}
-          onOpenProjectSettings={openProjectSettings}
-          onMoveProject={moveProject}
-        />
+  const sidebarJsx = useMemo(() => (
+    <aside
+      className="sidebar"
+      ref={sidebarRef}
+      style={
+        { ["--projectsListMaxHeight" as any]: `${projectsListMaxHeight}px` } as React.CSSProperties
+      }
+    >
+      <ProjectsSection
+        projects={projects}
+        activeProjectId={activeProjectId}
+        activeProject={activeProject}
+        environments={environments}
+        sessionCountByProject={stableSessionCountByProject}
+        workingAgentCountByProject={stableWorkingAgentCountByProject}
+        onNewProject={openNewProject}
+        onProjectSettings={openRenameProject}
+        onDeleteProject={handleDeleteProject}
+        onSelectProject={selectProject}
+        onOpenProjectSettings={openProjectSettings}
+        onMoveProject={moveProject}
+      />
 
-        <QuickPromptsSection
-          prompts={prompts}
-          activeSessionId={activeId}
-          onSendPrompt={handleSendPromptToActive}
-          onEditPrompt={openPromptEditor}
-          onOpenPromptsPanel={handleOpenPromptsPanel}
-        />
+      <QuickPromptsSection
+        prompts={prompts}
+        activeSessionId={activeId}
+        onSendPrompt={handleSendPromptToActive}
+        onEditPrompt={openPromptEditor}
+        onOpenPromptsPanel={handleOpenPromptsPanel}
+      />
 
-        <div
-          className="sidebarResizeHandle"
-          role="separator"
-          aria-label="Resize Projects and Sessions"
-          aria-orientation="horizontal"
-          aria-valuemin={MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT}
-          aria-valuemax={MAX_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT}
-          aria-valuenow={Math.round(projectsListMaxHeight)}
-          tabIndex={0}
-          onDoubleClick={resetProjectsListMaxHeight}
-          onKeyDown={handleProjectsDividerKeyDown}
-          onPointerDown={handleProjectsDividerPointerDown}
-          title="Drag to resize • Double-click to auto-fit"
-        />
+      <div
+        className="sidebarResizeHandle"
+        role="separator"
+        aria-label="Resize Projects and Sessions"
+        aria-orientation="horizontal"
+        aria-valuemin={MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT}
+        aria-valuemax={MAX_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT}
+        aria-valuenow={Math.round(projectsListMaxHeight)}
+        tabIndex={0}
+        onDoubleClick={resetProjectsListMaxHeight}
+        onKeyDown={handleProjectsDividerKeyDown}
+        onPointerDown={handleProjectsDividerPointerDown}
+        title="Drag to resize • Double-click to auto-fit"
+      />
 
-        <SessionsSection
-          agentShortcuts={agentShortcuts}
-          sessions={stableProjectSessions}
-          activeSessionId={activeId}
-          onSelectSession={setActiveId}
-          onCloseSession={handleCloseSession}
-          onQuickStart={handleQuickStartFromSidebar}
-          onOpenNewSession={handleOpenNewSession}
-          onOpenPersistentSessions={handleOpenPersistentSessions}
-          onOpenSshManager={handleOpenSshManager}
-          onOpenAgentShortcuts={handleOpenAgentShortcuts}
-        />
-      </aside>
+      <SessionsSection
+        agentShortcuts={agentShortcuts}
+        sessions={stableProjectSessions}
+        activeSessionId={activeId}
+        onSelectSession={setActiveId}
+        onCloseSession={handleCloseSession}
+        onQuickStart={handleQuickStartFromSidebar}
+        onOpenNewSession={handleOpenNewSession}
+        onOpenPersistentSessions={handleOpenPersistentSessions}
+        onOpenSshManager={handleOpenSshManager}
+        onOpenAgentShortcuts={handleOpenAgentShortcuts}
+      />
+    </aside>
+  ), [
+    projects, activeProjectId, activeProject, environments,
+    stableSessionCountByProject, stableWorkingAgentCountByProject,
+    prompts, agentShortcuts, stableProjectSessions,
+    activeId, projectsListMaxHeight,
+    selectProject, moveProject, openNewProject, openRenameProject,
+    openProjectSettings, handleDeleteProject,
+    handleSendPromptToActive, openPromptEditor, handleOpenPromptsPanel,
+    handleCloseSession, handleQuickStartFromSidebar,
+    handleOpenNewSession, handleOpenPersistentSessions,
+    handleOpenSshManager, handleOpenAgentShortcuts,
+    resetProjectsListMaxHeight, handleProjectsDividerKeyDown,
+    handleProjectsDividerPointerDown,
+  ]);
 
-      <main className="main">
-	        <div className="topbar">
-	          <div className="activeTitle">
-            <span>{activeProject ? `Project: ${activeProject.title}` : "Project: —"}</span>
-            <span>{active ? ` • ${active.name}` : " • No session"}</span>
-            {activeIsSsh ? (
+  const topbarJsx = useMemo(() => (
+    <div className="topbar">
+      <div className="activeTitle">
+        <span>{activeProject ? `Project: ${activeProject.title}` : "Project: —"}</span>
+        <span>{active ? ` • ${active.name}` : " • No session"}</span>
+        {activeIsSsh ? (
+          <>
+            {" "}
+            <span className="chip chip-ssh" title="SSH">
+              <span className="chipLabel">ssh</span>
+            </span>
+          </>
+        ) : null}
+      </div>
+      <div className="topbarRight">
+        {persistenceDisabledReason && (
+          <div className="errorBanner" role="alert">
+            <div className="errorText" title={persistenceDisabledReason}>
+              {persistenceDisabledReason}
+            </div>
+            {secureStorageMode === "keychain" &&
+            /keychain|keyring/i.test(persistenceDisabledReason) ? (
+              <button
+                type="button"
+                className="errorClose"
+                onClick={() => void retrySecureStorage()}
+                disabled={secureStorageRetrying}
+                title="Retry Keychain access"
+              >
+                {secureStorageRetrying ? "Retrying…" : "Retry"}
+              </button>
+            ) : (
+              <button
+                className="errorClose"
+                onClick={() => setPersistenceDisabledReason(null)}
+                title="Dismiss"
+              >
+                ×
+              </button>
+            )}
+          </div>
+        )}
+
+        {error && (
+          <div className="errorBanner" role="alert">
+            <div className="errorText" title={error}>
+              {error}
+            </div>
+            <button className="errorClose" onClick={() => setError(null)} title="Dismiss">
+              ×
+            </button>
+          </div>
+        )}
+
+        {notice && (
+          <div className="noticeBanner" role="status" aria-live="polite">
+            <div className="noticeText" title={notice}>
+              {notice}
+            </div>
+            <button className="errorClose" onClick={dismissNotice} title="Dismiss">
+              ×
+            </button>
+          </div>
+        )}
+
+        {!error && !notice && (
+          <div className="shortcutHint">
+            <kbd>{"\u2318"}K</kbd> Quick Access
+          </div>
+        )}
+
+        {/* Recording Timer */}
+        {active?.recordingActive && (
+          <div className="recordingTimer">
+            <span className="recordingTimerDot" />
+            <span>REC</span>
+          </div>
+        )}
+
+        {active && (
+          <>
+            {!activeIsSsh ? (
               <>
-                {" "}
-                <span className="chip chip-ssh" title="SSH">
-                  <span className="chipLabel">ssh</span>
-                </span>
+                <div className="topbarExternalActions">
+                  <button
+                    className="iconBtn iconBtnText"
+                    onClick={() => {
+                      const cwd = active.cwd?.trim() ?? "";
+                      if (!cwd) return;
+                      void invoke("open_path_in_file_manager", { path: cwd }).catch((err) =>
+                        reportError("Failed to open folder in Finder", err),
+                      );
+                    }}
+                    disabled={!active.cwd}
+                    title={active.cwd ? `Open in Finder — ${active.cwd}` : "Open in Finder"}
+                  >
+                    Open in Finder
+                  </button>
+
+                  <button
+                    className="iconBtn iconBtnText"
+                    onClick={() => {
+                      const cwd = active.cwd?.trim() ?? "";
+                      if (!cwd) return;
+                      void invoke("open_path_in_vscode", { path: cwd }).catch((err) =>
+                        reportError("Failed to open VS Code", err),
+                      );
+                    }}
+                    disabled={!active.cwd}
+                    title={active.cwd ? `Open in VS Code — ${active.cwd}` : "Open in VS Code"}
+                  >
+                    Open in VS Code
+                  </button>
+                </div>
               </>
             ) : null}
-          </div>
-		          <div className="topbarRight">
-		            {persistenceDisabledReason && (
-		              <div className="errorBanner" role="alert">
-		                <div className="errorText" title={persistenceDisabledReason}>
-		                  {persistenceDisabledReason}
-		                </div>
-		                {secureStorageMode === "keychain" &&
-		                /keychain|keyring/i.test(persistenceDisabledReason) ? (
-		                  <button
-		                    type="button"
-		                    className="errorClose"
-		                    onClick={() => void retrySecureStorage()}
-		                    disabled={secureStorageRetrying}
-		                    title="Retry Keychain access"
-		                  >
-		                    {secureStorageRetrying ? "Retrying…" : "Retry"}
-		                  </button>
-		                ) : (
-		                  <button
-		                    className="errorClose"
-		                    onClick={() => setPersistenceDisabledReason(null)}
-		                    title="Dismiss"
-		                  >
-		                    ×
-		                  </button>
-		                )}
-		              </div>
-		            )}
 
-	            {error && (
-	              <div className="errorBanner" role="alert">
-	                <div className="errorText" title={error}>
-	                  {error}
-	                </div>
-	                <button className="errorClose" onClick={() => setError(null)} title="Dismiss">
-	                  ×
-	                </button>
-	              </div>
-	            )}
-
-		            {notice && (
-		              <div className="noticeBanner" role="status" aria-live="polite">
-		                <div className="noticeText" title={notice}>
-		                  {notice}
-		                </div>
-		                <button className="errorClose" onClick={dismissNotice} title="Dismiss">
-		                  ×
-		                </button>
-		              </div>
-		            )}
-
-	            {!error && !notice && (
-	              <div className="shortcutHint">
-	                <kbd>{"\u2318"}K</kbd> Quick Access
-	              </div>
-	            )}
-
-            {/* Recording Timer */}
-            {active?.recordingActive && (
-              <div className="recordingTimer">
-                <span className="recordingTimerDot" />
-                <span>REC</span>
-              </div>
-            )}
-
-            {active && (
-              <>
-                {!activeIsSsh ? (
-                  <>
-	                    <div className="topbarExternalActions">
-	                      <button
-	                        className="iconBtn iconBtnText"
-	                        onClick={() => {
-	                          const cwd = active.cwd?.trim() ?? "";
-	                          if (!cwd) return;
-	                          void invoke("open_path_in_file_manager", { path: cwd }).catch((err) =>
-	                            reportError("Failed to open folder in Finder", err),
-                          );
-                        }}
-                        disabled={!active.cwd}
-                        title={active.cwd ? `Open in Finder — ${active.cwd}` : "Open in Finder"}
-                      >
-                        Open in Finder
-	                      </button>
-
-	                      <button
-	                        className="iconBtn iconBtnText"
-	                        onClick={() => {
-	                          const cwd = active.cwd?.trim() ?? "";
-	                          if (!cwd) return;
-	                          void invoke("open_path_in_vscode", { path: cwd }).catch((err) =>
-	                            reportError("Failed to open VS Code", err),
-                          );
-                        }}
-                        disabled={!active.cwd}
-                        title={active.cwd ? `Open in VS Code — ${active.cwd}` : "Open in VS Code"}
-                      >
-                        Open in VS Code
-                      </button>
-                    </div>
-                  </>
-                ) : null}
-
-                <button
-                  className={`iconBtn ${activeWorkspaceView.fileExplorerOpen ? "iconBtnActive" : ""}`}
-                  onClick={() => {
-                    updateActiveWorkspaceView((prev) => {
-                      if (prev.fileExplorerOpen) {
-                        return { ...prev, fileExplorerOpen: false };
-                      }
-                      if (activeIsSsh) {
-                        return { ...prev, fileExplorerOpen: true };
-                      }
-                      const root = (
-                        prev.fileExplorerRootDir ??
-                        prev.codeEditorRootDir ??
-                        activeProject?.basePath ??
-                        active?.cwd ??
-                        ""
-                      ).trim();
-                      if (!root) return prev;
-                      return {
-                        ...prev,
-                        fileExplorerOpen: true,
-                        fileExplorerRootDir: prev.fileExplorerRootDir ?? root,
-                      };
-                    });
-                  }}
-                  disabled={
-                    activeIsSsh
-                      ? !activeWorkspaceView.fileExplorerOpen && !activeSshTarget
-                      : !activeWorkspaceView.fileExplorerOpen &&
-                        !(
+            <button
+              className={`iconBtn ${activeWorkspaceView.fileExplorerOpen ? "iconBtnActive" : ""}`}
+              onClick={() => {
+                updateActiveWorkspaceView((prev) => {
+                  if (prev.fileExplorerOpen) {
+                    return { ...prev, fileExplorerOpen: false };
+                  }
+                  if (activeIsSsh) {
+                    return { ...prev, fileExplorerOpen: true };
+                  }
+                  const root = (
+                    prev.fileExplorerRootDir ??
+                    prev.codeEditorRootDir ??
+                    activeProject?.basePath ??
+                    active?.cwd ??
+                    ""
+                  ).trim();
+                  if (!root) return prev;
+                  return {
+                    ...prev,
+                    fileExplorerOpen: true,
+                    fileExplorerRootDir: prev.fileExplorerRootDir ?? root,
+                  };
+                });
+              }}
+              disabled={
+                activeIsSsh
+                  ? !activeWorkspaceView.fileExplorerOpen && !activeSshTarget
+                  : !activeWorkspaceView.fileExplorerOpen &&
+                    !(
+                      activeWorkspaceView.fileExplorerRootDir ??
+                      activeWorkspaceView.codeEditorRootDir ??
+                      activeProject?.basePath ??
+                      active?.cwd ??
+                      ""
+                    ).trim()
+              }
+              title={
+                activeWorkspaceView.fileExplorerOpen
+                  ? activeIsSsh
+                    ? "Close remote file tree"
+                    : "Close file tree"
+                  : activeIsSsh
+                    ? `Open remote file tree — ${activeSshTarget ?? "ssh"}`
+                    : `Open file tree — ${
+                        (
                           activeWorkspaceView.fileExplorerRootDir ??
                           activeWorkspaceView.codeEditorRootDir ??
                           activeProject?.basePath ??
                           active?.cwd ??
                           ""
-                        ).trim()
-                  }
-                  title={
-                    activeWorkspaceView.fileExplorerOpen
-                      ? activeIsSsh
-                        ? "Close remote file tree"
-                        : "Close file tree"
-                      : activeIsSsh
-                        ? `Open remote file tree — ${activeSshTarget ?? "ssh"}`
-                        : `Open file tree — ${
-                            (
-                              activeWorkspaceView.fileExplorerRootDir ??
-                              activeWorkspaceView.codeEditorRootDir ??
-                              activeProject?.basePath ??
-                              active?.cwd ??
-                              ""
-                            ).trim() || "—"
-                          }`
-                  }
-                >
-                  <Icon name="folder" />
-                </button>
+                        ).trim() || "—"
+                      }`
+              }
+            >
+              <Icon name="folder" />
+            </button>
 
-                {/* Record Button */}
-                <button
-                  className={`iconBtn ${active.recordingActive ? "iconBtnRecording" : ""}`}
-                  onClick={() =>
-                    active.recordingActive ? void stopRecording(active.id) : openRecordPrompt(active.id)
-                  }
-                  disabled={Boolean(active.exited || active.closing)}
-                  title={active.recordingActive ? "Stop recording (active)" : "Start recording"}
-                >
-                  <Icon name={active.recordingActive ? "stop" : "record"} />
-                </button>
+            {/* Record Button */}
+            <button
+              className={`iconBtn ${active.recordingActive ? "iconBtnRecording" : ""}`}
+              onClick={() =>
+                active.recordingActive ? void stopRecording(active.id) : openRecordPrompt(active.id)
+              }
+              disabled={Boolean(active.exited || active.closing)}
+              title={active.recordingActive ? "Stop recording (active)" : "Start recording"}
+            >
+              <Icon name={active.recordingActive ? "stop" : "record"} />
+            </button>
 
-                {/* Panels Button */}
-                <button
-                  className={`iconBtn ${slidePanelOpen ? "iconBtnActive" : ""}`}
-                  onClick={() => {
-                    if (slidePanelOpen) {
-                      setSlidePanelOpen(false);
-                  } else {
-                      void refreshRecordings();
-                      setSlidePanelOpen(true);
-                    }
-                  }}
-                  title={`${slidePanelOpen ? "Close" : "Open"} panels (\u2318\u21E7P / \u2318\u21E7R / \u2318\u21E7A)`}
-                >
-                  <Icon name="panel" />
-                </button>
+            {/* Panels Button */}
+            <button
+              className={`iconBtn ${slidePanelOpen ? "iconBtnActive" : ""}`}
+              onClick={() => {
+                if (slidePanelOpen) {
+                  setSlidePanelOpen(false);
+                } else {
+                  void refreshRecordings();
+                  setSlidePanelOpen(true);
+                }
+              }}
+              title={`${slidePanelOpen ? "Close" : "Open"} panels (\u2318\u21E7P / \u2318\u21E7R / \u2318\u21E7A)`}
+            >
+              <Icon name="panel" />
+            </button>
 
-                {/* Replay Button */}
-                <button
-                  className="iconBtn"
-                  onClick={() => void openReplayForActive()}
-                  disabled={!active.lastRecordingId}
-                  title={active.lastRecordingId ? "Replay last recording" : "No recording yet"}
-                >
-                  <Icon name="play" />
-                </button>
-              </>
-            )}
-          </div>
-        </div>
+            {/* Replay Button */}
+            <button
+              className="iconBtn"
+              onClick={() => void openReplayForActive()}
+              disabled={!active.lastRecordingId}
+              title={active.lastRecordingId ? "Replay last recording" : "No recording yet"}
+            >
+              <Icon name="play" />
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  ), [
+    active, activeProject, activeIsSsh, activeSshTarget, activeWorkspaceView,
+    error, notice, persistenceDisabledReason,
+    secureStorageMode, secureStorageRetrying, slidePanelOpen,
+    retrySecureStorage, dismissNotice, reportError,
+    updateActiveWorkspaceView, stopRecording, openRecordPrompt,
+    refreshRecordings, openReplayForActive,
+  ]);
 
-		        <div className="terminalArea">
-	            <div
-	              ref={workspaceRowRef}
-	              className={`workspaceRow ${workspaceResizeMode ? "workspaceResizing" : ""}`}
-	              style={
-	                {
-	                  "--workspaceEditorWidthPx": `${activeWorkspaceView.editorWidth}px`,
-	                  "--workspaceFileTreeWidthPx": `${activeWorkspaceView.treeWidth}px`,
-	                } as React.CSSProperties
-	              }
-	            >
-              <TerminalPane
-                sessions={terminalPaneSessions}
-                activeId={activeId}
-                onCwdChange={onCwdChange}
-                onCommandChange={onCommandChange}
-                onSessionResize={onSessionResize}
-                registry={registry}
-                pendingData={pendingData}
+  const workspaceRowJsx = useMemo(() => (
+      <div
+        ref={workspaceRowRef}
+        className={`workspaceRow ${workspaceResizeMode ? "workspaceResizing" : ""}`}
+        style={
+          {
+            "--workspaceEditorWidthPx": `${activeWorkspaceView.editorWidth}px`,
+            "--workspaceFileTreeWidthPx": `${activeWorkspaceView.treeWidth}px`,
+          } as React.CSSProperties
+        }
+      >
+        <TerminalPane
+          sessions={terminalPaneSessions}
+          activeId={activeId}
+          onCwdChange={onCwdChange}
+          onCommandChange={onCommandChange}
+          onSessionResize={onSessionResize}
+          registry={registry}
+          pendingData={pendingData}
+        />
+
+        {activeWorkspaceView.codeEditorOpen &&
+        (
+          activeWorkspaceView.codeEditorRootDir ??
+          activeWorkspaceView.fileExplorerRootDir ??
+          (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
+        ).trim() ? (
+          <>
+            <div
+              className="workspaceResize"
+              onMouseDown={beginWorkspaceResize("editor")}
+              aria-hidden="true"
+            />
+            <React.Suspense
+              fallback={
+                <section className="codeEditorPanel" aria-label="Editor">
+                  <div className="empty">Loading editor…</div>
+                </section>
+              }
+            >
+              <LazyCodeEditorPanel
+                key={`code-editor:${activeWorkspaceKey}`}
+                provider={activeIsSsh ? "ssh" : "local"}
+                sshTarget={activeIsSsh ? activeSshTarget : null}
+                rootDir={
+                  (
+                    activeWorkspaceView.codeEditorRootDir ??
+                    activeWorkspaceView.fileExplorerRootDir ??
+                    (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
+                  ).trim()
+                }
+                openFileRequest={activeWorkspaceView.openFileRequest}
+                persistedState={activeWorkspaceView.codeEditorPersistedState}
+                fsEvent={activeWorkspaceView.codeEditorFsEvent}
+                onPersistState={(state) =>
+                  updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
+                    ...prev,
+                    codeEditorPersistedState: state,
+                  }))
+                }
+                onConsumeOpenFileRequest={() =>
+                  updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
+                    ...prev,
+                    openFileRequest: null,
+                  }))
+                }
+                onActiveFilePathChange={(path) =>
+                  updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => {
+                    if (prev.codeEditorActiveFilePath === path) return prev;
+                    return { ...prev, codeEditorActiveFilePath: path };
+                  })
+                }
+                onCloseEditor={closeCodeEditor}
               />
+            </React.Suspense>
+          </>
+        ) : null}
 
-	              {activeWorkspaceView.codeEditorOpen &&
-	              (
-	                activeWorkspaceView.codeEditorRootDir ??
-	                activeWorkspaceView.fileExplorerRootDir ??
+        {activeWorkspaceView.fileExplorerOpen &&
+        (
+          activeWorkspaceView.fileExplorerRootDir ??
+          activeWorkspaceView.codeEditorRootDir ??
+          (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
+        ).trim() ? (
+          <>
+            <div
+              className="workspaceResize"
+              onMouseDown={beginWorkspaceResize("tree")}
+              aria-hidden="true"
+            />
+            <FileExplorerPanel
+              key={`file-tree:${activeWorkspaceKey}`}
+              isOpen
+              provider={activeIsSsh ? "ssh" : "local"}
+              sshTarget={activeIsSsh ? activeSshTarget : null}
+              rootDir={
+                (
+                  activeWorkspaceView.fileExplorerRootDir ??
+                  activeWorkspaceView.codeEditorRootDir ??
                   (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
-	              ).trim() ? (
-	                <>
-	                  <div
-	                    className="workspaceResize"
-	                    onMouseDown={beginWorkspaceResize("editor")}
-	                    aria-hidden="true"
-	                  />
-	                  <React.Suspense
-	                    fallback={
-	                      <section className="codeEditorPanel" aria-label="Editor">
-	                        <div className="empty">Loading editor…</div>
-	                      </section>
-	                    }
-	                  >
-	                    <LazyCodeEditorPanel
-	                      key={`code-editor:${activeWorkspaceKey}`}
-                        provider={activeIsSsh ? "ssh" : "local"}
-                        sshTarget={activeIsSsh ? activeSshTarget : null}
-	                      rootDir={
-	                        (
-	                          activeWorkspaceView.codeEditorRootDir ??
-	                          activeWorkspaceView.fileExplorerRootDir ??
-	                          (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
-	                        ).trim()
-	                      }
-	                      openFileRequest={activeWorkspaceView.openFileRequest}
-	                      persistedState={activeWorkspaceView.codeEditorPersistedState}
-                        fsEvent={activeWorkspaceView.codeEditorFsEvent}
-	                      onPersistState={(state) =>
-	                        updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
-	                          ...prev,
-	                          codeEditorPersistedState: state,
-	                        }))
-	                      }
-	                      onConsumeOpenFileRequest={() =>
-	                        updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
-	                          ...prev,
-	                          openFileRequest: null,
-	                        }))
-	                      }
-			                      onActiveFilePathChange={(path) =>
-			                        updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => {
-			                          if (prev.codeEditorActiveFilePath === path) return prev;
-			                          return { ...prev, codeEditorActiveFilePath: path };
-			                        })
-			                      }
-			                      onCloseEditor={closeCodeEditor}
-			                    />
-		                  </React.Suspense>
-	                </>
-	              ) : null}
+                ).trim()
+              }
+              persistedState={activeWorkspaceView.fileExplorerPersistedState}
+              activeFilePath={activeWorkspaceView.codeEditorActiveFilePath}
+              onSelectFile={handleSelectWorkspaceFile}
+              onOpenTerminalAtPath={handleOpenTerminalAtPath}
+              onPersistState={(state) =>
+                updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
+                  ...prev,
+                  fileExplorerPersistedState: state,
+                }))
+              }
+              onPathRenamed={handleRenameWorkspacePath}
+              onPathDeleted={handleDeleteWorkspacePath}
+              onClose={() =>
+                updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
+                  ...prev,
+                  fileExplorerOpen: false,
+                }))
+              }
+            />
+          </>
+        ) : activeWorkspaceView.fileExplorerOpen && activeIsSsh ? (
+          <>
+            <div
+              className="workspaceResize"
+              onMouseDown={beginWorkspaceResize("tree")}
+              aria-hidden="true"
+            />
+            <aside className="fileExplorerPanel" aria-label="Files">
+              <div className="fileExplorerHeader">
+                <div className="fileExplorerTitle">
+                  <span>Files</span>
+                  <span className="fileExplorerPath">remote</span>
+                </div>
+                <div className="fileExplorerActions">
+                  <button
+                    type="button"
+                    className="btnSmall btnIcon"
+                    onClick={() =>
+                      updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
+                        ...prev,
+                        fileExplorerOpen: false,
+                      }))
+                    }
+                    title="Close"
+                  >
+                    <Icon name="close" />
+                  </button>
+                </div>
+              </div>
+              <div className="fileExplorerList" role="tree">
+                <div className="fileExplorerRow fileExplorerMeta">
+                  {activeSshTarget ? "Loading remote files…" : "Missing SSH target."}
+                </div>
+              </div>
+            </aside>
+          </>
+        ) : null}
+      </div>
+  ), [
+    terminalPaneSessions, activeId, activeWorkspaceView, activeWorkspaceKey,
+    activeIsSsh, activeSshTarget, activeProject, active,
+    workspaceResizeMode, activeProjectId,
+    onCwdChange, onCommandChange, onSessionResize,
+    beginWorkspaceResize, updateWorkspaceViewForKey,
+    handleSelectWorkspaceFile, handleOpenTerminalAtPath,
+    handleRenameWorkspacePath, handleDeleteWorkspacePath, closeCodeEditor,
+  ]);
 
-	              {activeWorkspaceView.fileExplorerOpen &&
-	              (
-	                activeWorkspaceView.fileExplorerRootDir ??
-	                activeWorkspaceView.codeEditorRootDir ??
-                  (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
-	              ).trim() ? (
-	                <>
-	                  <div
-	                    className="workspaceResize"
-	                    onMouseDown={beginWorkspaceResize("tree")}
-	                    aria-hidden="true"
-	                  />
-	                  <FileExplorerPanel
-	                    key={`file-tree:${activeWorkspaceKey}`}
-	                    isOpen
-                      provider={activeIsSsh ? "ssh" : "local"}
-                      sshTarget={activeIsSsh ? activeSshTarget : null}
-	                    rootDir={
-	                      (
-	                        activeWorkspaceView.fileExplorerRootDir ??
-	                        activeWorkspaceView.codeEditorRootDir ??
-	                        (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
-	                      ).trim()
-	                    }
-                      persistedState={activeWorkspaceView.fileExplorerPersistedState}
-	                    activeFilePath={activeWorkspaceView.codeEditorActiveFilePath}
-	                    onSelectFile={handleSelectWorkspaceFile}
-                      onOpenTerminalAtPath={handleOpenTerminalAtPath}
-                      onPersistState={(state) =>
-                        updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
-                          ...prev,
-                          fileExplorerPersistedState: state,
-                        }))
-                      }
-                      onPathRenamed={handleRenameWorkspacePath}
-                      onPathDeleted={handleDeleteWorkspacePath}
-	                    onClose={() =>
-	                      updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
-	                        ...prev,
-	                        fileExplorerOpen: false,
-	                      }))
-	                    }
-	                  />
-	                </>
-	              ) : activeWorkspaceView.fileExplorerOpen && activeIsSsh ? (
-                  <>
-                    <div
-                      className="workspaceResize"
-                      onMouseDown={beginWorkspaceResize("tree")}
-                      aria-hidden="true"
-                    />
-                    <aside className="fileExplorerPanel" aria-label="Files">
-                      <div className="fileExplorerHeader">
-                        <div className="fileExplorerTitle">
-                          <span>Files</span>
-                          <span className="fileExplorerPath">remote</span>
-                        </div>
-                        <div className="fileExplorerActions">
-                          <button
-                            type="button"
-                            className="btnSmall btnIcon"
-                            onClick={() =>
-                              updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
-                                ...prev,
-                                fileExplorerOpen: false,
-                              }))
-                            }
-                            title="Close"
-                          >
-                            <Icon name="close" />
-                          </button>
-                        </div>
-                      </div>
-                      <div className="fileExplorerList" role="tree">
-                        <div className="fileExplorerRow fileExplorerMeta">
-                          {activeSshTarget ? "Loading remote files…" : "Missing SSH target."}
-                        </div>
-                      </div>
-                    </aside>
-                  </>
-                ) : null}
-            </div>
+  return (
+    <div className="app">
+      {sidebarJsx}
+
+      <main className="main">
+        {topbarJsx}
+
+        <div className="terminalArea">
+          {workspaceRowJsx}
 	
-	          <NewSessionModal
+	          {newOpen && <NewSessionModal
 	            isOpen={newOpen}
 	            projectTitle={activeProject?.title ?? null}
             name={newName}
@@ -5596,9 +5653,9 @@ export default function App() {
               setNewPersistent(false);
             }}
             onSubmit={onNewSubmit}
-          />
+          />}
 
-          <SshManagerModal
+          {sshManagerOpen && <SshManagerModal
             isOpen={sshManagerOpen}
             hosts={sshHosts}
             hostsLoading={sshHostsLoading}
@@ -5625,9 +5682,9 @@ export default function App() {
               setSshError(null);
             }}
             onConnect={() => void onSshConnect()}
-          />
+          />}
 
-          <PersistentSessionsModal
+          {persistentSessionsOpen && <PersistentSessionsModal
             isOpen={persistentSessionsOpen}
             loading={persistentSessionsLoading}
             error={persistentSessionsError}
@@ -5640,9 +5697,9 @@ export default function App() {
             onRefresh={() => void refreshPersistentSessions()}
             onAttach={(persistId) => void attachPersistentSession(persistId)}
             onRequestKill={(persistId) => setConfirmKillPersistentId(persistId)}
-          />
+          />}
 
-          <AgentShortcutsModal
+          {agentShortcutsOpen && <AgentShortcutsModal
             isOpen={agentShortcutsOpen}
             agentShortcuts={agentShortcuts}
             onClose={() => setAgentShortcutsOpen(false)}
@@ -5653,9 +5710,9 @@ export default function App() {
             onResetDefaults={() =>
               setAgentShortcutIds(cleanAgentShortcutIds(DEFAULT_AGENT_SHORTCUT_IDS))
             }
-          />
+          />}
 
-          <ConfirmActionModal
+          {confirmKillPersistentId && <ConfirmActionModal
             isOpen={Boolean(confirmKillPersistentId)}
             title="Kill persistent session"
             message={
@@ -5673,9 +5730,9 @@ export default function App() {
               setConfirmKillPersistentId(null);
             }}
             onConfirm={() => void confirmKillPersistentSession()}
-          />
+          />}
 
-          <ProjectModal
+          {projectOpen && <ProjectModal
             isOpen={projectOpen}
             mode={projectMode}
             title={projectTitle}
@@ -5699,9 +5756,9 @@ export default function App() {
             onChangeAssetsEnabled={setProjectAssetsEnabled}
             onClose={() => setProjectOpen(false)}
             onSubmit={onProjectSubmit}
-          />
+          />}
 
-          <ConfirmDeleteProjectModal
+          {confirmDeleteProjectOpen && activeProject && <ConfirmDeleteProjectModal
             isOpen={confirmDeleteProjectOpen && Boolean(activeProject)}
             projectTitle={activeProject?.title ?? ""}
             onClose={() => setConfirmDeleteProjectOpen(false)}
@@ -5709,9 +5766,9 @@ export default function App() {
               setConfirmDeleteProjectOpen(false);
               void deleteActiveProject();
             }}
-          />
+          />}
 
-          <ConfirmDeleteRecordingModal
+          {confirmDeleteRecordingId && <ConfirmDeleteRecordingModal
             isOpen={Boolean(confirmDeleteRecordingId)}
             recordingLabel={
               confirmDeleteRecordingId
@@ -5725,9 +5782,9 @@ export default function App() {
               setConfirmDeleteRecordingId(null);
               if (id) void deleteRecording(id);
             }}
-          />
+          />}
 
-          <ConfirmActionModal
+          {confirmDeletePromptId && <ConfirmActionModal
             isOpen={Boolean(confirmDeletePromptId)}
             title="Delete prompt"
             message={
@@ -5741,9 +5798,9 @@ export default function App() {
             confirmDanger
             onClose={() => setConfirmDeletePromptId(null)}
             onConfirm={confirmDeletePrompt}
-          />
+          />}
 
-          <ConfirmActionModal
+          {confirmDeleteEnvironmentId && <ConfirmActionModal
             isOpen={Boolean(confirmDeleteEnvironmentId)}
             title="Delete environment"
             message={
@@ -5759,9 +5816,9 @@ export default function App() {
             confirmDanger
             onClose={() => setConfirmDeleteEnvironmentId(null)}
             onConfirm={confirmDeleteEnvironment}
-          />
+          />}
 
-          <ConfirmActionModal
+          {confirmDeleteAssetId && <ConfirmActionModal
             isOpen={Boolean(confirmDeleteAssetId)}
             title="Delete template"
             message={
@@ -5776,9 +5833,9 @@ export default function App() {
             confirmDanger
             onClose={() => setConfirmDeleteAssetId(null)}
             onConfirm={confirmDeleteAsset}
-          />
+          />}
 
-          <ApplyAssetModal
+          {applyAssetRequest && pendingApplyAsset && <ApplyAssetModal
             isOpen={Boolean(applyAssetRequest && pendingApplyAsset)}
             templateName={pendingApplyAsset?.name ?? ""}
             relativePath={pendingApplyAsset?.relativePath ?? ""}
@@ -5788,9 +5845,9 @@ export default function App() {
             error={applyAssetError}
             onClose={closeApplyAssetModal}
             onApply={(overwrite) => void confirmApplyAsset(overwrite)}
-          />
+          />}
 
-          <PathPickerModal
+          {pathPickerOpen && <PathPickerModal
             isOpen={pathPickerOpen}
             listing={pathPickerListing}
             input={pathPickerInput}
@@ -5811,9 +5868,9 @@ export default function App() {
               setPathPickerOpen(false);
               setPathPickerTarget(null);
             }}
-          />
+          />}
 
-          <UpdateModal
+          {updatesOpen && <UpdateModal
             isOpen={updatesOpen}
             appName={appInfo?.name ?? "Agents UI"}
             currentVersion={appInfo?.version ?? null}
@@ -5824,7 +5881,7 @@ export default function App() {
             onClose={() => setUpdatesOpen(false)}
             onCheck={() => void checkForUpdates()}
             onOpenRelease={(url) => void openExternal(url)}
-          />
+          />}
 
           {secureStorageSettingsOpen && (
             <div
@@ -6573,7 +6630,7 @@ export default function App() {
           )}
 
           {/* Slide Panel */}
-          <SlidePanel
+          {slidePanelOpen && <SlidePanel
             isOpen={slidePanelOpen}
             onClose={() => setSlidePanelOpen(false)}
             activeTab={slidePanelTab}
@@ -6895,7 +6952,7 @@ export default function App() {
                 </div>
               </>
             )}
-          </SlidePanel>
+          </SlidePanel>}
         </div>
       </main>
 

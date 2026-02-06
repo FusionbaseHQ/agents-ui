@@ -27,11 +27,36 @@ function TerminalPaneImpl({
   registry,
   pendingData,
 }: TerminalPaneProps) {
+  const paneRef = React.useRef<HTMLDivElement | null>(null);
+  const prevActiveIdRef = React.useRef<string | null>(null);
+
+  // Eagerly toggle visibility via direct DOM before React's commit phase.
+  // useLayoutEffect fires synchronously after DOM mutations but before paint,
+  // so this runs as early as possible when activeId changes.
+  React.useLayoutEffect(() => {
+    const pane = paneRef.current;
+    if (!pane || activeId === prevActiveIdRef.current) return;
+    prevActiveIdRef.current = activeId;
+
+    const containers = pane.children;
+    for (let i = 0; i < containers.length; i++) {
+      const el = containers[i] as HTMLElement;
+      const sessionId = el.dataset.sessionId;
+      if (!sessionId) continue;
+      if (sessionId === activeId) {
+        el.classList.remove("terminalHidden");
+      } else {
+        el.classList.add("terminalHidden");
+      }
+    }
+  }, [activeId]);
+
   return (
-    <div className="terminalPane" aria-label="Terminal">
+    <div className="terminalPane" aria-label="Terminal" ref={paneRef}>
       {sessions.map((session) => (
         <div
           key={session.id}
+          data-session-id={session.id}
           className={`terminalContainer ${session.id === activeId ? "" : "terminalHidden"}`}
         >
           <SessionTerminal
