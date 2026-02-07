@@ -121,6 +121,8 @@ const STORAGE_RECENT_SESSIONS_KEY = "agents-ui-recent-sessions-v1";
 
 const MAX_PENDING_SESSIONS = 32;
 const MAX_PENDING_CHUNKS_PER_SESSION = 200;
+const MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION = 64;
+const HIDDEN_OUTPUT_FLUSH_BUDGET_BYTES = 64 * 1024;
 
 const DEFAULT_AGENT_SHORTCUT_IDS = ["codex", "claude", "gemini"];
 const DEFAULT_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT = 290;
@@ -1352,21 +1354,81 @@ export default function App() {
     if (outputQueueRef.current.size === 0) return;
     const queue = outputQueueRef.current;
     outputQueueRef.current = new Map();
+    const activeId = activeIdRef.current;
+    let hiddenBudget = HIDDEN_OUTPUT_FLUSH_BUDGET_BYTES;
 
-    for (const [id, chunks] of queue) {
-      if (closingSessions.current.has(id)) continue;
-      if (!chunks.length) continue;
+    const requeueDeferredChunks = (id: string, chunks: string[]) => {
+      if (!chunks.length) return;
+      const existing = outputQueueRef.current.get(id) ?? [];
+      const merged = chunks.concat(existing);
+      if (merged.length <= MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION) {
+        outputQueueRef.current.set(id, merged);
+        return;
+      }
+      const head = merged.slice(0, MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION - 1);
+      const tail = merged.slice(MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION - 1).join("");
+      outputQueueRef.current.set(id, [...head, tail]);
+    };
+
+    const flushAllChunks = (id: string, chunks: string[]) => {
+      if (closingSessions.current.has(id) || chunks.length === 0) return;
       const text = chunks.length === 1 ? chunks[0] : chunks.join("");
       const entry = registry.current.get(id);
       if (entry) {
-        // Write directly — xterm 5 buffers internally before renderer is ready.
-        // Gating on isTerminalRendererReady caused a race: the flush RAF fires
-        // before the renderer-init RAF, data goes to pendingData, and flushPending
-        // (which only runs once at mount) has already returned.
         entry.term.write(text);
-        continue;
+        return;
       }
       pushPendingData(id, text);
+    };
+
+    const flushHiddenChunksWithBudget = (id: string, chunks: string[]) => {
+      if (closingSessions.current.has(id) || chunks.length === 0) return;
+      const entry = registry.current.get(id);
+      if (!entry) {
+        const text = chunks.length === 1 ? chunks[0] : chunks.join("");
+        pushPendingData(id, text);
+        return;
+      }
+      if (hiddenBudget <= 0) {
+        requeueDeferredChunks(id, chunks);
+        return;
+      }
+
+      let consumedChars = 0;
+      let consumedCount = 0;
+      while (consumedCount < chunks.length) {
+        const chunk = chunks[consumedCount];
+        if (consumedChars > 0 && consumedChars + chunk.length > hiddenBudget) break;
+        consumedChars += chunk.length;
+        consumedCount += 1;
+        if (consumedChars >= hiddenBudget) break;
+      }
+
+      if (consumedCount === 0) {
+        consumedCount = 1;
+        consumedChars = chunks[0].length;
+      }
+
+      const visible = chunks.slice(0, consumedCount);
+      const deferred = chunks.slice(consumedCount);
+      entry.term.write(visible.length === 1 ? visible[0] : visible.join(""));
+      hiddenBudget -= consumedChars;
+      if (deferred.length > 0) {
+        requeueDeferredChunks(id, deferred);
+      }
+    };
+
+    if (activeId) {
+      const activeChunks = queue.get(activeId);
+      if (activeChunks) {
+        flushAllChunks(activeId, activeChunks);
+        queue.delete(activeId);
+      }
+    }
+
+    for (const [id, chunks] of queue) {
+      if (id === activeId) continue;
+      flushHiddenChunksWithBudget(id, chunks);
     }
   }, [pushPendingData]);
 
@@ -1382,6 +1444,10 @@ export default function App() {
       outputFlushRafRef.current = null;
       outputFlushTimerRef.current = null;
       flushQueuedOutput();
+      if (outputQueueRef.current.size > 0) {
+        outputFlushRafRef.current = window.requestAnimationFrame(flush);
+        outputFlushTimerRef.current = window.setTimeout(flush, 20);
+      }
     };
 
     outputFlushRafRef.current = window.requestAnimationFrame(flush);
@@ -3955,7 +4021,7 @@ export default function App() {
               const queue = outputQueueRef.current.get(id) ?? [];
               if (queue.length === 0) {
                 queue.push(text);
-              } else if (queue.length >= 64) {
+              } else if (queue.length >= MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION) {
                 queue[queue.length - 1] += text;
               } else {
                 queue.push(text);
