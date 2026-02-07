@@ -4940,8 +4940,7 @@ export default function App() {
         title: effect.label,
         command: effect.matchCommands[0] ?? effect.label,
       }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
+    [quickStart],
   );
 
   const handleOpenNewSession = useCallback(() => {

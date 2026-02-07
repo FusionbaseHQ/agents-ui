@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -199,6 +199,74 @@ fn default_user_shell() -> String {
     }
 }
 
+fn run_command_output_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+    label: &str,
+) -> Result<std::process::Output, String> {
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("{label} failed: {e}"))?;
+
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{label} failed: missing stdout pipe"))?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{label} failed: missing stderr pipe"))?;
+
+    let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>();
+    let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut reader = stdout_pipe;
+        let _ = reader.read_to_end(&mut buf);
+        let _ = stdout_tx.send(buf);
+    });
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut reader = stderr_pipe;
+        let _ = reader.read_to_end(&mut buf);
+        let _ = stderr_tx.send(buf);
+    });
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "{label} timed out after {}ms",
+                        timeout.as_millis()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("{label} failed: {e}")),
+        }
+    };
+
+    let stdout = stdout_rx
+        .recv_timeout(Duration::from_millis(200))
+        .unwrap_or_default();
+    let stderr = stderr_rx
+        .recv_timeout(Duration::from_millis(200))
+        .unwrap_or_default();
+
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn login_shell_path(shell: &str, base_path: &str) -> Option<String> {
     let shell_name = Path::new(shell)
@@ -258,31 +326,36 @@ fn login_shell_path(shell: &str, base_path: &str) -> Option<String> {
 
         let mut child = pair.slave.spawn_command(cmd).ok()?;
         let mut reader = pair.master.try_clone_reader().ok()?;
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut utf8_carry: Vec<u8> = Vec::new();
+            let mut output = String::new();
 
-        let mut buf = [0u8; 4096];
-        let mut utf8_carry: Vec<u8> = Vec::new();
-        let mut output = String::new();
-        let start_time = Instant::now();
-
-        loop {
-            if start_time.elapsed().as_millis() > 2000 {
-                break;
-            }
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    output.push_str(&decode_utf8_stream(&mut utf8_carry, &buf[..n]));
-                    if output.contains(START) && output.contains(END) {
-                        break;
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        output.push_str(&decode_utf8_stream(&mut utf8_carry, &buf[..n]));
+                        if output.contains(START) && output.contains(END) {
+                            break;
+                        }
                     }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
 
-        if !utf8_carry.is_empty() {
-            output.push_str(&String::from_utf8_lossy(&utf8_carry));
-        }
+            if !utf8_carry.is_empty() {
+                output.push_str(&String::from_utf8_lossy(&utf8_carry));
+            }
+            let _ = tx.send(output);
+        });
+
+        let output = match rx.recv_timeout(Duration::from_millis(2000)) {
+            Ok(data) => data,
+            Err(RecvTimeoutError::Timeout) => String::new(),
+            Err(RecvTimeoutError::Disconnected) => String::new(),
+        };
 
         let _ = child.kill();
         let _ = child.wait();
@@ -303,15 +376,21 @@ fn login_shell_path(shell: &str, base_path: &str) -> Option<String> {
     }
 
     for args in arg_sets {
-        let out = Command::new(shell)
-            .args(&args)
+        let mut cmd = Command::new(shell);
+        cmd.args(&args)
             .arg(&script)
             .env("PATH", base_path)
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
-            .env("SHELL", shell)
-            .output()
-            .ok()?;
+            .env("SHELL", shell);
+        let out = match run_command_output_with_timeout(
+            cmd,
+            Duration::from_millis(2000),
+            "login shell PATH probe",
+        ) {
+            Ok(out) => out,
+            Err(_) => continue,
+        };
 
         let stdout = String::from_utf8_lossy(&out.stdout);
         if let Some(path) = extract_path(&stdout) {
@@ -451,12 +530,15 @@ fn zellij_list_sessions(
     zellij_home: &Path,
     socket_dir: &Path,
 ) -> Result<Vec<String>, String> {
-    let out = Command::new(zellij)
-        .args(["list-sessions", "--short", "--no-formatting"])
+    let mut cmd = Command::new(zellij);
+    cmd.args(["list-sessions", "--short", "--no-formatting"])
         .env("HOME", zellij_home.to_string_lossy().to_string())
-        .env("ZELLIJ_SOCKET_DIR", socket_dir.to_string_lossy().to_string())
-        .output()
-        .map_err(|e| format!("failed to run bundled zellij: {e}"))?;
+        .env("ZELLIJ_SOCKET_DIR", socket_dir.to_string_lossy().to_string());
+    let out = run_command_output_with_timeout(
+        cmd,
+        Duration::from_millis(2000),
+        "bundled zellij list-sessions",
+    )?;
 
     if out.status.success() {
         let stdout = String::from_utf8_lossy(&out.stdout);
