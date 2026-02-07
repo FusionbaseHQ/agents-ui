@@ -1516,6 +1516,27 @@ export default function App() {
     return hasAlphaNum;
   };
 
+  const isControlOrWhitespaceOnlyOutput = (data: string): boolean => {
+    let i = 0;
+    while (i < data.length) {
+      const ch = data[i];
+      if (ch === "\u001b") {
+        i = skipEscapeSequence(data, i + 1);
+        continue;
+      }
+      if (ch < " " || ch === "\u007f") {
+        i += 1;
+        continue;
+      }
+      if (ch.trim() === "") {
+        i += 1;
+        continue;
+      }
+      return false;
+    }
+    return true;
+  };
+
   function markAgentWorkingFromOutput(id: string, data: string) {
     if (!hydratedRef.current) return;
     const session = sessionByIdRef.current.get(id);
@@ -4016,6 +4037,10 @@ export default function App() {
 
 		        // Ignore events for sessions being closed
 		        if (closingSessions.current.has(id)) return;
+              // Hidden sessions can emit frequent control/whitespace-only chatter
+              // (cursor movement, prompt redraw). Drop those chunks early.
+              const isHiddenSession = activeIdRef.current !== id;
+              if (isHiddenSession && isControlOrWhitespaceOnlyOutput(text)) return;
 
 			        markAgentWorkingFromOutput(id, text);
               const queue = outputQueueRef.current.get(id) ?? [];
