@@ -2579,6 +2579,23 @@ select.input {
 }
 
 /* Keyboard Shortcut Hint */
+.restoreHint {
+  font-size: 11px;
+  color: rgba(200, 212, 255, 0.78);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  letter-spacing: 0.01em;
+}
+
+.restoreHintDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgba(139, 168, 255, 0.9);
+  animation: restoreHintPulse 1.6s ease-in-out infinite;
+}
+
 .shortcutHint {
   font-size: 11px;
   color: var(--muted);
@@ -2592,6 +2609,18 @@ select.input {
   padding: 2px 6px;
   border-radius: 4px;
   font-family: ui-monospace, monospace;
+}
+
+@keyframes restoreHintPulse {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.08);
+  }
 }
 
 /* SSH Modal */

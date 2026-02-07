@@ -108,6 +108,7 @@ type TrayMenuEventPayload = {
 type RecentSessionKey = { projectId: string; persistId: string };
 type TrayRecentSession = { label: string; projectId: string; persistId: string };
 type OutputQueueBySession = Map<string, string[]>;
+type SessionRestoreProgress = { remaining: number; total: number };
 
 const STORAGE_PROJECTS_KEY = "agents-ui-projects";
 const STORAGE_ACTIVE_PROJECT_KEY = "agents-ui-active-project-id";
@@ -896,6 +897,9 @@ export default function App() {
   });
   const [activeId, setActiveId] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
+  const [sessionRestoreProgress, setSessionRestoreProgress] = useState<SessionRestoreProgress | null>(
+    null,
+  );
   const [newOpen, setNewOpen] = useState(false);
   const [sshManagerOpen, setSshManagerOpen] = useState(false);
   const [sshHosts, setSshHosts] = useState<SshHostEntry[]>([]);
@@ -4343,9 +4347,30 @@ export default function App() {
         .filter((s) => projectById.has(s.projectId))
         .sort((a, b) => a.createdAt - b.createdAt);
 
-      const restored: Session[] = [];
-      for (const s of persisted) {
-        if (cancelled) break;
+      const syncLastActiveByProject = (items: Session[]) => {
+        for (const p of state.projects) {
+          const desired = activeSessionByProject[p.id];
+          const session =
+            (desired ? items.find((s) => s.projectId === p.id && s.persistId === desired) : null) ??
+            items.find((s) => s.projectId === p.id) ??
+            null;
+          if (session) lastActiveByProject.current.set(p.id, session.id);
+          else lastActiveByProject.current.delete(p.id);
+        }
+      };
+
+      const pickActiveFromProject = (items: Session[]): Session | null => {
+        const desired = activeSessionByProject[activeProjectId];
+        return (
+          (desired
+            ? items.find((s) => s.projectId === activeProjectId && s.persistId === desired)
+            : null) ??
+          items.find((s) => s.projectId === activeProjectId) ??
+          null
+        );
+      };
+
+      const restorePersistedSession = async (s: PersistedSession): Promise<Session | null> => {
         try {
           const createdRaw = await createSession({
             projectId: s.projectId,
@@ -4362,8 +4387,6 @@ export default function App() {
             createdAt: s.createdAt,
           });
           const created = applyPendingExit(createdRaw);
-          restored.push(created);
-
           const restoreCmd =
             (s.persistent
               ? null
@@ -4390,9 +4413,35 @@ export default function App() {
               }
             })();
           }
+          return created;
         } catch (err) {
           if (!cancelled) reportError("Failed to restore session", err);
+          return null;
         }
+      };
+
+      const desiredActivePersistId = activeSessionByProject[activeProjectId];
+      const prioritizedFirst =
+        (desiredActivePersistId
+          ? persisted.find(
+              (s) => s.projectId === activeProjectId && s.persistId === desiredActivePersistId,
+            )
+          : null) ??
+        persisted.find((s) => s.projectId === activeProjectId) ??
+        null;
+      const orderedPersisted = prioritizedFirst
+        ? [prioritizedFirst, ...persisted.filter((s) => s !== prioritizedFirst)]
+        : persisted;
+
+      const restored: Session[] = [];
+      let firstRestoreIndex = -1;
+      for (let i = 0; i < orderedPersisted.length; i += 1) {
+        if (cancelled) break;
+        const created = await restorePersistedSession(orderedPersisted[i]);
+        if (!created) continue;
+        restored.push(created);
+        firstRestoreIndex = i;
+        break;
       }
 
       if (cancelled) {
@@ -4400,59 +4449,82 @@ export default function App() {
         return;
       }
 
-	      if (restored.length === 0) {
-	        let first: Session;
-	        try {
-	          const basePath = projectById.get(activeProjectId)?.basePath ?? resolvedHome ?? null;
-	          const createdRaw = await createSession({
-	            projectId: activeProjectId,
-	            cwd: basePath,
-	            envVars: envVarsForProject(activeProjectId),
-	          });
-	          first = applyPendingExit(createdRaw);
-	        } catch (err) {
-	          if (!cancelled) reportError("Failed to create session", err);
-	          setSessions([]);
-	          setActiveId(null);
-	          setHydrated(true);
-	          return;
-	        }
-	        if (cancelled) {
-	          await closeSession(first.id).catch(() => {});
-	          return;
-	        }
+      if (restored.length === 0) {
+        let first: Session;
+        try {
+          const basePath = projectById.get(activeProjectId)?.basePath ?? resolvedHome ?? null;
+          const createdRaw = await createSession({
+            projectId: activeProjectId,
+            cwd: basePath,
+            envVars: envVarsForProject(activeProjectId),
+          });
+          first = applyPendingExit(createdRaw);
+        } catch (err) {
+          if (!cancelled) reportError("Failed to create session", err);
+          setSessionRestoreProgress(null);
+          setSessions([]);
+          setActiveId(null);
+          setHydrated(true);
+          return;
+        }
+        if (cancelled) {
+          await closeSession(first.id).catch(() => {});
+          return;
+        }
+        syncLastActiveByProject([first]);
+        setSessionRestoreProgress(null);
         setSessions([first]);
         setActiveId(first.id);
         setHydrated(true);
         return;
       }
 
-      for (const p of state.projects) {
-        const desired = activeSessionByProject[p.id];
-        const session =
-          (desired
-            ? restored.find((s) => s.projectId === p.id && s.persistId === desired)
-            : null) ?? restored.find((s) => s.projectId === p.id) ?? null;
-        if (session) lastActiveByProject.current.set(p.id, session.id);
+      syncLastActiveByProject(restored);
+      const initialActive = pickActiveFromProject(restored);
+      setSessions(restored);
+      setActiveId(initialActive ? initialActive.id : null);
+      const totalToRestore = orderedPersisted.length;
+      const attemptedCount = Math.max(1, firstRestoreIndex + 1);
+      const remainingAfterInitial = Math.max(0, totalToRestore - attemptedCount);
+      if (remainingAfterInitial > 0) {
+        setSessionRestoreProgress({ remaining: remainingAfterInitial, total: totalToRestore });
+      } else {
+        setSessionRestoreProgress(null);
+      }
+      setHydrated(true);
+
+      if (remainingAfterInitial === 0) return;
+
+      let attempted = attemptedCount;
+      const remainingCandidates = orderedPersisted.slice(firstRestoreIndex + 1);
+      for (const s of remainingCandidates) {
+        if (cancelled) break;
+        const created = await restorePersistedSession(s);
+        attempted += 1;
+        if (created) {
+          restored.push(created);
+          restored.sort((a, b) => a.createdAt - b.createdAt);
+          syncLastActiveByProject(restored);
+          const nextActive = pickActiveFromProject(restored);
+          setSessions((prev) =>
+            [...prev, created].sort((a, b) => a.createdAt - b.createdAt),
+          );
+          if (nextActive) setActiveId(nextActive.id);
+        }
+        if (!cancelled) {
+          const remaining = Math.max(0, totalToRestore - attempted);
+          if (remaining > 0) setSessionRestoreProgress({ remaining, total: totalToRestore });
+          else setSessionRestoreProgress(null);
+        }
       }
 
-      setSessions(restored);
-      const desired = activeSessionByProject[activeProjectId];
-      const active =
-        (desired
-          ? restored.find(
-              (s) => s.projectId === activeProjectId && s.persistId === desired,
-            )
-          : null) ??
-        restored.find((s) => s.projectId === activeProjectId) ??
-        null;
-      setActiveId(active ? active.id : null);
-      setHydrated(true);
+      if (!cancelled) setSessionRestoreProgress(null);
     };
-	
+		
 	    void setup().catch((err) => {
 	      if (cancelled) return;
 	      reportError("Startup failed", err);
+	      setSessionRestoreProgress(null);
 	      setHydrated(true);
 	    });
 
@@ -5258,6 +5330,18 @@ export default function App() {
           </div>
         )}
 
+        {sessionRestoreProgress && (
+          <div
+            className="restoreHint"
+            role="status"
+            aria-live="polite"
+            title={`Restoring saved sessions (${sessionRestoreProgress.total - sessionRestoreProgress.remaining}/${sessionRestoreProgress.total})`}
+          >
+            <span className="restoreHintDot" />
+            <span>{`Restoring ${sessionRestoreProgress.remaining}…`}</span>
+          </div>
+        )}
+
         {!error && !notice && (
           <div className="shortcutHint">
             <kbd>{"\u2318"}K</kbd> Quick Access
@@ -5411,7 +5495,7 @@ export default function App() {
     </div>
   ), [
     active, activeProject, activeIsSsh, activeSshTarget, activeWorkspaceView,
-    error, notice, persistenceDisabledReason,
+    error, notice, persistenceDisabledReason, sessionRestoreProgress,
     secureStorageMode, secureStorageRetrying, slidePanelOpen,
     retrySecureStorage, dismissNotice, reportError,
     updateActiveWorkspaceView, stopRecording, openRecordPrompt,
