@@ -3625,6 +3625,22 @@ export default function App() {
     [],
   );
 
+  const updateSessionById = useCallback(
+    (id: string, updater: (session: Session) => Session) => {
+      setSessions((prev) => {
+        const index = prev.findIndex((s) => s.id === id);
+        if (index < 0) return prev;
+        const current = prev[index];
+        const next = updater(current);
+        if (next === current) return prev;
+        const out = prev.slice();
+        out[index] = next;
+        return out;
+      });
+    },
+    [],
+  );
+
   function openPathPicker(target: "project" | "session", initial: string | null) {
     setPathPickerTarget(target);
     pathPickerInitialPathRef.current = initial;
@@ -3646,15 +3662,12 @@ export default function App() {
     agentWorkingMapRef.current.set(id, false);
     scheduleAgentWorkingSync();
 
-    setSessions((prev) =>
-      prev.map((s) => {
-        if (s.id !== id) return s;
-        const nextCwd = s.cwd !== trimmed ? trimmed : s.cwd;
-        if (nextCwd === s.cwd && !s.effectId) return s;
-        return { ...s, cwd: nextCwd, effectId: null, processTag: null };
-      }),
-    );
-  }, [clearAgentIdleTimer, scheduleAgentWorkingSync]);
+    updateSessionById(id, (s) => {
+      const nextCwd = s.cwd !== trimmed ? trimmed : s.cwd;
+      if (nextCwd === s.cwd && !s.effectId) return s;
+      return { ...s, cwd: nextCwd, effectId: null, processTag: null };
+    });
+  }, [clearAgentIdleTimer, scheduleAgentWorkingSync, updateSessionById]);
 
   const onCommandChange = useCallback((id: string, commandLine: string, source: "osc" | "input" = "input") => {
     const trimmed = commandLine.trim();
@@ -3668,13 +3681,10 @@ export default function App() {
         clearAgentIdleTimer(id);
         agentWorkingMapRef.current.set(id, false);
         scheduleAgentWorkingSync();
-        setSessions((prev) =>
-          prev.map((s) => {
-            if (s.id !== id) return s;
-            if (!s.effectId) return s;
-            return { ...s, effectId: null, processTag: null };
-          }),
-        );
+        updateSessionById(id, (s) => {
+          if (!s.effectId) return s;
+          return { ...s, effectId: null, processTag: null };
+        });
         return;
       }
 
@@ -3683,24 +3693,21 @@ export default function App() {
       clearAgentIdleTimer(id);
       agentWorkingMapRef.current.set(id, false);
       scheduleAgentWorkingSync();
-      setSessions((prev) =>
-        prev.map((s) => {
-          if (s.id !== id) return s;
-          const nextRestoreCommand = effect && !s.persistent ? trimmed : null;
-          if (
-            s.effectId === nextEffectId &&
-            (s.restoreCommand ?? null) === nextRestoreCommand
-          ) {
-            return s;
-          }
-          return {
-            ...s,
-            effectId: nextEffectId,
-            restoreCommand: nextRestoreCommand,
-            processTag: null,
-          };
-        }),
-      );
+      updateSessionById(id, (s) => {
+        const nextRestoreCommand = effect && !s.persistent ? trimmed : null;
+        if (
+          s.effectId === nextEffectId &&
+          (s.restoreCommand ?? null) === nextRestoreCommand
+        ) {
+          return s;
+        }
+        return {
+          ...s,
+          effectId: nextEffectId,
+          restoreCommand: nextRestoreCommand,
+          processTag: null,
+        };
+      });
       return;
     }
 
@@ -3714,21 +3721,18 @@ export default function App() {
     clearAgentIdleTimer(id);
     agentWorkingMapRef.current.set(id, false);
     scheduleAgentWorkingSync();
-    setSessions((prev) =>
-      prev.map((s) => {
-        if (s.id !== id) return s;
-        const nextRestoreCommand = effect && !s.persistent ? trimmed : null;
-        if (s.effectId === nextEffectId && (s.restoreCommand ?? null) === nextRestoreCommand)
-          return s;
-        return {
-          ...s,
-          effectId: nextEffectId,
-          restoreCommand: nextRestoreCommand,
-          processTag: null,
-        };
-      }),
-    );
-  }, [clearAgentIdleTimer, scheduleAgentWorkingSync]);
+    updateSessionById(id, (s) => {
+      const nextRestoreCommand = effect && !s.persistent ? trimmed : null;
+      if (s.effectId === nextEffectId && (s.restoreCommand ?? null) === nextRestoreCommand)
+        return s;
+      return {
+        ...s,
+        effectId: nextEffectId,
+        restoreCommand: nextRestoreCommand,
+        processTag: null,
+      };
+    });
+  }, [clearAgentIdleTimer, scheduleAgentWorkingSync, updateSessionById]);
 
   function pickActiveSessionId(projectId: string): string | null {
     const sessions = sessionsRef.current;
