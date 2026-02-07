@@ -399,6 +399,39 @@ pub async fn ssh_default_root(target: String) -> Result<String, String> {
         .map_err(|e| format!("ssh task join failed: {e:?}"))?
 }
 
+#[tauri::command]
+pub async fn ssh_effective_user(target: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || ssh_effective_user_sync(target))
+        .await
+        .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+fn ssh_effective_user_sync(target: String) -> Result<String, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("missing ssh target".to_string());
+    }
+
+    // Single-line command to avoid shell parsing differences across hosts.
+    let script = r#"id -un 2>/dev/null || whoami 2>/dev/null"#;
+    let command = build_sh_c_command(script, None, &[]);
+    let args = vec![command];
+    let output = run_ssh(target, &args, None)?;
+    if !output.status.success() {
+        return Err(output_to_error("ssh failed", &output));
+    }
+    let user = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if user.is_empty() {
+        return Err("ssh returned empty user".to_string());
+    }
+    Ok(user)
+}
+
 fn ssh_default_root_sync(target: String) -> Result<String, String> {
     let target = target.trim();
     if target.is_empty() {

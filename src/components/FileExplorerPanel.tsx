@@ -56,6 +56,18 @@ function normalizePath(input: string): string {
   return trimmed.replace(/\/+$/, "");
 }
 
+function normalizeSshRootPath(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) return "/";
+  if (trimmed === "~") return "/";
+  if (trimmed.startsWith("~/")) {
+    const normalized = normalizePath(trimmed.slice(1));
+    return normalized.startsWith("/") ? normalized : "/";
+  }
+  const normalized = normalizePath(trimmed);
+  return normalized.startsWith("/") ? normalized : "/";
+}
+
 function dirname(input: string): string {
   const path = normalizePath(input);
   const idx = path.lastIndexOf("/");
@@ -243,8 +255,50 @@ export function FileExplorerPanel({
   onPathRenamed?: (fromPath: string, toPath: string) => void;
   onPathDeleted?: (path: string) => void;
 }) {
-  const root = React.useMemo(() => normalizePath(rootDir), [rootDir]);
+  const root = React.useMemo(
+    () => (provider === "ssh" ? normalizeSshRootPath(rootDir) : normalizePath(rootDir)),
+    [provider, rootDir],
+  );
   const sshTargetValue = React.useMemo(() => (sshTarget ?? "").trim() || null, [sshTarget]);
+  const [sshEffectiveUser, setSshEffectiveUser] = React.useState<string | null>(null);
+  const [sshEffectiveUserLoading, setSshEffectiveUserLoading] = React.useState(false);
+  React.useEffect(() => {
+    let cancelled = false;
+    if (provider !== "ssh" || !sshTargetValue) {
+      setSshEffectiveUser(null);
+      setSshEffectiveUserLoading(false);
+      return;
+    }
+    setSshEffectiveUserLoading(true);
+    void invoke<string>("ssh_effective_user", { target: sshTargetValue })
+      .then((value) => {
+        if (cancelled) return;
+        const trimmed = value.trim();
+        setSshEffectiveUser(trimmed || null);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setSshEffectiveUser(null);
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setSshEffectiveUserLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [provider, sshTargetValue]);
+  const rootPathLabel = React.useMemo(() => {
+    if (provider !== "ssh") return shortenPathSmart(rootDir, 46);
+    const label = basename(root);
+    if (label) return label;
+    return shortenPathSmart(rootDir, 46);
+  }, [provider, root, rootDir]);
+  const rootPathTitle = React.useMemo(() => {
+    if (provider !== "ssh") return shortenPathSmart(rootDir, 120);
+    if (sshTargetValue) return `${sshTargetValue}:${root}`;
+    return shortenPathSmart(rootDir, 120);
+  }, [provider, root, rootDir, sshTargetValue]);
   const [expandedDirs, setExpandedDirs] = React.useState<Set<string>>(() => new Set([root]));
   const [dirStateByPath, setDirStateByPath] = React.useState<Record<string, DirectoryState>>({});
   const panelRef = React.useRef<HTMLElement | null>(null);
@@ -1049,9 +1103,21 @@ export function FileExplorerPanel({
       <div className="fileExplorerHeader">
         <div className="fileExplorerTitle">
           <span>Files</span>
-          <span className="fileExplorerPath" title={shortenPathSmart(rootDir, 120)}>
-            {shortenPathSmart(rootDir, 46)}
+          <span className="fileExplorerPath" title={rootPathTitle}>
+            {rootPathLabel}
           </span>
+          {provider === "ssh" && (
+            <span
+              className="fileExplorerSshUser"
+              title={
+                sshEffectiveUser
+                  ? `Listing files as ${sshEffectiveUser} on ${sshTargetValue ?? "ssh"}`
+                  : `Listing user unavailable for ${sshTargetValue ?? "ssh"}`
+              }
+            >
+              {sshEffectiveUserLoading ? "as …" : `as ${sshEffectiveUser ?? "?"}`}
+            </span>
+          )}
         </div>
         <div className="fileExplorerActions">
           <button type="button" className="btnSmall btnIcon" onClick={refreshRoot} title="Refresh">

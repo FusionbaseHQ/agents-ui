@@ -992,6 +992,15 @@ body {
   max-width: 200px;
 }
 
+.fileExplorerSshUser {
+  color: rgba(200, 212, 255, 0.68);
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  opacity: 0.9;
+}
+
 .fileExplorerActions {
   display: flex;
   align-items: center;

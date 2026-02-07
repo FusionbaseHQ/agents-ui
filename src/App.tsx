@@ -303,6 +303,15 @@ function sshTargetFromCommandLine(commandLine: string | null | undefined): strin
   return target ? target : null;
 }
 
+function sshTargetFromSessionName(name: string | null | undefined): string | null {
+  const trimmed = name?.trim() ?? "";
+  if (!trimmed) return null;
+  if (!/^ssh\s+/i.test(trimmed)) return null;
+  const remainder = trimmed.replace(/^ssh\s+/i, "");
+  const target = remainder.split(":")[0]?.trim() ?? "";
+  return target ? target : null;
+}
+
 function parseEnvContentToVars(content: string): Record<string, string> {
   const out: Record<string, string> = {};
   const normalized = normalizeSmartQuotes(content);
@@ -811,14 +820,18 @@ async function createSession(input: {
 
   const trimmedCommand = (input.launchCommand ?? "").trim();
   const launchCommand = persistent ? null : trimmedCommand ? trimmedCommand : null;
-  const isSshSession = isSshCommandLine(launchCommand ?? input.restoreCommand ?? null);
+  const trimmedRestoreCommand = (input.restoreCommand ?? "").trim();
+  const restoreCommand = trimmedRestoreCommand ? trimmedRestoreCommand : null;
+  const explicitSshTarget = input.sshTarget?.trim() || null;
+  const commandForDetection = launchCommand ?? restoreCommand;
+  const isSshSession = Boolean(explicitSshTarget) || isSshCommandLine(commandForDetection);
   const sshTarget = isSshSession
-    ? (input.sshTarget?.trim() || sshTargetFromCommandLine(launchCommand ?? input.restoreCommand ?? null))
+    ? (explicitSshTarget || sshTargetFromCommandLine(commandForDetection))
     : null;
   const sshRootDir = isSshSession ? input.sshRootDir?.trim() || null : null;
-  const processTag = launchCommand ? commandTagFromCommandLine(launchCommand) : null;
+  const processTag = commandForDetection ? commandTagFromCommandLine(commandForDetection) : null;
   const effect = detectProcessEffect({
-    command: launchCommand,
+    command: commandForDetection,
     name: input.name ?? null,
   });
   const info = await invoke<SessionInfo>("create_session", {
@@ -836,7 +849,7 @@ async function createSession(input: {
     persistent,
     createdAt: input.createdAt ?? Date.now(),
     launchCommand,
-    restoreCommand: input.restoreCommand ?? null,
+    restoreCommand,
     sshTarget,
     sshRootDir,
     lastRecordingId: input.lastRecordingId ?? null,
@@ -1057,7 +1070,9 @@ export default function App() {
   const activeWorkspaceKey = useMemo(() => {
     const active = sessions.find((s) => s.id === activeId) ?? null;
     if (!active) return activeProjectId;
-    const isSsh = isSshCommandLine(active.launchCommand ?? active.restoreCommand ?? null);
+    const isSsh =
+      Boolean((active.sshTarget ?? "").trim()) ||
+      isSshCommandLine(active.launchCommand ?? active.restoreCommand ?? null);
     if (isSsh) {
       const target =
         active.sshTarget?.trim() ||
@@ -1575,15 +1590,18 @@ export default function App() {
 
   const activeIsSsh = useMemo(() => {
     if (!active) return false;
-    return isSshCommandLine(active.launchCommand ?? active.restoreCommand ?? null);
+    return (
+      Boolean((active.sshTarget ?? "").trim()) ||
+      isSshCommandLine(active.launchCommand ?? active.restoreCommand ?? null)
+    );
   }, [active]);
 
   const activeSshTarget = useMemo(() => {
-    if (!activeIsSsh || !active) return null;
+    if (!active) return null;
     const stored = active.sshTarget?.trim() ?? "";
     if (stored) return stored;
     return sshTargetFromCommandLine(active.launchCommand ?? active.restoreCommand ?? null);
-  }, [active, activeIsSsh]);
+  }, [active]);
 
   const sshRootResolveInFlightRef = useRef<Set<string>>(new Set());
   useEffect(() => {
@@ -4377,7 +4395,10 @@ export default function App() {
             name: s.name,
             launchCommand: s.launchCommand,
             restoreCommand: s.restoreCommand ?? null,
-            sshTarget: s.sshTarget ?? null,
+            sshTarget:
+              s.sshTarget ??
+              sshTargetFromCommandLine(s.launchCommand ?? s.restoreCommand ?? null) ??
+              sshTargetFromSessionName(s.name),
             sshRootDir: s.sshRootDir ?? null,
             lastRecordingId: s.lastRecordingId ?? null,
             cwd: s.cwd ?? projectById.get(s.projectId)?.basePath ?? resolvedHome ?? null,
@@ -4625,6 +4646,7 @@ export default function App() {
       name,
       launchCommand: data.persistent ? null : data.command,
       restoreCommand: data.persistent ? data.command : null,
+      sshTarget: data.host,
       persistent: data.persistent,
       cwd: validatedCwd,
       envVars: envVarsForProjectId(activeProjectId, projects, environments),

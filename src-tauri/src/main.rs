@@ -28,6 +28,7 @@ use secure::{prepare_secure_storage, reset_secure_storage};
 use ssh::list_ssh_hosts;
 use ssh_fs::{
     ssh_default_root, ssh_delete_fs_entry, ssh_download_file, ssh_download_to_temp,
+    ssh_effective_user,
     ssh_list_fs_entries, ssh_read_text_file, ssh_rename_fs_entry, ssh_upload_file,
     ssh_write_text_file,
 };
@@ -103,6 +104,7 @@ fn main() {
             delete_fs_entry,
             copy_fs_entry,
             ssh_default_root,
+            ssh_effective_user,
             ssh_list_fs_entries,
             ssh_read_text_file,
             ssh_write_text_file,
