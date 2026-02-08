@@ -117,12 +117,11 @@ const SessionItem = React.memo(function SessionItem({
       </div>
       <button
         className="closeBtn"
-        disabled={isClosing}
         onClick={(e) => {
           e.stopPropagation();
           onCloseSession(s.id);
         }}
-        title="Close session"
+        title={isClosing ? "Force close session" : "Close session"}
       >
         ×
       </button>

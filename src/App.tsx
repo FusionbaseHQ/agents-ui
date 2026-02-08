@@ -557,6 +557,20 @@ function loadLegacyPersistedSessions(): PersistedSession[] {
   }
 }
 
+function dedupePersistedSessions(input: PersistedSession[]): PersistedSession[] {
+  const sorted = input.slice().sort((a, b) => a.createdAt - b.createdAt);
+  const byKey = new Map<string, PersistedSession>();
+  for (const session of sorted) {
+    const persistId = (session.persistId ?? "").trim();
+    if (!persistId) continue;
+    const key = session.persistent
+      ? `persistent:${persistId}`
+      : `session:${session.projectId}:${persistId}`;
+    if (!byKey.has(key)) byKey.set(key, session);
+  }
+  return Array.from(byKey.values());
+}
+
 function loadLegacyActiveSessionByProject(): Record<string, string> {
   try {
     const raw = localStorage.getItem(STORAGE_ACTIVE_SESSION_BY_PROJECT_KEY);
@@ -1274,6 +1288,7 @@ export default function App() {
   const secureStorageRetryingRef = useRef(false);
   const secureStorageModeRef = useRef(secureStorageMode);
   const lastResizeAtRef = useRef<Map<string, number>>(new Map());
+  const attachingPersistentIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     let cancelled = false;
@@ -1893,6 +1908,29 @@ export default function App() {
     };
   }, []);
 
+  const addSessionWithProjectSafeActivation = useCallback((session: Session) => {
+    setSessions((prev) => {
+      if (prev.some((s) => s.id === session.id)) {
+        if (import.meta.env.DEV) {
+          console.warn(`[addSession] Duplicate session id=${session.id} name="${session.name}" — skipped`);
+        }
+        return prev;
+      }
+      return [...prev, session];
+    });
+    if (activeProjectIdRef.current === session.projectId) {
+      setActiveId(session.id);
+      return;
+    }
+    if (import.meta.env.DEV) {
+      console.warn(
+        `[addSession] Session "${session.name}" (project=${session.projectId}) added but NOT activated ` +
+        `— active project is ${activeProjectIdRef.current}`,
+      );
+    }
+    lastActiveByProject.current.set(session.projectId, session.id);
+  }, []);
+
   const handleOpenTerminalAtPath = useCallback(
     async (path: string, provider: "local" | "ssh", sshTarget: string | null) => {
       const desiredPath = path.trim();
@@ -1916,8 +1954,7 @@ export default function App() {
             envVars,
           });
           const s = applyPendingExit(createdRaw);
-          setSessions((prev) => [...prev, s]);
-          setActiveId(s.id);
+          addSessionWithProjectSafeActivation(s);
         } catch (err) {
           reportError("Failed to create session", err);
         }
@@ -1958,8 +1995,7 @@ export default function App() {
             null,
         });
         const s = applyPendingExit(createdRaw);
-        setSessions((prev) => [...prev, s]);
-        setActiveId(s.id);
+        addSessionWithProjectSafeActivation(s);
       } catch (err) {
         reportError("Failed to create SSH session", err);
       }
@@ -1973,6 +2009,7 @@ export default function App() {
       activeWorkspaceView.codeEditorRootDir,
       activeWorkspaceView.fileExplorerRootDir,
       applyPendingExit,
+      addSessionWithProjectSafeActivation,
       assetSettings.autoApplyEnabled,
       assets,
       environments,
@@ -1981,6 +2018,28 @@ export default function App() {
   );
 
   useEffect(() => {
+    // Dedup guard: if the sessions array has duplicates by id, fix it.
+    const seenIds = new Set<string>();
+    let hasDupes = false;
+    for (const s of sessions) {
+      if (seenIds.has(s.id)) { hasDupes = true; break; }
+      seenIds.add(s.id);
+    }
+    if (hasDupes) {
+      if (import.meta.env.DEV) {
+        console.warn(`[sessions sync] Detected duplicate session IDs — deduplicating`);
+      }
+      const deduped: Session[] = [];
+      const seen = new Set<string>();
+      for (const s of sessions) {
+        if (seen.has(s.id)) continue;
+        seen.add(s.id);
+        deduped.push(s);
+      }
+      setSessions(deduped);
+      return; // effect will re-run with deduped sessions
+    }
+
     sessionIdsRef.current = sessions.map((s) => s.id);
     sessionsRef.current = sessions;
     sessionByIdRef.current = new Map(sessions.map((session) => [session.id, session]));
@@ -2002,6 +2061,51 @@ export default function App() {
   useEffect(() => {
     activeProjectIdRef.current = activeProjectId;
   }, [activeProjectId]);
+
+  // Clean up sessions with invalid projectId or duplicate persistId+projectId.
+  // This handles corrupted persisted state, orphaned sessions, and ghost duplicates.
+  useEffect(() => {
+    if (!hydrated) return;
+    const validProjectIds = new Set(projects.map((p) => p.id));
+    setSessions((prev) => {
+      // Step 1: Remove sessions with invalid projectId.
+      let next = prev.filter((s) => validProjectIds.has(s.projectId));
+
+      // Step 2: Deduplicate by persistId + projectId (keep earliest by createdAt).
+      const seen = new Map<string, string>(); // key → session.id (winner)
+      const dupeIds = new Set<string>();
+      for (const s of next) {
+        const key = `${s.projectId}:${s.persistId}`;
+        const existing = seen.get(key);
+        if (existing) {
+          dupeIds.add(s.id); // later duplicate — remove
+        } else {
+          seen.set(key, s.id);
+        }
+      }
+      if (dupeIds.size > 0) {
+        if (import.meta.env.DEV) {
+          console.warn(
+            `[session cleanup] Removing ${dupeIds.size} duplicate session(s)`,
+            next.filter((s) => dupeIds.has(s.id)).map((s) => ({ id: s.id, name: s.name, persistId: s.persistId, projectId: s.projectId })),
+          );
+        }
+        next = next.filter((s) => !dupeIds.has(s.id));
+      }
+
+      if (next.length === prev.length) return prev;
+      if (import.meta.env.DEV) {
+        const orphaned = prev.filter((s) => !validProjectIds.has(s.projectId));
+        if (orphaned.length > 0) {
+          console.warn(
+            `[session cleanup] Removed ${orphaned.length} orphaned session(s):`,
+            orphaned.map((s) => ({ id: s.id, name: s.name, projectId: s.projectId })),
+          );
+        }
+      }
+      return next;
+    });
+  }, [hydrated, projects]);
 
   useEffect(() => {
     secureStorageModeRef.current = secureStorageMode;
@@ -2098,12 +2202,30 @@ export default function App() {
 
   const terminalPaneSessionsRef = useRef<TerminalPaneSession[]>([]);
   const terminalPaneSessions = useMemo<TerminalPaneSession[]>(() => {
-    const next = sessions.map((s) => ({
-      id: s.id,
-      persistent: s.persistent,
-      exited: Boolean(s.exited),
-      closing: Boolean(s.closing),
-    }));
+    if (import.meta.env.DEV) {
+      const foreignCount = sessions.filter((s) => s.projectId !== activeProjectId).length;
+      if (foreignCount > 0) {
+        console.warn(
+          `[TerminalPane] Filtering out ${foreignCount} session(s) from other projects. ` +
+          `Active project: ${activeProjectId}, total sessions: ${sessions.length}, ` +
+          `project distribution:`,
+          Object.fromEntries(
+            [...new Set(sessions.map((s) => s.projectId))].map((pid) => [
+              pid,
+              sessions.filter((s) => s.projectId === pid).length,
+            ]),
+          ),
+        );
+      }
+    }
+    const next = sessions
+      .filter((s) => s.projectId === activeProjectId)
+      .map((s) => ({
+        id: s.id,
+        persistent: s.persistent,
+        exited: Boolean(s.exited),
+        closing: Boolean(s.closing),
+      }));
     const prev = terminalPaneSessionsRef.current;
     if (
       prev.length === next.length &&
@@ -2119,7 +2241,7 @@ export default function App() {
     }
     terminalPaneSessionsRef.current = next;
     return next;
-  }, [sessions]);
+  }, [sessions, activeProjectId]);
 
   useEffect(() => {
     if (!hydrated || persistenceDisabledReason) return;
@@ -3416,8 +3538,7 @@ export default function App() {
         envVars: envVarsForProjectId(projectId, projects, environments),
       });
       const s = applyPendingExit(createdRaw);
-      setSessions((prev) => [...prev, s]);
-      setActiveId(s.id);
+      addSessionWithProjectSafeActivation(s);
       await sleep(50);
       await sendPromptToSession(s.id, prompt, mode);
     } catch (err) {
@@ -3681,7 +3802,10 @@ export default function App() {
         envVars: envVarsForProjectId(projectId, projects, environments),
       });
       const created = applyPendingExit(createdRaw);
-      setSessions((prev) => [...prev, created]);
+      setSessions((prev) => {
+        if (prev.some((s) => s.id === created.id)) return prev;
+        return [...prev, created];
+      });
       setActiveProjectId(projectId);
       setActiveId(created.id);
       setReplayTargetSessionId(created.id);
@@ -3843,12 +3967,29 @@ export default function App() {
     });
   }, [clearAgentIdleTimer, scheduleAgentWorkingSync, updateSessionById]);
 
-  function pickActiveSessionId(projectId: string): string | null {
-    const sessions = sessionsRef.current;
+  function pickActiveSessionIdFromList(projectId: string, sessions: Session[]): string | null {
     const last = lastActiveByProject.current.get(projectId);
-    if (last && sessionByIdRef.current.has(last)) return last;
-    const first = sessions.find((s) => s.projectId === projectId);
-    return first ? first.id : null;
+    if (last) {
+      const lastSession = sessions.find((s) => s.id === last && s.projectId === projectId && !s.closing);
+      if (lastSession) return lastSession.id;
+    }
+    // Prefer live (non-exited, non-closing) sessions
+    const firstLive = sessions.find((s) => s.projectId === projectId && !s.exited && !s.closing);
+    if (firstLive) return firstLive.id;
+    // Fall back to non-closing (includes exited)
+    const firstOpen = sessions.find((s) => s.projectId === projectId && !s.closing);
+    if (firstOpen) return firstOpen.id;
+    // Last resort: any session in this project
+    const firstAny = sessions.find((s) => s.projectId === projectId);
+    return firstAny ? firstAny.id : null;
+  }
+
+  function pickActiveSessionId(projectId: string): string | null {
+    return pickActiveSessionIdFromList(projectId, sessionsRef.current);
+  }
+
+  function pickActiveSessionIdFrom(projectId: string, sessions: Session[]): string | null {
+    return pickActiveSessionIdFromList(projectId, sessions);
   }
 
   const selectProject = useCallback((projectId: string) => {
@@ -3956,6 +4097,7 @@ export default function App() {
     setProjects((prev) => [...prev, project]);
     setProjectOpen(false);
     setActiveProjectId(id);
+    setActiveId(null); // No sessions yet; prevents flash of previous project's terminal
 
     try {
       await ensureAutoAssets(validatedBasePath, id, data.assetsEnabled);
@@ -3965,8 +4107,7 @@ export default function App() {
         envVars: envVarsForProjectId(id, [...projects, project], environments),
       });
       const s = applyPendingExit(createdRaw);
-      setSessions((prev) => [...prev, s]);
-      setActiveId(s.id);
+      addSessionWithProjectSafeActivation(s);
     } catch (err) {
       reportError("Failed to create session", err);
       setActiveId(null);
@@ -3982,19 +4123,8 @@ export default function App() {
       .map((s) => s.id);
 
     for (const id of idsToClose) {
-      clearAgentIdleTimer(id);
-      lastResizeAtRef.current.delete(id);
-      if (!closingSessions.current.has(id)) {
-        const timeout = window.setTimeout(() => {
-          closingSessions.current.delete(id);
-          pendingData.current.delete(id);
-        }, 30_000);
-        closingSessions.current.set(id, timeout);
-      }
-      pendingData.current.delete(id);
+      removeSessionFromState(id);
     }
-
-    setSessions((prev) => prev.filter((s) => s.projectId !== activeProjectId));
     lastActiveByProject.current.delete(activeProjectId);
     setActiveSessionByProject((prev) => {
       if (!(activeProjectId in prev)) return prev;
@@ -4014,6 +4144,7 @@ export default function App() {
       };
       setProjects([fallback]);
       setActiveProjectId(fallback.id);
+      setActiveId(null);
       try {
         const createdRaw = await createSession({
           projectId: fallback.id,
@@ -4037,13 +4168,18 @@ export default function App() {
   }
 
   useEffect(() => {
-    const active = activeIdRef.current;
-    if (active) {
-      const session = sessionsRef.current.find((s) => s.id === active);
-      if (session && session.projectId === activeProjectId) return;
+    const activeSession = activeId ? sessions.find((s) => s.id === activeId) ?? null : null;
+    if (activeSession && activeSession.projectId === activeProjectId && !activeSession.closing) return;
+    if (import.meta.env.DEV && activeSession && activeSession.projectId !== activeProjectId) {
+      console.warn(
+        `[activeId sync] Correcting cross-project activeId. ` +
+        `activeId session project: ${activeSession.projectId}, activeProjectId: ${activeProjectId}, ` +
+        `session: ${activeSession.name}`,
+      );
     }
-    setActiveId(pickActiveSessionId(activeProjectId));
-  }, [activeProjectId]);
+    const next = pickActiveSessionIdFrom(activeProjectId, sessions);
+    if (next !== activeId) setActiveId(next);
+  }, [activeId, activeProjectId, sessions]);
 
   useEffect(() => {
     let cancelled = false;
@@ -4361,9 +4497,9 @@ export default function App() {
         return envVarsForProjectId(projectId, state.projects, state.environments ?? []);
       };
 
-      const persisted = state.sessions
-        .filter((s) => projectById.has(s.projectId))
-        .sort((a, b) => a.createdAt - b.createdAt);
+      const persisted = dedupePersistedSessions(
+        state.sessions.filter((s) => projectById.has(s.projectId)),
+      );
 
       const syncLastActiveByProject = (items: Session[]) => {
         for (const p of state.projects) {
@@ -4526,11 +4662,17 @@ export default function App() {
           restored.push(created);
           restored.sort((a, b) => a.createdAt - b.createdAt);
           syncLastActiveByProject(restored);
-          const nextActive = pickActiveFromProject(restored);
-          setSessions((prev) =>
-            [...prev, created].sort((a, b) => a.createdAt - b.createdAt),
-          );
-          if (nextActive) setActiveId(nextActive.id);
+          setSessions((prev) => {
+            if (prev.some((s) => s.id === created.id)) return prev; // dedup guard
+            return [...prev, created].sort((a, b) => a.createdAt - b.createdAt);
+          });
+          // Only update activeId if the restored session belongs to the
+          // user's current project — they may have switched away since
+          // the restore loop started.
+          if (created.projectId === activeProjectIdRef.current) {
+            const nextActive = pickActiveFromProject(restored);
+            if (nextActive) setActiveId(nextActive.id);
+          }
         }
         if (!cancelled) {
           const remaining = Math.max(0, totalToRestore - attempted);
@@ -4621,8 +4763,7 @@ export default function App() {
         envVars: envVarsForProjectId(activeProjectId, projects, environments),
       });
       const s = applyPendingExit(createdRaw);
-      setSessions((prev) => [...prev, s]);
-      setActiveId(s.id);
+      addSessionWithProjectSafeActivation(s);
       setNewOpen(false);
     } catch (err) {
       reportError("Failed to create session", err);
@@ -4652,8 +4793,7 @@ export default function App() {
       envVars: envVarsForProjectId(activeProjectId, projects, environments),
     });
     const s = applyPendingExit(createdRaw);
-    setSessions((prev) => [...prev, s]);
-    setActiveId(s.id);
+    addSessionWithProjectSafeActivation(s);
     setSshManagerOpen(false);
 
     if (data.persistent) {
@@ -4669,114 +4809,108 @@ export default function App() {
     }
   }
 
-  async function onClose(id: string) {
+  // Immediately remove a session from UI state. Synchronous — never blocks.
+  // Backend cleanup is fire-and-forget.
+  function removeSessionFromState(id: string) {
     clearAgentIdleTimer(id);
     lastResizeAtRef.current.delete(id);
-    const session = sessionsRef.current.find((s) => s.id === id) ?? null;
-    const wasPersistent = Boolean(session?.persistent && !session?.exited);
-    if (session?.recordingActive) {
-      try {
-        await invoke("stop_session_recording", { id });
-      } catch {
-        // ignore
-      }
-    }
-    setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, closing: true } : s)));
-
-    if (!closingSessions.current.has(id)) {
-      const timeout = window.setTimeout(() => {
-        closingSessions.current.delete(id);
-        pendingData.current.delete(id);
-      }, 30_000);
-      closingSessions.current.set(id, timeout);
-    }
-
-    // Clean up pending buffer
     pendingData.current.delete(id);
-
-    let killErr: string | null = null;
-    let killedPersistent = false;
-    let closeErr: unknown | null = null;
-    try {
-      try {
-        // Close the attached client first so zellij is no longer "in use" when we kill the session.
-        await closeSession(id);
-      } catch (err) {
-        closeErr = err;
-      }
-
-      if (wasPersistent && session?.persistId) {
-        try {
-          await invoke("kill_persistent_session", { persistId: session.persistId });
-          killedPersistent = true;
-        } catch (err) {
-          killErr = formatError(err);
-        } finally {
-          void refreshPersistentSessions();
-        }
-      }
-
-      if (closeErr) throw closeErr;
-    } catch (err) {
-      const timeout = closingSessions.current.get(id);
-      if (timeout !== undefined) window.clearTimeout(timeout);
+    // Mark as closing so output/exit handlers ignore stale backend events.
+    const prevTimeout = closingSessions.current.get(id);
+    if (prevTimeout !== undefined) window.clearTimeout(prevTimeout);
+    const cleanupTimeout = window.setTimeout(() => {
       closingSessions.current.delete(id);
-      setSessions((prev) =>
-        prev.map((s) => (s.id === id ? { ...s, closing: false } : s)),
-      );
-      reportError("Failed to close session", err);
-      return;
-    }
-
-    if (wasPersistent && session) {
-      if (killedPersistent) {
-        showNotice(`Closed "${session.name}" and killed persistent terminal.`);
-      } else if (killErr) {
-        showNotice(
-          `Closed "${session.name}" but failed to kill persistent terminal. Manage via Persistent terminals (∞).`,
-        );
-      } else {
-        showNotice(`Closed "${session.name}".`);
-      }
-    }
-
+    }, 10_000);
+    closingSessions.current.set(id, cleanupTimeout);
     setSessions((prev) => {
-      const closing = prev.find((s) => s.id === id);
+      const removed = prev.find((s) => s.id === id);
       const next = prev.filter((s) => s.id !== id);
+      if (next.length === prev.length) return prev; // not found — no-op
       setActiveId((prevActive) => {
         if (prevActive !== id) return prevActive;
-        if (!closing) return next.length ? next[0].id : null;
-        const sameProject = next.filter((s) => s.projectId === closing.projectId);
-        return sameProject.length ? sameProject[0].id : null;
+        const projectId = removed?.projectId ?? activeProjectIdRef.current;
+        return pickActiveSessionIdFromList(projectId, next);
       });
       return next;
     });
   }
 
-  async function attachPersistentSession(persistId: string) {
-    const existing = sessionsRef.current.find((s) => s.persistId === persistId) ?? null;
-    if (existing && !existing.exited && !existing.closing) {
-      setActiveProjectId(existing.projectId);
-      setActiveId(existing.id);
-      return;
-    }
+  // Close a session: remove from UI immediately, then async backend cleanup.
+  function onClose(id: string) {
+    // Snapshot session data before removal (for async cleanup).
+    const session = sessionsRef.current.find((s) => s.id === id) ?? null;
 
-    const cwd = activeProject?.basePath ?? homeDirRef.current ?? null;
+    // Step 1: Remove from UI state immediately. No "closing" intermediate state.
+    removeSessionFromState(id);
+
+    // Step 2: Fire-and-forget backend + persistent session cleanup.
+    void (async () => {
+      try {
+        if (session?.recordingActive) {
+          await invoke("stop_session_recording", { id }).catch(() => {});
+        }
+        await closeSession(id).catch(() => {});
+
+        const wasPersistent = Boolean(session?.persistent && !session?.exited);
+        if (wasPersistent && session?.persistId) {
+          let killedPersistent = false;
+          let killErr: string | null = null;
+          try {
+            await invoke("kill_persistent_session", { persistId: session.persistId });
+            killedPersistent = true;
+          } catch (err) {
+            killErr = formatError(err);
+          } finally {
+            void refreshPersistentSessions();
+          }
+          if (killedPersistent) {
+            showNotice(`Closed "${session.name}" and killed persistent terminal.`);
+          } else if (killErr) {
+            showNotice(
+              `Closed "${session.name}" but failed to kill persistent terminal. Manage via Persistent terminals (∞).`,
+            );
+          } else {
+            showNotice(`Closed "${session.name}".`);
+          }
+        }
+      } catch {
+        // All cleanup is best-effort.
+      }
+    })();
+  }
+
+  async function attachPersistentSession(persistId: string) {
+    const normalizedPersistId = persistId.trim();
+    if (!normalizedPersistId) return;
+    if (attachingPersistentIdsRef.current.has(normalizedPersistId)) return;
+    attachingPersistentIdsRef.current.add(normalizedPersistId);
     try {
-      if (cwd) await ensureAutoAssets(cwd, activeProjectId);
+      const existing = sessionsRef.current.find(
+        (s) => s.persistId === normalizedPersistId && !s.exited && !s.closing,
+      ) ?? null;
+      if (existing) {
+        setActiveProjectId(existing.projectId);
+        setActiveId(existing.id);
+        return;
+      }
+
+      const projectId = activeProjectIdRef.current;
+      const cwd = projectByIdRef.current.get(projectId)?.basePath ?? homeDirRef.current ?? null;
+      if (cwd) await ensureAutoAssets(cwd, projectId);
       const createdRaw = await createSession({
-        projectId: activeProjectId,
-        name: `persist ${persistId.slice(0, 8)}`,
+        projectId,
+        name: `persist ${normalizedPersistId.slice(0, 8)}`,
         persistent: true,
-        persistId,
+        persistId: normalizedPersistId,
         cwd,
-        envVars: envVarsForProjectId(activeProjectId, projects, environments),
+        envVars: envVarsForProjectId(projectId, projects, environments),
       });
       const created = applyPendingExit(createdRaw);
-      setSessions((prev) => [...prev, created]);
-      setActiveId(created.id);
+      addSessionWithProjectSafeActivation(created);
     } catch (err) {
       reportError("Failed to attach persistent session", err);
+    } finally {
+      attachingPersistentIdsRef.current.delete(normalizedPersistId);
     }
   }
 
@@ -4789,13 +4923,14 @@ export default function App() {
       await Promise.all(toClose.map((id) => closeSession(id).catch(() => {})));
       await invoke("kill_persistent_session", { persistId });
 
-      setSessions((prev) => prev.filter((s) => s.persistId !== persistId));
-      setActiveId((prevActive) => {
-        if (!prevActive) return prevActive;
-        const stillExists = sessionsRef.current.some(
-          (s) => s.id === prevActive && s.persistId !== persistId,
-        );
-        return stillExists ? prevActive : null;
+      setSessions((prev) => {
+        const next = prev.filter((s) => s.persistId !== persistId);
+        setActiveId((prevActive) => {
+          if (!prevActive) return prevActive;
+          if (next.some((s) => s.id === prevActive)) return prevActive;
+          return pickActiveSessionIdFromList(activeProjectIdRef.current, next);
+        });
+        return next;
       });
 
       showNotice(`Killed persistent session ${persistId.slice(0, 8)}`);
@@ -4856,8 +4991,7 @@ export default function App() {
       });
       const created = applyPendingExit(createdRaw);
       const next = created;
-      setSessions((prev) => [...prev, next]);
-      setActiveId(next.id);
+      addSessionWithProjectSafeActivation(next);
 
       const commandLine = (preset.command ?? "").trim();
       if (commandLine) {
