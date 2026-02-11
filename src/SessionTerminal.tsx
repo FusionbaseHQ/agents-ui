@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import React, { useEffect, useRef } from "react";
 import { Terminal } from "xterm";
+import { CanvasAddon } from "xterm-addon-canvas";
 import { FitAddon } from "xterm-addon-fit";
 
 export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon }>;
@@ -165,6 +166,8 @@ function SessionTerminal(props: SessionTerminalProps) {
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(container);
+    const canvasAddon = new CanvasAddon();
+    term.loadAddon(canvasAddon);
     patchXtermRenderServiceDimensions(term);
 
     const reportTransportError = (operation: "write" | "resize", err: unknown) => {
@@ -587,6 +590,7 @@ function SessionTerminal(props: SessionTerminalProps) {
 	      props.registry.current.delete(props.id);
 	      props.pendingData.current.delete(props.id);
 	      wheelCleanup?.();
+	      canvasAddon.dispose();
 	      term.dispose();
 	      termRef.current = null;
 	      fitRef.current = null;

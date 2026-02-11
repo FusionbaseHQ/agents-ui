@@ -1740,7 +1740,8 @@ pub fn create_session(
     // recv_timeout ensures the buffer is flushed even when the reader blocks on I/O.
     std::thread::spawn(move || {
         const OUTPUT_EMIT_BYTES: usize = 32 * 1024;
-        const OUTPUT_EMIT_INTERVAL: Duration = Duration::from_millis(12);
+        const OUTPUT_EMIT_INTERVAL_FAST: Duration = Duration::from_millis(8);
+        const OUTPUT_EMIT_INTERVAL_SLOW: Duration = Duration::from_millis(24);
 
         let mut output_buffer = String::new();
         let mut last_emit_at = Instant::now();
@@ -1761,7 +1762,14 @@ pub fn create_session(
         };
 
         loop {
-            match rx.recv_timeout(OUTPUT_EMIT_INTERVAL) {
+            // Adaptive interval: batch more aggressively when buffer is large
+            // to reduce IPC overhead under heavy output.
+            let interval = if output_buffer.len() > OUTPUT_EMIT_BYTES {
+                OUTPUT_EMIT_INTERVAL_SLOW
+            } else {
+                OUTPUT_EMIT_INTERVAL_FAST
+            };
+            match rx.recv_timeout(interval) {
                 Ok(data) => {
                     output_buffer.push_str(&data);
                     if output_buffer.len() >= OUTPUT_EMIT_BYTES {

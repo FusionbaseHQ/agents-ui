@@ -128,7 +128,6 @@ const STORAGE_RECENT_SESSIONS_KEY = "agents-ui-recent-sessions-v1";
 const MAX_PENDING_SESSIONS = 32;
 const MAX_PENDING_CHUNKS_PER_SESSION = 200;
 const MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION = 64;
-const HIDDEN_OUTPUT_FLUSH_BUDGET_BYTES = 64 * 1024;
 const SSH_RECONNECT_BASE_MS = 1000;
 const SSH_RECONNECT_MAX_MS = 30_000;
 const SSH_RECONNECT_MAX_ATTEMPTS = 6;
@@ -1298,9 +1297,9 @@ export default function App() {
   const pendingData = useRef<PendingDataBuffer>(new Map());
   const outputQueueRef = useRef<OutputQueueBySession>(new Map());
   const outputFlushRafRef = useRef<number | null>(null);
-  const outputFlushTimerRef = useRef<number | null>(null);
   const pendingExitCodes = useRef<Map<string, number | null>>(new Map());
   const closingSessions = useRef<Map<string, number>>(new Map());
+  const exitedCleanupTimers = useRef<Map<string, number>>(new Map());
   const sessionIdsRef = useRef<string[]>([]);
   const sessionsRef = useRef<Session[]>([]);
   const sessionByIdRef = useRef<Map<string, Session>>(new Map());
@@ -1464,7 +1463,9 @@ export default function App() {
     const queue = outputQueueRef.current;
     outputQueueRef.current = new Map();
     const activeId = preferredActiveId === undefined ? activeIdRef.current : preferredActiveId;
-    let hiddenBudget = HIDDEN_OUTPUT_FLUSH_BUDGET_BYTES;
+    const hiddenCount = Math.max(1, queue.size - (activeId && queue.has(activeId) ? 1 : 0));
+    const PER_HIDDEN_SESSION_BUDGET = 32 * 1024;
+    let hiddenBudget = Math.min(hiddenCount * PER_HIDDEN_SESSION_BUDGET, 256 * 1024);
 
     const requeueDeferredChunks = (id: string, chunks: string[]) => {
       if (!chunks.length) return;
@@ -1481,12 +1482,12 @@ export default function App() {
 
     const flushAllChunks = (id: string, chunks: string[]) => {
       if (closingSessions.current.has(id) || chunks.length === 0) return;
-      const text = chunks.length === 1 ? chunks[0] : chunks.join("");
       const entry = registry.current.get(id);
       if (entry) {
-        entry.term.write(text);
+        for (const chunk of chunks) entry.term.write(chunk);
         return;
       }
+      const text = chunks.length === 1 ? chunks[0] : chunks.join("");
       pushPendingData(id, text);
     };
 
@@ -1542,25 +1543,15 @@ export default function App() {
   }, [pushPendingData]);
 
   const scheduleOutputFlush = useCallback(() => {
-    if (outputFlushRafRef.current !== null || outputFlushTimerRef.current !== null) return;
+    if (outputFlushRafRef.current !== null) return;
     const flush = () => {
-      if (outputFlushRafRef.current !== null) {
-        window.cancelAnimationFrame(outputFlushRafRef.current);
-      }
-      if (outputFlushTimerRef.current !== null) {
-        window.clearTimeout(outputFlushTimerRef.current);
-      }
       outputFlushRafRef.current = null;
-      outputFlushTimerRef.current = null;
       flushQueuedOutput();
       if (outputQueueRef.current.size > 0) {
         outputFlushRafRef.current = window.requestAnimationFrame(flush);
-        outputFlushTimerRef.current = window.setTimeout(flush, 20);
       }
     };
-
     outputFlushRafRef.current = window.requestAnimationFrame(flush);
-    outputFlushTimerRef.current = window.setTimeout(flush, 20);
   }, [flushQueuedOutput]);
 
   const skipEscapeSequence = (data: string, start: number): number => {
@@ -2470,7 +2461,19 @@ export default function App() {
 
   useLayoutEffect(() => {
     activeIdRef.current = activeId;
+    if (outputFlushRafRef.current !== null) {
+      window.cancelAnimationFrame(outputFlushRafRef.current);
+      outputFlushRafRef.current = null;
+    }
     flushQueuedOutput(activeId);
+    // Cancel exited-session auto-cleanup if user switches back to it
+    if (activeId) {
+      const cleanupTimer = exitedCleanupTimers.current.get(activeId);
+      if (cleanupTimer !== undefined) {
+        window.clearTimeout(cleanupTimer);
+        exitedCleanupTimers.current.delete(activeId);
+      }
+    }
   }, [activeId, flushQueuedOutput]);
 
   useEffect(() => {
@@ -4686,7 +4689,13 @@ export default function App() {
               if (queue.length === 0) {
                 queue.push(text);
               } else if (queue.length >= MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION) {
-                queue[queue.length - 1] += text;
+                const last = queue[queue.length - 1];
+                if (last.length >= 64 * 1024) {
+                  queue.shift();
+                  queue.push(text);
+                } else {
+                  queue[queue.length - 1] += text;
+                }
               } else {
                 queue.push(text);
               }
@@ -4744,6 +4753,17 @@ export default function App() {
           if (!found) pendingExitCodes.current.set(id, exit_code ?? null);
           return next;
         });
+
+        // Auto-cleanup exited sessions after 120s if user is not viewing them
+        if (!exitedCleanupTimers.current.has(id)) {
+          const timer = window.setTimeout(() => {
+            exitedCleanupTimers.current.delete(id);
+            if (activeIdRef.current !== id) {
+              removeSessionFromState(id);
+            }
+          }, 120_000);
+          exitedCleanupTimers.current.set(id, timer);
+        }
       });
       unlisteners.push(unlistenExit);
 
@@ -5231,10 +5251,6 @@ export default function App() {
           window.cancelAnimationFrame(outputFlushRafRef.current);
           outputFlushRafRef.current = null;
         }
-        if (outputFlushTimerRef.current !== null) {
-          window.clearTimeout(outputFlushTimerRef.current);
-          outputFlushTimerRef.current = null;
-        }
         outputQueueRef.current.clear();
         pendingAgentWorkingRef.current.clear();
         if (agentWorkingSyncTimerRef.current !== null) {
@@ -5351,6 +5367,11 @@ export default function App() {
   // Immediately remove a session from UI state. Synchronous — never blocks.
   // Backend cleanup is fire-and-forget.
   function removeSessionFromState(id: string) {
+    const exitTimer = exitedCleanupTimers.current.get(id);
+    if (exitTimer !== undefined) {
+      window.clearTimeout(exitTimer);
+      exitedCleanupTimers.current.delete(id);
+    }
     clearSessionRuntimeBuffers(id);
     commandLifecycleSessionsRef.current.delete(id);
     // Mark as closing so output/exit handlers ignore stale backend events.
