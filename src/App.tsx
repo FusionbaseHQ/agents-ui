@@ -77,6 +77,11 @@ type Session = SessionInfo & {
   exited?: boolean;
   closing?: boolean;
   exitCode?: number | null;
+  connectionState?: "connected" | "reconnecting" | "disconnected";
+  reconnectAttempt?: number;
+  nextReconnectAt?: number | null;
+  disconnectReason?: string | null;
+  manualReconnectAvailable?: boolean;
 };
 
 type WorkspaceView = {
@@ -124,6 +129,11 @@ const MAX_PENDING_SESSIONS = 32;
 const MAX_PENDING_CHUNKS_PER_SESSION = 200;
 const MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION = 64;
 const HIDDEN_OUTPUT_FLUSH_BUDGET_BYTES = 64 * 1024;
+const SSH_RECONNECT_BASE_MS = 1000;
+const SSH_RECONNECT_MAX_MS = 30_000;
+const SSH_RECONNECT_MAX_ATTEMPTS = 6;
+const SESSION_HEALTHCHECK_VISIBLE_INTERVAL_MS = 30_000;
+const SESSION_HEALTHCHECK_MIN_GAP_MS = 5_000;
 
 const DEFAULT_AGENT_SHORTCUT_IDS = ["codex", "claude", "gemini"];
 const DEFAULT_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT = 290;
@@ -283,7 +293,7 @@ function buildSshCommandAtRemoteDir(input: {
   // IMPORTANT: pass the remote command as a *single* ssh argument so remote quoting survives.
   const remoteCommandArg = shellEscapePosix(remoteCommand);
 
-  return [program, ...options, "-t", target, remoteCommandArg].join(" ");
+  return ensureSshKeepAliveOptions([program, ...options, "-t", target, remoteCommandArg].join(" ")) ?? "ssh";
 }
 
 function isSshCommandLine(commandLine: string | null | undefined): boolean {
@@ -292,6 +302,41 @@ function isSshCommandLine(commandLine: string | null | undefined): boolean {
   const token = trimmed.split(/\s+/)[0];
   const base = token.split(/[\\/]/).pop() ?? token;
   return base.toLowerCase().replace(/\.exe$/, "") === "ssh";
+}
+
+function hasSshOption(parts: string[], keyLower: string): boolean {
+  for (let i = 1; i < parts.length; i += 1) {
+    const token = parts[i];
+    const tokenLower = token.toLowerCase();
+    if (tokenLower.startsWith("-o")) {
+      if (tokenLower === "-o") {
+        const value = (parts[i + 1] ?? "").trim().toLowerCase();
+        if (value.startsWith(`${keyLower}=`)) return true;
+        i += 1;
+        continue;
+      }
+      const value = token.slice(2).trim().toLowerCase();
+      if (value.startsWith(`${keyLower}=`)) return true;
+    }
+  }
+  return false;
+}
+
+function ensureSshKeepAliveOptions(commandLine: string | null | undefined): string | null {
+  const trimmed = commandLine?.trim() ?? "";
+  if (!trimmed) return null;
+  if (!isSshCommandLine(trimmed)) return trimmed;
+
+  const parts = trimmed.split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return trimmed;
+
+  const inject: string[] = [];
+  if (!hasSshOption(parts, "serveraliveinterval")) inject.push("-o", "ServerAliveInterval=15");
+  if (!hasSshOption(parts, "serveralivecountmax")) inject.push("-o", "ServerAliveCountMax=3");
+  if (!hasSshOption(parts, "tcpkeepalive")) inject.push("-o", "TCPKeepAlive=yes");
+  if (inject.length === 0) return trimmed;
+
+  return [parts[0], ...inject, ...parts.slice(1)].join(" ");
 }
 
 function sshTargetFromCommandLine(commandLine: string | null | undefined): string | null {
@@ -310,6 +355,24 @@ function sshTargetFromSessionName(name: string | null | undefined): string | nul
   const remainder = trimmed.replace(/^ssh\s+/i, "");
   const target = remainder.split(":")[0]?.trim() ?? "";
   return target ? target : null;
+}
+
+function isSshSession(session: {
+  sshTarget?: string | null;
+  launchCommand?: string | null;
+  restoreCommand?: string | null;
+} | null | undefined): boolean {
+  if (!session) return false;
+  return (
+    Boolean((session.sshTarget ?? "").trim()) ||
+    isSshCommandLine(session.launchCommand ?? session.restoreCommand ?? null)
+  );
+}
+
+function reconnectDelayMsForAttempt(attempt: number): number {
+  const bounded = Math.max(1, attempt);
+  const exp = bounded - 1;
+  return Math.min(SSH_RECONNECT_MAX_MS, SSH_RECONNECT_BASE_MS * 2 ** exp);
 }
 
 function parseEnvContentToVars(content: string): Record<string, string> {
@@ -833,9 +896,11 @@ async function createSession(input: {
   const persistId = input.persistId ?? makeId();
 
   const trimmedCommand = (input.launchCommand ?? "").trim();
-  const launchCommand = persistent ? null : trimmedCommand ? trimmedCommand : null;
+  const launchCommandRaw = persistent ? null : trimmedCommand ? trimmedCommand : null;
+  const launchCommand = ensureSshKeepAliveOptions(launchCommandRaw);
   const trimmedRestoreCommand = (input.restoreCommand ?? "").trim();
-  const restoreCommand = trimmedRestoreCommand ? trimmedRestoreCommand : null;
+  const restoreCommandRaw = trimmedRestoreCommand ? trimmedRestoreCommand : null;
+  const restoreCommand = ensureSshKeepAliveOptions(restoreCommandRaw);
   const explicitSshTarget = input.sshTarget?.trim() || null;
   const commandForDetection = launchCommand ?? restoreCommand;
   const isSshSession = Boolean(explicitSshTarget) || isSshCommandLine(commandForDetection);
@@ -871,6 +936,11 @@ async function createSession(input: {
     cwd: info.cwd ?? input.cwd ?? null,
     effectId: effect?.id ?? null,
     processTag,
+    connectionState: "connected",
+    reconnectAttempt: 0,
+    nextReconnectAt: null,
+    disconnectReason: null,
+    manualReconnectAvailable: false,
   };
 }
 
@@ -1238,8 +1308,13 @@ export default function App() {
   const hydratedRef = useRef<boolean>(hydrated);
   const activeIdRef = useRef<string | null>(null);
   const projectsRef = useRef<Project[]>(projects);
+  const environmentsRef = useRef<EnvironmentConfig[]>(environments);
   const projectByIdRef = useRef<Map<string, Project>>(new Map());
   const activeProjectIdRef = useRef<string>(activeProjectId);
+  const reconnectTimersRef = useRef<Map<string, number>>(new Map());
+  const reconnectInFlightRef = useRef<Set<string>>(new Set());
+  const healthCheckInFlightRef = useRef(false);
+  const lastHealthCheckAtRef = useRef(0);
   const lastActiveByProject = useRef<Map<string, string>>(new Map());
   const newSessionModalRef = useRef<NewSessionModalHandle>(null);
   const projectModalRef = useRef<ProjectModalHandle>(null);
@@ -1384,11 +1459,11 @@ export default function App() {
     pendingData.current.set(id, buffer);
   }, []);
 
-  const flushQueuedOutput = useCallback(() => {
+  const flushQueuedOutput = useCallback((preferredActiveId?: string | null) => {
     if (outputQueueRef.current.size === 0) return;
     const queue = outputQueueRef.current;
     outputQueueRef.current = new Map();
-    const activeId = activeIdRef.current;
+    const activeId = preferredActiveId === undefined ? activeIdRef.current : preferredActiveId;
     let hiddenBudget = HIDDEN_OUTPUT_FLUSH_BUDGET_BYTES;
 
     const requeueDeferredChunks = (id: string, chunks: string[]) => {
@@ -1550,32 +1625,14 @@ export default function App() {
     return hasAlphaNum;
   };
 
-  const isControlOrWhitespaceOnlyOutput = (data: string): boolean => {
-    let i = 0;
-    while (i < data.length) {
-      const ch = data[i];
-      if (ch === "\u001b") {
-        i = skipEscapeSequence(data, i + 1);
-        continue;
-      }
-      if (ch < " " || ch === "\u007f") {
-        i += 1;
-        continue;
-      }
-      if (ch.trim() === "") {
-        i += 1;
-        continue;
-      }
-      return false;
-    }
-    return true;
-  };
-
   function markAgentWorkingFromOutput(id: string, data: string) {
     if (!hydratedRef.current) return;
     const session = sessionByIdRef.current.get(id);
     if (!session) return;
     if (!session.effectId || session.exited || session.closing) return;
+    if (session.connectionState === "reconnecting" || session.connectionState === "disconnected") {
+      return;
+    }
 
     if (!data) return;
 
@@ -1598,17 +1655,66 @@ export default function App() {
     scheduleAgentIdle(id, session.effectId);
   }
 
+  const clearReconnectTimer = useCallback((id: string) => {
+    const existing = reconnectTimersRef.current.get(id);
+    if (existing !== undefined) {
+      window.clearTimeout(existing);
+      reconnectTimersRef.current.delete(id);
+    }
+  }, []);
+
+  const clearSessionRuntimeBuffers = useCallback((id: string) => {
+    clearAgentIdleTimer(id);
+    agentWorkingMapRef.current.set(id, false);
+    lastResizeAtRef.current.delete(id);
+    pendingData.current.delete(id);
+    outputQueueRef.current.delete(id);
+    pendingExitCodes.current.delete(id);
+    clearReconnectTimer(id);
+    reconnectInFlightRef.current.delete(id);
+  }, [clearAgentIdleTimer, clearReconnectTimer]);
+
+  const markSessionAliveFromOutput = useCallback((id: string) => {
+    const current = sessionByIdRef.current.get(id);
+    if (!current) return;
+    const state = current.connectionState ?? "connected";
+    const attempt = current.reconnectAttempt ?? 0;
+    if (
+      state === "connected" &&
+      attempt === 0 &&
+      !current.manualReconnectAvailable &&
+      !current.disconnectReason &&
+      !current.exited
+    ) {
+      return;
+    }
+
+    setSessions((prev) => {
+      const index = prev.findIndex((s) => s.id === id);
+      if (index < 0) return prev;
+      const session = prev[index];
+      const next = prev.slice();
+      next[index] = {
+        ...session,
+        exited: false,
+        exitCode: null,
+        connectionState: "connected",
+        reconnectAttempt: 0,
+        nextReconnectAt: null,
+        disconnectReason: null,
+        manualReconnectAvailable: false,
+      };
+      return next;
+    });
+  }, []);
+
   const active = useMemo(
     () => sessions.find((s) => s.id === activeId) ?? null,
     [sessions, activeId],
   );
 
   const activeIsSsh = useMemo(() => {
-    if (!active) return false;
-    return (
-      Boolean((active.sshTarget ?? "").trim()) ||
-      isSshCommandLine(active.launchCommand ?? active.restoreCommand ?? null)
-    );
+    return isSshSession(active);
   }, [active]);
 
   const activeSshTarget = useMemo(() => {
@@ -1854,7 +1960,14 @@ export default function App() {
     const workingCounts = new Map<string, number>();
     for (const s of sessions) {
       sessionCounts.set(s.projectId, (sessionCounts.get(s.projectId) ?? 0) + 1);
-      if (s.effectId && !s.exited && !s.closing && agentWorkingIds.has(s.id)) {
+      if (
+        s.effectId &&
+        !s.exited &&
+        !s.closing &&
+        s.connectionState !== "reconnecting" &&
+        s.connectionState !== "disconnected" &&
+        agentWorkingIds.has(s.id)
+      ) {
         workingCounts.set(s.projectId, (workingCounts.get(s.projectId) ?? 0) + 1);
       }
     }
@@ -1867,6 +1980,7 @@ export default function App() {
     const activeByPersistId = new Map<string, Session>();
     for (const s of sessions) {
       if (s.exited || s.closing) continue;
+      if (s.connectionState === "reconnecting" || s.connectionState === "disconnected") continue;
       if (!activeByPersistId.has(s.persistId)) activeByPersistId.set(s.persistId, s);
     }
     const out: PersistentSessionsModalItem[] = [];
@@ -1900,13 +2014,322 @@ export default function App() {
     if (pending === undefined) return session;
     pendingExitCodes.current.delete(session.id);
     agentWorkingMapRef.current.set(session.id, false);
+    const reconnectable = isSshSession(session);
     return {
       ...session,
       exited: true,
       exitCode: pending,
       recordingActive: false,
+      connectionState: reconnectable ? "disconnected" : session.connectionState ?? "connected",
+      manualReconnectAvailable: reconnectable,
+      disconnectReason: reconnectable ? "Session exited before attach." : session.disconnectReason ?? null,
     };
   }, []);
+
+  const reconnectSshSessionRef = useRef<
+    (id: string, reason: string, options?: { immediate?: boolean; manual?: boolean }) => void
+  >(() => {});
+
+  const reconnectSshSession = useCallback(
+    (id: string, reason: string, options?: { immediate?: boolean; manual?: boolean }) => {
+      const manual = Boolean(options?.manual);
+      const immediate = Boolean(options?.immediate);
+      const base = sessionByIdRef.current.get(id) ?? null;
+      if (!base) return;
+      if (base.closing) return;
+      if (!isSshSession(base)) return;
+      if (base.manualReconnectAvailable && !manual) return;
+      if (!manual && reconnectTimersRef.current.has(id)) return;
+      if (!manual && reconnectInFlightRef.current.has(id)) return;
+
+      clearReconnectTimer(id);
+      if (manual) reconnectInFlightRef.current.delete(id);
+
+      const previousAttempt = manual ? 0 : Math.max(0, base.reconnectAttempt ?? 0);
+      const nextAttempt = previousAttempt + 1;
+      if (nextAttempt > SSH_RECONNECT_MAX_ATTEMPTS) {
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === id
+              ? {
+                  ...s,
+                  connectionState: "disconnected",
+                  nextReconnectAt: null,
+                  disconnectReason: reason || "SSH disconnected.",
+                  manualReconnectAvailable: true,
+                  reconnectAttempt: SSH_RECONNECT_MAX_ATTEMPTS,
+                  exited: false,
+                  exitCode: null,
+                }
+              : s,
+          ),
+        );
+        return;
+      }
+
+      const delayMs = immediate ? 0 : reconnectDelayMsForAttempt(nextAttempt);
+      const nextReconnectAt = Date.now() + delayMs;
+
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === id
+            ? {
+                ...s,
+                exited: false,
+                exitCode: null,
+                recordingActive: false,
+                connectionState: "reconnecting",
+                reconnectAttempt: nextAttempt,
+                nextReconnectAt,
+                disconnectReason: reason || "SSH disconnected.",
+                manualReconnectAvailable: false,
+              }
+            : s,
+        ),
+      );
+
+      const attemptReconnect = async () => {
+        const current = sessionByIdRef.current.get(id) ?? null;
+        if (!current) return;
+        if (current.closing) return;
+        if (!isSshSession(current)) return;
+        if (reconnectInFlightRef.current.has(id)) return;
+
+        reconnectInFlightRef.current.add(id);
+        let replacementId: string | null = null;
+        try {
+          const fallbackCommand =
+            current.sshTarget && !current.launchCommand && !current.restoreCommand
+              ? `ssh ${current.sshTarget}`
+              : null;
+          const baseCommand = ensureSshKeepAliveOptions(
+            current.launchCommand ?? current.restoreCommand ?? fallbackCommand,
+          );
+          const launchCommand = current.persistent ? null : baseCommand;
+          const restoreCommand = current.persistent
+            ? baseCommand
+            : ensureSshKeepAliveOptions(current.restoreCommand ?? baseCommand);
+          const cwd =
+            current.cwd ??
+            projectByIdRef.current.get(current.projectId)?.basePath ??
+            homeDirRef.current ??
+            null;
+          const envVars = envVarsForProjectId(
+            current.projectId,
+            projectsRef.current,
+            environmentsRef.current,
+          );
+
+          const createdRaw = await createSession({
+            projectId: current.projectId,
+            name: current.name,
+            launchCommand,
+            restoreCommand,
+            sshTarget: current.sshTarget,
+            sshRootDir: current.sshRootDir,
+            lastRecordingId: current.lastRecordingId ?? null,
+            cwd,
+            envVars,
+            persistent: current.persistent,
+            persistId: current.persistId,
+            createdAt: current.createdAt,
+          });
+          const created = applyPendingExit(createdRaw);
+          replacementId = created.id;
+
+          if (current.persistent) {
+            const bootstrap = (restoreCommand ?? launchCommand ?? "").trim();
+            if (bootstrap) {
+              await invoke("write_to_session", {
+                id: created.id,
+                data: bootstrap,
+                source: "system",
+              });
+              await sleep(30);
+              await invoke("write_to_session", { id: created.id, data: "\r", source: "system" });
+            }
+          }
+
+          if (!sessionByIdRef.current.has(id)) {
+            await closeSession(created.id).catch(() => {});
+            replacementId = null;
+            return;
+          }
+
+          clearSessionRuntimeBuffers(id);
+          commandLifecycleSessionsRef.current.delete(id);
+
+          setSessions((prev) => {
+            const index = prev.findIndex((s) => s.id === id);
+            if (index < 0) return prev;
+            const previous = prev[index];
+            const next = prev.slice();
+            next[index] = {
+              ...previous,
+              ...created,
+              id: created.id,
+              name: previous.name,
+              projectId: previous.projectId,
+              persistId: previous.persistId,
+              persistent: previous.persistent,
+              createdAt: previous.createdAt,
+              launchCommand: previous.launchCommand ?? created.launchCommand,
+              restoreCommand: previous.restoreCommand ?? created.restoreCommand,
+              sshTarget: previous.sshTarget ?? created.sshTarget,
+              sshRootDir: previous.sshRootDir ?? created.sshRootDir,
+              lastRecordingId: previous.lastRecordingId ?? created.lastRecordingId,
+              recordingActive: false,
+              exited: false,
+              closing: false,
+              exitCode: null,
+              connectionState: "connected",
+              reconnectAttempt: nextAttempt,
+              nextReconnectAt: null,
+              disconnectReason: null,
+              manualReconnectAvailable: false,
+            };
+            return next;
+          });
+
+          lastActiveByProject.current.set(current.projectId, created.id);
+          setActiveId((prevActive) => (prevActive === id ? created.id : prevActive));
+        } catch (err) {
+          const message = formatError(err);
+          if (replacementId) {
+            await closeSession(replacementId).catch(() => {});
+          }
+          const latest = sessionByIdRef.current.get(id) ?? null;
+          if (!latest || latest.closing) return;
+          if ((latest.reconnectAttempt ?? nextAttempt) >= SSH_RECONNECT_MAX_ATTEMPTS) {
+            setSessions((prev) =>
+              prev.map((s) =>
+                s.id === id
+                  ? {
+                      ...s,
+                      connectionState: "disconnected",
+                      disconnectReason: message || "SSH disconnected.",
+                      manualReconnectAvailable: true,
+                      nextReconnectAt: null,
+                    }
+                  : s,
+              ),
+            );
+            return;
+          }
+          reconnectSshSessionRef.current(id, message || "SSH reconnect failed.", {
+            immediate: false,
+          });
+        } finally {
+          reconnectInFlightRef.current.delete(id);
+        }
+      };
+
+      if (delayMs === 0) {
+        void attemptReconnect();
+        return;
+      }
+
+      const timeout = window.setTimeout(() => {
+        reconnectTimersRef.current.delete(id);
+        void attemptReconnect();
+      }, delayMs);
+      reconnectTimersRef.current.set(id, timeout);
+    },
+    [applyPendingExit, clearReconnectTimer, clearSessionRuntimeBuffers],
+  );
+
+  reconnectSshSessionRef.current = reconnectSshSession;
+
+  const runSessionHealthCheckRef = useRef<(reason: string, force?: boolean) => void>(() => {});
+
+  const runSessionHealthCheck = useCallback(
+    (reason: string, force = false) => {
+      if (!hydratedRef.current) return;
+      if (!force && document.visibilityState !== "visible") return;
+      const now = Date.now();
+      if (!force && now - lastHealthCheckAtRef.current < SESSION_HEALTHCHECK_MIN_GAP_MS) return;
+      if (healthCheckInFlightRef.current) return;
+
+      healthCheckInFlightRef.current = true;
+      lastHealthCheckAtRef.current = now;
+
+      void (async () => {
+        try {
+          const backend = await invoke<SessionInfo[]>("list_sessions");
+          const backendIds = new Set(backend.map((s) => s.id));
+          const missingSsh: string[] = [];
+          const missingOther: string[] = [];
+
+          for (const session of sessionsRef.current) {
+            if (session.exited || session.closing) continue;
+            if ((session.connectionState ?? "connected") === "reconnecting") continue;
+            if (backendIds.has(session.id)) continue;
+            if (isSshSession(session)) missingSsh.push(session.id);
+            else missingOther.push(session.id);
+          }
+
+          if (missingOther.length > 0) {
+            const missingSet = new Set(missingOther);
+            setSessions((prev) =>
+              prev.map((s) =>
+                missingSet.has(s.id)
+                  ? {
+                      ...s,
+                      exited: true,
+                      exitCode: s.exitCode ?? null,
+                      recordingActive: false,
+                      connectionState: "disconnected",
+                      disconnectReason: `Session lost (${reason}).`,
+                      manualReconnectAvailable: false,
+                    }
+                  : s,
+              ),
+            );
+            for (const id of missingOther) {
+              clearSessionRuntimeBuffers(id);
+            }
+          }
+
+          for (const id of missingSsh) {
+            reconnectSshSessionRef.current(id, `SSH lost (${reason}).`, { immediate: true });
+          }
+        } catch {
+          // Best-effort reconciliation.
+        } finally {
+          healthCheckInFlightRef.current = false;
+        }
+      })();
+    },
+    [clearSessionRuntimeBuffers],
+  );
+
+  runSessionHealthCheckRef.current = runSessionHealthCheck;
+
+  useEffect(() => {
+    if (!hydrated) return;
+
+    const onVisibility = () => {
+      if (document.visibilityState !== "visible") return;
+      runSessionHealthCheckRef.current("visibility", true);
+    };
+    const onFocus = () => {
+      runSessionHealthCheckRef.current("focus", true);
+    };
+    const interval = window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      runSessionHealthCheckRef.current("interval");
+    }, SESSION_HEALTHCHECK_VISIBLE_INTERVAL_MS);
+
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("focus", onFocus);
+    runSessionHealthCheckRef.current("startup", true);
+
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [hydrated]);
 
   const addSessionWithProjectSafeActivation = useCallback((session: Session) => {
     setSessions((prev) => {
@@ -2045,9 +2468,10 @@ export default function App() {
     sessionByIdRef.current = new Map(sessions.map((session) => [session.id, session]));
   }, [sessions]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     activeIdRef.current = activeId;
-  }, [activeId]);
+    flushQueuedOutput(activeId);
+  }, [activeId, flushQueuedOutput]);
 
   useEffect(() => {
     hydratedRef.current = hydrated;
@@ -2057,6 +2481,10 @@ export default function App() {
     projectsRef.current = projects;
     projectByIdRef.current = new Map(projects.map((p) => [p.id, p]));
   }, [projects]);
+
+  useEffect(() => {
+    environmentsRef.current = environments;
+  }, [environments]);
 
   useEffect(() => {
     activeProjectIdRef.current = activeProjectId;
@@ -2202,29 +2630,14 @@ export default function App() {
 
   const terminalPaneSessionsRef = useRef<TerminalPaneSession[]>([]);
   const terminalPaneSessions = useMemo<TerminalPaneSession[]>(() => {
-    if (import.meta.env.DEV) {
-      const foreignCount = sessions.filter((s) => s.projectId !== activeProjectId).length;
-      if (foreignCount > 0) {
-        console.warn(
-          `[TerminalPane] Filtering out ${foreignCount} session(s) from other projects. ` +
-          `Active project: ${activeProjectId}, total sessions: ${sessions.length}, ` +
-          `project distribution:`,
-          Object.fromEntries(
-            [...new Set(sessions.map((s) => s.projectId))].map((pid) => [
-              pid,
-              sessions.filter((s) => s.projectId === pid).length,
-            ]),
-          ),
-        );
-      }
-    }
     const next = sessions
-      .filter((s) => s.projectId === activeProjectId)
       .map((s) => ({
         id: s.id,
+        projectId: s.projectId,
         persistent: s.persistent,
         exited: Boolean(s.exited),
         closing: Boolean(s.closing),
+        connectionState: s.connectionState ?? "connected",
       }));
     const prev = terminalPaneSessionsRef.current;
     if (
@@ -2232,16 +2645,18 @@ export default function App() {
       prev.every(
         (p, i) =>
           p.id === next[i].id &&
+          p.projectId === next[i].projectId &&
           p.persistent === next[i].persistent &&
           p.exited === next[i].exited &&
-          p.closing === next[i].closing,
+          p.closing === next[i].closing &&
+          p.connectionState === next[i].connectionState,
       )
     ) {
       return prev;
     }
     terminalPaneSessionsRef.current = next;
     return next;
-  }, [sessions, activeProjectId]);
+  }, [sessions]);
 
   useEffect(() => {
     if (!hydrated || persistenceDisabledReason) return;
@@ -2359,6 +2774,7 @@ export default function App() {
 
     for (const session of sessions) {
       if (session.exited || session.closing) continue;
+      if (session.connectionState === "reconnecting" || session.connectionState === "disconnected") continue;
       sessionsOpen += 1;
       if (session.effectId && agentWorkingIds.has(session.id)) {
         workingCount += 1;
@@ -2400,7 +2816,13 @@ export default function App() {
   }, [trayStatus, hydrated]);
 
   const trayRecentSessions = useMemo<TrayRecentSession[]>(() => {
-    const open = sessions.filter((s) => !s.exited && !s.closing);
+    const open = sessions.filter(
+      (s) =>
+        !s.exited &&
+        !s.closing &&
+        s.connectionState !== "reconnecting" &&
+        s.connectionState !== "disconnected",
+    );
     const byKey = new Map<string, Session>();
     for (const s of open) byKey.set(`${s.projectId}:${s.persistId}`, s);
 
@@ -2421,7 +2843,15 @@ export default function App() {
       out.push({ label, projectId: s.projectId, persistId: s.persistId });
     };
 
-    if (active && !active.exited && !active.closing) add(active);
+    if (
+      active &&
+      !active.exited &&
+      !active.closing &&
+      active.connectionState !== "reconnecting" &&
+      active.connectionState !== "disconnected"
+    ) {
+      add(active);
+    }
 
     for (const key of recentSessionKeys) {
       const s = byKey.get(`${key.projectId}:${key.persistId}`);
@@ -3482,6 +3912,18 @@ export default function App() {
   }
 
   async function sendPromptToSession(sessionId: string, prompt: Prompt, mode: "paste" | "send") {
+    const session = sessionByIdRef.current.get(sessionId) ?? null;
+    if (
+      session &&
+      (session.exited ||
+        session.closing ||
+        session.connectionState === "reconnecting" ||
+        session.connectionState === "disconnected")
+    ) {
+      showNotice("Session is not currently interactive.");
+      return;
+    }
+
     if (mode === "paste") {
       try {
         registry.current.get(sessionId)?.term.focus();
@@ -3884,6 +4326,35 @@ export default function App() {
     lastResizeAtRef.current.set(id, Date.now());
   }, []);
 
+  const onSessionTransportError = useCallback(
+    (id: string, operation: "write" | "resize", errorMessage: string) => {
+      if (closingSessions.current.has(id)) return;
+      const session = sessionByIdRef.current.get(id) ?? null;
+      if (!session) {
+        runSessionHealthCheckRef.current("transport-error", true);
+        return;
+      }
+      if (session.exited || session.closing) return;
+
+      if (operation === "resize") {
+        runSessionHealthCheckRef.current("transport-error", true);
+        return;
+      }
+
+      if (isSshSession(session)) {
+        reconnectSshSessionRef.current(
+          id,
+          `${operation} failed${errorMessage ? `: ${errorMessage}` : ""}`,
+          { immediate: true },
+        );
+        return;
+      }
+
+      runSessionHealthCheckRef.current("transport-error", true);
+    },
+    [],
+  );
+
   const onCwdChange = useCallback((id: string, cwd: string) => {
     const trimmed = cwd.trim();
     if (!trimmed) return;
@@ -3970,11 +4441,25 @@ export default function App() {
   function pickActiveSessionIdFromList(projectId: string, sessions: Session[]): string | null {
     const last = lastActiveByProject.current.get(projectId);
     if (last) {
-      const lastSession = sessions.find((s) => s.id === last && s.projectId === projectId && !s.closing);
+      const lastSession = sessions.find(
+        (s) =>
+          s.id === last &&
+          s.projectId === projectId &&
+          !s.closing &&
+          s.connectionState !== "reconnecting" &&
+          s.connectionState !== "disconnected",
+      );
       if (lastSession) return lastSession.id;
     }
     // Prefer live (non-exited, non-closing) sessions
-    const firstLive = sessions.find((s) => s.projectId === projectId && !s.exited && !s.closing);
+    const firstLive = sessions.find(
+      (s) =>
+        s.projectId === projectId &&
+        !s.exited &&
+        !s.closing &&
+        s.connectionState !== "reconnecting" &&
+        s.connectionState !== "disconnected",
+    );
     if (firstLive) return firstLive.id;
     // Fall back to non-closing (includes exited)
     const firstOpen = sessions.find((s) => s.projectId === projectId && !s.closing);
@@ -4195,11 +4680,7 @@ export default function App() {
 
 		        // Ignore events for sessions being closed
 		        if (closingSessions.current.has(id)) return;
-              // Hidden sessions can emit frequent control/whitespace-only chatter
-              // (cursor movement, prompt redraw). Drop those chunks early.
-              const isHiddenSession = activeIdRef.current !== id;
-              if (isHiddenSession && isControlOrWhitespaceOnlyOutput(text)) return;
-
+              markSessionAliveFromOutput(id);
 			        markAgentWorkingFromOutput(id, text);
               const queue = outputQueueRef.current.get(id) ?? [];
               if (queue.length === 0) {
@@ -4229,6 +4710,19 @@ export default function App() {
           return;
         }
 
+        const exitedSession = sessionByIdRef.current.get(id) ?? null;
+        if (
+          exitedSession &&
+          isSshSession(exitedSession) &&
+          !exitedSession.manualReconnectAvailable
+        ) {
+          reconnectSshSessionRef.current(
+            id,
+            `SSH exited${exit_code != null ? ` (${exit_code})` : ""}.`,
+          );
+          return;
+        }
+
         setSessions((prev) => {
           let found = false;
           const next = prev.map((s) => {
@@ -4239,6 +4733,12 @@ export default function App() {
               exited: true,
               exitCode: exit_code ?? null,
               recordingActive: false,
+              connectionState: isSshSession(s) ? "disconnected" : s.connectionState ?? "connected",
+              manualReconnectAvailable: Boolean(isSshSession(s)),
+              disconnectReason:
+                isSshSession(s) && !s.disconnectReason
+                  ? `SSH exited${exit_code != null ? ` (${exit_code})` : ""}.`
+                  : s.disconnectReason ?? null,
             };
           });
           if (!found) pendingExitCodes.current.set(id, exit_code ?? null);
@@ -4589,14 +5089,24 @@ export default function App() {
       const orderedPersisted = prioritizedFirst
         ? [prioritizedFirst, ...persisted.filter((s) => s !== prioritizedFirst)]
         : persisted;
+      const totalToRestore = orderedPersisted.length;
+      if (totalToRestore > 0) {
+        setSessionRestoreProgress({ remaining: totalToRestore, total: totalToRestore });
+        showNotice(
+          `Restoring ${totalToRestore} saved terminal${totalToRestore === 1 ? "" : "s"}…`,
+          20_000,
+        );
+      } else {
+        setSessionRestoreProgress(null);
+      }
 
-      const restored: Session[] = [];
+      let restored: Session[] = [];
       let firstRestoreIndex = -1;
       for (let i = 0; i < orderedPersisted.length; i += 1) {
         if (cancelled) break;
         const created = await restorePersistedSession(orderedPersisted[i]);
         if (!created) continue;
-        restored.push(created);
+        restored = [...restored, created];
         firstRestoreIndex = i;
         break;
       }
@@ -4633,14 +5143,22 @@ export default function App() {
         setSessions([first]);
         setActiveId(first.id);
         setHydrated(true);
+        if (totalToRestore > 0) {
+          showNotice(
+            `Restored 0/${totalToRestore} saved terminal${totalToRestore === 1 ? "" : "s"}. Opened a new terminal.`,
+            9000,
+          );
+        }
         return;
       }
 
       syncLastActiveByProject(restored);
       const initialActive = pickActiveFromProject(restored);
-      setSessions(restored);
+      // Never pass a mutable working array reference into React state.
+      // If we later mutate that same array during the restore loop, React can
+      // miss updates because the state reference is unchanged.
+      setSessions([...restored]);
       setActiveId(initialActive ? initialActive.id : null);
-      const totalToRestore = orderedPersisted.length;
       const attemptedCount = Math.max(1, firstRestoreIndex + 1);
       const remainingAfterInitial = Math.max(0, totalToRestore - attemptedCount);
       if (remainingAfterInitial > 0) {
@@ -4650,7 +5168,15 @@ export default function App() {
       }
       setHydrated(true);
 
-      if (remainingAfterInitial === 0) return;
+      if (remainingAfterInitial === 0) {
+        if (totalToRestore > 0) {
+          showNotice(
+            `Restored ${restored.length}/${totalToRestore} saved terminal${totalToRestore === 1 ? "" : "s"}.`,
+            7000,
+          );
+        }
+        return;
+      }
 
       let attempted = attemptedCount;
       const remainingCandidates = orderedPersisted.slice(firstRestoreIndex + 1);
@@ -4659,8 +5185,7 @@ export default function App() {
         const created = await restorePersistedSession(s);
         attempted += 1;
         if (created) {
-          restored.push(created);
-          restored.sort((a, b) => a.createdAt - b.createdAt);
+          restored = [...restored, created].sort((a, b) => a.createdAt - b.createdAt);
           syncLastActiveByProject(restored);
           setSessions((prev) => {
             if (prev.some((s) => s.id === created.id)) return prev; // dedup guard
@@ -4681,7 +5206,15 @@ export default function App() {
         }
       }
 
-      if (!cancelled) setSessionRestoreProgress(null);
+      if (!cancelled) {
+        setSessionRestoreProgress(null);
+        if (totalToRestore > 0) {
+          showNotice(
+            `Restored ${restored.length}/${totalToRestore} saved terminal${totalToRestore === 1 ? "" : "s"}.`,
+            7000,
+          );
+        }
+      }
     };
 		
 	    void setup().catch((err) => {
@@ -4724,6 +5257,12 @@ export default function App() {
 	        window.clearTimeout(timeout);
 	      }
 	      closingSessions.current.clear();
+        for (const timeout of reconnectTimersRef.current.values()) {
+          window.clearTimeout(timeout);
+        }
+        reconnectTimersRef.current.clear();
+        reconnectInFlightRef.current.clear();
+        healthCheckInFlightRef.current = false;
 	      for (const timeout of agentIdleTimersRef.current.values()) {
 	        window.clearTimeout(timeout);
 	      }
@@ -4812,9 +5351,8 @@ export default function App() {
   // Immediately remove a session from UI state. Synchronous — never blocks.
   // Backend cleanup is fire-and-forget.
   function removeSessionFromState(id: string) {
-    clearAgentIdleTimer(id);
-    lastResizeAtRef.current.delete(id);
-    pendingData.current.delete(id);
+    clearSessionRuntimeBuffers(id);
+    commandLifecycleSessionsRef.current.delete(id);
     // Mark as closing so output/exit handlers ignore stale backend events.
     const prevTimeout = closingSessions.current.get(id);
     if (prevTimeout !== undefined) window.clearTimeout(prevTimeout);
@@ -4886,7 +5424,12 @@ export default function App() {
     attachingPersistentIdsRef.current.add(normalizedPersistId);
     try {
       const existing = sessionsRef.current.find(
-        (s) => s.persistId === normalizedPersistId && !s.exited && !s.closing,
+        (s) =>
+          s.persistId === normalizedPersistId &&
+          !s.exited &&
+          !s.closing &&
+          s.connectionState !== "reconnecting" &&
+          s.connectionState !== "disconnected",
       ) ?? null;
       if (existing) {
         setActiveProjectId(existing.projectId);
@@ -5256,6 +5799,13 @@ export default function App() {
     [],
   );
 
+  const handleReconnectSession = useCallback((id: string) => {
+    reconnectSshSessionRef.current(id, "Manual reconnect", {
+      immediate: true,
+      manual: true,
+    });
+  }, []);
+
   const handleQuickStartFromSidebar = useCallback(
     (effect: ProcessEffect) =>
       void quickStart({
@@ -5399,6 +5949,7 @@ export default function App() {
         activeSessionId={activeId}
         onSelectSession={setActiveId}
         onCloseSession={handleCloseSession}
+        onReconnectSession={handleReconnectSession}
         onQuickStart={handleQuickStartFromSidebar}
         onOpenNewSession={handleOpenNewSession}
         onOpenPersistentSessions={handleOpenPersistentSessions}
@@ -5414,7 +5965,7 @@ export default function App() {
     selectProject, moveProject, openNewProject, openRenameProject,
     openProjectSettings, handleDeleteProject,
     handleSendPromptToActive, openPromptEditor, handleOpenPromptsPanel,
-    handleCloseSession, handleQuickStartFromSidebar,
+    handleCloseSession, handleReconnectSession, handleQuickStartFromSidebar,
     handleOpenNewSession, handleOpenPersistentSessions,
     handleOpenSshManager, handleOpenAgentShortcuts,
     resetProjectsListMaxHeight, handleProjectsDividerKeyDown,
@@ -5495,6 +6046,34 @@ export default function App() {
           >
             <span className="restoreHintDot" />
             <span>{`Restoring ${sessionRestoreProgress.remaining}…`}</span>
+          </div>
+        )}
+
+        {activeIsSsh && active?.connectionState === "reconnecting" && (
+          <div
+            className="restoreHint"
+            role="status"
+            aria-live="polite"
+            title={active.disconnectReason ?? "Reconnecting SSH session"}
+          >
+            <span className="restoreHintDot" />
+            <span>
+              {`Reconnecting${active.reconnectAttempt ? ` (${Math.min(active.reconnectAttempt, SSH_RECONNECT_MAX_ATTEMPTS)}/${SSH_RECONNECT_MAX_ATTEMPTS})` : "…"}`}
+            </span>
+          </div>
+        )}
+
+        {activeIsSsh && active?.connectionState === "disconnected" && (
+          <div className="restoreHint restoreHintError" role="status" aria-live="polite">
+            <span className="restoreHintDot" />
+            <span title={active.disconnectReason ?? undefined}>Disconnected</span>
+            <button
+              type="button"
+              className="btnSmall"
+              onClick={() => handleReconnectSession(active.id)}
+            >
+              Reconnect
+            </button>
           </div>
         )}
 
@@ -5614,7 +6193,7 @@ export default function App() {
               onClick={() =>
                 active.recordingActive ? void stopRecording(active.id) : openRecordPrompt(active.id)
               }
-              disabled={Boolean(active.exited || active.closing)}
+              disabled={Boolean(active.exited || active.closing || active.connectionState === "reconnecting" || active.connectionState === "disconnected")}
               title={active.recordingActive ? "Stop recording (active)" : "Start recording"}
             >
               <Icon name={active.recordingActive ? "stop" : "record"} />
@@ -5654,6 +6233,7 @@ export default function App() {
     error, notice, persistenceDisabledReason, sessionRestoreProgress,
     secureStorageMode, secureStorageRetrying, slidePanelOpen,
     retrySecureStorage, dismissNotice, reportError,
+    handleReconnectSession,
     updateActiveWorkspaceView, stopRecording, openRecordPrompt,
     refreshRecordings, openReplayForActive,
   ]);
@@ -5672,9 +6252,11 @@ export default function App() {
         <TerminalPane
           sessions={terminalPaneSessions}
           activeId={activeId}
+          activeProjectId={activeProjectId}
           onCwdChange={onCwdChange}
           onCommandChange={onCommandChange}
           onSessionResize={onSessionResize}
+          onSessionTransportError={onSessionTransportError}
           registry={registry}
           pendingData={pendingData}
         />
@@ -5819,10 +6401,10 @@ export default function App() {
         ) : null}
       </div>
   ), [
-    terminalPaneSessions, activeId, activeWorkspaceView, activeWorkspaceKey,
+    terminalPaneSessions, activeId, activeProjectId, activeWorkspaceView, activeWorkspaceKey,
     activeIsSsh, activeSshTarget, activeProject, active,
     workspaceResizeMode, activeProjectId,
-    onCwdChange, onCommandChange, onSessionResize,
+    onCwdChange, onCommandChange, onSessionResize, onSessionTransportError,
     beginWorkspaceResize, updateWorkspaceViewForKey,
     handleSelectWorkspaceFile, handleOpenTerminalAtPath,
     handleRenameWorkspacePath, handleDeleteWorkspacePath, closeCodeEditor,

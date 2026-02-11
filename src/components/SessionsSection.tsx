@@ -25,6 +25,10 @@ type Session = {
   exited?: boolean;
   closing?: boolean;
   exitCode?: number | null;
+  connectionState?: "connected" | "reconnecting" | "disconnected";
+  reconnectAttempt?: number;
+  manualReconnectAvailable?: boolean;
+  disconnectReason?: string | null;
 };
 
 type SessionItemProps = {
@@ -33,6 +37,7 @@ type SessionItemProps = {
   isAgentWorking: boolean;
   onSelectSession: (sessionId: string) => void;
   onCloseSession: (sessionId: string) => void;
+  onReconnectSession: (sessionId: string) => void;
 };
 
 const SessionItem = React.memo(function SessionItem({
@@ -41,9 +46,13 @@ const SessionItem = React.memo(function SessionItem({
   isAgentWorking,
   onSelectSession,
   onCloseSession,
+  onReconnectSession,
 }: SessionItemProps) {
   const isExited = Boolean(s.exited);
   const isClosing = Boolean(s.closing);
+  const connectionState = s.connectionState ?? "connected";
+  const isReconnecting = connectionState === "reconnecting";
+  const isDisconnected = connectionState === "disconnected";
   const effect = getProcessEffectById(s.effectId);
   const chipLabel = effect?.label ?? s.processTag ?? null;
   const hasAgentIcon = Boolean(effect?.iconSrc);
@@ -72,6 +81,8 @@ const SessionItem = React.memo(function SessionItem({
       className={`sessionItem ${isActive ? "sessionItemActive" : ""} ${
         isExited ? "sessionItemExited" : ""
       } ${isClosing ? "sessionItemClosing" : ""} ${
+        isReconnecting ? "sessionItemReconnecting" : ""
+      } ${isDisconnected ? "sessionItemDisconnected" : ""} ${
         isSshType ? "sessionItemSsh" : ""
       } ${isPersistent ? "sessionItemPersistent" : ""} ${
         isDefaultType ? "sessionItemDefault" : ""
@@ -99,6 +110,14 @@ const SessionItem = React.memo(function SessionItem({
           {isRecording && <span className="recordingDot" title="Recording" />}
           {isClosing ? (
             <span className="sessionStatus">closing…</span>
+          ) : isReconnecting ? (
+            <span className="sessionStatus" title={s.disconnectReason ?? undefined}>
+              reconnecting…
+            </span>
+          ) : isDisconnected ? (
+            <span className="sessionStatus" title={s.disconnectReason ?? undefined}>
+              disconnected
+            </span>
           ) : isExited ? (
             <span className="sessionStatus">
               exited{s.exitCode != null ? ` ${s.exitCode}` : ""}
@@ -115,6 +134,18 @@ const SessionItem = React.memo(function SessionItem({
           })()}
         </div>
       </div>
+      {isDisconnected && s.manualReconnectAvailable && (
+        <button
+          className="reconnectBtn"
+          onClick={(e) => {
+            e.stopPropagation();
+            onReconnectSession(s.id);
+          }}
+          title="Reconnect session"
+        >
+          ↻
+        </button>
+      )}
       <button
         className="closeBtn"
         onClick={(e) => {
@@ -136,6 +167,7 @@ type SessionsSectionProps = {
   activeSessionId: string | null;
   onSelectSession: (sessionId: string) => void;
   onCloseSession: (sessionId: string) => void;
+  onReconnectSession: (sessionId: string) => void;
   onQuickStart: (effect: ProcessEffect) => void;
   onOpenNewSession: () => void;
   onOpenAgentShortcuts: () => void;
@@ -150,6 +182,7 @@ export const SessionsSection = React.memo(function SessionsSection({
   activeSessionId,
   onSelectSession,
   onCloseSession,
+  onReconnectSession,
   onQuickStart,
   onOpenNewSession,
   onOpenAgentShortcuts,
@@ -334,6 +367,7 @@ export const SessionsSection = React.memo(function SessionsSection({
               isAgentWorking={agentWorkingIds.has(s.id)}
               onSelectSession={onSelectSession}
               onCloseSession={onCloseSession}
+              onReconnectSession={onReconnectSession}
             />
           ))
         )}

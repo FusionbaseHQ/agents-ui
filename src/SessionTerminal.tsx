@@ -85,6 +85,16 @@ async function copyToClipboard(text: string): Promise<boolean> {
   }
 }
 
+function formatInvokeError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
+
 type SessionTerminalProps = {
   id: string;
   active: boolean;
@@ -94,6 +104,7 @@ type SessionTerminalProps = {
   onCommandChange?: (id: string, commandLine: string, source?: "osc" | "input") => void;
   onResize?: (id: string, size: { cols: number; rows: number }) => void;
   onUserEnter?: (id: string) => void;
+  onTransportError?: (id: string, operation: "write" | "resize", errorMessage: string) => void;
   registry: React.MutableRefObject<TerminalRegistry>;
   pendingData: React.MutableRefObject<PendingDataBuffer>;
 };
@@ -116,6 +127,7 @@ function SessionTerminal(props: SessionTerminalProps) {
     wheelRemainder: number;
   }>({ active: false, wheelRemainder: 0 });
   const commandBufferRef = useRef<string>("");
+  const flushPendingRef = useRef<(attemptsLeft: number) => void>(() => {});
 
   const onCwdChangeRef = useRef(props.onCwdChange);
   onCwdChangeRef.current = props.onCwdChange;
@@ -125,6 +137,8 @@ function SessionTerminal(props: SessionTerminalProps) {
   onResizeRef.current = props.onResize;
   const onUserEnterRef = useRef(props.onUserEnter);
   onUserEnterRef.current = props.onUserEnter;
+  const onTransportErrorRef = useRef(props.onTransportError);
+  onTransportErrorRef.current = props.onTransportError;
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -153,9 +167,20 @@ function SessionTerminal(props: SessionTerminalProps) {
     term.open(container);
     patchXtermRenderServiceDimensions(term);
 
+    const reportTransportError = (operation: "write" | "resize", err: unknown) => {
+      onTransportErrorRef.current?.(props.id, operation, formatInvokeError(err));
+    };
+    const writeToSession = (data: string, source: "user" | "ui" | "system") =>
+      invoke("write_to_session", { id: props.id, data, source }).catch((err) => {
+        reportTransportError("write", err);
+      });
+    const resizeSession = (cols: number, rows: number) =>
+      invoke("resize_session", { id: props.id, cols, rows }).catch((err) => {
+        reportTransportError("resize", err);
+      });
+
     if (props.persistent) {
-      const sendZellij = (data: string) =>
-        invoke("write_to_session", { id: props.id, data, source: "ui" }).catch(() => {});
+      const sendZellij = (data: string) => writeToSession(data, "ui");
 
       const skipEscapeSequence = (data: string, start: number): number => {
         const next = data[start];
@@ -304,16 +329,12 @@ function SessionTerminal(props: SessionTerminalProps) {
         if (state.active) {
           state.active = false;
           if (data === "\x1b") {
-            void invoke("write_to_session", { id: props.id, data: "\x1b", source: "ui" }).catch(() => {});
+            void writeToSession("\x1b", "ui");
           } else {
-            void invoke("write_to_session", { id: props.id, data: "\x1b", source: "ui" })
-              .catch(() => {})
-              .then(() =>
-                invoke("write_to_session", { id: props.id, data, source: "user" }).catch(() => {}),
-              );
+            void writeToSession("\x1b", "ui").then(() => writeToSession(data, "user"));
           }
         } else {
-          void invoke("write_to_session", { id: props.id, data, source: "user" }).catch(() => {});
+          void writeToSession(data, "user");
         }
         if (data.includes("\r") || data.includes("\n")) {
           onUserEnterRef.current?.(props.id);
@@ -335,7 +356,7 @@ function SessionTerminal(props: SessionTerminalProps) {
         return true;
       });
       term.onData((data) => {
-        void invoke("write_to_session", { id: props.id, data, source: "user" }).catch(() => {});
+        void writeToSession(data, "user");
         if (data.includes("\r") || data.includes("\n")) {
           onUserEnterRef.current?.(props.id);
         }
@@ -453,7 +474,7 @@ function SessionTerminal(props: SessionTerminalProps) {
 	      if (last && last.cols === cols && last.rows === rows) return;
 	      lastSizeRef.current = { cols, rows };
 	      onResizeRef.current?.(props.id, { cols, rows });
-	      void invoke("resize_session", { id: props.id, cols, rows }).catch(() => {});
+	      void resizeSession(cols, rows);
 
 	      // Cooldown: prevent rapid-fire resize during continuous window drag
 	      resizeCooldownRef.current = true;
@@ -498,6 +519,7 @@ function SessionTerminal(props: SessionTerminalProps) {
 	        }
 	      }
 	    };
+	    flushPendingRef.current = flushPending;
 	    flushPending(20);
 
 		    // Create ResizeObserver inside useEffect for proper cleanup
@@ -540,11 +562,7 @@ function SessionTerminal(props: SessionTerminalProps) {
           state.active = true;
           const count = Math.min(Math.abs(lines), 120);
           const step = lines < 0 ? "k" : "j";
-          void invoke("write_to_session", {
-            id: props.id,
-            data: `${prefix}${step.repeat(count)}`,
-            source: "ui",
-          }).catch(() => {});
+          void writeToSession(`${prefix}${step.repeat(count)}`, "ui");
         }
       };
 
@@ -572,6 +590,7 @@ function SessionTerminal(props: SessionTerminalProps) {
 	      term.dispose();
 	      termRef.current = null;
 	      fitRef.current = null;
+	      flushPendingRef.current = () => {};
 	      resizeRafRef.current = null;
 	      resizeTimeoutRef.current = null;
 	      resizeRetryCountRef.current = 0;
@@ -586,6 +605,7 @@ function SessionTerminal(props: SessionTerminalProps) {
   useEffect(() => {
     if (!props.active) return;
     needsResizeRef.current = false;
+    flushPendingRef.current(20);
     const term = termRef.current;
     const fit = fitRef.current;
     const container = containerRef.current;
@@ -624,11 +644,18 @@ function SessionTerminal(props: SessionTerminalProps) {
 	        }
 	        return;
 	      }
+      try {
+        term.refresh(0, Math.max(0, term.rows - 1));
+      } catch {
+        // best-effort redraw
+      }
 	      const { cols, rows } = term;
 	      const last = lastSizeRef.current;
 	      if (!last || last.cols !== cols || last.rows !== rows) {
 	        lastSizeRef.current = { cols, rows };
-	        void invoke("resize_session", { id: props.id, cols, rows }).catch(() => {});
+	        void invoke("resize_session", { id: props.id, cols, rows }).catch((err) => {
+            onTransportErrorRef.current?.(props.id, "resize", formatInvokeError(err));
+          });
       }
     };
 

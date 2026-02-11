@@ -544,6 +544,14 @@ body {
   opacity: 0.7;
 }
 
+.sessionItemReconnecting {
+  border-color: rgba(243, 191, 106, 0.34);
+}
+
+.sessionItemDisconnected {
+  border-color: rgba(255, 120, 120, 0.3);
+}
+
 .sessionItemSsh {
   /* Type color only (no left border bar). */
 }
@@ -589,6 +597,14 @@ body {
 
 .sessionItemDefault .dot:not(.dotActive) {
   background: rgba(107, 138, 253, 0.78);
+}
+
+.sessionItemReconnecting .dot:not(.dotActive) {
+  background: rgba(243, 191, 106, 0.9);
+}
+
+.sessionItemDisconnected .dot:not(.dotActive) {
+  background: rgba(255, 120, 120, 0.9);
 }
 
 .dot {
@@ -789,6 +805,19 @@ body {
   background: rgba(255, 255, 255, 0.05);
 }
 
+.reconnectBtn {
+  border: 1px solid rgba(34, 211, 238, 0.35);
+  background: rgba(34, 211, 238, 0.1);
+  color: rgba(232, 250, 255, 0.92);
+  padding: 6px 8px;
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+.reconnectBtn:hover {
+  background: rgba(34, 211, 238, 0.18);
+}
+
 .main {
   flex: 1;
   display: flex;
@@ -950,7 +979,6 @@ body {
   visibility: hidden;
   pointer-events: none;
   contain: strict;
-  content-visibility: hidden;
 }
 
 /* File Explorer + Editor */
@@ -2603,6 +2631,14 @@ select.input {
   border-radius: 50%;
   background: rgba(139, 168, 255, 0.9);
   animation: restoreHintPulse 1.6s ease-in-out infinite;
+}
+
+.restoreHintError {
+  color: rgba(255, 196, 196, 0.88);
+}
+
+.restoreHintError .restoreHintDot {
+  background: rgba(255, 128, 128, 0.95);
 }
 
 .shortcutHint {

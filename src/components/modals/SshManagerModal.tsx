@@ -69,6 +69,9 @@ function buildSshCommand(input: {
   if (!host) return null;
 
   const args: string[] = ["ssh"];
+  args.push("-o", "ServerAliveInterval=15");
+  args.push("-o", "ServerAliveCountMax=3");
+  args.push("-o", "TCPKeepAlive=yes");
   if (input.exitOnForwardFailure && input.forwards.length > 0) {
     args.push("-o", "ExitOnForwardFailure=yes");
   }
