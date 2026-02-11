@@ -40,6 +40,7 @@ import { UpdateModal, UpdateCheckState } from "./components/modals/UpdateModal";
 import {
   SshManagerModal,
   type SshConnectData,
+  type SshHistoryEntry,
   type SshHostEntry,
 } from "./components/modals/SshManagerModal";
 
@@ -124,6 +125,8 @@ const STORAGE_WORKSPACE_EDITOR_WIDTH_KEY = "agents-ui-workspace-editor-width-v1"
 const STORAGE_WORKSPACE_FILE_TREE_WIDTH_KEY = "agents-ui-workspace-file-tree-width-v1";
 const STORAGE_WORKSPACE_VIEW_BY_KEY = "agents-ui-workspace-view-by-key-v1";
 const STORAGE_RECENT_SESSIONS_KEY = "agents-ui-recent-sessions-v1";
+const STORAGE_SSH_HISTORY_KEY = "agents-ui-ssh-history-v1";
+const MAX_SSH_HISTORY = 10;
 
 const MAX_PENDING_SESSIONS = 32;
 const MAX_PENDING_CHUNKS_PER_SESSION = 200;
@@ -1001,6 +1004,12 @@ export default function App() {
   const [sshHosts, setSshHosts] = useState<SshHostEntry[]>([]);
   const [sshHostsLoading, setSshHostsLoading] = useState(false);
   const [sshHostsError, setSshHostsError] = useState<string | null>(null);
+  const [sshHistory, setSshHistory] = useState<SshHistoryEntry[]>(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_SSH_HISTORY_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch { return []; }
+  });
   const [projectOpen, setProjectOpen] = useState(false);
   const [confirmDeleteProjectOpen, setConfirmDeleteProjectOpen] = useState(false);
   const [confirmDeleteRecordingId, setConfirmDeleteRecordingId] = useState<string | null>(null);
@@ -5351,6 +5360,9 @@ export default function App() {
     addSessionWithProjectSafeActivation(s);
     setSshManagerOpen(false);
 
+    // Save to SSH history
+    pushSshHistory({ host: data.host, command: data.command, persistent: data.persistent, connectedAt: Date.now() });
+
     if (data.persistent) {
       void (async () => {
         try {
@@ -5362,6 +5374,33 @@ export default function App() {
         }
       })();
     }
+  }
+
+  function pushSshHistory(entry: SshHistoryEntry) {
+    setSshHistory((prev) => {
+      const next = [entry, ...prev.filter((e) => e.command !== entry.command)].slice(0, MAX_SSH_HISTORY);
+      try { localStorage.setItem(STORAGE_SSH_HISTORY_KEY, JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }
+
+  function removeSshHistoryEntry(index: number) {
+    setSshHistory((prev) => {
+      const next = prev.filter((_, i) => i !== index);
+      try { localStorage.setItem(STORAGE_SSH_HISTORY_KEY, JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }
+
+  function onSshHistoryConnect(entry: SshHistoryEntry) {
+    void onSshConnect({
+      host: entry.host,
+      persistent: entry.persistent,
+      forwardOnly: false,
+      exitOnForwardFailure: true,
+      forwards: [],
+      command: entry.command,
+    });
   }
 
   // Immediately remove a session from UI state. Synchronous — never blocks.
@@ -6462,10 +6501,13 @@ export default function App() {
             hosts={sshHosts}
             hostsLoading={sshHostsLoading}
             hostsError={sshHostsError}
+            history={sshHistory}
             onRefreshHosts={() => void refreshSshHosts()}
             onCopyToClipboard={(text) => void handleCopySshCommand(text)}
             onClose={() => setSshManagerOpen(false)}
             onConnect={onSshConnect}
+            onHistoryConnect={onSshHistoryConnect}
+            onHistoryRemove={removeSshHistoryEntry}
           />}
 
           {persistentSessionsOpen && <PersistentSessionsModal

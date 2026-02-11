@@ -28,6 +28,13 @@ export type SshConnectData = {
   command: string;
 };
 
+export type SshHistoryEntry = {
+  host: string;
+  command: string;
+  persistent: boolean;
+  connectedAt: number;
+};
+
 function formatHostDetails(entry: SshHostEntry): string | null {
   const hostName = entry.hostName?.trim() || null;
   const user = entry.user?.trim() || null;
@@ -105,20 +112,38 @@ type SshManagerModalProps = {
   hosts: SshHostEntry[];
   hostsLoading: boolean;
   hostsError: string | null;
+  history: SshHistoryEntry[];
   onRefreshHosts: () => void;
   onCopyToClipboard: (text: string) => void;
   onClose: () => void;
   onConnect: (data: SshConnectData) => Promise<void>;
+  onHistoryConnect: (entry: SshHistoryEntry) => void;
+  onHistoryRemove: (index: number) => void;
 };
+
+function formatTimeAgo(ts: number): string {
+  const diff = Date.now() - ts;
+  const minutes = Math.floor(diff / 60_000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  return `${Math.floor(days / 30)}mo ago`;
+}
 
 export function SshManagerModal({
   hosts,
   hostsLoading,
   hostsError,
+  history,
   onRefreshHosts,
   onCopyToClipboard,
   onClose,
   onConnect,
+  onHistoryConnect,
+  onHistoryRemove,
 }: SshManagerModalProps) {
   const [host, setHost] = useState("");
   const [persistent, setPersistent] = useState(false);
@@ -243,7 +268,9 @@ export function SshManagerModal({
 
   return (
     <div className="modalBackdrop" onClick={onClose}>
-      <div className="modal sshModal" onClick={(e) => e.stopPropagation()}>
+      <div className={`modal sshModal ${history.length > 0 ? "sshModalWithHistory" : ""}`} onClick={(e) => e.stopPropagation()}>
+        <div className="sshModalBody">
+        <div className="sshModalMain">
         <div className="sshHeader">
           <div className="sshHeaderIcon" aria-hidden="true">
             <Icon name="ssh" size={20} />
@@ -496,6 +523,44 @@ export function SshManagerModal({
             </button>
           </div>
         </form>
+        </div>
+
+        {history.length > 0 && (
+          <div className="sshHistoryPanel">
+            <div className="sshHistoryHeader">
+              <div className="sshHostListHeaderTitle">Recent</div>
+              <div className="sshHostListHeaderMeta">{history.length}</div>
+            </div>
+            <div className="sshHistoryList">
+              {history.map((entry, i) => (
+                <button
+                  key={`${entry.host}-${entry.connectedAt}`}
+                  type="button"
+                  className="sshHistoryItem"
+                  onClick={() => onHistoryConnect(entry)}
+                  title={entry.command}
+                >
+                  <div className="sshHistoryItemMain">
+                    <div className="sshHostAlias">{entry.host}</div>
+                    <div className="sshHostMeta">
+                      {entry.persistent ? "persistent • " : ""}{formatTimeAgo(entry.connectedAt)}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="sshHistoryRemove"
+                    onClick={(e) => { e.stopPropagation(); onHistoryRemove(i); }}
+                    title="Remove from history"
+                    aria-label="Remove from history"
+                  >
+                    ×
+                  </button>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        </div>
       </div>
     </div>
   );
