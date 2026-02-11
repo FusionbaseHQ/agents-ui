@@ -298,7 +298,7 @@ export function SshManagerModal({
                 value={host}
                 onChange={(e) => setHost(e.target.value)}
                 placeholder="Start typing an SSH host…"
-                list="ssh-hosts"
+                autoComplete="off"
                 autoCapitalize="off"
                 autoCorrect="off"
                 spellCheck={false}
@@ -313,12 +313,6 @@ export function SshManagerModal({
                 Refresh
               </button>
             </div>
-            <datalist id="ssh-hosts">
-              {hosts.map((h) => (
-                <option key={h.alias} value={h.alias} />
-              ))}
-            </datalist>
-
             {!hostsLoading && !hostsError && (
               <div className="sshHostList" aria-label="SSH config hosts">
                 <div className="sshHostListHeader">
