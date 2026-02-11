@@ -42,7 +42,8 @@ function formatHostDetails(entry: SshHostEntry): string | null {
   const parts: string[] = [];
   if (user && hostName) parts.push(`${user}@${hostName}`);
   else if (hostName) parts.push(hostName);
-  if (port) parts.push(`:${port}`);
+  else if (user) parts.push(`${user}@`);
+  if (port && port !== 22) parts.push(`:${port}`);
   return parts.length ? parts.join("") : null;
 }
 
