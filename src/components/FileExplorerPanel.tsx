@@ -596,10 +596,13 @@ export function FileExplorerPanel({
   React.useEffect(() => {
     const el = listRef.current;
     if (!el) return;
-    const update = () => setListHeight(el.clientHeight);
-    update();
+    const syncDimensions = () => {
+      setListHeight(el.clientHeight);
+      setScrollTop(el.scrollTop);
+    };
+    syncDimensions();
     if (typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(() => update());
+    const ro = new ResizeObserver(() => syncDimensions());
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
@@ -610,6 +613,26 @@ export function FileExplorerPanel({
     const onScroll = () => setScrollTop(el.scrollTop);
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
+  // Re-sync scroll position when window regains visibility — the browser may
+  // have internally reset el.scrollTop while the tab was hidden/minimized
+  // without firing a scroll event, desynchronising the virtual-scroll state.
+  React.useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const handler = () => {
+      if (!document.hidden) {
+        setScrollTop(el.scrollTop);
+        setListHeight(el.clientHeight);
+      }
+    };
+    document.addEventListener("visibilitychange", handler);
+    window.addEventListener("focus", handler);
+    return () => {
+      document.removeEventListener("visibilitychange", handler);
+      window.removeEventListener("focus", handler);
+    };
   }, []);
 
   const restoredRef = React.useRef(false);
