@@ -2339,6 +2339,11 @@ select.input {
   to { opacity: 1; }
 }
 
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 .commandPalette {
   width: min(560px, calc(100% - 32px));
   background: linear-gradient(180deg, rgba(20, 28, 40, 0.98), rgba(12, 18, 26, 0.98));

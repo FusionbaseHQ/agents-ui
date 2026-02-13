@@ -144,6 +144,22 @@ async function copyToClipboard(text: string): Promise<boolean> {
   }
 }
 
+/** Fast equality check for directory entries — skips state update when nothing changed. */
+function entriesEqual(a: FsEntry[], b: FsEntry[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].path !== b[i].path || a[i].isDir !== b[i].isDir || a[i].size !== b[i].size) {
+      return false;
+    }
+  }
+  return true;
+}
+
+const POLL_INTERVAL_MS = 5_000;
+const POLL_TIMEOUT_MS = 15_000;
+const POLL_MAX_PER_TICK = 5;
+const MUTATION_COOLDOWN_MS = 8_000;
+
 type FileRowProps = {
   entry: FsEntry;
   depth: number;
@@ -232,6 +248,7 @@ export function FileExplorerPanel({
   isOpen,
   provider,
   sshTarget,
+  sshConnectionState,
   rootDir,
   persistedState,
   activeFilePath,
@@ -245,6 +262,7 @@ export function FileExplorerPanel({
   isOpen: boolean;
   provider: "local" | "ssh";
   sshTarget?: string | null;
+  sshConnectionState?: "connected" | "reconnecting" | "disconnected";
   rootDir: string;
   persistedState?: FileExplorerPersistedState | null;
   activeFilePath: string | null;
@@ -363,6 +381,13 @@ export function FileExplorerPanel({
     onPersistStateRef.current = onPersistState;
   }, [onPersistState]);
 
+  // --- Auto-refresh polling infrastructure (SSH only) ---
+  const [refreshing, setRefreshing] = React.useState(false);
+  const pollIntervalRef = React.useRef<number | null>(null);
+  const inFlightPollsRef = React.useRef<Set<string>>(new Set());
+  const lastPollTimeRef = React.useRef<Map<string, number>>(new Map());
+  const mutationCooldownRef = React.useRef<Map<string, number>>(new Map());
+
   const persistStateNow = React.useCallback(() => {
     const persist = onPersistStateRef.current;
     if (!persist) return;
@@ -449,6 +474,90 @@ export function FileExplorerPanel({
     [provider, root, sshTargetValue],
   );
 
+  /**
+   * Silent background poll for a single directory.
+   * - Does NOT set loading state (invisible to user)
+   * - Compares with cached entries — skips update if unchanged
+   * - Swallows errors (keeps showing cached data)
+   * - Cleans up expandedDirs/dirStateByPath for removed child directories
+   */
+  const pollDirectory = React.useCallback(
+    async (dirPath: string): Promise<void> => {
+      const path = normalizePath(dirPath);
+      if (inFlightPollsRef.current.has(path)) return;
+      inFlightPollsRef.current.add(path);
+      try {
+        const fetchPromise =
+          provider === "ssh"
+            ? invoke<FsEntry[]>("ssh_list_fs_entries", { target: sshTargetValue, root, path })
+            : invoke<FsEntry[]>("list_fs_entries", { root, path });
+
+        const entries = await Promise.race([
+          fetchPromise,
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("poll timeout")), POLL_TIMEOUT_MS),
+          ),
+        ]);
+
+        // Guard: discard result if dir was collapsed/renamed/removed while polling
+        if (!expandedDirsRef.current.has(path) && path !== rootRef.current) return;
+
+        const oldState = dirStateByPathRef.current[path];
+        // Skip if this dir is currently in a user-triggered load (loading spinner visible)
+        if (oldState?.loading) return;
+        // Skip update if entries haven't changed
+        if (oldState && !oldState.error && entriesEqual(oldState.entries, entries)) return;
+
+        // Detect removed child directories for cleanup
+        if (oldState?.entries) {
+          const oldDirPaths = new Set(oldState.entries.filter((e) => e.isDir).map((e) => e.path));
+          const newDirPaths = new Set(entries.filter((e) => e.isDir).map((e) => e.path));
+          const removedDirs = [...oldDirPaths].filter((p) => !newDirPaths.has(p));
+
+          if (removedDirs.length > 0) {
+            setExpandedDirs((prev) => {
+              const next = new Set(prev);
+              let changed = false;
+              for (const removed of removedDirs) {
+                for (const dir of prev) {
+                  if (dir === removed || dir.startsWith(`${removed}/`)) {
+                    next.delete(dir);
+                    changed = true;
+                  }
+                }
+              }
+              return changed ? next : prev;
+            });
+            setDirStateByPath((prev) => {
+              const next = { ...prev };
+              let changed = false;
+              for (const removed of removedDirs) {
+                for (const key of Object.keys(prev)) {
+                  if (key === removed || key.startsWith(`${removed}/`)) {
+                    delete next[key];
+                    changed = true;
+                  }
+                }
+              }
+              return changed ? next : prev;
+            });
+          }
+        }
+
+        // Apply the updated entries
+        setDirStateByPath((prev) => ({
+          ...prev,
+          [path]: { entries, loading: false, error: null },
+        }));
+      } catch {
+        // Silently skip — keep showing cached data, retry next tick
+      } finally {
+        inFlightPollsRef.current.delete(path);
+      }
+    },
+    [provider, root, sshTargetValue],
+  );
+
   React.useEffect(() => {
     const el = listRef.current;
     if (!el) return;
@@ -521,6 +630,79 @@ export function FileExplorerPanel({
     void loadDirectory(root);
     restoredRef.current = true;
   }, [isOpen, loadDirectory, persistedState, root]);
+
+  // --- Auto-refresh: polling orchestrator ---
+  const pollExpandedDirs = React.useCallback(async () => {
+    if (provider !== "ssh" || !sshTargetValue) return;
+
+    const expanded = Array.from(expandedDirsRef.current);
+    if (expanded.length === 0) return;
+
+    const now = Date.now();
+
+    // Prune stale entries from lastPollTime
+    for (const key of lastPollTimeRef.current.keys()) {
+      if (!expandedDirsRef.current.has(key)) lastPollTimeRef.current.delete(key);
+    }
+
+    // Filter candidates: not in-flight, not in mutation cooldown
+    const candidates = expanded.filter((dir) => {
+      if (inFlightPollsRef.current.has(dir)) return false;
+      const mutatedAt = mutationCooldownRef.current.get(dir);
+      if (mutatedAt && now - mutatedAt < MUTATION_COOLDOWN_MS) return false;
+      return true;
+    });
+
+    // Sort by staleness (least recently polled first)
+    candidates.sort((a, b) => {
+      const aTime = lastPollTimeRef.current.get(a) ?? 0;
+      const bTime = lastPollTimeRef.current.get(b) ?? 0;
+      return aTime - bTime;
+    });
+
+    const batch = candidates.slice(0, POLL_MAX_PER_TICK);
+    for (const dir of batch) {
+      lastPollTimeRef.current.set(dir, now);
+    }
+
+    await Promise.allSettled(batch.map((dir) => pollDirectory(dir)));
+  }, [provider, sshTargetValue, pollDirectory]);
+
+  // --- Auto-refresh: timer start/stop ---
+  React.useEffect(() => {
+    if (!isOpen || provider !== "ssh") return;
+    if (sshConnectionState === "reconnecting" || sshConnectionState === "disconnected") return;
+
+    const interval = window.setInterval(pollExpandedDirs, POLL_INTERVAL_MS);
+    pollIntervalRef.current = interval;
+
+    return () => {
+      window.clearInterval(interval);
+      pollIntervalRef.current = null;
+    };
+  }, [isOpen, provider, sshConnectionState, pollExpandedDirs]);
+
+  // --- Auto-refresh: pause when tab/window is hidden ---
+  React.useEffect(() => {
+    if (!isOpen || provider !== "ssh") return;
+    const handler = () => {
+      if (document.hidden) {
+        if (pollIntervalRef.current !== null) {
+          window.clearInterval(pollIntervalRef.current);
+          pollIntervalRef.current = null;
+        }
+      } else if (
+        pollIntervalRef.current === null &&
+        sshConnectionState !== "reconnecting" &&
+        sshConnectionState !== "disconnected"
+      ) {
+        void pollExpandedDirs();
+        pollIntervalRef.current = window.setInterval(pollExpandedDirs, POLL_INTERVAL_MS);
+      }
+    };
+    document.addEventListener("visibilitychange", handler);
+    return () => document.removeEventListener("visibilitychange", handler);
+  }, [isOpen, provider, sshConnectionState, pollExpandedDirs]);
 
   React.useEffect(() => {
     if (!contextMenu) return;
@@ -672,11 +854,12 @@ export function FileExplorerPanel({
     [loadDirectory],
   );
 
-  const refreshRoot = React.useCallback(() => {
-    setDirStateByPath({});
-    setExpandedDirs(new Set([root]));
-    void loadDirectory(root);
-  }, [loadDirectory, root]);
+  const refreshRoot = React.useCallback(async () => {
+    setRefreshing(true);
+    const expanded = Array.from(expandedDirsRef.current);
+    await Promise.allSettled(expanded.map((dir) => pollDirectory(dir)));
+    setRefreshing(false);
+  }, [pollDirectory]);
 
   const submitRename = React.useCallback(
     async (e: React.FormEvent) => {
@@ -707,6 +890,7 @@ export function FileExplorerPanel({
             ? await invoke<string>("ssh_rename_fs_entry", { target: sshTargetValue, root, path: fromPath, newName: name })
             : await invoke<string>("rename_fs_entry", { root, path: fromPath, newName: name });
         if (entry.isDir) remapDirectoryPrefix(fromPath, toPath);
+        mutationCooldownRef.current.set(dirname(fromPath), Date.now());
         void loadDirectory(dirname(fromPath));
         onPathRenamed?.(fromPath, toPath);
         closeRenameModal();
@@ -733,6 +917,7 @@ export function FileExplorerPanel({
         ? invoke("ssh_delete_fs_entry", { target: sshTargetValue, root, path: target.path })
         : invoke("delete_fs_entry", { root, path: target.path }));
       if (target.isDir) removeDirectoryPrefix(target.path);
+      mutationCooldownRef.current.set(dirname(target.path), Date.now());
       void loadDirectory(dirname(target.path));
       onPathDeleted?.(target.path);
       closeDeleteModal();
@@ -1120,7 +1305,14 @@ export function FileExplorerPanel({
           )}
         </div>
         <div className="fileExplorerActions">
-          <button type="button" className="btnSmall btnIcon" onClick={refreshRoot} title="Refresh">
+          <button
+            type="button"
+            className="btnSmall btnIcon"
+            onClick={refreshRoot}
+            title="Refresh"
+            disabled={refreshing}
+            style={refreshing ? { animation: "spin 1s linear infinite" } : undefined}
+          >
             <Icon name="refresh" />
           </button>
           <button type="button" className="btnSmall btnIcon" onClick={onClose} title="Close">

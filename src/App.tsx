@@ -3286,20 +3286,45 @@ export default function App() {
     }
   }
 
+  const KNOWN_XTERM_RESIZE_RACE_SIGNATURES = [
+    "this._renderer.value.handleresize",
+    "undefined is not an object (evaluating 'this._renderer.value.handleresize')",
+  ];
+
+  function isKnownXtermRendererResizeRace(err: unknown): boolean {
+    const message = formatError(err).toLowerCase();
+    return KNOWN_XTERM_RESIZE_RACE_SIGNATURES.some((signature) => message.includes(signature));
+  }
   const reportError = useCallback((prefix: string, err: unknown) => {
     setError(`${prefix}: ${formatError(err)}`);
   }, []);
 
   const reportErrorRef = useRef(reportError);
+  const suppressedKnownXtermResizeRaceRef = useRef(false);
   useEffect(() => {
     reportErrorRef.current = reportError;
   }, [reportError]);
 
   useEffect(() => {
+    const logKnownXtermRaceSuppression = () => {
+      if (suppressedKnownXtermResizeRaceRef.current) return;
+      suppressedKnownXtermResizeRaceRef.current = true;
+      console.warn("[agents-ui] Suppressed known xterm renderer resize race");
+    };
+
     const handleError = (event: ErrorEvent) => {
-      reportErrorRef.current("Unexpected error", event.error ?? event.message);
+      const cause = event.error ?? event.message;
+      if (isKnownXtermRendererResizeRace(cause)) {
+        logKnownXtermRaceSuppression();
+        return;
+      }
+      reportErrorRef.current("Unexpected error", cause);
     };
     const handleRejection = (event: PromiseRejectionEvent) => {
+      if (isKnownXtermRendererResizeRace(event.reason)) {
+        logKnownXtermRaceSuppression();
+        return;
+      }
       reportErrorRef.current("Unhandled promise rejection", event.reason);
     };
     window.addEventListener("error", handleError);
@@ -6395,6 +6420,7 @@ export default function App() {
               isOpen
               provider={activeIsSsh ? "ssh" : "local"}
               sshTarget={activeIsSsh ? activeSshTarget : null}
+              sshConnectionState={activeIsSsh ? (active?.connectionState ?? "connected") : undefined}
               rootDir={
                 (
                   activeWorkspaceView.fileExplorerRootDir ??
