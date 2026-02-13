@@ -1148,6 +1148,68 @@ body {
   cursor: progress;
 }
 
+.fileExplorerTransfer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.7);
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  position: relative;
+  overflow: hidden;
+  min-height: 24px;
+  flex-shrink: 0;
+}
+
+.fileExplorerTransferBar {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(34, 211, 238, 0.12), transparent);
+  background-size: 200% 100%;
+  animation: transferSlide 1.5s ease-in-out infinite;
+}
+
+@keyframes transferSlide {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+.fileExplorerTransferText {
+  position: relative;
+  z-index: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.fileExplorerTransferSuccess {
+  color: rgba(34, 211, 238, 0.9);
+}
+
+.fileExplorerTransferError {
+  color: rgba(255, 130, 130, 0.9);
+}
+
+.fileExplorerTransferDismiss {
+  position: relative;
+  z-index: 1;
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.5);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 14px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.fileExplorerTransferDismiss:hover {
+  color: rgba(255, 255, 255, 0.8);
+}
+
 .codeEditorPanel {
   width: var(--workspaceEditorWidthPx, 520px);
   flex: 0 1 var(--workspaceEditorWidthPx, 520px);

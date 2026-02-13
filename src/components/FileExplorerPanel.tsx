@@ -339,7 +339,15 @@ export function FileExplorerPanel({
   const [deleteError, setDeleteError] = React.useState<string | null>(null);
 
   const [downloadBusy, setDownloadBusy] = React.useState(false);
-  const [downloadError, setDownloadError] = React.useState<string | null>(null);
+  const [transferStatus, setTransferStatus] = React.useState<{
+    type: "download" | "upload";
+    fileName: string;
+    phase: "active" | "success" | "error";
+    error?: string;
+    current?: number;
+    total?: number;
+  } | null>(null);
+  const transferDismissTimerRef = React.useRef<number | null>(null);
   const [dragDropActive, setDragDropActive] = React.useState(false);
   const [dropTarget, setDropTarget] = React.useState<string | null>(null);
   const [dragPreparing, setDragPreparing] = React.useState<string | null>(null);
@@ -387,6 +395,33 @@ export function FileExplorerPanel({
   const inFlightPollsRef = React.useRef<Set<string>>(new Set());
   const lastPollTimeRef = React.useRef<Map<string, number>>(new Map());
   const mutationCooldownRef = React.useRef<Map<string, number>>(new Map());
+
+  const showTransferSuccess = React.useCallback(
+    (type: "download" | "upload", fileName: string, total?: number) => {
+      if (transferDismissTimerRef.current !== null) window.clearTimeout(transferDismissTimerRef.current);
+      setTransferStatus({ type, fileName, phase: "success", total });
+      transferDismissTimerRef.current = window.setTimeout(() => {
+        transferDismissTimerRef.current = null;
+        setTransferStatus((prev) => (prev?.phase === "success" ? null : prev));
+      }, 3000);
+    },
+    [],
+  );
+
+  const showTransferError = React.useCallback(
+    (type: "download" | "upload", fileName: string, error: string) => {
+      if (transferDismissTimerRef.current !== null) window.clearTimeout(transferDismissTimerRef.current);
+      setTransferStatus({ type, fileName, phase: "error", error });
+    },
+    [],
+  );
+
+  // Clean up dismiss timer on unmount
+  React.useEffect(() => {
+    return () => {
+      if (transferDismissTimerRef.current !== null) window.clearTimeout(transferDismissTimerRef.current);
+    };
+  }, []);
 
   const persistStateNow = React.useCallback(() => {
     const persist = onPersistStateRef.current;
@@ -935,7 +970,6 @@ export function FileExplorerPanel({
 
     try {
       setDownloadBusy(true);
-      setDownloadError(null);
       const savePath = await save({
         defaultPath: entry.name,
         title: entry.isDir ? "Download folder" : "Download file",
@@ -945,20 +979,22 @@ export function FileExplorerPanel({
         return;
       }
 
+      setTransferStatus({ type: "download", fileName: entry.name, phase: "active" });
       await invoke("ssh_download_file", {
         target: sshTargetValue,
         root,
         remotePath: entry.path,
         localPath: savePath,
       });
+      showTransferSuccess("download", entry.name);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error("Download failed:", message);
-      setDownloadError(message);
+      showTransferError("download", entry.name, message);
     } finally {
       setDownloadBusy(false);
     }
-  }, [sshTargetValue, root]);
+  }, [sshTargetValue, root, showTransferSuccess, showTransferError]);
 
   const getDragIcon = React.useCallback((kind: "file" | "folder"): string => {
     const cached = dragIconCache.get(kind);
@@ -1052,6 +1088,12 @@ export function FileExplorerPanel({
         return next;
       });
 
+      const isSsh = provider === "ssh" && !!sshTargetValue;
+      const total = paths.length;
+      let completed = 0;
+      let lastError: string | null = null;
+      let lastName = "";
+
       for (const sourcePathRaw of paths) {
         const raw = sourcePathRaw.trim();
         const sourcePath = parseFileUrlPath(raw) ?? raw;
@@ -1060,12 +1102,23 @@ export function FileExplorerPanel({
         const name = basename(sourcePath);
         if (!name || name === "/") continue;
         const destPath = joinPath(destDir, name);
+        lastName = name;
 
         if (normalizePath(sourcePath) === normalizePath(destPath)) continue;
         if (normalizePath(destPath).startsWith(`${normalizePath(sourcePath)}/`)) continue;
 
+        if (isSsh) {
+          setTransferStatus({
+            type: "upload",
+            fileName: name,
+            phase: "active",
+            current: completed + 1,
+            total,
+          });
+        }
+
         try {
-          if (provider === "ssh" && sshTargetValue) {
+          if (isSsh) {
             await invoke("ssh_upload_file", {
               target: sshTargetValue,
               root,
@@ -1079,14 +1132,25 @@ export function FileExplorerPanel({
               destPath,
             });
           }
+          completed++;
         } catch (err) {
-          console.error("File transfer failed:", err);
+          const message = err instanceof Error ? err.message : String(err);
+          console.error("File transfer failed:", message);
+          lastError = message;
+        }
+      }
+
+      if (isSsh) {
+        if (lastError) {
+          showTransferError("upload", lastName, lastError);
+        } else {
+          showTransferSuccess("upload", lastName, total);
         }
       }
 
       void loadDirectory(destDir);
     },
-    [loadDirectory, provider, root, sshTargetValue],
+    [loadDirectory, provider, root, sshTargetValue, showTransferSuccess, showTransferError],
   );
 
   // Initiate native drag to Finder/Desktop
@@ -1589,22 +1653,44 @@ export function FileExplorerPanel({
         onConfirm={() => void confirmDelete()}
       />
 
-      {downloadError && (
-        <div
-          className="modalBackdrop modalBackdropTop"
-          onClick={() => setDownloadError(null)}
-        >
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3 className="modalTitle">Download Failed</h3>
-            <div className="pathPickerError" role="alert">
-              {downloadError}
-            </div>
-            <div className="modalActions">
-              <button type="button" className="btn" onClick={() => setDownloadError(null)}>
-                Close
+      {transferStatus && (
+        <div className="fileExplorerTransfer" role="status">
+          {transferStatus.phase === "active" && (
+            <>
+              <div className="fileExplorerTransferBar" />
+              <span className="fileExplorerTransferText">
+                {transferStatus.type === "download" ? "\u2193" : "\u2191"}{" "}
+                {transferStatus.current != null && transferStatus.total != null && transferStatus.total > 1
+                  ? `${transferStatus.current}/${transferStatus.total}: `
+                  : ""}
+                {transferStatus.type === "download" ? "Downloading" : "Uploading"}{" "}
+                {transferStatus.fileName}\u2026
+              </span>
+            </>
+          )}
+          {transferStatus.phase === "success" && (
+            <span className="fileExplorerTransferText fileExplorerTransferSuccess">
+              {transferStatus.type === "download" ? "\u2193" : "\u2191"}{" "}
+              {transferStatus.total != null && transferStatus.total > 1
+                ? `${transferStatus.type === "download" ? "Downloaded" : "Uploaded"} ${transferStatus.total} files`
+                : `${transferStatus.type === "download" ? "Downloaded" : "Uploaded"} ${transferStatus.fileName}`}
+            </span>
+          )}
+          {transferStatus.phase === "error" && (
+            <>
+              <span className="fileExplorerTransferText fileExplorerTransferError">
+                {transferStatus.type === "download" ? "Download" : "Upload"} failed: {transferStatus.error}
+              </span>
+              <button
+                type="button"
+                className="fileExplorerTransferDismiss"
+                onClick={() => setTransferStatus(null)}
+                aria-label="Dismiss"
+              >
+                \u00d7
               </button>
-            </div>
-          </div>
+            </>
+          )}
         </div>
       )}
     </aside>
