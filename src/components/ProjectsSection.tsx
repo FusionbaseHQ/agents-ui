@@ -1,11 +1,19 @@
 import React from "react";
 import { Icon } from "./Icon";
 
+const PROJECT_SYMBOLS = [
+  "\u{1F5A5}\uFE0F", "\u{1F4BB}", "\u{1F527}", "\u{1F680}", "\u26A1", "\u{1F41B}",
+  "\u{1F4E6}", "\u{1F9EA}", "\u{1F310}", "\u{1F512}", "\u{1F4DD}", "\u{1F3A8}",
+  "\u{1F5C4}\uFE0F", "\u{1F433}", "\u2601\uFE0F", "\u{1F4E1}", "\u{1F525}", "\u{1F4A1}",
+  "\u2B50", "\u{1F3E0}", "\u{1F6E0}\uFE0F", "\u{1F4CA}", "\u{1F916}", "\u{1F3AF}",
+];
+
 type Project = {
   id: string;
   title: string;
   basePath: string | null;
   environmentId: string | null;
+  symbol?: string | null;
 };
 
 type EnvironmentConfig = {
@@ -26,6 +34,8 @@ type ProjectsSectionProps = {
   onSelectProject: (projectId: string) => void;
   onOpenProjectSettings: (projectId: string) => void;
   onMoveProject: (projectId: string, targetProjectId: string, position: "before" | "after") => void;
+  onRenameProjectInline: (projectId: string, newName: string) => void;
+  onSetProjectSymbol: (projectId: string, symbol: string | null) => void;
 };
 
 export const ProjectsSection = React.memo(function ProjectsSection({
@@ -41,6 +51,8 @@ export const ProjectsSection = React.memo(function ProjectsSection({
   onSelectProject,
   onOpenProjectSettings,
   onMoveProject,
+  onRenameProjectInline,
+  onSetProjectSymbol,
 }: ProjectsSectionProps) {
   const [draggingProjectId, setDraggingProjectId] = React.useState<string | null>(null);
   const [dropTarget, setDropTarget] = React.useState<{
@@ -51,6 +63,107 @@ export const ProjectsSection = React.memo(function ProjectsSection({
   const projectListRef = React.useRef<HTMLDivElement | null>(null);
   const previousItemRectsRef = React.useRef<Map<string, DOMRect>>(new Map());
   const activeAnimationsRef = React.useRef<Map<string, Animation>>(new Map());
+
+  // Context menu state
+  const contextMenuRef = React.useRef<HTMLDivElement | null>(null);
+  const [contextMenu, setContextMenu] = React.useState<{
+    projectId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  // Inline rename state
+  const [renamingId, setRenamingId] = React.useState<string | null>(null);
+  const [renameValue, setRenameValue] = React.useState("");
+
+  // Symbol picker state
+  const symbolPickerRef = React.useRef<HTMLDivElement | null>(null);
+  const [symbolPicker, setSymbolPicker] = React.useState<{
+    projectId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  const handleRenameStart = React.useCallback(() => {
+    if (!contextMenu) return;
+    const project = projects.find((p) => p.id === contextMenu.projectId);
+    if (!project) return;
+    setRenamingId(contextMenu.projectId);
+    setRenameValue(project.title);
+    setContextMenu(null);
+  }, [contextMenu, projects]);
+
+  const handleRenameSubmit = React.useCallback(() => {
+    if (!renamingId) return;
+    const trimmed = renameValue.trim();
+    const project = projects.find((p) => p.id === renamingId);
+    if (trimmed && project && trimmed !== project.title) {
+      onRenameProjectInline(renamingId, trimmed);
+    }
+    setRenamingId(null);
+    setRenameValue("");
+  }, [renamingId, renameValue, projects, onRenameProjectInline]);
+
+  const handleRenameCancel = React.useCallback(() => {
+    setRenamingId(null);
+    setRenameValue("");
+  }, []);
+
+  const handleSetSymbolStart = React.useCallback(() => {
+    if (!contextMenu) return;
+    setSymbolPicker({
+      projectId: contextMenu.projectId,
+      x: contextMenu.x,
+      y: contextMenu.y,
+    });
+    setContextMenu(null);
+  }, [contextMenu]);
+
+  const handleRemoveSymbol = React.useCallback(() => {
+    if (!contextMenu) return;
+    onSetProjectSymbol(contextMenu.projectId, null);
+    setContextMenu(null);
+  }, [contextMenu, onSetProjectSymbol]);
+
+  const handleSymbolSelect = React.useCallback(
+    (sym: string) => {
+      if (!symbolPicker) return;
+      onSetProjectSymbol(symbolPicker.projectId, sym);
+      setSymbolPicker(null);
+    },
+    [symbolPicker, onSetProjectSymbol],
+  );
+
+  // Dismiss handlers for context menu and symbol picker
+  React.useEffect(() => {
+    if (!contextMenu && !symbolPicker) return;
+
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (contextMenuRef.current?.contains(target)) return;
+      if (symbolPickerRef.current?.contains(target)) return;
+      setContextMenu(null);
+      setSymbolPicker(null);
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setContextMenu(null);
+      setSymbolPicker(null);
+    };
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [contextMenu, symbolPicker]);
+
+  const contextProject = contextMenu
+    ? projects.find((p) => p.id === contextMenu.projectId)
+    : null;
 
   const handleDragEnd = React.useCallback(() => {
     setDraggingProjectId(null);
@@ -170,6 +283,11 @@ export const ProjectsSection = React.memo(function ProjectsSection({
                 className="projectItemMain"
                 onClick={() => onSelectProject(p.id)}
                 onDoubleClick={() => onOpenProjectSettings(p.id)}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setContextMenu({ projectId: p.id, x: e.clientX, y: e.clientY });
+                  setSymbolPicker(null);
+                }}
                 title={
                   [
                     p.title,
@@ -181,7 +299,24 @@ export const ProjectsSection = React.memo(function ProjectsSection({
                     .join("\n")
                 }
               >
-                <span className="projectTitle">{p.title}</span>
+                {p.symbol && <span className="sessionSymbol">{p.symbol}</span>}
+                {renamingId === p.id ? (
+                  <input
+                    className="sessionNameInput"
+                    value={renameValue}
+                    onChange={(e) => setRenameValue(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleRenameSubmit();
+                      if (e.key === "Escape") handleRenameCancel();
+                      e.stopPropagation();
+                    }}
+                    onBlur={handleRenameSubmit}
+                    onClick={(e) => e.stopPropagation()}
+                    autoFocus
+                  />
+                ) : (
+                  <span className="projectTitle">{p.title}</span>
+                )}
                 <span className="projectBadges">
                   {workingCount > 0 && (
                     <span
@@ -338,6 +473,76 @@ export const ProjectsSection = React.memo(function ProjectsSection({
           );
         })}
       </div>
+
+      {/* Context menu */}
+      {contextMenu && contextProject && (
+        <div
+          ref={contextMenuRef}
+          className="sessionContextMenu"
+          style={{ top: contextMenu.y, left: contextMenu.x }}
+          role="menu"
+        >
+          <button
+            type="button"
+            className="sessionContextMenuItem"
+            role="menuitem"
+            onClick={handleRenameStart}
+          >
+            Rename
+          </button>
+          <button
+            type="button"
+            className="sessionContextMenuItem"
+            role="menuitem"
+            onClick={handleSetSymbolStart}
+          >
+            Set symbol
+          </button>
+          {contextProject.symbol && (
+            <button
+              type="button"
+              className="sessionContextMenuItem"
+              role="menuitem"
+              onClick={handleRemoveSymbol}
+            >
+              Remove symbol
+            </button>
+          )}
+          <div className="sessionContextMenuSep" />
+          <button
+            type="button"
+            className="sessionContextMenuItem"
+            role="menuitem"
+            onClick={() => {
+              const pid = contextMenu.projectId;
+              setContextMenu(null);
+              onOpenProjectSettings(pid);
+            }}
+          >
+            Project settings
+          </button>
+        </div>
+      )}
+
+      {/* Symbol picker */}
+      {symbolPicker && (
+        <div
+          ref={symbolPickerRef}
+          className="sessionSymbolPicker"
+          style={{ top: symbolPicker.y, left: symbolPicker.x }}
+        >
+          {PROJECT_SYMBOLS.map((sym) => (
+            <button
+              key={sym}
+              type="button"
+              onClick={() => handleSymbolSelect(sym)}
+              title={sym}
+            >
+              {sym}
+            </button>
+          ))}
+        </div>
+      )}
     </>
   );
 });

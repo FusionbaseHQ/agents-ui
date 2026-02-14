@@ -52,6 +52,7 @@ type Project = {
   basePath: string | null;
   environmentId: string | null;
   assetsEnabled?: boolean;
+  symbol?: string | null;
 };
 
 type SessionInfo = {
@@ -676,6 +677,7 @@ function loadLegacyProjectState(): { projects: Project[]; activeProjectId: strin
             basePath: null,
             environmentId: null,
             assetsEnabled: true,
+            symbol: (p as { symbol?: string | null }).symbol ?? null,
           }));
       }
     }
@@ -2740,7 +2742,7 @@ export default function App() {
     try {
       localStorage.setItem(
         STORAGE_PROJECTS_KEY,
-        JSON.stringify(projects.map((p) => ({ id: p.id, title: p.title }))),
+        JSON.stringify(projects.map((p) => ({ id: p.id, title: p.title, symbol: p.symbol ?? null }))),
       );
       localStorage.setItem(STORAGE_ACTIVE_PROJECT_KEY, activeProjectId);
     } catch {
@@ -5922,6 +5924,31 @@ export default function App() {
     });
   }, []);
 
+  const handleRenameProjectInline = useCallback((projectId: string, newName: string) => {
+    const trimmed = newName.trim();
+    if (!trimmed) return;
+    setProjects((prev) => {
+      const idx = prev.findIndex((p) => p.id === projectId);
+      if (idx < 0) return prev;
+      if (prev[idx].title === trimmed) return prev;
+      const next = prev.slice();
+      next[idx] = { ...prev[idx], title: trimmed };
+      return next;
+    });
+  }, []);
+
+  const handleSetProjectSymbol = useCallback((projectId: string, symbol: string | null) => {
+    setProjects((prev) => {
+      const idx = prev.findIndex((p) => p.id === projectId);
+      if (idx < 0) return prev;
+      const current = prev[idx].symbol ?? null;
+      if (current === symbol) return prev;
+      const next = prev.slice();
+      next[idx] = { ...prev[idx], symbol };
+      return next;
+    });
+  }, []);
+
   const handleQuickStartFromSidebar = useCallback(
     (effect: ProcessEffect) =>
       void quickStart({
@@ -6033,6 +6060,8 @@ export default function App() {
         onSelectProject={selectProject}
         onOpenProjectSettings={openProjectSettings}
         onMoveProject={moveProject}
+        onRenameProjectInline={handleRenameProjectInline}
+        onSetProjectSymbol={handleSetProjectSymbol}
       />
 
       <QuickPromptsSection
@@ -6081,7 +6110,7 @@ export default function App() {
     prompts, agentShortcuts, stableProjectSessions, agentWorkingIds,
     activeId, projectsListMaxHeight,
     selectProject, moveProject, openNewProject, openRenameProject,
-    openProjectSettings, handleDeleteProject,
+    openProjectSettings, handleDeleteProject, handleRenameProjectInline, handleSetProjectSymbol,
     handleSendPromptToActive, openPromptEditor, handleOpenPromptsPanel,
     handleCloseSession, handleReconnectSession, handleRenameSession, handleSetSessionSymbol,
     handleQuickStartFromSidebar,
