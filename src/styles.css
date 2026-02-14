@@ -1174,6 +1174,91 @@ body {
   contain: strict;
 }
 
+/* Split pane header bar */
+.splitPaneHeader {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 26px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6px 0 10px;
+  font-size: 11px;
+  line-height: 26px;
+  background: rgba(255, 255, 255, 0.04);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-top: 2px solid rgba(var(--split-header-color, 107, 140, 222), 0.6);
+  color: rgba(255, 255, 255, 0.7);
+  user-select: none;
+  overflow: hidden;
+  border-radius: var(--radius-control) var(--radius-control) 0 0;
+}
+.splitPaneHeaderTitle {
+  font-weight: 600;
+  color: rgba(var(--split-header-color, 107, 140, 222), 1);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.splitPaneHeaderPath {
+  opacity: 0.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.splitPaneHeaderClose {
+  margin-left: auto;
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: var(--radius-control);
+  padding: 0;
+  transition: background 0.1s ease, color 0.1s ease;
+}
+.splitPaneHeaderClose:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.8);
+}
+
+/* Split divider hover indicator */
+.terminalSplitDivider::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  transition: background 0.15s ease;
+}
+.terminalSplitDivider:hover::before {
+  background: rgba(107, 140, 222, 0.45);
+}
+
+/* Sidebar secondary session indicator */
+.sessionItemSecondary {
+  border-color: rgba(107, 140, 222, 0.25);
+  background: rgba(107, 140, 222, 0.06);
+}
+.sessionItemSecondary .sessionName::after {
+  content: "split";
+  font-size: 9px;
+  opacity: 0.5;
+  margin-left: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
 /* File Explorer + Editor */
 .fileExplorerPanel {
   width: var(--workspaceFileTreeWidthPx, 320px);

@@ -54,6 +54,7 @@ type Session = {
 type SessionItemProps = {
   session: Session;
   isActive: boolean;
+  isSecondary: boolean;
   isAgentWorking: boolean;
   isRenaming: boolean;
   renameValue: string;
@@ -69,6 +70,7 @@ type SessionItemProps = {
 const SessionItem = React.memo(function SessionItem({
   session: s,
   isActive,
+  isSecondary,
   isAgentWorking,
   isRenaming,
   renameValue,
@@ -111,14 +113,16 @@ const SessionItem = React.memo(function SessionItem({
   return (
     <div
       className={`sessionItem ${isActive ? "sessionItemActive" : ""} ${
-        isExited ? "sessionItemExited" : ""
-      } ${isClosing ? "sessionItemClosing" : ""} ${
-        isReconnecting ? "sessionItemReconnecting" : ""
-      } ${isDisconnected ? "sessionItemDisconnected" : ""} ${
-        isSshType ? "sessionItemSsh" : ""
-      } ${isPersistent ? "sessionItemPersistent" : ""} ${
-        isDefaultType ? "sessionItemDefault" : ""
-      } ${s.color ? "sessionItemColored" : ""}`}
+        isSecondary ? "sessionItemSecondary" : ""
+      } ${isExited ? "sessionItemExited" : ""} ${
+        isClosing ? "sessionItemClosing" : ""
+      } ${isReconnecting ? "sessionItemReconnecting" : ""} ${
+        isDisconnected ? "sessionItemDisconnected" : ""
+      } ${isSshType ? "sessionItemSsh" : ""} ${
+        isPersistent ? "sessionItemPersistent" : ""
+      } ${isDefaultType ? "sessionItemDefault" : ""} ${
+        s.color ? "sessionItemColored" : ""
+      }`}
       style={s.color ? { "--tab-color": s.color } as React.CSSProperties : undefined}
       onClick={() => onSelectSession(s.id)}
       onContextMenu={(e) => {
@@ -218,6 +222,9 @@ type SessionsSectionProps = {
   sessions: Session[];
   agentWorkingIds: ReadonlySet<string>;
   activeSessionId: string | null;
+  splitPane: { secondaryId: string; direction: string; ratio: number } | null;
+  onSplitSession: (sessionId: string, direction: "horizontal" | "vertical") => void;
+  onUnsplit: () => void;
   onSelectSession: (sessionId: string) => void;
   onCloseSession: (sessionId: string) => void;
   onReconnectSession: (sessionId: string) => void;
@@ -236,6 +243,9 @@ export const SessionsSection = React.memo(function SessionsSection({
   sessions,
   agentWorkingIds,
   activeSessionId,
+  splitPane,
+  onSplitSession,
+  onUnsplit,
   onSelectSession,
   onCloseSession,
   onReconnectSession,
@@ -555,6 +565,7 @@ export const SessionsSection = React.memo(function SessionsSection({
               key={s.id}
               session={s}
               isActive={s.id === activeSessionId}
+              isSecondary={splitPane?.secondaryId === s.id}
               isAgentWorking={agentWorkingIds.has(s.id)}
               isRenaming={renamingId === s.id}
               renameValue={renamingId === s.id ? renameValue : ""}
@@ -620,6 +631,67 @@ export const SessionsSection = React.memo(function SessionsSection({
               onClick={handleRemoveColor}
             >
               Remove color
+            </button>
+          )}
+          <div className="sessionContextMenuSep" />
+          {!splitPane && sessions.length >= 2 && (() => {
+            // If right-clicking the active session, pick the first other session as secondary
+            // If right-clicking a different session, use it as secondary
+            const secondaryId = contextMenu.sessionId !== activeSessionId
+              ? contextMenu.sessionId
+              : sessions.find((s) => s.id !== activeSessionId && !s.closing)?.id ?? null;
+            if (!secondaryId) return null;
+            return (
+              <>
+                <button
+                  type="button"
+                  className="sessionContextMenuItem"
+                  role="menuitem"
+                  onClick={() => {
+                    onSplitSession(secondaryId, "vertical");
+                    setContextMenu(null);
+                  }}
+                >
+                  Split right
+                </button>
+                <button
+                  type="button"
+                  className="sessionContextMenuItem"
+                  role="menuitem"
+                  onClick={() => {
+                    onSplitSession(secondaryId, "horizontal");
+                    setContextMenu(null);
+                  }}
+                >
+                  Split down
+                </button>
+              </>
+            );
+          })()}
+          {splitPane && (contextMenu.sessionId === activeSessionId || contextMenu.sessionId === splitPane.secondaryId) && (
+            <button
+              type="button"
+              className="sessionContextMenuItem"
+              role="menuitem"
+              onClick={() => {
+                onUnsplit();
+                setContextMenu(null);
+              }}
+            >
+              Unsplit
+            </button>
+          )}
+          {splitPane && contextMenu.sessionId !== activeSessionId && contextMenu.sessionId !== splitPane.secondaryId && (
+            <button
+              type="button"
+              className="sessionContextMenuItem"
+              role="menuitem"
+              onClick={() => {
+                onSplitSession(contextMenu.sessionId, splitPane.direction as "horizontal" | "vertical");
+                setContextMenu(null);
+              }}
+            >
+              Show in split
             </button>
           )}
           <div className="sessionContextMenuSep" />

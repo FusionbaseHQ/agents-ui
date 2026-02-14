@@ -135,6 +135,7 @@ function formatInvokeError(err: unknown): string {
 type SessionTerminalProps = {
   id: string;
   active: boolean;
+  shouldFocus?: boolean;
   readOnly: boolean;
   persistent?: boolean;
   onCwdChange?: (id: string, cwd: string) => void;
@@ -189,13 +190,13 @@ function SessionTerminal(props: SessionTerminalProps) {
       cursorBlink: true,
       disableStdin: props.readOnly,
       fontFamily:
-        'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+        'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
       fontSize: 13,
       theme: {
-        background: "#0a0e16",
-        foreground: "#f0f4f8",
-        cursor: "#6b8afd",
-        selectionBackground: "rgba(34,211,238,0.25)",
+        background: "#0a0c10",
+        foreground: "#dce0e8",
+        cursor: "#6b8cde",
+        selectionBackground: "rgba(69,184,200,0.28)",
       },
       scrollback: 5000,
     });
@@ -669,13 +670,15 @@ function SessionTerminal(props: SessionTerminalProps) {
 	        return;
 	      }
 
-	      try {
-	        term.focus();
-	      } catch {
-	        if (attemptsLeft > 0) {
-	          window.requestAnimationFrame(() => attemptFit(attemptsLeft - 1));
+	      if (props.shouldFocus !== false) {
+	        try {
+	          term.focus();
+	        } catch {
+	          if (attemptsLeft > 0) {
+	            window.requestAnimationFrame(() => attemptFit(attemptsLeft - 1));
+	          }
+	          return;
 	        }
-	        return;
 	      }
 	      try {
 	        fit.fit();
@@ -704,7 +707,7 @@ function SessionTerminal(props: SessionTerminalProps) {
     return () => {
       cancelled = true;
     };
-  }, [props.active, props.id]);
+  }, [props.active, props.shouldFocus, props.id]);
 
   useEffect(() => {
     const term = termRef.current;

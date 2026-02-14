@@ -1007,6 +1007,13 @@ export default function App() {
     return DEFAULT_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT;
   });
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [splitPane, setSplitPane] = useState<{
+    secondaryId: string;
+    direction: "horizontal" | "vertical";
+    ratio: number;
+  } | null>(null);
+  const splitPaneRef = useRef<typeof splitPane>(null);
+  useEffect(() => { splitPaneRef.current = splitPane; }, [splitPane]);
   const [hydrated, setHydrated] = useState(false);
   const [sessionRestoreProgress, setSessionRestoreProgress] = useState<SessionRestoreProgress | null>(
     null,
@@ -1484,7 +1491,9 @@ export default function App() {
     const queue = outputQueueRef.current;
     outputQueueRef.current = new Map();
     const activeId = preferredActiveId === undefined ? activeIdRef.current : preferredActiveId;
-    const hiddenCount = Math.max(1, queue.size - (activeId && queue.has(activeId) ? 1 : 0));
+    const secondaryId = splitPaneRef.current?.secondaryId ?? null;
+    const visibleCount = (activeId && queue.has(activeId) ? 1 : 0) + (secondaryId && secondaryId !== activeId && queue.has(secondaryId) ? 1 : 0);
+    const hiddenCount = Math.max(1, queue.size - visibleCount);
     const PER_HIDDEN_SESSION_BUDGET = 32 * 1024;
     let hiddenBudget = Math.min(hiddenCount * PER_HIDDEN_SESSION_BUDGET, 256 * 1024);
 
@@ -1557,8 +1566,16 @@ export default function App() {
       }
     }
 
+    if (secondaryId && secondaryId !== activeId) {
+      const secondaryChunks = queue.get(secondaryId);
+      if (secondaryChunks) {
+        flushAllChunks(secondaryId, secondaryChunks);
+        queue.delete(secondaryId);
+      }
+    }
+
     for (const [id, chunks] of queue) {
-      if (id === activeId) continue;
+      if (id === activeId || id === secondaryId) continue;
       flushHiddenChunksWithBudget(id, chunks);
     }
   }, [pushPendingData]);
@@ -2496,6 +2513,8 @@ export default function App() {
         exitedCleanupTimers.current.delete(activeId);
       }
     }
+    // Guard: clear split if activeId matches secondaryId (prevent same session in both panes)
+    setSplitPane(prev => prev && prev.secondaryId === activeId ? null : prev);
   }, [activeId, flushQueuedOutput]);
 
   useEffect(() => {
@@ -2660,6 +2679,9 @@ export default function App() {
         id: s.id,
         projectId: s.projectId,
         persistent: s.persistent,
+        name: s.name,
+        cwd: s.cwd,
+        color: s.color ?? null,
         exited: Boolean(s.exited),
         closing: Boolean(s.closing),
         connectionState: s.connectionState ?? "connected",
@@ -2672,6 +2694,9 @@ export default function App() {
           p.id === next[i].id &&
           p.projectId === next[i].projectId &&
           p.persistent === next[i].persistent &&
+          p.name === next[i].name &&
+          p.cwd === next[i].cwd &&
+          p.color === next[i].color &&
           p.exited === next[i].exited &&
           p.closing === next[i].closing &&
           p.connectionState === next[i].connectionState,
@@ -4530,6 +4555,7 @@ export default function App() {
   const selectProject = useCallback((projectId: string) => {
     setActiveProjectId(projectId);
     setActiveId(pickActiveSessionId(projectId));
+    setSplitPane(null);
   }, []);
 
   const moveProject = useCallback((projectId: string, targetProjectId: string, position: "before" | "after") => {
@@ -5460,6 +5486,7 @@ export default function App() {
       closingSessions.current.delete(id);
     }, 10_000);
     closingSessions.current.set(id, cleanupTimeout);
+    setSplitPane(prev => prev?.secondaryId === id ? null : prev);
     setSessions((prev) => {
       const removed = prev.find((s) => s.id === id);
       const next = prev.filter((s) => s.id !== id);
@@ -5943,6 +5970,28 @@ export default function App() {
     });
   }, []);
 
+  const handleSplitSession = useCallback((sessionId: string, direction: "horizontal" | "vertical") => {
+    setSplitPane({ secondaryId: sessionId, direction, ratio: 0.5 });
+  }, []);
+
+  const handleUnsplit = useCallback(() => {
+    setSplitPane(null);
+  }, []);
+
+  const handleSplitRatioChange = useCallback((ratio: number) => {
+    setSplitPane(prev => prev ? { ...prev, ratio: Math.max(0.15, Math.min(0.85, ratio)) } : null);
+  }, []);
+
+  const handleCloseSplitPane = useCallback((closedSessionId: string) => {
+    const split = splitPaneRef.current;
+    if (!split) return;
+    // If closing the primary pane, make secondary the active session
+    if (closedSessionId !== split.secondaryId) {
+      setActiveId(split.secondaryId);
+    }
+    setSplitPane(null);
+  }, []);
+
   const handleRenameProjectInline = useCallback((projectId: string, newName: string) => {
     const trimmed = newName.trim();
     if (!trimmed) return;
@@ -6124,6 +6173,9 @@ export default function App() {
         sessions={stableProjectSessions}
         agentWorkingIds={agentWorkingIds}
         activeSessionId={activeId}
+        splitPane={splitPane}
+        onSplitSession={handleSplitSession}
+        onUnsplit={handleUnsplit}
         onSelectSession={setActiveId}
         onCloseSession={handleCloseSession}
         onReconnectSession={handleReconnectSession}
@@ -6141,12 +6193,12 @@ export default function App() {
     projects, activeProjectId, activeProject, environments,
     stableSessionCountByProject, stableWorkingAgentCountByProject,
     prompts, agentShortcuts, stableProjectSessions, agentWorkingIds,
-    activeId, projectsListMaxHeight,
+    activeId, splitPane, projectsListMaxHeight,
     selectProject, moveProject, openNewProject, openRenameProject,
     openProjectSettings, handleDeleteProject, handleRenameProjectInline, handleSetProjectSymbol, handleSetProjectColor,
     handleSendPromptToActive, openPromptEditor, handleOpenPromptsPanel,
     handleCloseSession, handleReconnectSession, handleRenameSession, handleSetSessionSymbol, handleSetSessionColor,
-    handleQuickStartFromSidebar,
+    handleSplitSession, handleUnsplit, handleQuickStartFromSidebar,
     handleOpenNewSession, handleOpenPersistentSessions,
     handleOpenSshManager, handleOpenAgentShortcuts,
     resetProjectsListMaxHeight, handleProjectsDividerKeyDown,
@@ -6434,6 +6486,9 @@ export default function App() {
           sessions={terminalPaneSessions}
           activeId={activeId}
           activeProjectId={activeProjectId}
+          splitPane={splitPane}
+          onSplitRatioChange={handleSplitRatioChange}
+          onCloseSplitPane={handleCloseSplitPane}
           onCwdChange={onCwdChange}
           onCommandChange={onCommandChange}
           onSessionResize={onSessionResize}
@@ -6583,7 +6638,8 @@ export default function App() {
         ) : null}
       </div>
   ), [
-    terminalPaneSessions, activeId, activeProjectId, activeWorkspaceView, activeWorkspaceKey,
+    terminalPaneSessions, activeId, activeProjectId, splitPane, handleSplitRatioChange, handleCloseSplitPane,
+    activeWorkspaceView, activeWorkspaceKey,
     activeIsSsh, activeSshTarget, activeProject, active,
     workspaceResizeMode, activeProjectId,
     onCwdChange, onCommandChange, onSessionResize, onSessionTransportError,
