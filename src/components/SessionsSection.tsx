@@ -1,4 +1,5 @@
 import React from "react";
+import { createPortal } from "react-dom";
 import { getProcessEffectById, type ProcessEffect } from "../processEffects";
 import { shortenPathSmart } from "../pathDisplay";
 import { Icon } from "./Icon";
@@ -581,8 +582,8 @@ export const SessionsSection = React.memo(function SessionsSection({
         )}
       </div>
 
-      {/* Context menu */}
-      {contextMenu && contextSession && (
+      {/* Context menu — portalled to body to escape sidebar's backdrop-filter containing block */}
+      {contextMenu && contextSession && createPortal(
         <div
           ref={contextMenuRef}
           className="sessionContextMenu"
@@ -703,11 +704,12 @@ export const SessionsSection = React.memo(function SessionsSection({
           >
             Close session
           </button>
-        </div>
+        </div>,
+        document.body,
       )}
 
       {/* Symbol picker */}
-      {symbolPicker && (
+      {symbolPicker && createPortal(
         <div
           ref={symbolPickerRef}
           className="sessionSymbolPicker"
@@ -723,15 +725,19 @@ export const SessionsSection = React.memo(function SessionsSection({
               {sym}
             </button>
           ))}
-        </div>
+        </div>,
+        document.body,
       )}
 
       {/* Color picker */}
-      {colorPicker && (
+      {colorPicker && createPortal(
         <div
           ref={colorPickerRef}
           className="tabColorPicker"
-          style={{ top: colorPicker.y, left: colorPicker.x }}
+          style={{
+            top: Math.min(colorPicker.y, window.innerHeight - 100),
+            left: Math.min(colorPicker.x, window.innerWidth - 160),
+          }}
         >
           {TAB_COLORS.map((c) => (
             <button
@@ -742,7 +748,8 @@ export const SessionsSection = React.memo(function SessionsSection({
               style={{ background: `rgb(${c.value})` }}
             />
           ))}
-        </div>
+        </div>,
+        document.body,
       )}
     </>
   );

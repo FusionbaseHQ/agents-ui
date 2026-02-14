@@ -1,4 +1,5 @@
 import React from "react";
+import { createPortal } from "react-dom";
 import { Icon } from "./Icon";
 
 const TAB_COLORS = [
@@ -528,7 +529,7 @@ export const ProjectsSection = React.memo(function ProjectsSection({
       </div>
 
       {/* Context menu */}
-      {contextMenu && contextProject && (
+      {contextMenu && contextProject && createPortal(
         <div
           ref={contextMenuRef}
           className="sessionContextMenu"
@@ -592,11 +593,12 @@ export const ProjectsSection = React.memo(function ProjectsSection({
           >
             Project settings
           </button>
-        </div>
+        </div>,
+        document.body,
       )}
 
       {/* Symbol picker */}
-      {symbolPicker && (
+      {symbolPicker && createPortal(
         <div
           ref={symbolPickerRef}
           className="sessionSymbolPicker"
@@ -612,15 +614,19 @@ export const ProjectsSection = React.memo(function ProjectsSection({
               {sym}
             </button>
           ))}
-        </div>
+        </div>,
+        document.body,
       )}
 
       {/* Color picker */}
-      {colorPicker && (
+      {colorPicker && createPortal(
         <div
           ref={colorPickerRef}
           className="tabColorPicker"
-          style={{ top: colorPicker.y, left: colorPicker.x }}
+          style={{
+            top: Math.min(colorPicker.y, window.innerHeight - 100),
+            left: Math.min(colorPicker.x, window.innerWidth - 160),
+          }}
         >
           {TAB_COLORS.map((c) => (
             <button
@@ -631,7 +637,8 @@ export const ProjectsSection = React.memo(function ProjectsSection({
               style={{ background: `rgb(${c.value})` }}
             />
           ))}
-        </div>
+        </div>,
+        document.body,
       )}
     </>
   );
