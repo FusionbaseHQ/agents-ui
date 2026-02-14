@@ -53,6 +53,7 @@ type Project = {
   environmentId: string | null;
   assetsEnabled?: boolean;
   symbol?: string | null;
+  color?: string | null;
 };
 
 type SessionInfo = {
@@ -77,6 +78,7 @@ type Session = SessionInfo & {
   effectId?: string | null;
   processTag?: string | null;
   symbol?: string | null;
+  color?: string | null;
   exited?: boolean;
   closing?: boolean;
   exitCode?: number | null;
@@ -457,6 +459,7 @@ type PersistedSession = {
   cwd: string | null;
   persistent?: boolean;
   symbol?: string | null;
+  color?: string | null;
   createdAt: number;
 };
 
@@ -563,6 +566,7 @@ function toPersistedSession(session: Session): PersistedSession {
     cwd: session.cwd,
     persistent: session.persistent,
     symbol: session.symbol ?? null,
+    color: session.color ?? null,
     createdAt: session.createdAt,
   };
 }
@@ -580,6 +584,7 @@ function persistedSessionEquals(a: PersistedSession, b: PersistedSession): boole
     a.cwd === b.cwd &&
     Boolean(a.persistent) === Boolean(b.persistent) &&
     (a.symbol ?? null) === (b.symbol ?? null) &&
+    (a.color ?? null) === (b.color ?? null) &&
     a.createdAt === b.createdAt
   );
 }
@@ -678,6 +683,7 @@ function loadLegacyProjectState(): { projects: Project[]; activeProjectId: strin
             environmentId: null,
             assetsEnabled: true,
             symbol: (p as { symbol?: string | null }).symbol ?? null,
+            color: (p as { color?: string | null }).color ?? null,
           }));
       }
     }
@@ -2742,7 +2748,7 @@ export default function App() {
     try {
       localStorage.setItem(
         STORAGE_PROJECTS_KEY,
-        JSON.stringify(projects.map((p) => ({ id: p.id, title: p.title, symbol: p.symbol ?? null }))),
+        JSON.stringify(projects.map((p) => ({ id: p.id, title: p.title, symbol: p.symbol ?? null, color: p.color ?? null }))),
       );
       localStorage.setItem(STORAGE_ACTIVE_PROJECT_KEY, activeProjectId);
     } catch {
@@ -5106,6 +5112,7 @@ export default function App() {
           });
           const created = applyPendingExit(createdRaw);
           if (s.symbol) created.symbol = s.symbol;
+          if (s.color) created.color = s.color;
           const restoreCmd =
             (s.persistent
               ? null
@@ -5924,6 +5931,18 @@ export default function App() {
     });
   }, []);
 
+  const handleSetSessionColor = useCallback((sessionId: string, color: string | null) => {
+    setSessions((prev) => {
+      const idx = prev.findIndex((s) => s.id === sessionId);
+      if (idx < 0) return prev;
+      const current = prev[idx].color ?? null;
+      if (current === color) return prev;
+      const next = prev.slice();
+      next[idx] = { ...prev[idx], color };
+      return next;
+    });
+  }, []);
+
   const handleRenameProjectInline = useCallback((projectId: string, newName: string) => {
     const trimmed = newName.trim();
     if (!trimmed) return;
@@ -5945,6 +5964,18 @@ export default function App() {
       if (current === symbol) return prev;
       const next = prev.slice();
       next[idx] = { ...prev[idx], symbol };
+      return next;
+    });
+  }, []);
+
+  const handleSetProjectColor = useCallback((projectId: string, color: string | null) => {
+    setProjects((prev) => {
+      const idx = prev.findIndex((p) => p.id === projectId);
+      if (idx < 0) return prev;
+      const current = prev[idx].color ?? null;
+      if (current === color) return prev;
+      const next = prev.slice();
+      next[idx] = { ...prev[idx], color };
       return next;
     });
   }, []);
@@ -6062,6 +6093,7 @@ export default function App() {
         onMoveProject={moveProject}
         onRenameProjectInline={handleRenameProjectInline}
         onSetProjectSymbol={handleSetProjectSymbol}
+        onSetProjectColor={handleSetProjectColor}
       />
 
       <QuickPromptsSection
@@ -6097,6 +6129,7 @@ export default function App() {
         onReconnectSession={handleReconnectSession}
         onRenameSession={handleRenameSession}
         onSetSessionSymbol={handleSetSessionSymbol}
+        onSetSessionColor={handleSetSessionColor}
         onQuickStart={handleQuickStartFromSidebar}
         onOpenNewSession={handleOpenNewSession}
         onOpenPersistentSessions={handleOpenPersistentSessions}
@@ -6110,9 +6143,9 @@ export default function App() {
     prompts, agentShortcuts, stableProjectSessions, agentWorkingIds,
     activeId, projectsListMaxHeight,
     selectProject, moveProject, openNewProject, openRenameProject,
-    openProjectSettings, handleDeleteProject, handleRenameProjectInline, handleSetProjectSymbol,
+    openProjectSettings, handleDeleteProject, handleRenameProjectInline, handleSetProjectSymbol, handleSetProjectColor,
     handleSendPromptToActive, openPromptEditor, handleOpenPromptsPanel,
-    handleCloseSession, handleReconnectSession, handleRenameSession, handleSetSessionSymbol,
+    handleCloseSession, handleReconnectSession, handleRenameSession, handleSetSessionSymbol, handleSetSessionColor,
     handleQuickStartFromSidebar,
     handleOpenNewSession, handleOpenPersistentSessions,
     handleOpenSshManager, handleOpenAgentShortcuts,

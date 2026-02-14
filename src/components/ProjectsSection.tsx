@@ -1,6 +1,17 @@
 import React from "react";
 import { Icon } from "./Icon";
 
+const TAB_COLORS = [
+  { name: "Blue", value: "107, 140, 222" },
+  { name: "Cyan", value: "69, 184, 200" },
+  { name: "Pink", value: "200, 120, 152" },
+  { name: "Green", value: "88, 184, 120" },
+  { name: "Orange", value: "210, 155, 80" },
+  { name: "Red", value: "208, 100, 100" },
+  { name: "Purple", value: "155, 120, 210" },
+  { name: "Yellow", value: "210, 195, 80" },
+];
+
 const PROJECT_SYMBOLS = [
   "\u{1F5A5}\uFE0F", "\u{1F4BB}", "\u{1F527}", "\u{1F680}", "\u26A1", "\u{1F41B}",
   "\u{1F4E6}", "\u{1F9EA}", "\u{1F310}", "\u{1F512}", "\u{1F4DD}", "\u{1F3A8}",
@@ -14,6 +25,7 @@ type Project = {
   basePath: string | null;
   environmentId: string | null;
   symbol?: string | null;
+  color?: string | null;
 };
 
 type EnvironmentConfig = {
@@ -36,6 +48,7 @@ type ProjectsSectionProps = {
   onMoveProject: (projectId: string, targetProjectId: string, position: "before" | "after") => void;
   onRenameProjectInline: (projectId: string, newName: string) => void;
   onSetProjectSymbol: (projectId: string, symbol: string | null) => void;
+  onSetProjectColor: (projectId: string, color: string | null) => void;
 };
 
 export const ProjectsSection = React.memo(function ProjectsSection({
@@ -53,6 +66,7 @@ export const ProjectsSection = React.memo(function ProjectsSection({
   onMoveProject,
   onRenameProjectInline,
   onSetProjectSymbol,
+  onSetProjectColor,
 }: ProjectsSectionProps) {
   const [draggingProjectId, setDraggingProjectId] = React.useState<string | null>(null);
   const [dropTarget, setDropTarget] = React.useState<{
@@ -79,6 +93,14 @@ export const ProjectsSection = React.memo(function ProjectsSection({
   // Symbol picker state
   const symbolPickerRef = React.useRef<HTMLDivElement | null>(null);
   const [symbolPicker, setSymbolPicker] = React.useState<{
+    projectId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  // Color picker state
+  const colorPickerRef = React.useRef<HTMLDivElement | null>(null);
+  const [colorPicker, setColorPicker] = React.useState<{
     projectId: string;
     x: number;
     y: number;
@@ -134,23 +156,51 @@ export const ProjectsSection = React.memo(function ProjectsSection({
     [symbolPicker, onSetProjectSymbol],
   );
 
-  // Dismiss handlers for context menu and symbol picker
+  const handleSetColorStart = React.useCallback(() => {
+    if (!contextMenu) return;
+    setColorPicker({
+      projectId: contextMenu.projectId,
+      x: contextMenu.x,
+      y: contextMenu.y,
+    });
+    setContextMenu(null);
+  }, [contextMenu]);
+
+  const handleRemoveColor = React.useCallback(() => {
+    if (!contextMenu) return;
+    onSetProjectColor(contextMenu.projectId, null);
+    setContextMenu(null);
+  }, [contextMenu, onSetProjectColor]);
+
+  const handleColorSelect = React.useCallback(
+    (val: string) => {
+      if (!colorPicker) return;
+      onSetProjectColor(colorPicker.projectId, val);
+      setColorPicker(null);
+    },
+    [colorPicker, onSetProjectColor],
+  );
+
+  // Dismiss handlers for context menu, symbol picker, color picker
   React.useEffect(() => {
-    if (!contextMenu && !symbolPicker) return;
+    if (!contextMenu && !symbolPicker && !colorPicker) return;
 
     const handlePointerDown = (event: MouseEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
       if (contextMenuRef.current?.contains(target)) return;
       if (symbolPickerRef.current?.contains(target)) return;
+      if (colorPickerRef.current?.contains(target)) return;
       setContextMenu(null);
       setSymbolPicker(null);
+      setColorPicker(null);
     };
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       setContextMenu(null);
       setSymbolPicker(null);
+      setColorPicker(null);
     };
 
     document.addEventListener("mousedown", handlePointerDown);
@@ -159,7 +209,7 @@ export const ProjectsSection = React.memo(function ProjectsSection({
       document.removeEventListener("mousedown", handlePointerDown);
       document.removeEventListener("keydown", handleKeyDown);
     };
-  }, [contextMenu, symbolPicker]);
+  }, [contextMenu, symbolPicker, colorPicker]);
 
   const contextProject = contextMenu
     ? projects.find((p) => p.id === contextMenu.projectId)
@@ -274,9 +324,11 @@ export const ProjectsSection = React.memo(function ProjectsSection({
                 isDragging ? "projectItemDragging" : "",
                 dropPosition === "before" ? "projectItemDropBefore" : "",
                 dropPosition === "after" ? "projectItemDropAfter" : "",
+                p.color ? "projectItemColored" : "",
               ]
                 .filter(Boolean)
                 .join(" ")}
+              style={p.color ? { "--tab-color": p.color } as React.CSSProperties : undefined}
             >
               <button
                 type="button"
@@ -287,6 +339,7 @@ export const ProjectsSection = React.memo(function ProjectsSection({
                   e.preventDefault();
                   setContextMenu({ projectId: p.id, x: e.clientX, y: e.clientY });
                   setSymbolPicker(null);
+                  setColorPicker(null);
                 }}
                 title={
                   [
@@ -508,6 +561,24 @@ export const ProjectsSection = React.memo(function ProjectsSection({
               Remove symbol
             </button>
           )}
+          <button
+            type="button"
+            className="sessionContextMenuItem"
+            role="menuitem"
+            onClick={handleSetColorStart}
+          >
+            Set color
+          </button>
+          {contextProject.color && (
+            <button
+              type="button"
+              className="sessionContextMenuItem"
+              role="menuitem"
+              onClick={handleRemoveColor}
+            >
+              Remove color
+            </button>
+          )}
           <div className="sessionContextMenuSep" />
           <button
             type="button"
@@ -540,6 +611,25 @@ export const ProjectsSection = React.memo(function ProjectsSection({
             >
               {sym}
             </button>
+          ))}
+        </div>
+      )}
+
+      {/* Color picker */}
+      {colorPicker && (
+        <div
+          ref={colorPickerRef}
+          className="tabColorPicker"
+          style={{ top: colorPicker.y, left: colorPicker.x }}
+        >
+          {TAB_COLORS.map((c) => (
+            <button
+              key={c.value}
+              type="button"
+              onClick={() => handleColorSelect(c.value)}
+              title={c.name}
+              style={{ background: `rgb(${c.value})` }}
+            />
           ))}
         </div>
       )}

@@ -11,6 +11,17 @@ function isSshCommand(commandLine: string | null | undefined): boolean {
   return base.toLowerCase().replace(/\.exe$/, "") === "ssh";
 }
 
+const TAB_COLORS = [
+  { name: "Blue", value: "107, 140, 222" },
+  { name: "Cyan", value: "69, 184, 200" },
+  { name: "Pink", value: "200, 120, 152" },
+  { name: "Green", value: "88, 184, 120" },
+  { name: "Orange", value: "210, 155, 80" },
+  { name: "Red", value: "208, 100, 100" },
+  { name: "Purple", value: "155, 120, 210" },
+  { name: "Yellow", value: "210, 195, 80" },
+];
+
 const SESSION_SYMBOLS = [
   "\u{1F5A5}\uFE0F", "\u{1F4BB}", "\u{1F527}", "\u{1F680}", "\u26A1", "\u{1F41B}",
   "\u{1F4E6}", "\u{1F9EA}", "\u{1F310}", "\u{1F512}", "\u{1F4DD}", "\u{1F3A8}",
@@ -37,6 +48,7 @@ type Session = {
   manualReconnectAvailable?: boolean;
   disconnectReason?: string | null;
   symbol?: string | null;
+  color?: string | null;
 };
 
 type SessionItemProps = {
@@ -106,14 +118,14 @@ const SessionItem = React.memo(function SessionItem({
         isSshType ? "sessionItemSsh" : ""
       } ${isPersistent ? "sessionItemPersistent" : ""} ${
         isDefaultType ? "sessionItemDefault" : ""
-      }`}
+      } ${s.color ? "sessionItemColored" : ""}`}
+      style={s.color ? { "--tab-color": s.color } as React.CSSProperties : undefined}
       onClick={() => onSelectSession(s.id)}
       onContextMenu={(e) => {
         e.preventDefault();
         onContextMenu(s.id, e.clientX, e.clientY);
       }}
     >
-      <div className={`dot ${isActive ? "dotActive" : ""}`} />
       <div className="sessionMeta">
         <div className="sessionName">
           {s.symbol && <span className="sessionSymbol">{s.symbol}</span>}
@@ -211,6 +223,7 @@ type SessionsSectionProps = {
   onReconnectSession: (sessionId: string) => void;
   onRenameSession: (sessionId: string, newName: string) => void;
   onSetSessionSymbol: (sessionId: string, symbol: string | null) => void;
+  onSetSessionColor: (sessionId: string, color: string | null) => void;
   onQuickStart: (effect: ProcessEffect) => void;
   onOpenNewSession: () => void;
   onOpenAgentShortcuts: () => void;
@@ -228,6 +241,7 @@ export const SessionsSection = React.memo(function SessionsSection({
   onReconnectSession,
   onRenameSession,
   onSetSessionSymbol,
+  onSetSessionColor,
   onQuickStart,
   onOpenNewSession,
   onOpenAgentShortcuts,
@@ -259,10 +273,19 @@ export const SessionsSection = React.memo(function SessionsSection({
     y: number;
   } | null>(null);
 
+  // Color picker state
+  const colorPickerRef = React.useRef<HTMLDivElement | null>(null);
+  const [colorPicker, setColorPicker] = React.useState<{
+    sessionId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+
   const handleContextMenu = React.useCallback(
     (sessionId: string, x: number, y: number) => {
       setContextMenu({ sessionId, x, y });
       setSymbolPicker(null);
+      setColorPicker(null);
     },
     [],
   );
@@ -317,15 +340,40 @@ export const SessionsSection = React.memo(function SessionsSection({
     [symbolPicker, onSetSessionSymbol],
   );
 
+  const handleSetColorStart = React.useCallback(() => {
+    if (!contextMenu) return;
+    setColorPicker({
+      sessionId: contextMenu.sessionId,
+      x: contextMenu.x,
+      y: contextMenu.y,
+    });
+    setContextMenu(null);
+  }, [contextMenu]);
+
+  const handleRemoveColor = React.useCallback(() => {
+    if (!contextMenu) return;
+    onSetSessionColor(contextMenu.sessionId, null);
+    setContextMenu(null);
+  }, [contextMenu, onSetSessionColor]);
+
+  const handleColorSelect = React.useCallback(
+    (val: string) => {
+      if (!colorPicker) return;
+      onSetSessionColor(colorPicker.sessionId, val);
+      setColorPicker(null);
+    },
+    [colorPicker, onSetSessionColor],
+  );
+
   const handleCloseFromContextMenu = React.useCallback(() => {
     if (!contextMenu) return;
     onCloseSession(contextMenu.sessionId);
     setContextMenu(null);
   }, [contextMenu, onCloseSession]);
 
-  // Dismiss handlers for menus, context menu, symbol picker
+  // Dismiss handlers for menus, context menu, symbol picker, color picker
   React.useEffect(() => {
-    if (!createOpen && !settingsOpen && !contextMenu && !symbolPicker) return;
+    if (!createOpen && !settingsOpen && !contextMenu && !symbolPicker && !colorPicker) return;
 
     const handlePointerDown = (event: MouseEvent) => {
       const target = event.target;
@@ -334,10 +382,12 @@ export const SessionsSection = React.memo(function SessionsSection({
       if (settingsMenuRef.current?.contains(target)) return;
       if (contextMenuRef.current?.contains(target)) return;
       if (symbolPickerRef.current?.contains(target)) return;
+      if (colorPickerRef.current?.contains(target)) return;
       setCreateOpen(false);
       setSettingsOpen(false);
       setContextMenu(null);
       setSymbolPicker(null);
+      setColorPicker(null);
     };
 
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -346,6 +396,7 @@ export const SessionsSection = React.memo(function SessionsSection({
       setSettingsOpen(false);
       setContextMenu(null);
       setSymbolPicker(null);
+      setColorPicker(null);
     };
 
     document.addEventListener("mousedown", handlePointerDown);
@@ -354,7 +405,7 @@ export const SessionsSection = React.memo(function SessionsSection({
       document.removeEventListener("mousedown", handlePointerDown);
       document.removeEventListener("keydown", handleKeyDown);
     };
-  }, [createOpen, settingsOpen, contextMenu, symbolPicker]);
+  }, [createOpen, settingsOpen, contextMenu, symbolPicker, colorPicker]);
 
   const contextSession = contextMenu
     ? sessions.find((s) => s.id === contextMenu.sessionId)
@@ -553,6 +604,24 @@ export const SessionsSection = React.memo(function SessionsSection({
               Remove symbol
             </button>
           )}
+          <button
+            type="button"
+            className="sessionContextMenuItem"
+            role="menuitem"
+            onClick={handleSetColorStart}
+          >
+            Set color
+          </button>
+          {contextSession.color && (
+            <button
+              type="button"
+              className="sessionContextMenuItem"
+              role="menuitem"
+              onClick={handleRemoveColor}
+            >
+              Remove color
+            </button>
+          )}
           <div className="sessionContextMenuSep" />
           <button
             type="button"
@@ -581,6 +650,25 @@ export const SessionsSection = React.memo(function SessionsSection({
             >
               {sym}
             </button>
+          ))}
+        </div>
+      )}
+
+      {/* Color picker */}
+      {colorPicker && (
+        <div
+          ref={colorPickerRef}
+          className="tabColorPicker"
+          style={{ top: colorPicker.y, left: colorPicker.x }}
+        >
+          {TAB_COLORS.map((c) => (
+            <button
+              key={c.value}
+              type="button"
+              onClick={() => handleColorSelect(c.value)}
+              title={c.name}
+              style={{ background: `rgb(${c.value})` }}
+            />
           ))}
         </div>
       )}
