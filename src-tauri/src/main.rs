@@ -19,8 +19,8 @@ use files::{copy_fs_entry, delete_fs_entry, list_fs_entries, read_text_file, ren
 use file_manager::{open_path_in_file_manager, open_path_in_vscode};
 use pty::{
     close_session, create_session, detach_session, kill_persistent_session, list_persistent_sessions,
-    list_sessions, resize_session, start_session_recording, stop_session_recording, write_to_session,
-    AppState,
+    list_sessions, rename_session, resize_session, start_session_recording, stop_session_recording,
+    write_to_session, AppState,
 };
 use persist::{list_directories, load_persisted_state, load_persisted_state_meta, save_persisted_state, validate_directory};
 use recording::{delete_recording, list_recordings, load_recording};
@@ -85,6 +85,7 @@ fn main() {
             write_to_session,
             resize_session,
             close_session,
+            rename_session,
             detach_session,
             list_sessions,
             list_persistent_sessions,

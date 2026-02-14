@@ -1181,7 +1181,98 @@ $env.config = ($env.config | upsert keybindings [
 "#,
     );
     config.push_str(
-        r#"$env.config = ($env.config | upsert hooks.pre_execution [
+        r#"# Conda compatibility for bundled Nu.
+# Conda currently does not provide a native Nushell hook; emulate activate/deactivate
+# by parsing `conda shell.posix` output and applying env mutations in-session.
+def --env __agents_ui_conda_apply_record [key: string, value: string] {
+  if $key == "PATH" {
+    let path_list = if (($value | str trim) == "") { [] } else { $value | split row ":" }
+    load-env { PATH: $path_list }
+  } else {
+    load-env ({} | upsert $key $value)
+  }
+}
+
+def __agents_ui_conda_error [out: record] {
+  let stderr = ($out.stderr | default "" | str trim)
+  let stdout = ($out.stdout | default "" | str trim)
+  let msg = if $stderr != "" {
+    $stderr
+  } else if $stdout != "" {
+    $stdout
+  } else {
+    "conda command failed"
+  }
+  error make { msg: $msg }
+}
+
+def --env __agents_ui_conda_apply [...shell_args: string] {
+  let out = (^conda shell.posix ...$shell_args | complete)
+  if ($out.exit_code != 0) {
+    __agents_ui_conda_error $out
+  }
+
+  mut skipped_hook_count = 0
+  for raw_line in ($out.stdout | lines) {
+    let line = ($raw_line | str trim)
+    if $line == "" {
+      continue
+    }
+
+    let unset_match = ($line | parse -r '^unset +(?<key>[A-Za-z_][A-Za-z0-9_]*)$')
+    if (($unset_match | length) > 0) {
+      let key = ($unset_match | get 0.key)
+      do -i { hide-env $key }
+      continue
+    }
+
+    let export_single = ($line | parse -r "^export +(?<key>[A-Za-z_][A-Za-z0-9_]*)='(?<value>.*)'$")
+    if (($export_single | length) > 0) {
+      let key = ($export_single | get 0.key)
+      let value = ($export_single | get 0.value)
+      __agents_ui_conda_apply_record $key $value
+      continue
+    }
+
+    let export_double = ($line | parse -r '^export +(?<key>[A-Za-z_][A-Za-z0-9_]*)="(?<value>.*)"$')
+    if (($export_double | length) > 0) {
+      let key = ($export_double | get 0.key)
+      let value = ($export_double | get 0.value)
+      __agents_ui_conda_apply_record $key $value
+      continue
+    }
+
+    let export_raw = ($line | parse -r '^export +(?<key>[A-Za-z_][A-Za-z0-9_]*)=(?<value>.*)$')
+    if (($export_raw | length) > 0) {
+      let key = ($export_raw | get 0.key)
+      let value = ($export_raw | get 0.value)
+      __agents_ui_conda_apply_record $key $value
+      continue
+    }
+
+    let hook_match = ($line | parse -r '^\. +"(?<path>.+)"$')
+    if (($hook_match | length) > 0) {
+      $skipped_hook_count = $skipped_hook_count + 1
+      continue
+    }
+  }
+
+  if $skipped_hook_count > 0 {
+    print $"[agents-ui] conda hook scripts were skipped in Nushell: ($skipped_hook_count) hook lines."
+  }
+}
+
+def --wrapped --env conda [...args: string] {
+  let subcmd = ($args | get 0? | default "")
+  if $subcmd in [activate deactivate reactivate] {
+    __agents_ui_conda_apply ...$args
+    return
+  }
+
+  ^conda ...$args
+}
+
+$env.config = ($env.config | upsert hooks.pre_execution [
   {||
     let cleaned = (commandline | str trim | str replace --all (char newline) " ")
     let osc = (char --integer 27) + "]1337;Command=" + $cleaned + (char --integer 7)
@@ -1200,7 +1291,8 @@ $env.PROMPT_COMMAND = {||
   let cwd = $env.PWD
   let osc = (char --integer 27) + "]1337;CurrentDir=" + $cwd + (char --integer 7)
   let dir = ($cwd | path basename)
-  $osc + (ansi cyan) + $dir + (ansi reset) + " "
+  let conda_prefix = ($env.CONDA_PROMPT_MODIFIER? | default "")
+  $osc + $conda_prefix + (ansi cyan) + $dir + (ansi reset) + " "
 }
 
 $env.PROMPT_INDICATOR = {|| "❯ " }
@@ -1978,6 +2070,20 @@ pub fn resize_session(
             pixel_height: 0,
         })
         .map_err(|e| format!("resize failed: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn rename_session(state: State<'_, AppState>, id: String, name: String) -> Result<(), String> {
+    let mut sessions = state
+        .inner
+        .sessions
+        .lock()
+        .map_err(|_| "state poisoned")?;
+    let session = sessions
+        .get_mut(&id)
+        .ok_or_else(|| "Session not found".to_string())?;
+    session.name = name;
     Ok(())
 }
 

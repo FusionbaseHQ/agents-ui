@@ -17,6 +17,11 @@ type RenderDimensionsFallback = {
   };
 };
 
+const KNOWN_XTERM_RESIZE_RACE_SIGNATURES = [
+  "this._renderer.value.handleresize",
+  "undefined is not an object (evaluating 'this._renderer.value.handleresize')",
+];
+
 function createEmptyRenderDimensions(): RenderDimensionsFallback {
   const dim = (): RenderDimension => ({ width: 0, height: 0 });
   return {
@@ -44,6 +49,37 @@ function patchXtermRenderServiceDimensions(term: Terminal): void {
     });
 
     renderService.__agentsUiSafeDimensions = true;
+  } catch {
+    // ignore
+  }
+}
+
+function isKnownXtermPausedResizeRace(err: unknown): boolean {
+  const message = formatInvokeError(err).toLowerCase();
+  return KNOWN_XTERM_RESIZE_RACE_SIGNATURES.some((signature) => message.includes(signature));
+}
+
+function patchXtermPausedResizeTask(term: Terminal): void {
+  try {
+    const core = (term as unknown as { _core?: any })._core;
+    const renderService = core?._renderService;
+    const pausedResizeTask = renderService?._pausedResizeTask;
+    if (!pausedResizeTask || typeof pausedResizeTask.set !== "function") return;
+    if (pausedResizeTask.__agentsUiSafePausedResizeTask) return;
+
+    const originalSet = pausedResizeTask.set.bind(pausedResizeTask);
+    pausedResizeTask.set = (task: () => boolean | void) => {
+      originalSet(() => {
+        try {
+          return task();
+        } catch (err) {
+          if (isKnownXtermPausedResizeRace(err)) return;
+          throw err;
+        }
+      });
+    };
+
+    pausedResizeTask.__agentsUiSafePausedResizeTask = true;
   } catch {
     // ignore
   }
@@ -169,6 +205,7 @@ function SessionTerminal(props: SessionTerminalProps) {
     const canvasAddon = new CanvasAddon();
     term.loadAddon(canvasAddon);
     patchXtermRenderServiceDimensions(term);
+    patchXtermPausedResizeTask(term);
 
     const reportTransportError = (operation: "write" | "resize", err: unknown) => {
       onTransportErrorRef.current?.(props.id, operation, formatInvokeError(err));

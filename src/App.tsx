@@ -75,6 +75,7 @@ type Session = SessionInfo & {
   cwd: string | null;
   effectId?: string | null;
   processTag?: string | null;
+  symbol?: string | null;
   exited?: boolean;
   closing?: boolean;
   exitCode?: number | null;
@@ -454,6 +455,7 @@ type PersistedSession = {
   lastRecordingId?: string | null;
   cwd: string | null;
   persistent?: boolean;
+  symbol?: string | null;
   createdAt: number;
 };
 
@@ -559,6 +561,7 @@ function toPersistedSession(session: Session): PersistedSession {
     lastRecordingId: session.lastRecordingId ?? null,
     cwd: session.cwd,
     persistent: session.persistent,
+    symbol: session.symbol ?? null,
     createdAt: session.createdAt,
   };
 }
@@ -575,6 +578,7 @@ function persistedSessionEquals(a: PersistedSession, b: PersistedSession): boole
     (a.lastRecordingId ?? null) === (b.lastRecordingId ?? null) &&
     a.cwd === b.cwd &&
     Boolean(a.persistent) === Boolean(b.persistent) &&
+    (a.symbol ?? null) === (b.symbol ?? null) &&
     a.createdAt === b.createdAt
   );
 }
@@ -2178,6 +2182,7 @@ export default function App() {
               sshTarget: previous.sshTarget ?? created.sshTarget,
               sshRootDir: previous.sshRootDir ?? created.sshRootDir,
               lastRecordingId: previous.lastRecordingId ?? created.lastRecordingId,
+              symbol: previous.symbol,
               recordingActive: false,
               exited: false,
               closing: false,
@@ -5098,6 +5103,7 @@ export default function App() {
             createdAt: s.createdAt,
           });
           const created = applyPendingExit(createdRaw);
+          if (s.symbol) created.symbol = s.symbol;
           const restoreCmd =
             (s.persistent
               ? null
@@ -5891,6 +5897,31 @@ export default function App() {
     });
   }, []);
 
+  const handleRenameSession = useCallback((sessionId: string, newName: string) => {
+    const trimmed = newName.trim();
+    if (!trimmed) return;
+    setSessions((prev) => {
+      const idx = prev.findIndex((s) => s.id === sessionId);
+      if (idx < 0 || prev[idx].name === trimmed) return prev;
+      const next = prev.slice();
+      next[idx] = { ...prev[idx], name: trimmed };
+      return next;
+    });
+    invoke("rename_session", { id: sessionId, name: trimmed }).catch(() => {});
+  }, []);
+
+  const handleSetSessionSymbol = useCallback((sessionId: string, symbol: string | null) => {
+    setSessions((prev) => {
+      const idx = prev.findIndex((s) => s.id === sessionId);
+      if (idx < 0) return prev;
+      const current = prev[idx].symbol ?? null;
+      if (current === symbol) return prev;
+      const next = prev.slice();
+      next[idx] = { ...prev[idx], symbol };
+      return next;
+    });
+  }, []);
+
   const handleQuickStartFromSidebar = useCallback(
     (effect: ProcessEffect) =>
       void quickStart({
@@ -6035,6 +6066,8 @@ export default function App() {
         onSelectSession={setActiveId}
         onCloseSession={handleCloseSession}
         onReconnectSession={handleReconnectSession}
+        onRenameSession={handleRenameSession}
+        onSetSessionSymbol={handleSetSessionSymbol}
         onQuickStart={handleQuickStartFromSidebar}
         onOpenNewSession={handleOpenNewSession}
         onOpenPersistentSessions={handleOpenPersistentSessions}
@@ -6050,7 +6083,8 @@ export default function App() {
     selectProject, moveProject, openNewProject, openRenameProject,
     openProjectSettings, handleDeleteProject,
     handleSendPromptToActive, openPromptEditor, handleOpenPromptsPanel,
-    handleCloseSession, handleReconnectSession, handleQuickStartFromSidebar,
+    handleCloseSession, handleReconnectSession, handleRenameSession, handleSetSessionSymbol,
+    handleQuickStartFromSidebar,
     handleOpenNewSession, handleOpenPersistentSessions,
     handleOpenSshManager, handleOpenAgentShortcuts,
     resetProjectsListMaxHeight, handleProjectsDividerKeyDown,

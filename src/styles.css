@@ -639,6 +639,105 @@ body {
   text-overflow: ellipsis;
 }
 
+.sessionSymbol {
+  flex-shrink: 0;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.sessionNameInput {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-family: inherit;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(107, 138, 253, 0.5);
+  border-radius: 4px;
+  color: inherit;
+  padding: 1px 4px;
+  outline: none;
+}
+
+.sessionNameInput:focus {
+  border-color: rgba(107, 138, 253, 0.8);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* Session context menu */
+.sessionContextMenu {
+  position: fixed;
+  min-width: 180px;
+  padding: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: linear-gradient(180deg, rgba(20, 28, 40, 0.98), rgba(12, 18, 26, 0.98));
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  z-index: 400;
+}
+
+.sessionContextMenuItem {
+  display: block;
+  width: 100%;
+  padding: 7px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  color: rgba(255, 255, 255, 0.85);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sessionContextMenuItem:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.sessionContextMenuItemDanger {
+  color: rgba(255, 100, 100, 0.9);
+}
+
+.sessionContextMenuItemDanger:hover {
+  background: rgba(255, 80, 80, 0.12);
+}
+
+.sessionContextMenuSep {
+  height: 1px;
+  margin: 4px 8px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* Symbol picker grid */
+.sessionSymbolPicker {
+  position: fixed;
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 2px;
+  padding: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: linear-gradient(180deg, rgba(20, 28, 40, 0.98), rgba(12, 18, 26, 0.98));
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  z-index: 410;
+}
+
+.sessionSymbolPicker button {
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  font-size: 18px;
+  cursor: pointer;
+}
+
+.sessionSymbolPicker button:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
 .sessionStatus {
   font-size: 11px;
   color: var(--muted);

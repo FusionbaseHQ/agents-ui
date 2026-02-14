@@ -11,6 +11,13 @@ function isSshCommand(commandLine: string | null | undefined): boolean {
   return base.toLowerCase().replace(/\.exe$/, "") === "ssh";
 }
 
+const SESSION_SYMBOLS = [
+  "\u{1F5A5}\uFE0F", "\u{1F4BB}", "\u{1F527}", "\u{1F680}", "\u26A1", "\u{1F41B}",
+  "\u{1F4E6}", "\u{1F9EA}", "\u{1F310}", "\u{1F512}", "\u{1F4DD}", "\u{1F3A8}",
+  "\u{1F5C4}\uFE0F", "\u{1F433}", "\u2601\uFE0F", "\u{1F4E1}", "\u{1F525}", "\u{1F4A1}",
+  "\u2B50", "\u{1F3E0}", "\u{1F6E0}\uFE0F", "\u{1F4CA}", "\u{1F916}", "\u{1F3AF}",
+];
+
 type Session = {
   id: string;
   name: string;
@@ -29,24 +36,37 @@ type Session = {
   reconnectAttempt?: number;
   manualReconnectAvailable?: boolean;
   disconnectReason?: string | null;
+  symbol?: string | null;
 };
 
 type SessionItemProps = {
   session: Session;
   isActive: boolean;
   isAgentWorking: boolean;
+  isRenaming: boolean;
+  renameValue: string;
   onSelectSession: (sessionId: string) => void;
   onCloseSession: (sessionId: string) => void;
   onReconnectSession: (sessionId: string) => void;
+  onContextMenu: (sessionId: string, x: number, y: number) => void;
+  onRenameValueChange: (value: string) => void;
+  onRenameSubmit: () => void;
+  onRenameCancel: () => void;
 };
 
 const SessionItem = React.memo(function SessionItem({
   session: s,
   isActive,
   isAgentWorking,
+  isRenaming,
+  renameValue,
   onSelectSession,
   onCloseSession,
   onReconnectSession,
+  onContextMenu,
+  onRenameValueChange,
+  onRenameSubmit,
+  onRenameCancel,
 }: SessionItemProps) {
   const isExited = Boolean(s.exited);
   const isClosing = Boolean(s.closing);
@@ -88,10 +108,15 @@ const SessionItem = React.memo(function SessionItem({
         isDefaultType ? "sessionItemDefault" : ""
       }`}
       onClick={() => onSelectSession(s.id)}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onContextMenu(s.id, e.clientX, e.clientY);
+      }}
     >
       <div className={`dot ${isActive ? "dotActive" : ""}`} />
       <div className="sessionMeta">
         <div className="sessionName">
+          {s.symbol && <span className="sessionSymbol">{s.symbol}</span>}
           {hasAgentIcon && chipLabel && effect?.iconSrc && (
             <span className={`agentBadge chip-${effect.id}`} title={chipLabel}>
               <img className="agentIcon" src={effect.iconSrc} alt={chipLabel} />
@@ -100,7 +125,23 @@ const SessionItem = React.memo(function SessionItem({
               )}
             </span>
           )}
-          <span className="sessionNameText">{s.name}</span>
+          {isRenaming ? (
+            <input
+              className="sessionNameInput"
+              value={renameValue}
+              onChange={(e) => onRenameValueChange(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") onRenameSubmit();
+                if (e.key === "Escape") onRenameCancel();
+                e.stopPropagation();
+              }}
+              onBlur={onRenameSubmit}
+              onClick={(e) => e.stopPropagation()}
+              autoFocus
+            />
+          ) : (
+            <span className="sessionNameText">{s.name}</span>
+          )}
           {showChipLabel && chipLabel && (
             <span className={chipClass} title={chipLabel}>
               <span className="chipLabel">{chipLabel}</span>
@@ -168,6 +209,8 @@ type SessionsSectionProps = {
   onSelectSession: (sessionId: string) => void;
   onCloseSession: (sessionId: string) => void;
   onReconnectSession: (sessionId: string) => void;
+  onRenameSession: (sessionId: string, newName: string) => void;
+  onSetSessionSymbol: (sessionId: string, symbol: string | null) => void;
   onQuickStart: (effect: ProcessEffect) => void;
   onOpenNewSession: () => void;
   onOpenAgentShortcuts: () => void;
@@ -183,6 +226,8 @@ export const SessionsSection = React.memo(function SessionsSection({
   onSelectSession,
   onCloseSession,
   onReconnectSession,
+  onRenameSession,
+  onSetSessionSymbol,
   onQuickStart,
   onOpenNewSession,
   onOpenAgentShortcuts,
@@ -194,22 +239,113 @@ export const SessionsSection = React.memo(function SessionsSection({
   const [createOpen, setCreateOpen] = React.useState(false);
   const [settingsOpen, setSettingsOpen] = React.useState(false);
 
+  // Context menu state
+  const contextMenuRef = React.useRef<HTMLDivElement | null>(null);
+  const [contextMenu, setContextMenu] = React.useState<{
+    sessionId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  // Inline rename state
+  const [renamingId, setRenamingId] = React.useState<string | null>(null);
+  const [renameValue, setRenameValue] = React.useState("");
+
+  // Symbol picker state
+  const symbolPickerRef = React.useRef<HTMLDivElement | null>(null);
+  const [symbolPicker, setSymbolPicker] = React.useState<{
+    sessionId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  const handleContextMenu = React.useCallback(
+    (sessionId: string, x: number, y: number) => {
+      setContextMenu({ sessionId, x, y });
+      setSymbolPicker(null);
+    },
+    [],
+  );
+
+  const handleRenameStart = React.useCallback(() => {
+    if (!contextMenu) return;
+    const session = sessions.find((s) => s.id === contextMenu.sessionId);
+    if (!session) return;
+    setRenamingId(contextMenu.sessionId);
+    setRenameValue(session.name);
+    setContextMenu(null);
+  }, [contextMenu, sessions]);
+
+  const handleRenameSubmit = React.useCallback(() => {
+    if (!renamingId) return;
+    const trimmed = renameValue.trim();
+    const session = sessions.find((s) => s.id === renamingId);
+    if (trimmed && session && trimmed !== session.name) {
+      onRenameSession(renamingId, trimmed);
+    }
+    setRenamingId(null);
+    setRenameValue("");
+  }, [renamingId, renameValue, sessions, onRenameSession]);
+
+  const handleRenameCancel = React.useCallback(() => {
+    setRenamingId(null);
+    setRenameValue("");
+  }, []);
+
+  const handleSetSymbolStart = React.useCallback(() => {
+    if (!contextMenu) return;
+    setSymbolPicker({
+      sessionId: contextMenu.sessionId,
+      x: contextMenu.x,
+      y: contextMenu.y,
+    });
+    setContextMenu(null);
+  }, [contextMenu]);
+
+  const handleRemoveSymbol = React.useCallback(() => {
+    if (!contextMenu) return;
+    onSetSessionSymbol(contextMenu.sessionId, null);
+    setContextMenu(null);
+  }, [contextMenu, onSetSessionSymbol]);
+
+  const handleSymbolSelect = React.useCallback(
+    (sym: string) => {
+      if (!symbolPicker) return;
+      onSetSessionSymbol(symbolPicker.sessionId, sym);
+      setSymbolPicker(null);
+    },
+    [symbolPicker, onSetSessionSymbol],
+  );
+
+  const handleCloseFromContextMenu = React.useCallback(() => {
+    if (!contextMenu) return;
+    onCloseSession(contextMenu.sessionId);
+    setContextMenu(null);
+  }, [contextMenu, onCloseSession]);
+
+  // Dismiss handlers for menus, context menu, symbol picker
   React.useEffect(() => {
-    if (!createOpen && !settingsOpen) return;
+    if (!createOpen && !settingsOpen && !contextMenu && !symbolPicker) return;
 
     const handlePointerDown = (event: MouseEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
       if (createMenuRef.current?.contains(target)) return;
       if (settingsMenuRef.current?.contains(target)) return;
+      if (contextMenuRef.current?.contains(target)) return;
+      if (symbolPickerRef.current?.contains(target)) return;
       setCreateOpen(false);
       setSettingsOpen(false);
+      setContextMenu(null);
+      setSymbolPicker(null);
     };
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       setCreateOpen(false);
       setSettingsOpen(false);
+      setContextMenu(null);
+      setSymbolPicker(null);
     };
 
     document.addEventListener("mousedown", handlePointerDown);
@@ -218,7 +354,11 @@ export const SessionsSection = React.memo(function SessionsSection({
       document.removeEventListener("mousedown", handlePointerDown);
       document.removeEventListener("keydown", handleKeyDown);
     };
-  }, [createOpen, settingsOpen]);
+  }, [createOpen, settingsOpen, contextMenu, symbolPicker]);
+
+  const contextSession = contextMenu
+    ? sessions.find((s) => s.id === contextMenu.sessionId)
+    : null;
 
   return (
     <>
@@ -365,13 +505,85 @@ export const SessionsSection = React.memo(function SessionsSection({
               session={s}
               isActive={s.id === activeSessionId}
               isAgentWorking={agentWorkingIds.has(s.id)}
+              isRenaming={renamingId === s.id}
+              renameValue={renamingId === s.id ? renameValue : ""}
               onSelectSession={onSelectSession}
               onCloseSession={onCloseSession}
               onReconnectSession={onReconnectSession}
+              onContextMenu={handleContextMenu}
+              onRenameValueChange={setRenameValue}
+              onRenameSubmit={handleRenameSubmit}
+              onRenameCancel={handleRenameCancel}
             />
           ))
         )}
       </div>
+
+      {/* Context menu */}
+      {contextMenu && contextSession && (
+        <div
+          ref={contextMenuRef}
+          className="sessionContextMenu"
+          style={{ top: contextMenu.y, left: contextMenu.x }}
+          role="menu"
+        >
+          <button
+            type="button"
+            className="sessionContextMenuItem"
+            role="menuitem"
+            onClick={handleRenameStart}
+          >
+            Rename
+          </button>
+          <button
+            type="button"
+            className="sessionContextMenuItem"
+            role="menuitem"
+            onClick={handleSetSymbolStart}
+          >
+            Set symbol
+          </button>
+          {contextSession.symbol && (
+            <button
+              type="button"
+              className="sessionContextMenuItem"
+              role="menuitem"
+              onClick={handleRemoveSymbol}
+            >
+              Remove symbol
+            </button>
+          )}
+          <div className="sessionContextMenuSep" />
+          <button
+            type="button"
+            className="sessionContextMenuItem sessionContextMenuItemDanger"
+            role="menuitem"
+            onClick={handleCloseFromContextMenu}
+          >
+            Close session
+          </button>
+        </div>
+      )}
+
+      {/* Symbol picker */}
+      {symbolPicker && (
+        <div
+          ref={symbolPickerRef}
+          className="sessionSymbolPicker"
+          style={{ top: symbolPicker.y, left: symbolPicker.x }}
+        >
+          {SESSION_SYMBOLS.map((sym) => (
+            <button
+              key={sym}
+              type="button"
+              onClick={() => handleSymbolSelect(sym)}
+              title={sym}
+            >
+              {sym}
+            </button>
+          ))}
+        </div>
+      )}
     </>
   );
 });
