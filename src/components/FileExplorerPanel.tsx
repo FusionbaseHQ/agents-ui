@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -550,6 +551,12 @@ export function FileExplorerPanel({
           const removedDirs = [...oldDirPaths].filter((p) => !newDirPaths.has(p));
 
           if (removedDirs.length > 0) {
+            // Unwatch removed directories from local filesystem watcher
+            if (provider === "local" && watcherIdRef.current) {
+              for (const removed of removedDirs) {
+                invoke("unwatch_directory", { watcherId: watcherIdRef.current, path: removed }).catch(() => {});
+              }
+            }
             setExpandedDirs((prev) => {
               const next = new Set(prev);
               let changed = false;
@@ -762,6 +769,63 @@ export function FileExplorerPanel({
     return () => document.removeEventListener("visibilitychange", handler);
   }, [isOpen, provider, sshConnectionState, pollExpandedDirs]);
 
+  // --- Local filesystem watcher (OS-native, via notify crate) ---
+  const watcherIdRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (!isOpen || provider !== "local") return;
+
+    const watcherId = `fw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    watcherIdRef.current = watcherId;
+
+    let unlisten: (() => void) | null = null;
+    let stopped = false;
+
+    const setup = async () => {
+      try {
+        await invoke("start_fs_watcher", { watcherId, root });
+      } catch (e) {
+        console.warn("[fs_watcher] Failed to start watcher:", e);
+        return;
+      }
+
+      if (stopped) {
+        invoke("stop_fs_watcher", { watcherId }).catch(() => {});
+        return;
+      }
+
+      // Watch all currently expanded directories
+      for (const dir of expandedDirsRef.current) {
+        if (dir !== root) {
+          invoke("watch_directory", { watcherId, path: dir }).catch(() => {});
+        }
+      }
+
+      // Listen for fs-changed events
+      unlisten = await listen<{ path: string; watcherId: string }>("fs-changed", (event) => {
+        if (event.payload.watcherId !== watcherId) return;
+
+        // Skip if directory is in mutation cooldown
+        const cooldownAt = mutationCooldownRef.current.get(event.payload.path);
+        if (cooldownAt && Date.now() - cooldownAt < MUTATION_COOLDOWN_MS) return;
+
+        void pollDirectory(event.payload.path);
+      });
+
+      if (stopped && unlisten) {
+        unlisten();
+      }
+    };
+
+    void setup();
+
+    return () => {
+      stopped = true;
+      watcherIdRef.current = null;
+      if (unlisten) unlisten();
+      invoke("stop_fs_watcher", { watcherId }).catch(() => {});
+    };
+  }, [isOpen, provider, root, pollDirectory]);
+
   React.useEffect(() => {
     if (!contextMenu) return;
 
@@ -897,6 +961,7 @@ export function FileExplorerPanel({
   const toggleDir = React.useCallback(
     (dirPath: string) => {
       const path = normalizePath(dirPath);
+      let expanding = false;
       setExpandedDirs((prev) => {
         const next = new Set(prev);
         if (next.has(path)) {
@@ -904,12 +969,21 @@ export function FileExplorerPanel({
           return next;
         }
         next.add(path);
+        expanding = true;
         return next;
       });
+      // Watch/unwatch for local filesystem watcher
+      if (provider === "local" && watcherIdRef.current) {
+        if (expanding) {
+          invoke("watch_directory", { watcherId: watcherIdRef.current, path }).catch(() => {});
+        } else {
+          invoke("unwatch_directory", { watcherId: watcherIdRef.current, path }).catch(() => {});
+        }
+      }
       const state = dirStateByPathRef.current[path];
       if (!state || state.error) void loadDirectory(path);
     },
-    [loadDirectory],
+    [loadDirectory, provider],
   );
 
   const refreshRoot = React.useCallback(async () => {

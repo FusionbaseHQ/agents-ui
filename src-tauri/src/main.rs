@@ -3,6 +3,7 @@ mod app_info;
 mod assets;
 mod files;
 mod file_manager;
+mod fs_watcher;
 mod pty;
 mod persist;
 mod recording;
@@ -32,6 +33,7 @@ use ssh_fs::{
     ssh_list_fs_entries, ssh_read_text_file, ssh_rename_fs_entry, ssh_upload_file,
     ssh_write_text_file,
 };
+use fs_watcher::{start_fs_watcher, stop_fs_watcher, watch_directory, unwatch_directory, FsWatcherState};
 use startup::get_startup_flags;
 use tray::{build_status_tray, set_tray_agent_count, set_tray_recent_sessions, set_tray_status};
 use tauri::Manager;
@@ -64,6 +66,7 @@ fn main() {
     startup::init_startup_flags();
     tauri::Builder::default()
         .manage(AppState::default())
+        .manage(FsWatcherState::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_drag::init())
@@ -126,7 +129,11 @@ fn main() {
             set_tray_recent_sessions,
             open_path_in_file_manager,
             open_path_in_vscode,
-            get_app_info
+            get_app_info,
+            start_fs_watcher,
+            stop_fs_watcher,
+            watch_directory,
+            unwatch_directory
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
