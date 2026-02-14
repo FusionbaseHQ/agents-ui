@@ -335,6 +335,12 @@ export function FileExplorerPanel({
   const [renameError, setRenameError] = React.useState<string | null>(null);
   const renameInputRef = React.useRef<HTMLInputElement | null>(null);
 
+  const [newFileDir, setNewFileDir] = React.useState<string | null>(null);
+  const [newFileName, setNewFileName] = React.useState("");
+  const [newFileBusy, setNewFileBusy] = React.useState(false);
+  const [newFileError, setNewFileError] = React.useState<string | null>(null);
+  const newFileInputRef = React.useRef<HTMLInputElement | null>(null);
+
   const [deleteTarget, setDeleteTarget] = React.useState<FsEntry | null>(null);
   const [deleteBusy, setDeleteBusy] = React.useState(false);
   const [deleteError, setDeleteError] = React.useState<string | null>(null);
@@ -857,12 +863,68 @@ export function FileExplorerPanel({
     }, 0);
   }, [renameTarget]);
 
+  React.useEffect(() => {
+    if (!newFileDir) return;
+    window.setTimeout(() => {
+      newFileInputRef.current?.focus();
+    }, 0);
+  }, [newFileDir]);
+
   const closeRenameModal = React.useCallback(() => {
     if (renameBusy) return;
     setRenameTarget(null);
     setRenameValue("");
     setRenameError(null);
   }, [renameBusy]);
+
+  const closeNewFileModal = React.useCallback(() => {
+    if (newFileBusy) return;
+    setNewFileDir(null);
+    setNewFileName("");
+    setNewFileError(null);
+  }, [newFileBusy]);
+
+  const submitNewFile = React.useCallback(
+    async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!newFileDir) return;
+
+      const name = newFileName.trim();
+      if (!name) {
+        setNewFileError("File name cannot be empty.");
+        return;
+      }
+      if (name === "." || name === "..") {
+        setNewFileError("That name is not allowed.");
+        return;
+      }
+      if (/[\\/]/.test(name)) {
+        setNewFileError("Name must not contain / or \\.");
+        return;
+      }
+
+      setNewFileBusy(true);
+      setNewFileError(null);
+      try {
+        const filePath = joinPath(newFileDir, name);
+        if (provider === "ssh") {
+          if (!sshTargetValue) throw new Error("Missing SSH target.");
+          await invoke("ssh_create_file", { target: sshTargetValue, root, path: filePath });
+        } else {
+          await invoke("create_file", { root, path: filePath });
+        }
+        mutationCooldownRef.current.set(newFileDir, Date.now());
+        void loadDirectory(newFileDir);
+        closeNewFileModal();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setNewFileError(message);
+      } finally {
+        setNewFileBusy(false);
+      }
+    },
+    [closeNewFileModal, loadDirectory, newFileDir, newFileName, provider, root, sshTargetValue],
+  );
 
   const closeDeleteModal = React.useCallback(() => {
     if (deleteBusy) return;
@@ -1654,6 +1716,20 @@ export function FileExplorerPanel({
             className="sidebarActionMenuItem"
             role="menuitem"
             onClick={() => {
+              const targetDir = contextMenu.entry.isDir ? contextMenu.entry.path : dirname(contextMenu.entry.path);
+              setNewFileDir(targetDir);
+              setNewFileName("");
+              setNewFileError(null);
+              setContextMenu(null);
+            }}
+          >
+            New file…
+          </button>
+          <button
+            type="button"
+            className="sidebarActionMenuItem"
+            role="menuitem"
+            onClick={() => {
               setRenameTarget(contextMenu.entry);
               setRenameValue(contextMenu.entry.name);
               setRenameError(null);
@@ -1715,6 +1791,47 @@ export function FileExplorerPanel({
                 </button>
                 <button type="submit" className="btn" disabled={renameBusy}>
                   {renameBusy ? "Renaming…" : "Rename"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {newFileDir && (
+        <div
+          className="modalBackdrop modalBackdropTop"
+          onClick={() => {
+            closeNewFileModal();
+          }}
+        >
+          <div
+            className="modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="modalTitle">New file</h3>
+            {newFileError && (
+              <div className="pathPickerError" role="alert">
+                {newFileError}
+              </div>
+            )}
+            <form onSubmit={(e) => void submitNewFile(e)}>
+              <div className="formRow">
+                <input
+                  className="input"
+                  ref={newFileInputRef}
+                  value={newFileName}
+                  onChange={(e) => setNewFileName(e.target.value)}
+                  placeholder="example.txt"
+                  disabled={newFileBusy}
+                />
+              </div>
+              <div className="modalActions">
+                <button type="button" className="btn" onClick={closeNewFileModal} disabled={newFileBusy}>
+                  Cancel
+                </button>
+                <button type="submit" className="btn" disabled={newFileBusy}>
+                  {newFileBusy ? "Creating…" : "Create"}
                 </button>
               </div>
             </form>

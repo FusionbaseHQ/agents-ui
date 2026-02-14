@@ -143,6 +143,20 @@ pub fn write_text_file(root: String, path: String, content: String) -> Result<()
     Ok(())
 }
 
+#[tauri::command]
+pub fn create_file(root: String, path: String) -> Result<(), String> {
+    let root = Path::new(root.trim());
+    let path = Path::new(path.trim());
+    let (_, canon_parent) = ensure_parent_within_root(root, path)?;
+    let name = path.file_name().ok_or_else(|| "missing file name".to_string())?;
+    let target = canon_parent.join(name);
+    if target.exists() {
+        return Err("file already exists".to_string());
+    }
+    fs::write(&target, b"").map_err(|e| format!("create failed: {e}"))?;
+    Ok(())
+}
+
 fn ensure_parent_within_root(root: &Path, path: &Path) -> Result<(PathBuf, PathBuf), String> {
     let root = ensure_root_dir(root)?;
     if !path.is_absolute() {

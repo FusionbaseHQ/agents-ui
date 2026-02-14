@@ -4751,8 +4751,15 @@ export default function App() {
 			      const unlistenOutput = await listen<PtyOutput>("pty-output", (event) => {
 			        if (cancelled) return;
 			        const { id, data } = event.payload as { id: string; data?: unknown };
-              const text = coercePtyDataToString(data);
+              let text = coercePtyDataToString(data);
               if (!text) return;
+              // Strip echoed Cursor Position Report responses (ESC[row;colR).
+              // TUI apps send ESC[6n to query cursor position; xterm.js responds
+              // via onData which the PTY kernel may echo back as visible garbage.
+              if (text.includes("\x1b[") && text.includes("R")) {
+                text = text.replace(/\x1b\[\d{1,4};\d{1,4}R/g, "");
+                if (!text) return;
+              }
 
 		        // Ignore events for sessions being closed
 		        if (closingSessions.current.has(id)) return;
