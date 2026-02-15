@@ -197,10 +197,10 @@ function SessionTerminal(props: SessionTerminalProps) {
         'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
       fontSize: 13,
       theme: {
-        background: "#0a0c10",
-        foreground: "#dce0e8",
-        cursor: "#6b8cde",
-        selectionBackground: "rgba(69,184,200,0.28)",
+        background: "#0b0b0c",
+        foreground: "#e6e2d9",
+        cursor: "#d8b04c",
+        selectionBackground: "rgba(216,176,76,0.28)",
       },
       scrollback: 5000,
     });

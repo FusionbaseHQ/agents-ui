@@ -1253,7 +1253,7 @@ export function FileExplorerPanel({
     ctx.shadowColor = "rgba(0,0,0,0.35)";
     ctx.shadowBlur = 10;
     ctx.shadowOffsetY = 4;
-    ctx.fillStyle = "rgba(14, 16, 21, 0.94)";
+    ctx.fillStyle = "rgba(18, 18, 20, 0.94)";
     roundRect(6, 6, size - 12, size - 12, 14);
     ctx.fill();
 
@@ -1267,13 +1267,13 @@ export function FileExplorerPanel({
       ctx.fill();
       roundRect(14, 26, 36, 24, 6);
       ctx.fill();
-      ctx.fillStyle = "rgba(107, 140, 222, 0.35)";
+      ctx.fillStyle = "rgba(216, 176, 76, 0.35)";
       roundRect(14, 26, 36, 10, 6);
       ctx.fill();
     } else {
       roundRect(20, 16, 24, 32, 6);
       ctx.fill();
-      ctx.fillStyle = "rgba(14, 16, 21, 0.5)";
+      ctx.fillStyle = "rgba(18, 18, 20, 0.5)";
       ctx.beginPath();
       ctx.moveTo(40, 16);
       ctx.lineTo(44, 20);

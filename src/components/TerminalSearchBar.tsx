@@ -12,12 +12,12 @@ type TerminalSearchBarProps = {
 };
 
 const DECORATIONS = {
-  matchBackground: "#3a5a80",
-  matchBorder: "#4a6a90",
-  matchOverviewRuler: "#4a8ac7",
-  activeMatchBackground: "#6b8cde",
-  activeMatchBorder: "#8aa4e6",
-  activeMatchColorOverviewRuler: "#6b8cde",
+  matchBackground: "#3a3324",
+  matchBorder: "#6a5a2c",
+  matchOverviewRuler: "#b89432",
+  activeMatchBackground: "#d8b04c",
+  activeMatchBorder: "#f2db9a",
+  activeMatchColorOverviewRuler: "#d8b04c",
 };
 
 export function TerminalSearchBar({
