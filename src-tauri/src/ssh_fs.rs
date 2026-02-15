@@ -571,6 +571,31 @@ fn ssh_create_file_sync(target: String, root: String, path: String) -> Result<()
 }
 
 #[tauri::command]
+pub async fn ssh_create_directory(target: String, root: String, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || ssh_create_directory_sync(target, root, path))
+        .await
+        .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+fn ssh_create_directory_sync(target: String, root: String, path: String) -> Result<(), String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("missing ssh target".to_string());
+    }
+    let (root, path) = ensure_within_root(&root, &path)?;
+    ensure_not_root(&root, &path, "create")?;
+
+    let script = r#"set -e; dir="$1"; [ ! -e "$dir" ] || { echo "directory already exists" >&2; exit 1; }; parent="$(dirname "$dir")"; [ -d "$parent" ] || { echo "parent directory does not exist" >&2; exit 1; }; mkdir "$dir""#;
+    let command = build_sh_c_command(script, Some("--"), &[path]);
+    let args = vec![command];
+    let output = run_ssh(target, &args, None)?;
+    if !output.status.success() {
+        return Err(output_to_error("ssh failed", &output));
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn ssh_rename_fs_entry(target: String, root: String, path: String, new_name: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || ssh_rename_fs_entry_sync(target, root, path, new_name))
         .await

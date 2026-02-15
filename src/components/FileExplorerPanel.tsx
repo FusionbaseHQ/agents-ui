@@ -341,6 +341,12 @@ export function FileExplorerPanel({
   const [newFileError, setNewFileError] = React.useState<string | null>(null);
   const newFileInputRef = React.useRef<HTMLInputElement | null>(null);
 
+  const [newFolderDir, setNewFolderDir] = React.useState<string | null>(null);
+  const [newFolderName, setNewFolderName] = React.useState("");
+  const [newFolderBusy, setNewFolderBusy] = React.useState(false);
+  const [newFolderError, setNewFolderError] = React.useState<string | null>(null);
+  const newFolderInputRef = React.useRef<HTMLInputElement | null>(null);
+
   const [deleteTarget, setDeleteTarget] = React.useState<FsEntry | null>(null);
   const [deleteBusy, setDeleteBusy] = React.useState(false);
   const [deleteError, setDeleteError] = React.useState<string | null>(null);
@@ -870,6 +876,13 @@ export function FileExplorerPanel({
     }, 0);
   }, [newFileDir]);
 
+  React.useEffect(() => {
+    if (!newFolderDir) return;
+    window.setTimeout(() => {
+      newFolderInputRef.current?.focus();
+    }, 0);
+  }, [newFolderDir]);
+
   const closeRenameModal = React.useCallback(() => {
     if (renameBusy) return;
     setRenameTarget(null);
@@ -883,6 +896,65 @@ export function FileExplorerPanel({
     setNewFileName("");
     setNewFileError(null);
   }, [newFileBusy]);
+
+  const closeNewFolderModal = React.useCallback(() => {
+    if (newFolderBusy) return;
+    setNewFolderDir(null);
+    setNewFolderName("");
+    setNewFolderError(null);
+  }, [newFolderBusy]);
+
+  const submitNewFolder = React.useCallback(
+    async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!newFolderDir) return;
+
+      const name = newFolderName.trim();
+      if (!name) {
+        setNewFolderError("Folder name cannot be empty.");
+        return;
+      }
+      if (name === "." || name === "..") {
+        setNewFolderError("That name is not allowed.");
+        return;
+      }
+      if (/[\\/]/.test(name)) {
+        setNewFolderError("Name must not contain / or \\.");
+        return;
+      }
+
+      setNewFolderBusy(true);
+      setNewFolderError(null);
+      try {
+        const folderPath = joinPath(newFolderDir, name);
+        if (provider === "ssh") {
+          if (!sshTargetValue) throw new Error("Missing SSH target.");
+          await invoke("ssh_create_directory", { target: sshTargetValue, root, path: folderPath });
+        } else {
+          await invoke("create_directory", { root, path: folderPath });
+        }
+        mutationCooldownRef.current.set(newFolderDir, Date.now());
+        void loadDirectory(newFolderDir);
+        // Auto-expand the new folder
+        const normalizedPath = normalizePath(folderPath);
+        setExpandedDirs((prev) => {
+          const next = new Set(prev);
+          next.add(normalizedPath);
+          return next;
+        });
+        if (provider === "local" && watcherIdRef.current) {
+          invoke("watch_directory", { watcherId: watcherIdRef.current, path: normalizedPath }).catch(() => {});
+        }
+        closeNewFolderModal();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setNewFolderError(message);
+      } finally {
+        setNewFolderBusy(false);
+      }
+    },
+    [closeNewFolderModal, loadDirectory, newFolderDir, newFolderName, provider, root, sshTargetValue],
+  );
 
   const submitNewFile = React.useCallback(
     async (e: React.FormEvent) => {
@@ -1730,6 +1802,20 @@ export function FileExplorerPanel({
             className="sidebarActionMenuItem"
             role="menuitem"
             onClick={() => {
+              const targetDir = contextMenu.entry.isDir ? contextMenu.entry.path : dirname(contextMenu.entry.path);
+              setNewFolderDir(targetDir);
+              setNewFolderName("");
+              setNewFolderError(null);
+              setContextMenu(null);
+            }}
+          >
+            New folder…
+          </button>
+          <button
+            type="button"
+            className="sidebarActionMenuItem"
+            role="menuitem"
+            onClick={() => {
               setRenameTarget(contextMenu.entry);
               setRenameValue(contextMenu.entry.name);
               setRenameError(null);
@@ -1832,6 +1918,47 @@ export function FileExplorerPanel({
                 </button>
                 <button type="submit" className="btn" disabled={newFileBusy}>
                   {newFileBusy ? "Creating…" : "Create"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {newFolderDir && (
+        <div
+          className="modalBackdrop modalBackdropTop"
+          onClick={() => {
+            closeNewFolderModal();
+          }}
+        >
+          <div
+            className="modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="modalTitle">New folder</h3>
+            {newFolderError && (
+              <div className="pathPickerError" role="alert">
+                {newFolderError}
+              </div>
+            )}
+            <form onSubmit={(e) => void submitNewFolder(e)}>
+              <div className="formRow">
+                <input
+                  className="input"
+                  ref={newFolderInputRef}
+                  value={newFolderName}
+                  onChange={(e) => setNewFolderName(e.target.value)}
+                  placeholder="my-folder"
+                  disabled={newFolderBusy}
+                />
+              </div>
+              <div className="modalActions">
+                <button type="button" className="btn" onClick={closeNewFolderModal} disabled={newFolderBusy}>
+                  Cancel
+                </button>
+                <button type="submit" className="btn" disabled={newFolderBusy}>
+                  {newFolderBusy ? "Creating…" : "Create"}
                 </button>
               </div>
             </form>
