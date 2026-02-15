@@ -3,7 +3,12 @@ import type { SearchAddon } from "@xterm/addon-search";
 
 type TerminalSearchBarProps = {
   searchAddon: SearchAddon;
+  query: string;
+  onQueryChange: (value: string) => void;
+  caseSensitive: boolean;
+  onCaseSensitiveChange: (value: boolean) => void;
   onClose: () => void;
+  autoFocus?: boolean;
 };
 
 const DECORATIONS = {
@@ -15,17 +20,24 @@ const DECORATIONS = {
   activeMatchColorOverviewRuler: "#6b8cde",
 };
 
-export function TerminalSearchBar({ searchAddon, onClose }: TerminalSearchBarProps) {
-  const [query, setQuery] = React.useState("");
-  const [caseSensitive, setCaseSensitive] = React.useState(false);
+export function TerminalSearchBar({
+  searchAddon,
+  query,
+  onQueryChange,
+  caseSensitive,
+  onCaseSensitiveChange,
+  onClose,
+  autoFocus = false,
+}: TerminalSearchBarProps) {
   const [resultIndex, setResultIndex] = React.useState(-1);
   const [resultCount, setResultCount] = React.useState(0);
   const inputRef = React.useRef<HTMLInputElement | null>(null);
 
   React.useEffect(() => {
+    if (!autoFocus) return;
     inputRef.current?.focus();
     inputRef.current?.select();
-  }, []);
+  }, [autoFocus]);
 
   React.useEffect(() => {
     const dispose = searchAddon.onDidChangeResults(({ resultIndex, resultCount }: { resultIndex: number; resultCount: number }) => {
@@ -92,7 +104,7 @@ export function TerminalSearchBar({ searchAddon, onClose }: TerminalSearchBarPro
         className="terminalSearchInput"
         type="text"
         value={query}
-        onChange={(e) => setQuery(e.target.value)}
+        onChange={(e) => onQueryChange(e.target.value)}
         onKeyDown={handleKeyDown}
         placeholder="Find…"
         spellCheck={false}
@@ -102,7 +114,7 @@ export function TerminalSearchBar({ searchAddon, onClose }: TerminalSearchBarPro
       <button
         type="button"
         className={`terminalSearchCaseBtn${caseSensitive ? " active" : ""}`}
-        onMouseDown={(e) => onButtonMouseDown(e, () => setCaseSensitive((v) => !v))}
+        onMouseDown={(e) => onButtonMouseDown(e, () => onCaseSensitiveChange(!caseSensitive))}
         title="Match case"
       >
         Aa

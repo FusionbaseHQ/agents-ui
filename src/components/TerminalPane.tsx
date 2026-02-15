@@ -61,6 +61,8 @@ function TerminalPaneImpl({
   const paneRef = React.useRef<HTMLDivElement | null>(null);
   const prevVisibleIdRef = React.useRef<string | null>(null);
   const prevSecondaryIdRef = React.useRef<string | null>(null);
+  const [searchQuery, setSearchQuery] = React.useState("");
+  const [searchCaseSensitive, setSearchCaseSensitive] = React.useState(false);
 
   const visibleId = React.useMemo(() => {
     const activeSession = activeId ? (sessions.find((s) => s.id === activeId) ?? null) : null;
@@ -75,6 +77,16 @@ function TerminalPaneImpl({
 
   const secondaryVisibleId = splitPane?.secondaryId ?? null;
   const isSplit = secondaryVisibleId !== null && secondaryVisibleId !== visibleId;
+  const visibleSearchOpen = Boolean(
+    (visibleId && searchOpenSessions.has(visibleId)) ||
+      (isSplit && secondaryVisibleId && searchOpenSessions.has(secondaryVisibleId)),
+  );
+
+  React.useEffect(() => {
+    if (visibleSearchOpen) return;
+    if (searchQuery !== "") setSearchQuery("");
+    if (searchCaseSensitive) setSearchCaseSensitive(false);
+  }, [searchCaseSensitive, searchQuery, visibleSearchOpen]);
 
   // Eagerly toggle visibility via direct DOM before React's commit phase.
   React.useLayoutEffect(() => {
@@ -101,14 +113,20 @@ function TerminalPaneImpl({
     }
   }, [visibleId, secondaryVisibleId, isSplit]);
 
-  // Stable close handler map to avoid re-creating closures every render
-  const searchCloseHandlers = React.useMemo(() => {
-    const map = new Map<string, () => void>();
-    for (const session of sessions) {
-      map.set(session.id, () => onSearchClose(session.id));
+  const closeVisibleSearch = React.useCallback(() => {
+    // Close secondary first so focus ends on the primary terminal.
+    if (
+      isSplit &&
+      secondaryVisibleId &&
+      secondaryVisibleId !== visibleId &&
+      searchOpenSessions.has(secondaryVisibleId)
+    ) {
+      onSearchClose(secondaryVisibleId);
     }
-    return map;
-  }, [sessions, onSearchClose]);
+    if (visibleId && searchOpenSessions.has(visibleId)) {
+      onSearchClose(visibleId);
+    }
+  }, [isSplit, onSearchClose, searchOpenSessions, secondaryVisibleId, visibleId]);
 
   // Divider drag handler
   const handleDividerDrag = React.useCallback(
@@ -208,7 +226,12 @@ function TerminalPaneImpl({
             {searchAddon && (
               <TerminalSearchBar
                 searchAddon={searchAddon}
-                onClose={searchCloseHandlers.get(session.id)!}
+                query={searchQuery}
+                onQueryChange={setSearchQuery}
+                caseSensitive={searchCaseSensitive}
+                onCaseSensitiveChange={setSearchCaseSensitive}
+                onClose={closeVisibleSearch}
+                autoFocus={isPrimary}
               />
             )}
             <SessionTerminal
