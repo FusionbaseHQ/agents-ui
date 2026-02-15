@@ -21,7 +21,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-AGPL%203.0-blue.svg" alt="License">
   <img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-0.2.2-green.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.5.0-green.svg" alt="Version">
   <img src="https://img.shields.io/badge/tauri-v2-orange.svg" alt="Tauri">
 </p>
 
@@ -36,8 +36,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/FusionbaseHQ/agents-ui/releases/tag/v0.2.2">
-    <img src="https://img.shields.io/badge/Download-v0.2.2%20(macOS)-brightgreen" alt="Download v0.2.2 for macOS">
+  <a href="https://github.com/FusionbaseHQ/agents-ui/releases/tag/v0.5.0">
+    <img src="https://img.shields.io/badge/Download-v0.5.0%20(macOS)-brightgreen" alt="Download v0.5.0 for macOS">
   </a>
 </p>
 
@@ -49,10 +49,12 @@
 
 - Real PTY sessions
 - Persistent zellij sessions
+- Split views (saved terminal layouts)
 - SSH host picker (and port forwards)
 - Projects, prompts & assets
 - Recording & replay
 - Local + SSH file explorer + Monaco editor
+- Context-aware `Cmd/Ctrl+F`: terminal find vs editor find
 - Drag & drop file transfers: **Finder ↔ local ↔ SSH**
 
 ## Features
@@ -61,6 +63,8 @@
 - Multiple concurrent sessions (shells and agent CLIs)
 - Real embedded terminals powered by xterm.js + PTY backend
 - Session persistence across app restarts (optional)
+- Split views: saved 2-pane layouts per project (switch via sidebar)
+- In-terminal find (`Cmd/Ctrl+F`), synced across split panes
 - Working directory tracking and session status (exit codes, closed state)
 - Session recording and replay
 
@@ -87,6 +91,7 @@
 - Multi-tab editor with syntax highlighting for common languages
 - Save with `Cmd/Ctrl+S`, close tabs with `Cmd/Ctrl+W`
 - Works with both local and SSH-backed files
+- `Cmd/Ctrl+F` uses Monaco find when the editor is focused (terminal find otherwise)
 
 ### Command Palette
 - Quick access with `Cmd+K` / `Ctrl+K`
@@ -201,6 +206,7 @@ Press `Cmd+K` / `Ctrl+K` to open the command palette. Search and access:
 | Recordings Panel | `Cmd+Shift+R` | `Ctrl+Shift+R` |
 | Assets Panel | `Cmd+Shift+A` | `Ctrl+Shift+A` |
 | Quick Prompt 1-5 | `Cmd+1-5` | `Ctrl+1-5` |
+| Find (terminal/editor) | `Cmd+F` | `Ctrl+F` |
 | Editor: Save | `Cmd+S` | `Ctrl+S` |
 | Editor: Close tab | `Cmd+W` | `Ctrl+W` |
 
@@ -380,7 +386,7 @@ Ensure the CLI commands are available in your PATH.
 <details>
 <summary><strong>Can I customize the appearance?</strong></summary>
 
-The app uses a dark theme by default. Custom theming is planned for future releases. You can modify `src/styles.css` for development builds.
+The app uses a dark gray + gold theme by default. Custom theming is planned for future releases; you can modify `src/styles.css` for development builds.
 </details>
 
 ## Contributing

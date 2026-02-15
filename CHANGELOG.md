@@ -8,6 +8,14 @@ This project aims to follow Semantic Versioning.
 
 - No unreleased changes yet.
 
+## 0.5.0
+
+- Add split views (saved 2-pane terminal layouts) with sidebar grouping and full-layout switching.
+- Add in-terminal find (`Cmd/Ctrl+F`) with synced search across split panes.
+- Make `Cmd/Ctrl+F` context-aware: Monaco find when editor is focused, terminal find otherwise.
+- Improve sidebar UX: scrollable sessions list, split view members inherit session colors.
+- Theme overhaul: neutral dark gray surfaces with gold/yellow accents.
+
 ## 0.3.0
 
 - Add per-project file tree + Monaco editor, including better tab manageability and close affordances.
