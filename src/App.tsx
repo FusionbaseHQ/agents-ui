@@ -105,6 +105,17 @@ type WorkspaceView = {
   treeWidth: number;
 };
 
+type SplitView = {
+  id: string;
+  projectId: string;
+  aId: string;
+  bId: string;
+  direction: "horizontal" | "vertical";
+  ratio: number;
+  createdAt: number;
+  lastFocusedId: string;
+};
+
 type PtyOutput = { id: string; data: string };
 type PtyExit = { id: string; exit_code?: number | null };
 type AppInfo = { name: string; version: string; homepage?: string | null };
@@ -131,6 +142,7 @@ const STORAGE_WORKSPACE_FILE_TREE_WIDTH_KEY = "agents-ui-workspace-file-tree-wid
 const STORAGE_WORKSPACE_VIEW_BY_KEY = "agents-ui-workspace-view-by-key-v1";
 const STORAGE_RECENT_SESSIONS_KEY = "agents-ui-recent-sessions-v1";
 const STORAGE_SSH_HISTORY_KEY = "agents-ui-ssh-history-v1";
+const STORAGE_SPLIT_VIEWS_KEY = "agents-ui-split-views-v1";
 const MAX_SSH_HISTORY = 10;
 
 const MAX_PENDING_SESSIONS = 32;
@@ -663,6 +675,71 @@ function loadLegacyActiveSessionByProject(): Record<string, string> {
   }
 }
 
+type SplitViewsStorageV1 = {
+  schemaVersion: 1;
+  views: SplitView[];
+};
+
+function coerceSplitView(value: unknown): SplitView | null {
+  if (!value || typeof value !== "object") return null;
+  const rec = value as Record<string, unknown>;
+
+  const id = typeof rec.id === "string" ? rec.id.trim() : "";
+  const projectId = typeof rec.projectId === "string" ? rec.projectId.trim() : "";
+  const aId = typeof rec.aId === "string" ? rec.aId.trim() : "";
+  const bId = typeof rec.bId === "string" ? rec.bId.trim() : "";
+  const direction = rec.direction === "horizontal" || rec.direction === "vertical" ? rec.direction : null;
+  const ratioRaw = typeof rec.ratio === "number" && Number.isFinite(rec.ratio) ? rec.ratio : NaN;
+  const createdAt = typeof rec.createdAt === "number" && Number.isFinite(rec.createdAt) ? rec.createdAt : Date.now();
+
+  if (!id || !projectId || !aId || !bId || aId === bId || !direction) return null;
+
+  const ratio = Math.max(0.15, Math.min(0.85, Number.isFinite(ratioRaw) ? ratioRaw : 0.5));
+
+  const lastRaw = typeof rec.lastFocusedId === "string" ? rec.lastFocusedId.trim() : "";
+  const lastFocusedId = lastRaw === aId || lastRaw === bId ? lastRaw : aId;
+
+  return {
+    id,
+    projectId,
+    aId,
+    bId,
+    direction,
+    ratio,
+    createdAt,
+    lastFocusedId,
+  };
+}
+
+function loadPersistedSplitViews(): SplitView[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_SPLIT_VIEWS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return [];
+    const rec = parsed as Partial<SplitViewsStorageV1> & Record<string, unknown>;
+    if (rec.schemaVersion !== 1 || !Array.isArray(rec.views)) return [];
+    const out: SplitView[] = [];
+    for (const v of rec.views) {
+      const coerced = coerceSplitView(v);
+      if (coerced) out.push(coerced);
+      if (out.length >= 60) break;
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function persistSplitViews(views: SplitView[]) {
+  try {
+    const payload: SplitViewsStorageV1 = { schemaVersion: 1, views: views.slice(0, 60) };
+    localStorage.setItem(STORAGE_SPLIT_VIEWS_KEY, JSON.stringify(payload));
+  } catch {
+    // Best-effort.
+  }
+}
+
 function loadLegacyProjectState(): { projects: Project[]; activeProjectId: string } | null {
   let projects: Project[] = [];
   try {
@@ -1008,13 +1085,41 @@ export default function App() {
     return DEFAULT_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT;
   });
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [splitPane, setSplitPane] = useState<{
-    secondaryId: string;
-    direction: "horizontal" | "vertical";
-    ratio: number;
-  } | null>(null);
+  const [splitViews, setSplitViews] = useState<SplitView[]>(() => loadPersistedSplitViews());
+  const splitViewsRef = useRef(splitViews);
+  useEffect(() => {
+    splitViewsRef.current = splitViews;
+    persistSplitViews(splitViews);
+  }, [splitViews]);
+
+  const [activeSplitViewId, setActiveSplitViewId] = useState<string | null>(null);
+  const activeSplitViewIdRef = useRef(activeSplitViewId);
+  useEffect(() => {
+    activeSplitViewIdRef.current = activeSplitViewId;
+  }, [activeSplitViewId]);
+
+  const activeSplitView = useMemo(() => {
+    if (!activeSplitViewId) return null;
+    const view = splitViews.find((v) => v.id === activeSplitViewId) ?? null;
+    if (!view || view.projectId !== activeProjectId) return null;
+    return view;
+  }, [activeProjectId, activeSplitViewId, splitViews]);
+  const activeSplitViewRef = useRef<typeof activeSplitView>(null);
+  useEffect(() => {
+    activeSplitViewRef.current = activeSplitView;
+  }, [activeSplitView]);
+
+  const splitPane = useMemo(() => {
+    if (!activeSplitView || !activeId) return null;
+    const { aId, bId } = activeSplitView;
+    if (activeId !== aId && activeId !== bId) return null;
+    const secondaryId = activeId === aId ? bId : aId;
+    return { secondaryId, direction: activeSplitView.direction, ratio: activeSplitView.ratio };
+  }, [activeId, activeSplitView]);
   const splitPaneRef = useRef<typeof splitPane>(null);
-  useEffect(() => { splitPaneRef.current = splitPane; }, [splitPane]);
+  useEffect(() => {
+    splitPaneRef.current = splitPane;
+  }, [splitPane]);
   const [hydrated, setHydrated] = useState(false);
   const [sessionRestoreProgress, setSessionRestoreProgress] = useState<SessionRestoreProgress | null>(
     null,
@@ -2507,24 +2612,48 @@ export default function App() {
     sessionByIdRef.current = new Map(sessions.map((session) => [session.id, session]));
   }, [sessions]);
 
-  useLayoutEffect(() => {
-    activeIdRef.current = activeId;
-    if (outputFlushRafRef.current !== null) {
-      window.cancelAnimationFrame(outputFlushRafRef.current);
-      outputFlushRafRef.current = null;
-    }
+	  useLayoutEffect(() => {
+	    activeIdRef.current = activeId;
+	    if (outputFlushRafRef.current !== null) {
+	      window.cancelAnimationFrame(outputFlushRafRef.current);
+	      outputFlushRafRef.current = null;
+	    }
     flushQueuedOutput(activeId);
     // Cancel exited-session auto-cleanup if user switches back to it
     if (activeId) {
       const cleanupTimer = exitedCleanupTimers.current.get(activeId);
       if (cleanupTimer !== undefined) {
         window.clearTimeout(cleanupTimer);
-        exitedCleanupTimers.current.delete(activeId);
-      }
+	        exitedCleanupTimers.current.delete(activeId);
+	      }
+	    }
+	  }, [activeId, flushQueuedOutput]);
+
+  // Split view invariant: while a split view is active, the focused session must be a member.
+  // If the user switches to a different session (sidebar click, Ctrl+Tab, etc), exit the split view
+  // rather than injecting the new session into the split layout.
+  useEffect(() => {
+    if (!activeSplitViewId) return;
+    const view = activeSplitView;
+    if (!view) {
+      setActiveSplitViewId(null);
+      return;
     }
-    // Guard: clear split if activeId matches secondaryId (prevent same session in both panes)
-    setSplitPane(prev => prev && prev.secondaryId === activeId ? null : prev);
-  }, [activeId, flushQueuedOutput]);
+    if (!activeId || (activeId !== view.aId && activeId !== view.bId)) {
+      setActiveSplitViewId(null);
+      return;
+    }
+    if (view.lastFocusedId !== activeId) {
+      setSplitViews((prev) => {
+        const idx = prev.findIndex((v) => v.id === view.id);
+        if (idx < 0) return prev;
+        if (prev[idx].lastFocusedId === activeId) return prev;
+        const next = prev.slice();
+        next[idx] = { ...prev[idx], lastFocusedId: activeId };
+        return next;
+      });
+    }
+  }, [activeId, activeSplitView, activeSplitViewId]);
 
   useEffect(() => {
     hydratedRef.current = hydrated;
@@ -4664,7 +4793,7 @@ export default function App() {
   const selectProject = useCallback((projectId: string) => {
     setActiveProjectId(projectId);
     setActiveId(pickActiveSessionId(projectId));
-    setSplitPane(null);
+    setActiveSplitViewId(null);
   }, []);
 
   const moveProject = useCallback((projectId: string, targetProjectId: string, position: "before" | "after") => {
@@ -5663,13 +5792,19 @@ export default function App() {
     if (prevTimeout !== undefined) window.clearTimeout(prevTimeout);
     const cleanupTimeout = window.setTimeout(() => {
       closingSessions.current.delete(id);
-    }, 10_000);
-    closingSessions.current.set(id, cleanupTimeout);
-    setSplitPane(prev => prev?.secondaryId === id ? null : prev);
-    setSessions((prev) => {
-      const removed = prev.find((s) => s.id === id);
-      const next = prev.filter((s) => s.id !== id);
-      if (next.length === prev.length) return prev; // not found — no-op
+	    }, 10_000);
+	    closingSessions.current.set(id, cleanupTimeout);
+	    setSplitViews((prev) => prev.filter((v) => v.aId !== id && v.bId !== id));
+      setActiveSplitViewId((prev) => {
+        if (!prev) return prev;
+        const view = splitViewsRef.current.find((v) => v.id === prev) ?? null;
+        if (view && (view.aId === id || view.bId === id)) return null;
+        return prev;
+      });
+	    setSessions((prev) => {
+	      const removed = prev.find((s) => s.id === id);
+	      const next = prev.filter((s) => s.id !== id);
+	      if (next.length === prev.length) return prev; // not found — no-op
       setActiveId((prevActive) => {
         if (prevActive !== id) return prevActive;
         const projectId = removed?.projectId ?? activeProjectIdRef.current;
@@ -6150,18 +6285,83 @@ export default function App() {
   }, []);
 
   const handleSplitSession = useCallback((sessionId: string, direction: "horizontal" | "vertical") => {
-    setSplitPane((prev) => {
-      const ratio = prev?.ratio ?? 0.5;
-      return { secondaryId: sessionId, direction, ratio: Math.max(0.15, Math.min(0.85, ratio)) };
-    });
+    const projectId = activeProjectIdRef.current;
+    const primaryId = activeIdRef.current;
+    if (!primaryId || primaryId === sessionId) return;
+
+    const now = Date.now();
+    const existingViews = splitViewsRef.current;
+    const activeViewId = activeSplitViewIdRef.current;
+
+    if (activeViewId) {
+      const idx = existingViews.findIndex((v) => v.id === activeViewId);
+      const view = idx >= 0 ? existingViews[idx] : null;
+      if (view && view.projectId === projectId) {
+        const keepId =
+          primaryId === view.aId || primaryId === view.bId ? primaryId : view.lastFocusedId;
+        if (keepId === sessionId) return;
+        const next = existingViews.slice();
+        next[idx] = {
+          ...view,
+          aId: keepId,
+          bId: sessionId,
+          direction,
+          lastFocusedId: keepId,
+        };
+        setSplitViews(next);
+        setActiveSplitViewId(view.id);
+        setActiveId(keepId);
+        return;
+      }
+    }
+
+    const reusable =
+      existingViews.find(
+        (v) =>
+          v.projectId === projectId &&
+          v.direction === direction &&
+          ((v.aId === primaryId && v.bId === sessionId) || (v.aId === sessionId && v.bId === primaryId)),
+      ) ?? null;
+    if (reusable) {
+      setActiveSplitViewId(reusable.id);
+      setActiveId(primaryId);
+      return;
+    }
+
+    const id = makeId();
+    setSplitViews([
+      ...existingViews,
+      {
+        id,
+        projectId,
+        aId: primaryId,
+        bId: sessionId,
+        direction,
+        ratio: 0.5,
+        createdAt: now,
+        lastFocusedId: primaryId,
+      },
+    ]);
+    setActiveSplitViewId(id);
+    setActiveId(primaryId);
   }, []);
 
   const handleUnsplit = useCallback(() => {
-    setSplitPane(null);
+    setActiveSplitViewId(null);
   }, []);
 
   const handleSplitRatioChange = useCallback((ratio: number) => {
-    setSplitPane(prev => prev ? { ...prev, ratio: Math.max(0.15, Math.min(0.85, ratio)) } : null);
+    const viewId = activeSplitViewIdRef.current;
+    if (!viewId) return;
+    const clamped = Math.max(0.15, Math.min(0.85, ratio));
+    setSplitViews((prev) => {
+      const idx = prev.findIndex((v) => v.id === viewId);
+      if (idx < 0) return prev;
+      if (prev[idx].ratio === clamped) return prev;
+      const next = prev.slice();
+      next[idx] = { ...prev[idx], ratio: clamped };
+      return next;
+    });
   }, []);
 
   const handleCloseSplitPane = useCallback((closedSessionId: string) => {
@@ -6171,7 +6371,24 @@ export default function App() {
     if (closedSessionId !== split.secondaryId) {
       setActiveId(split.secondaryId);
     }
-    setSplitPane(null);
+    setActiveSplitViewId(null);
+  }, []);
+
+  const handleActivateSplitView = useCallback((viewId: string, focusSessionId?: string) => {
+    const view = splitViewsRef.current.find((v) => v.id === viewId) ?? null;
+    if (!view) return;
+    const focus =
+      focusSessionId && (focusSessionId === view.aId || focusSessionId === view.bId)
+        ? focusSessionId
+        : view.lastFocusedId;
+    const resolvedFocus = focus === view.aId || focus === view.bId ? focus : view.aId;
+    setActiveSplitViewId(viewId);
+    setActiveId(resolvedFocus);
+  }, []);
+
+  const handleRemoveSplitView = useCallback((viewId: string) => {
+    setSplitViews((prev) => prev.filter((v) => v.id !== viewId));
+    setActiveSplitViewId((prev) => (prev === viewId ? null : prev));
   }, []);
 
   const handleSearchClose = useCallback((sessionId: string) => {
@@ -6305,6 +6522,17 @@ export default function App() {
     return next;
   }, [projectSessions]);
 
+  const projectSplitViewsRef = useRef<SplitView[]>([]);
+  const stableProjectSplitViews = useMemo(() => {
+    const next = splitViews.filter((v) => v.projectId === activeProjectId);
+    const prev = projectSplitViewsRef.current;
+    if (prev.length === next.length && prev.every((p, i) => p === next[i])) {
+      return prev;
+    }
+    projectSplitViewsRef.current = next;
+    return next;
+  }, [activeProjectId, splitViews]);
+
   // -- Ref-stable Maps for ProjectsSection --
 
   const sessionCountByProjectRef = useRef<Map<string, number>>(new Map());
@@ -6391,9 +6619,13 @@ export default function App() {
         sessions={stableProjectSessions}
         agentWorkingIds={agentWorkingIds}
         activeSessionId={activeId}
+        splitViews={stableProjectSplitViews}
+        activeSplitViewId={activeSplitViewId}
         splitPane={splitPane}
         onSplitSession={handleSplitSession}
         onUnsplit={handleUnsplit}
+        onActivateSplitView={handleActivateSplitView}
+        onRemoveSplitView={handleRemoveSplitView}
         onSelectSession={setActiveId}
         onCloseSession={handleCloseSession}
         onReconnectSession={handleReconnectSession}
@@ -6410,13 +6642,13 @@ export default function App() {
   ), [
     projects, activeProjectId, activeProject, environments,
     stableSessionCountByProject, stableWorkingAgentCountByProject,
-    prompts, agentShortcuts, stableProjectSessions, agentWorkingIds,
-    activeId, splitPane, projectsListMaxHeight,
+    prompts, agentShortcuts, stableProjectSessions, stableProjectSplitViews, agentWorkingIds,
+    activeId, splitPane, activeSplitViewId, projectsListMaxHeight,
     selectProject, moveProject, openNewProject, openRenameProject,
     openProjectSettings, handleDeleteProject, handleRenameProjectInline, handleSetProjectSymbol, handleSetProjectColor,
     handleSendPromptToActive, openPromptEditor, handleOpenPromptsPanel,
     handleCloseSession, handleReconnectSession, handleRenameSession, handleSetSessionSymbol, handleSetSessionColor,
-    handleSplitSession, handleUnsplit, handleQuickStartFromSidebar,
+    handleSplitSession, handleUnsplit, handleActivateSplitView, handleRemoveSplitView, handleQuickStartFromSidebar,
     handleOpenNewSession, handleOpenPersistentSessions,
     handleOpenSshManager, handleOpenAgentShortcuts,
     resetProjectsListMaxHeight, handleProjectsDividerKeyDown,

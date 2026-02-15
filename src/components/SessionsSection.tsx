@@ -52,6 +52,15 @@ type Session = {
   color?: string | null;
 };
 
+type SplitView = {
+  id: string;
+  aId: string;
+  bId: string;
+  direction: "horizontal" | "vertical";
+  createdAt: number;
+  lastFocusedId: string;
+};
+
 type SessionItemProps = {
   session: Session;
   isActive: boolean;
@@ -230,9 +239,13 @@ type SessionsSectionProps = {
   sessions: Session[];
   agentWorkingIds: ReadonlySet<string>;
   activeSessionId: string | null;
+  splitViews: SplitView[];
+  activeSplitViewId: string | null;
   splitPane: { secondaryId: string; direction: "horizontal" | "vertical"; ratio: number } | null;
   onSplitSession: (sessionId: string, direction: "horizontal" | "vertical") => void;
   onUnsplit: () => void;
+  onActivateSplitView: (viewId: string, focusSessionId?: string) => void;
+  onRemoveSplitView: (viewId: string) => void;
   onSelectSession: (sessionId: string) => void;
   onCloseSession: (sessionId: string) => void;
   onReconnectSession: (sessionId: string) => void;
@@ -251,9 +264,13 @@ export const SessionsSection = React.memo(function SessionsSection({
   sessions,
   agentWorkingIds,
   activeSessionId,
+  splitViews,
+  activeSplitViewId,
   splitPane,
   onSplitSession,
   onUnsplit,
+  onActivateSplitView,
+  onRemoveSplitView,
   onSelectSession,
   onCloseSession,
   onReconnectSession,
@@ -429,43 +446,30 @@ export const SessionsSection = React.memo(function SessionsSection({
     ? sessions.find((s) => s.id === contextMenu.sessionId)
     : null;
 
-  const splitPrimaryId = React.useMemo(() => {
-    if (!splitPane) return null;
-    const active = activeSessionId ? sessions.find((s) => s.id === activeSessionId) ?? null : null;
-    if (active) return active.id;
-    return sessions.find((s) => !s.closing)?.id ?? sessions[0]?.id ?? null;
-  }, [activeSessionId, sessions, splitPane]);
-
-  const splitSecondaryId = splitPane?.secondaryId ?? null;
-  const splitPrimary = splitPrimaryId ? sessions.find((s) => s.id === splitPrimaryId) ?? null : null;
-  const splitSecondary = splitSecondaryId ? sessions.find((s) => s.id === splitSecondaryId) ?? null : null;
-  const hasValidSplitGroup = Boolean(
-    splitPane && splitPrimary && splitSecondary && splitPrimary.id !== splitSecondary.id,
-  );
-
-  const standaloneSessions = React.useMemo(() => {
-    if (!hasValidSplitGroup || !splitPrimary || !splitSecondary) return sessions;
-    const a = splitPrimary.id;
-    const b = splitSecondary.id;
-    return sessions.filter((s) => s.id !== a && s.id !== b);
-  }, [hasValidSplitGroup, sessions, splitPrimary, splitSecondary]);
-
-  const handleSelectSplitSession = React.useCallback(
+  const handleSelectStandaloneSession = React.useCallback(
     (sessionId: string) => {
-      if (!hasValidSplitGroup || !splitPane || !splitPrimary || !splitSecondary) {
-        onSelectSession(sessionId);
-        return;
-      }
-      if (sessionId === splitSecondary.id) {
-        // Swap focus to the other pane but keep the split visible.
-        onSelectSession(splitSecondary.id);
-        onSplitSession(splitPrimary.id, splitPane.direction);
-        return;
-      }
+      onUnsplit();
       onSelectSession(sessionId);
     },
-    [hasValidSplitGroup, onSelectSession, onSplitSession, splitPane, splitPrimary, splitSecondary],
+    [onSelectSession, onUnsplit],
   );
+
+  const resolvedSplitViews = React.useMemo(() => {
+    const sessionById = new Map(sessions.map((s) => [s.id, s] as const));
+    return splitViews
+      .slice()
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .map((view) => {
+        const aSession = sessionById.get(view.aId) ?? null;
+        const bSession = sessionById.get(view.bId) ?? null;
+        if (!aSession || !bSession) return null;
+        if (aSession.id === bSession.id) return null;
+        return { view, aSession, bSession };
+      })
+      .filter(
+        (item): item is { view: SplitView; aSession: Session; bSession: Session } => item !== null,
+      );
+  }, [sessions, splitViews]);
 
   return (
     <>
@@ -606,7 +610,7 @@ export const SessionsSection = React.memo(function SessionsSection({
         {sessions.length === 0 ? (
           <div className="empty">No sessions in this project.</div>
         ) : (
-          standaloneSessions.map((s) => (
+          sessions.map((s) => (
             <SessionItem
               key={s.id}
               session={s}
@@ -615,7 +619,7 @@ export const SessionsSection = React.memo(function SessionsSection({
               isAgentWorking={agentWorkingIds.has(s.id)}
               isRenaming={renamingId === s.id}
               renameValue={renamingId === s.id ? renameValue : ""}
-              onSelectSession={onSelectSession}
+              onSelectSession={handleSelectStandaloneSession}
               onCloseSession={onCloseSession}
               onReconnectSession={onReconnectSession}
               onContextMenu={handleContextMenu}
@@ -626,66 +630,93 @@ export const SessionsSection = React.memo(function SessionsSection({
           ))
         )}
 
-        {hasValidSplitGroup && splitPane && splitPrimary && splitSecondary ? (
+        {resolvedSplitViews.length > 0 ? (
           <>
-            <div className="sessionListSectionLabel">Split</div>
-            <div className="sessionSplitGroup" role="group" aria-label="Split terminals">
-              <div className="sessionSplitGroupHeader">
-                <Icon name="panel" size={14} />
-                <span className="sessionSplitGroupTitle">Split group</span>
-                <span className="sessionSplitGroupMeta">
-                  {splitPane.direction === "vertical" ? "right" : "down"}
-                </span>
-                <button
-                  type="button"
-                  className="sessionSplitGroupUnsplit"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onUnsplit();
+            <div className="sessionListSectionLabel">Split views</div>
+            {resolvedSplitViews.map(({ view, aSession, bSession }) => {
+              const isActiveView = view.id === activeSplitViewId;
+              const directionLabel = view.direction === "vertical" ? "right" : "down";
+              return (
+                <div
+                  key={view.id}
+                  className={`sessionSplitGroup ${isActiveView ? "sessionSplitGroupActive" : ""}`}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Split view: ${aSession.name} and ${bSession.name}`}
+                  onClick={() => onActivateSplitView(view.id)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      onActivateSplitView(view.id);
+                    }
                   }}
-                  title="Unsplit"
-                  aria-label="Unsplit"
                 >
-                  <Icon name="close" size={14} />
-                </button>
-              </div>
-              <div className="sessionSplitGroupMembers">
-                <SessionItem
-                  key={splitPrimary.id}
-                  session={splitPrimary}
-                  isActive={splitPrimary.id === activeSessionId}
-                  isSecondary={false}
-                  splitTag="A"
-                  isAgentWorking={agentWorkingIds.has(splitPrimary.id)}
-                  isRenaming={renamingId === splitPrimary.id}
-                  renameValue={renamingId === splitPrimary.id ? renameValue : ""}
-                  onSelectSession={handleSelectSplitSession}
-                  onCloseSession={onCloseSession}
-                  onReconnectSession={onReconnectSession}
-                  onContextMenu={handleContextMenu}
-                  onRenameValueChange={setRenameValue}
-                  onRenameSubmit={handleRenameSubmit}
-                  onRenameCancel={handleRenameCancel}
-                />
-                <SessionItem
-                  key={splitSecondary.id}
-                  session={splitSecondary}
-                  isActive={splitSecondary.id === activeSessionId}
-                  isSecondary={false}
-                  splitTag="B"
-                  isAgentWorking={agentWorkingIds.has(splitSecondary.id)}
-                  isRenaming={renamingId === splitSecondary.id}
-                  renameValue={renamingId === splitSecondary.id ? renameValue : ""}
-                  onSelectSession={handleSelectSplitSession}
-                  onCloseSession={onCloseSession}
-                  onReconnectSession={onReconnectSession}
-                  onContextMenu={handleContextMenu}
-                  onRenameValueChange={setRenameValue}
-                  onRenameSubmit={handleRenameSubmit}
-                  onRenameCancel={handleRenameCancel}
-                />
-              </div>
-            </div>
+                  <div className="sessionSplitGroupHeader">
+                    <Icon name="panel" size={14} />
+                    <span className="sessionSplitGroupTitle">Split view</span>
+                    <span className="sessionSplitGroupMeta">{directionLabel}</span>
+                    <button
+                      type="button"
+                      className="sessionSplitGroupRemove"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onRemoveSplitView(view.id);
+                      }}
+                      title="Remove split view"
+                      aria-label="Remove split view"
+                    >
+                      <Icon name="trash" size={14} />
+                    </button>
+                    {isActiveView ? (
+                      <button
+                        type="button"
+                        className="sessionSplitGroupUnsplit"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onUnsplit();
+                        }}
+                        title="Exit split view"
+                        aria-label="Exit split view"
+                      >
+                        <Icon name="close" size={14} />
+                      </button>
+                    ) : null}
+                  </div>
+                  <div className="sessionSplitGroupMembers">
+                    <button
+                      type="button"
+                      className="sessionSplitViewMember"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onActivateSplitView(view.id, aSession.id);
+                      }}
+                      title={aSession.cwd ?? undefined}
+                    >
+                      <span className="sessionSplitTag" aria-hidden="true">
+                        A
+                      </span>
+                      {aSession.symbol && <span className="sessionSymbol">{aSession.symbol}</span>}
+                      <span className="sessionSplitViewMemberName">{aSession.name}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="sessionSplitViewMember"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onActivateSplitView(view.id, bSession.id);
+                      }}
+                      title={bSession.cwd ?? undefined}
+                    >
+                      <span className="sessionSplitTag" aria-hidden="true">
+                        B
+                      </span>
+                      {bSession.symbol && <span className="sessionSymbol">{bSession.symbol}</span>}
+                      <span className="sessionSplitViewMemberName">{bSession.name}</span>
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
           </>
         ) : null}
       </div>

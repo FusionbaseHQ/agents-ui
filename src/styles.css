@@ -474,6 +474,17 @@ body {
   border-radius: var(--radius-sm);
   background: rgba(255, 255, 255, 0.015);
   overflow: hidden;
+  cursor: pointer;
+}
+
+.sessionSplitGroup:focus-visible {
+  outline: 2px solid rgba(107, 140, 222, 0.55);
+  outline-offset: 2px;
+}
+
+.sessionSplitGroupActive {
+  border-color: rgba(107, 140, 222, 0.28);
+  background: rgba(107, 140, 222, 0.035);
 }
 
 .sessionSplitGroupHeader {
@@ -499,8 +510,27 @@ body {
   letter-spacing: 0.12em;
 }
 
-.sessionSplitGroupUnsplit {
+.sessionSplitGroupRemove {
   margin-left: auto;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.6);
+  width: 26px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  padding: 0;
+}
+
+.sessionSplitGroupRemove:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.sessionSplitGroupUnsplit {
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: transparent;
   color: rgba(255, 255, 255, 0.6);
@@ -523,6 +553,39 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0;
+}
+
+.sessionSplitViewMember {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.78);
+  width: 100%;
+  padding: 8px 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+}
+
+.sessionSplitViewMember:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.sessionSplitViewMember + .sessionSplitViewMember {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.sessionSplitViewMemberName {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  font-weight: 550;
 }
 
 .sessionSplitGroupMembers .sessionItem {
@@ -1347,14 +1410,6 @@ body {
 .sessionItemSecondary {
   border-color: rgba(107, 140, 222, 0.25);
   background: rgba(107, 140, 222, 0.06);
-}
-.sessionItemSecondary .sessionName::after {
-  content: "split";
-  font-size: 9px;
-  opacity: 0.5;
-  margin-left: 6px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
 }
 
 /* Terminal Search Bar */
