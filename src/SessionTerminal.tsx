@@ -199,8 +199,8 @@ function SessionTerminal(props: SessionTerminalProps) {
       theme: {
         background: "#0b0b0c",
         foreground: "#e6e2d9",
-        cursor: "#d8b04c",
-        selectionBackground: "rgba(216,176,76,0.28)",
+        cursor: "#5FAFFF",
+        selectionBackground: "rgba(95,175,255,0.28)",
       },
       scrollback: 5000,
     });

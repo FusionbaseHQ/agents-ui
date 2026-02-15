@@ -31,8 +31,10 @@
   --text-bright: #f6f2e7;
   --text-secondary: #b6b0a4;
   --muted: #8c877d;
-  --accent: #d8b04c;
-  --accent-rgb: 216, 176, 76;
+  --accent: #5FAFFF;
+  --accent-rgb: 95, 175, 255;
+  --ssh: #2EC4B6;
+  --ssh-rgb: 46, 196, 182;
   --accent-2: #45b8c8;
   --accent-3: #7b85c8;
   --accent-persistent: #c87898;
@@ -229,7 +231,7 @@ body {
   top: -1px;
   height: 2px;
   border-radius: var(--radius-control);
-  background: rgba(69, 184, 200, 0.75);
+  background: rgba(var(--accent-rgb), 0.75);
 }
 
 .projectItemDropAfter::after {
@@ -240,7 +242,7 @@ body {
   bottom: -1px;
   height: 2px;
   border-radius: var(--radius-control);
-  background: rgba(69, 184, 200, 0.75);
+  background: rgba(var(--accent-rgb), 0.75);
 }
 
 .projectItem:hover {
@@ -589,10 +591,10 @@ body {
 }
 
 .sessionSplitViewMember.sessionSplitViewMemberSsh {
-  background: rgba(69, 184, 200, 0.035);
+  background: rgba(var(--ssh-rgb), 0.035);
 }
 .sessionSplitViewMember.sessionSplitViewMemberSsh:hover {
-  background: rgba(69, 184, 200, 0.055);
+  background: rgba(var(--ssh-rgb), 0.055);
 }
 
 .sessionSplitViewMember.sessionSplitViewMemberPersistent {
@@ -606,7 +608,7 @@ body {
   background: rgba(var(--accent-rgb), 0.14);
 }
 .sessionSplitViewMember.sessionSplitViewMemberActive.sessionSplitViewMemberSsh {
-  background: rgba(69, 184, 200, 0.085);
+  background: rgba(var(--ssh-rgb), 0.085);
 }
 .sessionSplitViewMember.sessionSplitViewMemberActive.sessionSplitViewMemberPersistent {
   background: rgba(200, 120, 152, 0.085);
@@ -770,9 +772,9 @@ body {
 }
 
 .sessionItemActive.sessionItemSsh {
-  border-color: rgba(69, 184, 200, 0.55);
-  background: rgba(69, 184, 200, 0.085);
-  box-shadow: 0 0 12px rgba(69, 184, 200, 0.10), inset 0 0 0 1px rgba(69, 184, 200, 0.15);
+  border-color: rgba(var(--ssh-rgb), 0.55);
+  background: rgba(var(--ssh-rgb), 0.085);
+  box-shadow: 0 0 12px rgba(var(--ssh-rgb), 0.10), inset 0 0 0 1px rgba(var(--ssh-rgb), 0.15);
 }
 
 .sessionItemActive.sessionItemPersistent {
@@ -807,12 +809,12 @@ body {
 }
 
 .sessionItem:not(.sessionItemActive).sessionItemSsh {
-  background: rgba(69, 184, 200, 0.035);
+  background: rgba(var(--ssh-rgb), 0.035);
 }
 
 .sessionItem:not(.sessionItemActive).sessionItemSsh:hover {
-  border-color: rgba(69, 184, 200, 0.24);
-  background: rgba(69, 184, 200, 0.055);
+  border-color: rgba(var(--ssh-rgb), 0.24);
+  background: rgba(var(--ssh-rgb), 0.055);
 }
 
 
@@ -1151,8 +1153,8 @@ body {
 }
 
 .chip-ssh {
-  border-color: rgba(69, 184, 200, 0.42);
-  background: rgba(69, 184, 200, 0.08);
+  border-color: rgba(var(--ssh-rgb), 0.42);
+  background: rgba(var(--ssh-rgb), 0.08);
   color: rgba(255, 255, 255, 0.88);
   border-radius: var(--radius-sm);
 }
@@ -1193,8 +1195,8 @@ body {
 }
 
 .reconnectBtn {
-  border: 1px solid rgba(69, 184, 200, 0.35);
-  background: rgba(69, 184, 200, 0.1);
+  border: 1px solid rgba(var(--ssh-rgb), 0.35);
+  background: rgba(var(--ssh-rgb), 0.1);
   color: rgba(232, 250, 255, 0.92);
   padding: 4px 6px;
   border-radius: var(--radius-sm);
@@ -1202,7 +1204,7 @@ body {
 }
 
 .reconnectBtn:hover {
-  background: rgba(69, 184, 200, 0.18);
+  background: rgba(var(--ssh-rgb), 0.18);
 }
 
 .main {
@@ -1710,9 +1712,9 @@ body {
 }
 
 .fileExplorerRowDropTarget {
-  background: rgba(69, 184, 200, 0.18);
-  border-color: rgba(69, 184, 200, 0.45);
-  outline: 1px dashed rgba(69, 184, 200, 0.6);
+  background: rgba(var(--accent-rgb), 0.18);
+  border-color: rgba(var(--accent-rgb), 0.45);
+  outline: 1px dashed rgba(var(--accent-rgb), 0.6);
   outline-offset: -1px;
 }
 
@@ -1742,7 +1744,7 @@ body {
 .fileExplorerTransferBar {
   position: absolute;
   inset: 0;
-  background: rgba(69, 184, 200, 0.06);
+  background: rgba(var(--accent-rgb), 0.06);
   background-size: 200% 100%;
   animation: transferSlide 1.5s ease-in-out infinite;
 }
@@ -1763,7 +1765,7 @@ body {
 }
 
 .fileExplorerTransferSuccess {
-  color: rgba(69, 184, 200, 0.9);
+  color: rgba(var(--accent-rgb), 0.9);
 }
 
 .fileExplorerTransferError {
@@ -3375,8 +3377,8 @@ select.input {
   align-items: center;
   justify-content: center;
   border-radius: var(--radius-lg);
-  border: 1px solid rgba(69, 184, 200, 0.30);
-  background: rgba(69, 184, 200, 0.10);
+  border: 1px solid rgba(var(--ssh-rgb), 0.30);
+  background: rgba(var(--ssh-rgb), 0.10);
   box-shadow: none;
   color: rgba(255, 255, 255, 0.92);
   flex: 0 0 auto;
@@ -3468,13 +3470,13 @@ select.input {
 }
 
 .sshHostItem:hover {
-  border-color: rgba(69, 184, 200, 0.28);
-  background: rgba(69, 184, 200, 0.06);
+  border-color: rgba(var(--ssh-rgb), 0.28);
+  background: rgba(var(--ssh-rgb), 0.06);
 }
 
 .sshHostItemActive {
-  border-color: rgba(69, 184, 200, 0.45);
-  background: rgba(69, 184, 200, 0.08);
+  border-color: rgba(var(--ssh-rgb), 0.45);
+  background: rgba(var(--ssh-rgb), 0.08);
 }
 
 .sshHostItemMain {
@@ -3505,8 +3507,8 @@ select.input {
   justify-content: center;
   border-radius: var(--radius-sm);
   color: rgba(255, 255, 255, 0.85);
-  background: rgba(69, 184, 200, 0.12);
-  border: 1px solid rgba(69, 184, 200, 0.2);
+  background: rgba(var(--ssh-rgb), 0.12);
+  border: 1px solid rgba(var(--ssh-rgb), 0.2);
 }
 
 .sshHostItem:not(.sshHostItemActive) .sshHostPick {
@@ -3675,8 +3677,8 @@ select.input {
 }
 
 .sshHistoryItem:hover {
-  border-color: rgba(69, 184, 200, 0.28);
-  background: rgba(69, 184, 200, 0.06);
+  border-color: rgba(var(--ssh-rgb), 0.28);
+  background: rgba(var(--ssh-rgb), 0.06);
 }
 
 .sshHistoryItemMain {

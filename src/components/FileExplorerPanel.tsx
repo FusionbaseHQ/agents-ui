@@ -1267,7 +1267,7 @@ export function FileExplorerPanel({
       ctx.fill();
       roundRect(14, 26, 36, 24, 6);
       ctx.fill();
-      ctx.fillStyle = "rgba(216, 176, 76, 0.35)";
+      ctx.fillStyle = "rgba(95, 175, 255, 0.35)";
       roundRect(14, 26, 36, 10, 6);
       ctx.fill();
     } else {
