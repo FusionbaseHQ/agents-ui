@@ -580,6 +580,52 @@ body {
   background: rgba(255, 255, 255, 0.03);
 }
 
+.sessionSplitViewMember.sessionSplitViewMemberDefault {
+  background: rgba(107, 140, 222, 0.035);
+}
+.sessionSplitViewMember.sessionSplitViewMemberDefault:hover {
+  background: rgba(107, 140, 222, 0.055);
+}
+
+.sessionSplitViewMember.sessionSplitViewMemberSsh {
+  background: rgba(69, 184, 200, 0.035);
+}
+.sessionSplitViewMember.sessionSplitViewMemberSsh:hover {
+  background: rgba(69, 184, 200, 0.055);
+}
+
+.sessionSplitViewMember.sessionSplitViewMemberPersistent {
+  background: rgba(200, 120, 152, 0.04);
+}
+.sessionSplitViewMember.sessionSplitViewMemberPersistent:hover {
+  background: rgba(200, 120, 152, 0.06);
+}
+
+.sessionSplitViewMember.sessionSplitViewMemberActive.sessionSplitViewMemberDefault {
+  background: rgba(107, 140, 222, 0.14);
+}
+.sessionSplitViewMember.sessionSplitViewMemberActive.sessionSplitViewMemberSsh {
+  background: rgba(69, 184, 200, 0.085);
+}
+.sessionSplitViewMember.sessionSplitViewMemberActive.sessionSplitViewMemberPersistent {
+  background: rgba(200, 120, 152, 0.085);
+}
+
+/* Split view member colored overrides (--tab-color set via inline style). */
+/* :not(.sessionSplitViewMemberActive) gives 0-3-0 specificity to beat type-based selectors. */
+.sessionSplitViewMember.sessionSplitViewMemberColored:not(.sessionSplitViewMemberActive) {
+  background: rgba(var(--tab-color), 0.13);
+  box-shadow: inset 0 0 0 1px rgba(var(--tab-color), 0.08);
+}
+.sessionSplitViewMember.sessionSplitViewMemberColored:not(.sessionSplitViewMemberActive):hover {
+  background: rgba(var(--tab-color), 0.18);
+  box-shadow: 0 0 8px rgba(var(--tab-color), 0.08), inset 0 0 0 1px rgba(var(--tab-color), 0.12);
+}
+.sessionSplitViewMember.sessionSplitViewMemberColored.sessionSplitViewMemberActive {
+  background: rgba(var(--tab-color), 0.22);
+  box-shadow: 0 0 14px rgba(var(--tab-color), 0.15), inset 0 0 0 1px rgba(var(--tab-color), 0.2);
+}
+
 .sessionSplitViewMember + .sessionSplitViewMember {
   border-top: 1px solid rgba(255, 255, 255, 0.06);
 }

@@ -685,7 +685,28 @@ export const SessionsSection = React.memo(function SessionsSection({
                   <div className="sessionSplitGroupMembers">
                     <button
                       type="button"
-                      className="sessionSplitViewMember"
+                      className={`sessionSplitViewMember ${
+                        aSession.id === activeSessionId ? "sessionSplitViewMemberActive" : ""
+                      } ${
+                        (() => {
+                          const launchOrRestore =
+                            aSession.launchCommand ??
+                            (aSession.restoreCommand?.trim() ? aSession.restoreCommand.trim() : null) ??
+                            null;
+                          const isPersistent = Boolean(aSession.persistent);
+                          const isSshType = isSshCommand(launchOrRestore) && !isPersistent;
+                          return isPersistent
+                            ? "sessionSplitViewMemberPersistent"
+                            : isSshType
+                              ? "sessionSplitViewMemberSsh"
+                              : "sessionSplitViewMemberDefault";
+                        })()
+                      } ${aSession.color ? "sessionSplitViewMemberColored" : ""}`}
+                      style={
+                        aSession.color
+                          ? ({ "--tab-color": aSession.color } as React.CSSProperties)
+                          : undefined
+                      }
                       onClick={(e) => {
                         e.stopPropagation();
                         onActivateSplitView(view.id, aSession.id);
@@ -700,7 +721,28 @@ export const SessionsSection = React.memo(function SessionsSection({
                     </button>
                     <button
                       type="button"
-                      className="sessionSplitViewMember"
+                      className={`sessionSplitViewMember ${
+                        bSession.id === activeSessionId ? "sessionSplitViewMemberActive" : ""
+                      } ${
+                        (() => {
+                          const launchOrRestore =
+                            bSession.launchCommand ??
+                            (bSession.restoreCommand?.trim() ? bSession.restoreCommand.trim() : null) ??
+                            null;
+                          const isPersistent = Boolean(bSession.persistent);
+                          const isSshType = isSshCommand(launchOrRestore) && !isPersistent;
+                          return isPersistent
+                            ? "sessionSplitViewMemberPersistent"
+                            : isSshType
+                              ? "sessionSplitViewMemberSsh"
+                              : "sessionSplitViewMemberDefault";
+                        })()
+                      } ${bSession.color ? "sessionSplitViewMemberColored" : ""}`}
+                      style={
+                        bSession.color
+                          ? ({ "--tab-color": bSession.color } as React.CSSProperties)
+                          : undefined
+                      }
                       onClick={(e) => {
                         e.stopPropagation();
                         onActivateSplitView(view.id, bSession.id);
