@@ -22,6 +22,7 @@ import { FileExplorerPanel, type FileExplorerPersistedState } from "./components
 import type {
   CodeEditorFsEvent,
   CodeEditorOpenFileRequest,
+  CodeEditorPanelHandle,
   CodeEditorPersistedState,
 } from "./components/CodeEditorPanel";
 import { AgentShortcutsModal } from "./components/AgentShortcutsModal";
@@ -1323,6 +1324,14 @@ export default function App() {
 
   const registry = useRef<TerminalRegistry>(new Map());
   const pendingData = useRef<PendingDataBuffer>(new Map());
+  const [terminalSearchSessions, setTerminalSearchSessions] = useState<Set<string>>(() => new Set());
+  const terminalSearchSessionsRef = useRef(terminalSearchSessions);
+  terminalSearchSessionsRef.current = terminalSearchSessions;
+  const terminalSearchTriggerAtRef = useRef(0);
+  const codeEditorPanelRef = useRef<CodeEditorPanelHandle | null>(null);
+  const handleTerminalRegistryChanged = useCallback(() => {
+    setTerminalSearchSessions((prev) => (prev.size === 0 ? prev : new Set(prev)));
+  }, []);
   const outputQueueRef = useRef<OutputQueueBySession>(new Map());
   const outputFlushRafRef = useRef<number | null>(null);
   const pendingExitCodes = useRef<Map<string, number | null>>(new Map());
@@ -3022,6 +3031,62 @@ export default function App() {
         environmentEditorOpen ||
         assetEditorOpen;
 
+      const resolveVisibleTerminalSearchTargets = (): string[] => {
+        const activeProjectId = activeProjectIdRef.current;
+        const allSessions = sessionsRef.current;
+        const activeId = activeIdRef.current;
+        const activeSession = activeId ? allSessions.find((s) => s.id === activeId) ?? null : null;
+        const inProject = allSessions.filter((s) => s.projectId === activeProjectId);
+        const primaryId =
+          (activeSession && activeSession.projectId === activeProjectId ? activeSession.id : null) ??
+          inProject.find((s) => !s.closing)?.id ??
+          inProject[0]?.id ??
+          null;
+        const split = splitPaneRef.current;
+        const secondaryId = split?.secondaryId ?? null;
+        const ids: string[] = [];
+        if (primaryId) ids.push(primaryId);
+        if (secondaryId && secondaryId !== primaryId) {
+          const secondarySession = allSessions.find((s) => s.id === secondaryId) ?? null;
+          if (secondarySession && secondarySession.projectId === activeProjectId) {
+            ids.push(secondaryId);
+          }
+        }
+        return ids;
+      };
+
+      const closeTerminalSearchForIds = (sessionIds: string[]) => {
+        if (sessionIds.length === 0) return;
+        setTerminalSearchSessions((prev) => {
+          const next = new Set(prev);
+          let changed = false;
+          for (const id of sessionIds) {
+            if (next.delete(id)) changed = true;
+          }
+          return changed ? next : prev;
+        });
+        for (const id of sessionIds) {
+          try { registry.current.get(id)?.search.clearDecorations(); } catch { /* ignore */ }
+        }
+        registry.current.get(sessionIds[0])?.term.focus();
+      };
+
+      const toggleTerminalSearchForIds = (sessionIds: string[]) => {
+        if (sessionIds.length === 0) return;
+        const allOpen = sessionIds.every((id) => terminalSearchSessionsRef.current.has(id));
+        if (allOpen) {
+          closeTerminalSearchForIds(sessionIds);
+          return;
+        }
+        setTerminalSearchSessions((prev) => {
+          const next = new Set(prev);
+          for (const id of sessionIds) {
+            next.add(id);
+          }
+          return next;
+        });
+      };
+
         // Command palette takes priority - Cmd+K or Ctrl+K
         const modKey = isMac ? e.metaKey : e.ctrlKey;
         if (modKey && e.key.toLowerCase() === "k" && !commandPaletteOpen) {
@@ -3039,6 +3104,50 @@ export default function App() {
           setCommandPaletteOpen(false);
           return;
         }
+
+      const isFKey = e.key.toLowerCase() === "f";
+      const isMacCmdF = e.metaKey && !e.shiftKey && isFKey;
+      const isTerminalSearchHotkey = isMacCmdF || (e.ctrlKey && e.shiftKey && isFKey);
+      if (isTerminalSearchHotkey) {
+        const activeEl = document.activeElement;
+        const inCodeEditor = isMacCmdF && activeEl instanceof Element && Boolean(activeEl.closest(".codeEditorPanel"));
+        if (inCodeEditor) {
+          const now = Date.now();
+          if (now - terminalSearchTriggerAtRef.current < 180) return;
+          const ran = codeEditorPanelRef.current?.openFind() ?? false;
+          if (ran) {
+            terminalSearchTriggerAtRef.current = now;
+            e.preventDefault();
+            e.stopPropagation();
+          }
+          return;
+        }
+
+        const resolvedTargets = resolveVisibleTerminalSearchTargets();
+        const targets = resolvedTargets.length > 0 ? resolvedTargets : Array.from(registry.current.keys()).slice(0, 2);
+        if (targets.length === 0) {
+          showNotice("No terminal available for search.", 2000);
+          return;
+        }
+        const now = Date.now();
+        if (now - terminalSearchTriggerAtRef.current < 180) return;
+        terminalSearchTriggerAtRef.current = now;
+        e.preventDefault();
+        e.stopPropagation();
+        toggleTerminalSearchForIds(targets);
+        return;
+      }
+
+      if (e.key === "Escape" && !commandPaletteOpen && !modalOpen) {
+        const targets = resolveVisibleTerminalSearchTargets();
+        const hasOpenSearch = targets.some((id) => terminalSearchSessionsRef.current.has(id));
+        if (hasOpenSearch) {
+          e.preventDefault();
+          e.stopPropagation();
+          closeTerminalSearchForIds(targets);
+          return;
+        }
+      }
 
         // Close slide panel with Escape
         if (e.key === "Escape" && slidePanelOpen && !modalOpen) {
@@ -4852,6 +4961,63 @@ export default function App() {
         if (event.payload.id === "help-check-updates") {
           setUpdatesOpen(true);
           void checkForUpdates();
+          return;
+        }
+        if (event.payload.id === "window-toggle-terminal-search") {
+          const now = Date.now();
+          if (now - terminalSearchTriggerAtRef.current < 180) return;
+          const activeEl = document.activeElement;
+          const inCodeEditor = activeEl instanceof Element && Boolean(activeEl.closest(".codeEditorPanel"));
+          if (inCodeEditor) {
+            const ran = codeEditorPanelRef.current?.openFind() ?? false;
+            if (ran) terminalSearchTriggerAtRef.current = now;
+            return;
+          }
+          const activeProjectId = activeProjectIdRef.current;
+          const allSessions = sessionsRef.current;
+          const activeId = activeIdRef.current;
+          const activeSession = activeId ? allSessions.find((s) => s.id === activeId) ?? null : null;
+          const inProject = allSessions.filter((s) => s.projectId === activeProjectId);
+          const primaryId =
+            (activeSession && activeSession.projectId === activeProjectId ? activeSession.id : null) ??
+            inProject.find((s) => !s.closing)?.id ??
+            inProject[0]?.id ??
+            null;
+          const split = splitPaneRef.current;
+          const secondaryId = split?.secondaryId ?? null;
+          const targets: string[] = [];
+          if (primaryId) targets.push(primaryId);
+          if (secondaryId && secondaryId !== primaryId) {
+            const secondarySession = allSessions.find((s) => s.id === secondaryId) ?? null;
+            if (secondarySession && secondarySession.projectId === activeProjectId) {
+              targets.push(secondaryId);
+            }
+          }
+          const resolvedTargets = targets.length > 0 ? targets : Array.from(registry.current.keys()).slice(0, 2);
+          if (resolvedTargets.length === 0) return;
+          terminalSearchTriggerAtRef.current = now;
+          const allOpen = resolvedTargets.every((id) => terminalSearchSessionsRef.current.has(id));
+          if (allOpen) {
+            setTerminalSearchSessions((prev) => {
+              const next = new Set(prev);
+              let changed = false;
+              for (const id of resolvedTargets) {
+                if (next.delete(id)) changed = true;
+              }
+              return changed ? next : prev;
+            });
+            for (const id of resolvedTargets) {
+              try { registry.current.get(id)?.search.clearDecorations(); } catch { /* ignore */ }
+            }
+            registry.current.get(resolvedTargets[0])?.term.focus();
+            return;
+          }
+          setTerminalSearchSessions((prev) => {
+            const next = new Set(prev);
+            for (const id of resolvedTargets) next.add(id);
+            return next;
+          });
+          return;
         }
       });
       unlisteners.push(unlistenMenu);
@@ -5486,6 +5652,12 @@ export default function App() {
     }
     clearSessionRuntimeBuffers(id);
     commandLifecycleSessionsRef.current.delete(id);
+    setTerminalSearchSessions((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
     // Mark as closing so output/exit handlers ignore stale backend events.
     const prevTimeout = closingSessions.current.get(id);
     if (prevTimeout !== undefined) window.clearTimeout(prevTimeout);
@@ -5999,6 +6171,42 @@ export default function App() {
     setSplitPane(null);
   }, []);
 
+  const handleSearchClose = useCallback((sessionId: string) => {
+    const activeProjectId = activeProjectIdRef.current;
+    const allSessions = sessionsRef.current;
+    const activeId = activeIdRef.current;
+    const activeSession = activeId ? allSessions.find((s) => s.id === activeId) ?? null : null;
+    const inProject = allSessions.filter((s) => s.projectId === activeProjectId);
+    const primaryId =
+      (activeSession && activeSession.projectId === activeProjectId ? activeSession.id : null) ??
+      inProject.find((s) => !s.closing)?.id ??
+      inProject[0]?.id ??
+      null;
+    const split = splitPaneRef.current;
+    const secondaryId = split?.secondaryId ?? null;
+    const visibleTargets: string[] = [];
+    if (primaryId) visibleTargets.push(primaryId);
+    if (secondaryId && secondaryId !== primaryId) {
+      const secondarySession = allSessions.find((s) => s.id === secondaryId) ?? null;
+      if (secondarySession && secondarySession.projectId === activeProjectId) {
+        visibleTargets.push(secondaryId);
+      }
+    }
+    const targets = visibleTargets.includes(sessionId) ? visibleTargets : [sessionId];
+    setTerminalSearchSessions((prev) => {
+      const next = new Set(prev);
+      let changed = false;
+      for (const id of targets) {
+        if (next.delete(id)) changed = true;
+      }
+      return changed ? next : prev;
+    });
+    for (const id of targets) {
+      try { registry.current.get(id)?.search.clearDecorations(); } catch { /* ignore */ }
+    }
+    registry.current.get(targets[0])?.term.focus();
+  }, []);
+
   const handleRenameProjectInline = useCallback((projectId: string, newName: string) => {
     const trimmed = newName.trim();
     if (!trimmed) return;
@@ -6502,6 +6710,9 @@ export default function App() {
           onSessionTransportError={onSessionTransportError}
           registry={registry}
           pendingData={pendingData}
+          onRegistryChanged={handleTerminalRegistryChanged}
+          searchOpenSessions={terminalSearchSessions}
+          onSearchClose={handleSearchClose}
         />
 
         {activeWorkspaceView.codeEditorOpen &&
@@ -6525,6 +6736,7 @@ export default function App() {
             >
               <LazyCodeEditorPanel
                 key={`code-editor:${activeWorkspaceKey}`}
+                ref={codeEditorPanelRef}
                 provider={activeIsSsh ? "ssh" : "local"}
                 sshTarget={activeIsSsh ? activeSshTarget : null}
                 rootDir={
@@ -6644,16 +6856,17 @@ export default function App() {
           </>
         ) : null}
       </div>
-  ), [
-    terminalPaneSessions, activeId, activeProjectId, splitPane, handleSplitRatioChange, handleCloseSplitPane,
-    activeWorkspaceView, activeWorkspaceKey,
-    activeIsSsh, activeSshTarget, activeProject, active,
-    workspaceResizeMode, activeProjectId,
-    onCwdChange, onCommandChange, onSessionResize, onSessionTransportError,
-    beginWorkspaceResize, updateWorkspaceViewForKey,
-    handleSelectWorkspaceFile, handleOpenTerminalAtPath,
-    handleRenameWorkspacePath, handleDeleteWorkspacePath, closeCodeEditor,
-  ]);
+	  ), [
+	    terminalPaneSessions, activeId, activeProjectId, splitPane, handleSplitRatioChange, handleCloseSplitPane,
+	    terminalSearchSessions, handleTerminalRegistryChanged, handleSearchClose,
+	    activeWorkspaceView, activeWorkspaceKey,
+	    activeIsSsh, activeSshTarget, activeProject, active,
+	    workspaceResizeMode, activeProjectId,
+	    onCwdChange, onCommandChange, onSessionResize, onSessionTransportError,
+	    beginWorkspaceResize, updateWorkspaceViewForKey,
+	    handleSelectWorkspaceFile, handleOpenTerminalAtPath,
+	    handleRenameWorkspacePath, handleDeleteWorkspacePath, closeCodeEditor,
+	  ]);
 
   return (
     <div className="app">

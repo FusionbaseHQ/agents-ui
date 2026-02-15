@@ -13,6 +13,10 @@ export type CodeEditorOpenFileRequest = { path: string; nonce: number };
 
 loader.config({ monaco: bundledMonaco });
 
+export type CodeEditorPanelHandle = {
+  openFind: () => boolean;
+};
+
 export type CodeEditorPersistedTab = {
   path: string;
   dirty: boolean;
@@ -112,18 +116,7 @@ function inferLanguageId(path: string): string {
   }
 }
 
-export function CodeEditorPanel({
-  provider,
-  sshTarget,
-  rootDir,
-  openFileRequest,
-  persistedState,
-  fsEvent,
-  onPersistState,
-  onConsumeOpenFileRequest,
-  onActiveFilePathChange,
-  onCloseEditor,
-}: {
+type CodeEditorPanelProps = {
   provider: "local" | "ssh";
   sshTarget?: string | null;
   rootDir: string;
@@ -134,7 +127,23 @@ export function CodeEditorPanel({
   onConsumeOpenFileRequest?: () => void;
   onActiveFilePathChange: (path: string | null) => void;
   onCloseEditor: () => void;
-}) {
+};
+
+export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEditorPanelProps>(function CodeEditorPanel(
+  {
+    provider,
+    sshTarget,
+    rootDir,
+    openFileRequest,
+    persistedState,
+    fsEvent,
+    onPersistState,
+    onConsumeOpenFileRequest,
+    onActiveFilePathChange,
+    onCloseEditor,
+  }: CodeEditorPanelProps,
+  ref,
+) {
   const [tabs, setTabs] = React.useState<Tab[]>([]);
   const [activePath, setActivePath] = React.useState<string | null>(null);
   const [saveStatus, setSaveStatus] = React.useState<"idle" | "saving" | "saved" | "error">("idle");
@@ -200,6 +209,22 @@ export function CodeEditorPanel({
   const nextLoadNonceRef = React.useRef(1);
   const monacoRef = React.useRef<MonacoType | null>(null);
   const editorRef = React.useRef<import("monaco-editor").editor.IStandaloneCodeEditor | null>(null);
+
+  const openFind = React.useCallback((): boolean => {
+    const editor = editorRef.current;
+    if (!editor) return false;
+    try {
+      editor.focus();
+      const action = editor.getAction("actions.find");
+      if (!action) return false;
+      void action.run();
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  React.useImperativeHandle(ref, () => ({ openFind }), [openFind]);
 
   const onPersistStateRef = React.useRef(onPersistState);
   React.useEffect(() => {
@@ -1046,6 +1071,6 @@ export function CodeEditorPanel({
       />
     </section>
   );
-}
+});
 
 export default CodeEditorPanel;

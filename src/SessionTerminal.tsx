@@ -3,8 +3,9 @@ import React, { useEffect, useRef } from "react";
 import { Terminal } from "xterm";
 import { CanvasAddon } from "xterm-addon-canvas";
 import { FitAddon } from "xterm-addon-fit";
+import { SearchAddon } from "@xterm/addon-search";
 
-export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon }>;
+export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon; search: SearchAddon }>;
 export type PendingDataBuffer = Map<string, string[]>;
 
 type RenderDimension = { width: number; height: number };
@@ -145,6 +146,7 @@ type SessionTerminalProps = {
   onTransportError?: (id: string, operation: "write" | "resize", errorMessage: string) => void;
   registry: React.MutableRefObject<TerminalRegistry>;
   pendingData: React.MutableRefObject<PendingDataBuffer>;
+  onRegistryChanged?: () => void;
 };
 
 function SessionTerminal(props: SessionTerminalProps) {
@@ -177,6 +179,8 @@ function SessionTerminal(props: SessionTerminalProps) {
   onUserEnterRef.current = props.onUserEnter;
   const onTransportErrorRef = useRef(props.onTransportError);
   onTransportErrorRef.current = props.onTransportError;
+  const onRegistryChangedRef = useRef(props.onRegistryChanged);
+  onRegistryChangedRef.current = props.onRegistryChanged;
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -201,10 +205,12 @@ function SessionTerminal(props: SessionTerminalProps) {
       scrollback: 5000,
     });
     const fit = new FitAddon();
+    const searchAddon = new SearchAddon();
     term.loadAddon(fit);
     term.open(container);
     const canvasAddon = new CanvasAddon();
     term.loadAddon(canvasAddon);
+    term.loadAddon(searchAddon);
     patchXtermRenderServiceDimensions(term);
     patchXtermPausedResizeTask(term);
 
@@ -326,6 +332,8 @@ function SessionTerminal(props: SessionTerminalProps) {
       term.attachCustomKeyEventHandler((event) => {
         if (event.type !== "keydown") return true;
         const key = event.key;
+        // Let Cmd+F / Ctrl+Shift+F bubble to global handler
+        if ((event.metaKey && key.toLowerCase() === "f") || (event.ctrlKey && event.shiftKey && key.toLowerCase() === "f")) return false;
         const isCopy =
           (event.metaKey || (event.ctrlKey && event.shiftKey)) &&
           !event.altKey &&
@@ -386,6 +394,8 @@ function SessionTerminal(props: SessionTerminalProps) {
       term.attachCustomKeyEventHandler((event) => {
         if (event.type !== "keydown") return true;
         const key = event.key;
+        // Let Cmd+F / Ctrl+Shift+F bubble to global handler
+        if ((event.metaKey && key.toLowerCase() === "f") || (event.ctrlKey && event.shiftKey && key.toLowerCase() === "f")) return false;
         const isCopy =
           (event.metaKey || (event.ctrlKey && event.shiftKey)) &&
           !event.altKey &&
@@ -526,8 +536,9 @@ function SessionTerminal(props: SessionTerminalProps) {
 	      }, 80);
 	    }
 
-		    // Register BEFORE flushing to avoid race with incoming events
-		    props.registry.current.set(props.id, { term, fit });
+	    // Register BEFORE flushing to avoid race with incoming events
+	    props.registry.current.set(props.id, { term, fit, search: searchAddon });
+    onRegistryChangedRef.current?.();
 
 	    // Flush any buffered data that arrived before we were ready (but wait for renderer readiness)
 	    const flushPending = (attemptsLeft: number) => {
@@ -626,8 +637,10 @@ function SessionTerminal(props: SessionTerminalProps) {
 	      }
 	      for (const d of oscDisposables) d.dispose();
 	      props.registry.current.delete(props.id);
+      onRegistryChangedRef.current?.();
 	      props.pendingData.current.delete(props.id);
 	      wheelCleanup?.();
+	      searchAddon.dispose();
 	      canvasAddon.dispose();
 	      term.dispose();
 	      termRef.current = null;

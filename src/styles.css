@@ -1259,6 +1259,97 @@ body {
   letter-spacing: 0.5px;
 }
 
+/* Terminal Search Bar */
+.terminalSearchBar {
+  position: absolute;
+  top: 8px;
+  right: 16px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  background: rgba(12, 15, 22, 0.92);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: var(--radius-control);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+.terminalPaneSplit .terminalSearchBar {
+  top: 34px;
+}
+.terminalSearchInput {
+  width: 180px;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: var(--radius-control);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--fg);
+  font-size: 12px;
+  font-family: inherit;
+  outline: none;
+}
+.terminalSearchInput:focus {
+  border-color: rgba(107, 140, 222, 0.5);
+}
+.terminalSearchCount {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.5);
+  white-space: nowrap;
+  padding: 0 4px;
+  min-width: 48px;
+  text-align: center;
+}
+.terminalSearchCaseBtn,
+.terminalSearchNavBtn,
+.terminalSearchCloseBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.5);
+  cursor: pointer;
+  border-radius: var(--radius-control);
+  padding: 0;
+  transition: background 0.1s ease, color 0.1s ease;
+}
+.terminalSearchCaseBtn {
+  width: 24px;
+  height: 24px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: inherit;
+}
+.terminalSearchCaseBtn.active {
+  background: rgba(107, 140, 222, 0.25);
+  color: rgba(107, 140, 222, 1);
+}
+.terminalSearchCaseBtn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.8);
+}
+.terminalSearchNavBtn {
+  width: 22px;
+  height: 22px;
+  font-size: 9px;
+}
+.terminalSearchNavBtn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.8);
+}
+.terminalSearchCloseBtn {
+  width: 22px;
+  height: 22px;
+  font-size: 14px;
+  margin-left: 2px;
+}
+.terminalSearchCloseBtn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.8);
+}
+
 /* File Explorer + Editor */
 .fileExplorerPanel {
   width: var(--workspaceFileTreeWidthPx, 320px);

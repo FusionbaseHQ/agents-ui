@@ -1,6 +1,7 @@
 import React from "react";
 import SessionTerminal, { type PendingDataBuffer, type TerminalRegistry } from "../SessionTerminal";
 import { shortenPathSmart } from "../pathDisplay";
+import { TerminalSearchBar } from "./TerminalSearchBar";
 
 export type SplitPane = {
   secondaryId: string;
@@ -33,6 +34,9 @@ type TerminalPaneProps = {
   onSessionTransportError: (id: string, operation: "write" | "resize", errorMessage: string) => void;
   registry: React.MutableRefObject<TerminalRegistry>;
   pendingData: React.MutableRefObject<PendingDataBuffer>;
+  onRegistryChanged: () => void;
+  searchOpenSessions: Set<string>;
+  onSearchClose: (sessionId: string) => void;
 };
 
 const SPLIT_HEADER_HEIGHT = 26;
@@ -50,6 +54,9 @@ function TerminalPaneImpl({
   onSessionTransportError,
   registry,
   pendingData,
+  onRegistryChanged,
+  searchOpenSessions,
+  onSearchClose,
 }: TerminalPaneProps) {
   const paneRef = React.useRef<HTMLDivElement | null>(null);
   const prevVisibleIdRef = React.useRef<string | null>(null);
@@ -93,6 +100,15 @@ function TerminalPaneImpl({
       }
     }
   }, [visibleId, secondaryVisibleId, isSplit]);
+
+  // Stable close handler map to avoid re-creating closures every render
+  const searchCloseHandlers = React.useMemo(() => {
+    const map = new Map<string, () => void>();
+    for (const session of sessions) {
+      map.set(session.id, () => onSearchClose(session.id));
+    }
+    return map;
+  }, [sessions, onSearchClose]);
 
   // Divider drag handler
   const handleDividerDrag = React.useCallback(
@@ -162,6 +178,8 @@ function TerminalPaneImpl({
         const isPrimary = session.id === visibleId;
         const isSecondary = isSplit && session.id === secondaryVisibleId;
         const showHeader = isSplit && (isPrimary || isSecondary);
+        const showSearch = (isPrimary || isSecondary) && searchOpenSessions.has(session.id);
+        const searchAddon = showSearch ? registry.current.get(session.id)?.search ?? null : null;
         return (
           <div
             key={session.id}
@@ -187,6 +205,12 @@ function TerminalPaneImpl({
                 </button>
               </div>
             )}
+            {searchAddon && (
+              <TerminalSearchBar
+                searchAddon={searchAddon}
+                onClose={searchCloseHandlers.get(session.id)!}
+              />
+            )}
             <SessionTerminal
               id={session.id}
               active={isPrimary || isSecondary}
@@ -204,6 +228,7 @@ function TerminalPaneImpl({
               onTransportError={onSessionTransportError}
               registry={registry}
               pendingData={pendingData}
+              onRegistryChanged={onRegistryChanged}
             />
           </div>
         );
@@ -226,7 +251,10 @@ function arePropsEqual(prev: TerminalPaneProps, next: TerminalPaneProps): boolea
     prev.onSessionResize === next.onSessionResize &&
     prev.onSessionTransportError === next.onSessionTransportError &&
     prev.registry === next.registry &&
-    prev.pendingData === next.pendingData
+    prev.pendingData === next.pendingData &&
+    prev.onRegistryChanged === next.onRegistryChanged &&
+    prev.searchOpenSessions === next.searchOpenSessions &&
+    prev.onSearchClose === next.onSearchClose
   );
 }
 
