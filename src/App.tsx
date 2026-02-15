@@ -6150,7 +6150,10 @@ export default function App() {
   }, []);
 
   const handleSplitSession = useCallback((sessionId: string, direction: "horizontal" | "vertical") => {
-    setSplitPane({ secondaryId: sessionId, direction, ratio: 0.5 });
+    setSplitPane((prev) => {
+      const ratio = prev?.ratio ?? 0.5;
+      return { secondaryId: sessionId, direction, ratio: Math.max(0.15, Math.min(0.85, ratio)) };
+    });
   }, []);
 
   const handleUnsplit = useCallback(() => {

@@ -459,6 +459,104 @@ body {
   padding-right: 2px;
 }
 
+.sessionListSectionLabel {
+  margin-top: 10px;
+  padding: 6px 8px 4px 8px;
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.45);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  user-select: none;
+}
+
+.sessionSplitGroup {
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.015);
+  overflow: hidden;
+}
+
+.sessionSplitGroupHeader {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.7);
+  user-select: none;
+}
+
+.sessionSplitGroupTitle {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.sessionSplitGroupMeta {
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.45);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.sessionSplitGroupUnsplit {
+  margin-left: auto;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.6);
+  width: 26px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  padding: 0;
+}
+
+.sessionSplitGroupUnsplit:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.sessionSplitGroupMembers {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.sessionSplitGroupMembers .sessionItem {
+  border-radius: 0;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+
+.sessionSplitGroupMembers .sessionItem:hover {
+  border-color: transparent;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.sessionSplitGroupMembers .sessionItem + .sessionItem {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.sessionSplitTag {
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  color: rgba(255, 255, 255, 0.8);
+  background: rgba(107, 140, 222, 0.18);
+  border: 1px solid rgba(107, 140, 222, 0.28);
+  flex-shrink: 0;
+}
+
 .sessionLegend {
   display: flex;
   flex-wrap: wrap;

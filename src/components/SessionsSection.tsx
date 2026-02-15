@@ -56,6 +56,7 @@ type SessionItemProps = {
   session: Session;
   isActive: boolean;
   isSecondary: boolean;
+  splitTag?: string | null;
   isAgentWorking: boolean;
   isRenaming: boolean;
   renameValue: string;
@@ -72,6 +73,7 @@ const SessionItem = React.memo(function SessionItem({
   session: s,
   isActive,
   isSecondary,
+  splitTag,
   isAgentWorking,
   isRenaming,
   renameValue,
@@ -133,6 +135,11 @@ const SessionItem = React.memo(function SessionItem({
     >
       <div className="sessionMeta">
         <div className="sessionName">
+          {splitTag ? (
+            <span className="sessionSplitTag" aria-hidden="true">
+              {splitTag}
+            </span>
+          ) : null}
           {s.symbol && <span className="sessionSymbol">{s.symbol}</span>}
           {hasAgentIcon && chipLabel && effect?.iconSrc && (
             <span className={`agentBadge chip-${effect.id}`} title={chipLabel}>
@@ -223,7 +230,7 @@ type SessionsSectionProps = {
   sessions: Session[];
   agentWorkingIds: ReadonlySet<string>;
   activeSessionId: string | null;
-  splitPane: { secondaryId: string; direction: string; ratio: number } | null;
+  splitPane: { secondaryId: string; direction: "horizontal" | "vertical"; ratio: number } | null;
   onSplitSession: (sessionId: string, direction: "horizontal" | "vertical") => void;
   onUnsplit: () => void;
   onSelectSession: (sessionId: string) => void;
@@ -422,6 +429,44 @@ export const SessionsSection = React.memo(function SessionsSection({
     ? sessions.find((s) => s.id === contextMenu.sessionId)
     : null;
 
+  const splitPrimaryId = React.useMemo(() => {
+    if (!splitPane) return null;
+    const active = activeSessionId ? sessions.find((s) => s.id === activeSessionId) ?? null : null;
+    if (active) return active.id;
+    return sessions.find((s) => !s.closing)?.id ?? sessions[0]?.id ?? null;
+  }, [activeSessionId, sessions, splitPane]);
+
+  const splitSecondaryId = splitPane?.secondaryId ?? null;
+  const splitPrimary = splitPrimaryId ? sessions.find((s) => s.id === splitPrimaryId) ?? null : null;
+  const splitSecondary = splitSecondaryId ? sessions.find((s) => s.id === splitSecondaryId) ?? null : null;
+  const hasValidSplitGroup = Boolean(
+    splitPane && splitPrimary && splitSecondary && splitPrimary.id !== splitSecondary.id,
+  );
+
+  const standaloneSessions = React.useMemo(() => {
+    if (!hasValidSplitGroup || !splitPrimary || !splitSecondary) return sessions;
+    const a = splitPrimary.id;
+    const b = splitSecondary.id;
+    return sessions.filter((s) => s.id !== a && s.id !== b);
+  }, [hasValidSplitGroup, sessions, splitPrimary, splitSecondary]);
+
+  const handleSelectSplitSession = React.useCallback(
+    (sessionId: string) => {
+      if (!hasValidSplitGroup || !splitPane || !splitPrimary || !splitSecondary) {
+        onSelectSession(sessionId);
+        return;
+      }
+      if (sessionId === splitSecondary.id) {
+        // Swap focus to the other pane but keep the split visible.
+        onSelectSession(splitSecondary.id);
+        onSplitSession(splitPrimary.id, splitPane.direction);
+        return;
+      }
+      onSelectSession(sessionId);
+    },
+    [hasValidSplitGroup, onSelectSession, onSplitSession, splitPane, splitPrimary, splitSecondary],
+  );
+
   return (
     <>
       <div className="sidebarHeader">
@@ -561,12 +606,12 @@ export const SessionsSection = React.memo(function SessionsSection({
         {sessions.length === 0 ? (
           <div className="empty">No sessions in this project.</div>
         ) : (
-          sessions.map((s) => (
+          standaloneSessions.map((s) => (
             <SessionItem
               key={s.id}
               session={s}
               isActive={s.id === activeSessionId}
-              isSecondary={splitPane?.secondaryId === s.id}
+              isSecondary={false}
               isAgentWorking={agentWorkingIds.has(s.id)}
               isRenaming={renamingId === s.id}
               renameValue={renamingId === s.id ? renameValue : ""}
@@ -580,6 +625,69 @@ export const SessionsSection = React.memo(function SessionsSection({
             />
           ))
         )}
+
+        {hasValidSplitGroup && splitPane && splitPrimary && splitSecondary ? (
+          <>
+            <div className="sessionListSectionLabel">Split</div>
+            <div className="sessionSplitGroup" role="group" aria-label="Split terminals">
+              <div className="sessionSplitGroupHeader">
+                <Icon name="panel" size={14} />
+                <span className="sessionSplitGroupTitle">Split group</span>
+                <span className="sessionSplitGroupMeta">
+                  {splitPane.direction === "vertical" ? "right" : "down"}
+                </span>
+                <button
+                  type="button"
+                  className="sessionSplitGroupUnsplit"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onUnsplit();
+                  }}
+                  title="Unsplit"
+                  aria-label="Unsplit"
+                >
+                  <Icon name="close" size={14} />
+                </button>
+              </div>
+              <div className="sessionSplitGroupMembers">
+                <SessionItem
+                  key={splitPrimary.id}
+                  session={splitPrimary}
+                  isActive={splitPrimary.id === activeSessionId}
+                  isSecondary={false}
+                  splitTag="A"
+                  isAgentWorking={agentWorkingIds.has(splitPrimary.id)}
+                  isRenaming={renamingId === splitPrimary.id}
+                  renameValue={renamingId === splitPrimary.id ? renameValue : ""}
+                  onSelectSession={handleSelectSplitSession}
+                  onCloseSession={onCloseSession}
+                  onReconnectSession={onReconnectSession}
+                  onContextMenu={handleContextMenu}
+                  onRenameValueChange={setRenameValue}
+                  onRenameSubmit={handleRenameSubmit}
+                  onRenameCancel={handleRenameCancel}
+                />
+                <SessionItem
+                  key={splitSecondary.id}
+                  session={splitSecondary}
+                  isActive={splitSecondary.id === activeSessionId}
+                  isSecondary={false}
+                  splitTag="B"
+                  isAgentWorking={agentWorkingIds.has(splitSecondary.id)}
+                  isRenaming={renamingId === splitSecondary.id}
+                  renameValue={renamingId === splitSecondary.id ? renameValue : ""}
+                  onSelectSession={handleSelectSplitSession}
+                  onCloseSession={onCloseSession}
+                  onReconnectSession={onReconnectSession}
+                  onContextMenu={handleContextMenu}
+                  onRenameValueChange={setRenameValue}
+                  onRenameSubmit={handleRenameSubmit}
+                  onRenameCancel={handleRenameCancel}
+                />
+              </div>
+            </div>
+          </>
+        ) : null}
       </div>
 
       {/* Context menu — portalled to body to escape sidebar's backdrop-filter containing block */}
