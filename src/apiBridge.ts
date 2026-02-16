@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 interface BridgeCommand {
   requestId: string;
   method: string;
-  params: Record<string, unknown>;
+  params: Record<string, unknown> | null;
 }
 
 type CommandHandler = (
@@ -51,7 +51,7 @@ export async function initBridge() {
     }
 
     try {
-      const result = await handler(params);
+      const result = await handler(params ?? {});
       await invoke("api_respond", {
         response: {
           requestId,

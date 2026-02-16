@@ -9,6 +9,8 @@ mod assets;
 mod files;
 mod file_manager;
 mod fs_watcher;
+mod mcp_server;
+mod mcp_tools;
 mod pty;
 mod persist;
 mod recording;
@@ -94,6 +96,12 @@ fn main() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 api_server::start_api_server(handle).await;
+            });
+
+            // Start the MCP server
+            let handle2 = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                mcp_server::start_mcp_server(handle2).await;
             });
 
             Ok(())

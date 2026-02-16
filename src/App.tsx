@@ -2663,10 +2663,59 @@ export default function App() {
   // ── External Control API bridge ──
   useEffect(() => {
     if (!hydrated) return;
+
+    // Shared helpers for recording start/stop (used by both sessions.* and recordings.* methods)
+    async function doStartRecording(sessionId: string, name: string) {
+      const s = sessionsRef.current.find((s) => s.id === sessionId);
+      if (!s) throw new Error("session not found");
+      if (s.recordingActive) throw new Error("recording already active");
+
+      const recordingId = makeId();
+      const effect = getProcessEffectById(s.effectId);
+      const bootstrapCommand =
+        (s.launchCommand ?? null) ||
+        (s.restoreCommand?.trim() ? s.restoreCommand.trim() : null) ||
+        (effect?.matchCommands?.[0] ?? null);
+      const safeId = await invoke<string>("start_session_recording", {
+        id: s.id,
+        recordingId,
+        recordingName: name,
+        encrypt: secureStorageModeRef.current === "keychain",
+        projectId: s.projectId,
+        sessionPersistId: s.persistId,
+        cwd: s.cwd,
+        effectId: s.effectId ?? null,
+        bootstrapCommand,
+      });
+      setSessions((prev) =>
+        prev.map((x) =>
+          x.id === sessionId
+            ? { ...x, recordingActive: true, lastRecordingId: safeId }
+            : x,
+        ),
+      );
+      return { sessionId, recordingId: safeId };
+    }
+
+    async function doStopRecording(sessionId: string) {
+      const s = sessionsRef.current.find((s) => s.id === sessionId);
+      if (!s) throw new Error("session not found");
+      if (!s.recordingActive) throw new Error("no active recording");
+
+      try {
+        await invoke("stop_session_recording", { id: s.id });
+      } finally {
+        setSessions((prev) =>
+          prev.map((x) => (x.id === sessionId ? { ...x, recordingActive: false } : x)),
+        );
+      }
+      return { sessionId };
+    }
+
     registerHandlers({
       // ── sessions ──
       "sessions.list": (p) => {
-        const pid = p.projectId as string | undefined;
+        const pid = p?.projectId as string | undefined;
         const all = sessionsRef.current;
         return pid ? all.filter((s) => s.projectId === pid) : all;
       },
@@ -2691,11 +2740,13 @@ export default function App() {
         });
         const s = applyPendingExit(createdRaw);
         addSessionWithProjectSafeActivation(s);
+        notifyStateChange("sessions.created", { sessionId: s.id, projectId: s.projectId });
         return s;
       },
       "sessions.close": async (p) => {
         const id = p.id as string;
         await closeSession(id);
+        notifyStateChange("sessions.closed", { sessionId: id });
         return null;
       },
       "sessions.rename": (p) => {
@@ -2704,18 +2755,21 @@ export default function App() {
         setSessions((prev) => prev.map((s) => s.id === id ? { ...s, name } : s));
         invoke("rename_session", { id, name }).catch(() => {});
         const s = sessionsRef.current.find((s) => s.id === id);
+        notifyStateChange("sessions.renamed", { sessionId: id, name });
         return s ? { ...s, name } : null;
       },
       "sessions.set_symbol": (p) => {
         const id = p.id as string;
         const symbol = (p.symbol as string) || null;
         setSessions((prev) => prev.map((s) => s.id === id ? { ...s, symbol } : s));
+        notifyStateChange("sessions.updated", { sessionId: id, symbol });
         return null;
       },
       "sessions.set_color": (p) => {
         const id = p.id as string;
         const color = (p.color as string) || null;
         setSessions((prev) => prev.map((s) => s.id === id ? { ...s, color } : s));
+        notifyStateChange("sessions.updated", { sessionId: id, color });
         return null;
       },
       "sessions.activate": (p) => {
@@ -2727,13 +2781,50 @@ export default function App() {
         }
         setActiveId(id);
         setActiveSplitViewId(null);
+        notifyStateChange("sessions.activated", { sessionId: id });
         return { activeSessionId: id };
       },
-      "sessions.start_recording": (p) => {
-        throw new Error("use recordings.start instead");
+      "sessions.reconnect": (p) => {
+        const id = p.sessionId as string;
+        const reason = (p.reason as string) || "API reconnect request";
+        const immediate = p.immediate as boolean | undefined;
+        const manual = p.manual as boolean | undefined;
+        reconnectSshSessionRef.current(id, reason, { immediate, manual });
+        notifyStateChange("sessions.reconnecting", { sessionId: id, reason });
+        return { sessionId: id };
       },
-      "sessions.stop_recording": (p) => {
-        throw new Error("use recordings.stop instead");
+      "sessions.start_recording": async (p) => {
+        const result = await doStartRecording(p.sessionId as string, p.name as string);
+        notifyStateChange("recordings.started", result);
+        return result;
+      },
+      "sessions.stop_recording": async (p) => {
+        const result = await doStopRecording(p.sessionId as string);
+        notifyStateChange("recordings.stopped", result);
+        return result;
+      },
+      "sessions.split": (p) => {
+        const sv: SplitView = {
+          id: makeId(),
+          projectId: p.projectId as string,
+          aId: p.aId as string,
+          bId: p.bId as string,
+          direction: p.direction as "horizontal" | "vertical",
+          ratio: (p.ratio as number) ?? 0.5,
+          createdAt: Date.now(),
+          lastFocusedId: p.aId as string,
+        };
+        setSplitViews((prev) => [...prev, sv]);
+        setActiveSplitViewId(sv.id);
+        notifyStateChange("split_views.created", { splitViewId: sv.id, projectId: sv.projectId });
+        return sv;
+      },
+      "sessions.unsplit": (p) => {
+        const id = p.id as string;
+        setSplitViews((prev) => prev.filter((sv) => sv.id !== id));
+        if (activeSplitViewIdRef.current === id) setActiveSplitViewId(null);
+        notifyStateChange("split_views.closed", { splitViewId: id });
+        return null;
       },
       // ── persistent_sessions ──
       "persistent_sessions.attach": async (p) => {
@@ -2751,6 +2842,7 @@ export default function App() {
         });
         const s = applyPendingExit(createdRaw);
         addSessionWithProjectSafeActivation(s);
+        notifyStateChange("sessions.created", { sessionId: s.id, projectId: s.projectId });
         return s;
       },
       // ── projects ──
@@ -2776,6 +2868,7 @@ export default function App() {
           assetsEnabled: p.assetsEnabled !== false,
         };
         setProjects((prev) => [...prev, project]);
+        notifyStateChange("projects.created", { projectId: id });
         return project;
       },
       "projects.update": (p) => {
@@ -2792,6 +2885,7 @@ export default function App() {
             ...(p.color !== undefined && { color: p.color as string | null }),
           };
         }));
+        notifyStateChange("projects.updated", { projectId: id });
         return projectsRef.current.find((pr) => pr.id === id) ?? null;
       },
       "projects.delete": async (p) => {
@@ -2812,6 +2906,7 @@ export default function App() {
           }
           return next;
         });
+        notifyStateChange("projects.deleted", { projectId: id });
         return null;
       },
       "projects.activate": (p) => {
@@ -2820,6 +2915,7 @@ export default function App() {
         setActiveProjectId(id);
         const lastSession = sessionsRef.current.find((s) => s.projectId === id);
         if (lastSession) setActiveId(lastSession.id);
+        notifyStateChange("projects.activated", { projectId: id });
         return { activeProjectId: id };
       },
       "projects.reorder": (p) => {
@@ -2832,11 +2928,29 @@ export default function App() {
           }
           return reordered;
         });
+        notifyStateChange("projects.reordered", { projectIds: ids });
         return null;
+      },
+      "projects.apply_assets": async (p) => {
+        const projectId = p.projectId as string;
+        const proj = projectsRef.current.find((pr) => pr.id === projectId);
+        if (!proj) throw new Error("project not found");
+        const dir = proj.basePath;
+        if (!dir) throw new Error("project has no basePath");
+        const overwrite = (p.overwrite as boolean) ?? false;
+        let allAssets: AssetTemplate[] = [];
+        setAssets((prev) => { allAssets = prev; return prev; });
+        const assetIds = p.assetIds as string[] | undefined;
+        const templates = assetIds
+          ? allAssets.filter((a) => assetIds.includes(a.id))
+          : allAssets;
+        if (templates.length === 0) throw new Error("no assets to apply");
+        const applied = await applyTextAssetsRaw(dir, templates, overwrite);
+        notifyStateChange("assets.applied", { projectId, applied });
+        return { applied };
       },
       // ── prompts ──
       "prompts.list": () => {
-        // Read from a snapshot via state setter to avoid needing a ref
         let result: Prompt[] = [];
         setPrompts((prev) => { result = prev; return prev; });
         return result;
@@ -2859,6 +2973,7 @@ export default function App() {
           createdAt: Date.now(),
         };
         setPrompts((prev) => [...prev, prompt]);
+        notifyStateChange("prompts.created", { promptId: id });
         return prompt;
       },
       "prompts.update": (p) => {
@@ -2874,17 +2989,52 @@ export default function App() {
           };
           return updated!;
         }));
+        notifyStateChange("prompts.updated", { promptId: id });
         return updated;
       },
       "prompts.delete": (p) => {
-        setPrompts((prev) => prev.filter((pr) => pr.id !== (p.id as string)));
+        const id = p.id as string;
+        setPrompts((prev) => prev.filter((pr) => pr.id !== id));
+        notifyStateChange("prompts.deleted", { promptId: id });
         return null;
       },
       "prompts.search": (p) => {
-        const q = ((p.q as string) || "").toLowerCase();
+        const q = ((p?.q as string) || "").toLowerCase();
         let result: Prompt[] = [];
         setPrompts((prev) => { result = prev; return prev; });
         return result.filter((pr) => pr.title.toLowerCase().includes(q) || pr.content.toLowerCase().includes(q));
+      },
+      "prompts.send": async (p) => {
+        const sessionId = p.sessionId as string;
+        const mode = (p.mode as "paste" | "send") || "send";
+        const s = sessionsRef.current.find((s) => s.id === sessionId);
+        if (!s) throw new Error("session not found");
+        if (s.exited || s.closing || s.connectionState === "reconnecting" || s.connectionState === "disconnected") {
+          throw new Error("session is not currently interactive");
+        }
+        let prompt: Prompt;
+        if (p.promptId) {
+          let found: Prompt | null = null;
+          setPrompts((prev) => { found = prev.find((pr) => pr.id === p.promptId) ?? null; return prev; });
+          if (!found) throw new Error("prompt not found");
+          prompt = found;
+        } else if (p.content) {
+          prompt = { id: makeId(), title: "api", content: p.content as string, createdAt: Date.now() };
+        } else {
+          throw new Error("promptId or content is required");
+        }
+        if (mode === "paste") {
+          await invoke("write_to_session", { id: sessionId, data: prompt.content, source: "user" });
+        } else {
+          const text = prompt.content.replace(/[\r\n]+$/, "");
+          if (text) {
+            await invoke("write_to_session", { id: sessionId, data: text, source: "user" });
+            await sleep(30);
+          }
+          await invoke("write_to_session", { id: sessionId, data: "\r", source: "user" });
+        }
+        notifyStateChange("prompts.sent", { sessionId, promptId: prompt.id, mode });
+        return { sessionId, promptId: prompt.id, mode };
       },
       // ── environments ──
       "environments.list": () => environmentsRef.current,
@@ -2902,6 +3052,7 @@ export default function App() {
           createdAt: Date.now(),
         };
         setEnvironments((prev) => [...prev, env]);
+        notifyStateChange("environments.created", { environmentId: id });
         return env;
       },
       "environments.update": (p) => {
@@ -2916,10 +3067,13 @@ export default function App() {
           };
           return updated!;
         }));
+        notifyStateChange("environments.updated", { environmentId: id });
         return updated;
       },
       "environments.delete": (p) => {
-        setEnvironments((prev) => prev.filter((e) => e.id !== (p.id as string)));
+        const id = p.id as string;
+        setEnvironments((prev) => prev.filter((e) => e.id !== id));
+        notifyStateChange("environments.deleted", { environmentId: id });
         return null;
       },
       // ── assets ──
@@ -2947,6 +3101,7 @@ export default function App() {
           autoApply: (p.autoApply as boolean) || false,
         };
         setAssets((prev) => [...prev, asset]);
+        notifyStateChange("assets.created", { assetId: id });
         return asset;
       },
       "assets.update": (p) => {
@@ -2963,20 +3118,35 @@ export default function App() {
           };
           return updated!;
         }));
+        notifyStateChange("assets.updated", { assetId: id });
         return updated;
       },
       "assets.delete": (p) => {
-        setAssets((prev) => prev.filter((a) => a.id !== (p.id as string)));
+        const id = p.id as string;
+        setAssets((prev) => prev.filter((a) => a.id !== id));
+        notifyStateChange("assets.deleted", { assetId: id });
         return null;
       },
       "assets.update_settings": (p) => {
         const settings: AssetSettings = { autoApplyEnabled: p.autoApplyEnabled as boolean };
         setAssetSettings(settings);
+        notifyStateChange("assets.settings_updated", { settings });
         return settings;
+      },
+      "assets.apply": async (p) => {
+        const assetId = p.assetId as string;
+        const dir = p.dir as string;
+        const overwrite = (p.overwrite as boolean) ?? false;
+        let asset: AssetTemplate | null = null;
+        setAssets((prev) => { asset = prev.find((a) => a.id === assetId) ?? null; return prev; });
+        if (!asset) throw new Error("asset not found");
+        const applied = await applyTextAssetsRaw(dir, [asset], overwrite);
+        notifyStateChange("assets.applied", { assetId, dir, applied });
+        return { applied };
       },
       // ── split_views ──
       "split_views.list": (p) => {
-        const pid = p.projectId as string | undefined;
+        const pid = p?.projectId as string | undefined;
         const all = splitViewsRef.current;
         return pid ? all.filter((sv) => sv.projectId === pid) : all;
       },
@@ -2993,6 +3163,7 @@ export default function App() {
         };
         setSplitViews((prev) => [...prev, sv]);
         setActiveSplitViewId(sv.id);
+        notifyStateChange("split_views.created", { splitViewId: sv.id, projectId: sv.projectId });
         return sv;
       },
       "split_views.update": (p) => {
@@ -3007,11 +3178,14 @@ export default function App() {
           };
           return updated!;
         }));
+        notifyStateChange("split_views.updated", { splitViewId: id });
         return updated;
       },
       "split_views.close": (p) => {
-        setSplitViews((prev) => prev.filter((sv) => sv.id !== (p.id as string)));
-        if (activeSplitViewIdRef.current === (p.id as string)) setActiveSplitViewId(null);
+        const id = p.id as string;
+        setSplitViews((prev) => prev.filter((sv) => sv.id !== id));
+        if (activeSplitViewIdRef.current === id) setActiveSplitViewId(null);
+        notifyStateChange("split_views.closed", { splitViewId: id });
         return null;
       },
       // ── ui ──
@@ -3027,6 +3201,7 @@ export default function App() {
         if (activeProjectIdRef.current !== s.projectId) setActiveProjectId(s.projectId);
         setActiveId(id);
         setActiveSplitViewId(null);
+        notifyStateChange("sessions.activated", { sessionId: id });
         return { activeSessionId: id };
       },
       "ui.navigate_session": (p) => {
@@ -3039,7 +3214,34 @@ export default function App() {
           : (curIdx - 1 + projectSessions.length) % projectSessions.length;
         const nextId = projectSessions[nextIdx].id;
         setActiveId(nextId);
+        notifyStateChange("sessions.activated", { sessionId: nextId });
         return { activeSessionId: nextId };
+      },
+      "ui.toggle_panel": (p) => {
+        const panel = p.panel as "prompts" | "recordings" | "assets";
+        let wasOpen = false;
+        let wasTab = "prompts";
+        setSlidePanelOpen((prev) => { wasOpen = prev; return prev; });
+        setSlidePanelTab((prev) => { wasTab = prev; return prev; });
+        const explicitOpen = p.open as boolean | undefined;
+        const shouldOpen = explicitOpen !== undefined ? explicitOpen : !(wasOpen && wasTab === panel);
+        if (shouldOpen) {
+          setSlidePanelTab(panel);
+          setSlidePanelOpen(true);
+        } else {
+          setSlidePanelOpen(false);
+        }
+        notifyStateChange("ui.panel_toggled", { panel, open: shouldOpen });
+        return { panel, open: shouldOpen };
+      },
+      "ui.command_palette": (p) => {
+        const explicitOpen = p.open as boolean | undefined;
+        let wasOpen = false;
+        setCommandPaletteOpen((prev) => { wasOpen = prev; return prev; });
+        const shouldOpen = explicitOpen !== undefined ? explicitOpen : !wasOpen;
+        setCommandPaletteOpen(shouldOpen);
+        notifyStateChange("ui.command_palette_toggled", { open: shouldOpen });
+        return { open: shouldOpen };
       },
       // ── app ──
       "app.state": async () => {
@@ -3047,11 +3249,15 @@ export default function App() {
         return state;
       },
       // ── recordings (bridge-routed start/stop) ──
-      "recordings.start": (p) => {
-        throw new Error("recordings.start requires full session context — use sessions.start_recording via the bridge or invoke directly");
+      "recordings.start": async (p) => {
+        const result = await doStartRecording(p.sessionId as string, p.name as string);
+        notifyStateChange("recordings.started", result);
+        return result;
       },
-      "recordings.stop": (p) => {
-        throw new Error("recordings.stop requires full session context — use sessions.stop_recording via the bridge or invoke directly");
+      "recordings.stop": async (p) => {
+        const result = await doStopRecording(p.sessionId as string);
+        notifyStateChange("recordings.stopped", result);
+        return result;
       },
       // ── ssh (bridge-routed) ──
       "ssh.history": () => {
@@ -3059,9 +3265,40 @@ export default function App() {
         setSshHistory((prev) => { result = prev; return prev; });
         return result;
       },
+      "ssh.connect": async (p) => {
+        const projectId = p.projectId as string;
+        const target = (p.target as string).trim();
+        if (!target) throw new Error("target is required");
+        const proj = projectsRef.current.find((pr) => pr.id === projectId);
+        if (!proj) throw new Error("project not found");
+        const remoteDir = ((p.remoteDir as string) || "").trim();
+        const envVars = envVarsForProjectId(projectId, projectsRef.current, environmentsRef.current);
+        const launchCommand = buildSshCommandAtRemoteDir({
+          baseCommandLine: null,
+          target,
+          remoteDir,
+        });
+        const cwd = (p.cwd as string) || proj.basePath || undefined;
+        const name = (p.name as string) || `ssh ${target}${remoteDir ? `: ${remoteDir}` : ""}`;
+        const createdRaw = await createSession({
+          projectId,
+          name,
+          launchCommand,
+          cwd: cwd ?? null,
+          envVars,
+          sshTarget: target,
+          persistent: p.persistent as boolean | undefined,
+        });
+        const s = applyPendingExit(createdRaw);
+        addSessionWithProjectSafeActivation(s);
+        pushSshHistory({ host: target, command: launchCommand, persistent: Boolean(p.persistent), connectedAt: Date.now() });
+        notifyStateChange("sessions.created", { sessionId: s.id, projectId, sshTarget: target });
+        return s;
+      },
       "ssh.delete_history": (p) => {
         const index = p.index as number;
         setSshHistory((prev) => prev.filter((_, i) => i !== index));
+        notifyStateChange("ssh.history_deleted", { index });
         return null;
       },
     });
