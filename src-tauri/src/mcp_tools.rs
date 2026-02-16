@@ -101,37 +101,37 @@ pub fn strip_ansi(text: &str) -> String {
 pub fn tool_list() -> Vec<Value> {
     vec![
         // Sessions
-        tool_def("list_sessions", "List all terminal sessions, optionally filtered by project", json!({
+        tool_def("list_sessions", "List all active terminal sessions in the workspace. Returns session IDs, names, working directories, and status. Use projectId to filter sessions belonging to a specific project.", json!({
             "type": "object",
             "properties": {
                 "projectId": { "type": "string", "description": "Filter by project ID" }
             }
         })),
-        tool_def("get_session", "Get details of a specific session", json!({
+        tool_def("get_session", "Get detailed information about a specific terminal session, including its name, working directory, process status, and associated project.", json!({
             "type": "object",
             "properties": {
                 "sessionId": { "type": "string", "description": "Session ID" }
             },
             "required": ["sessionId"]
         })),
-        tool_def("create_session", "Create a new terminal session", json!({
+        tool_def("create_session", "Create a new terminal session (PTY shell) in a project. Opens a ready-to-use shell. Use send_command to execute commands in it, and wait_for_output to capture results.", json!({
             "type": "object",
             "properties": {
                 "projectId": { "type": "string", "description": "Project ID to create session in" },
                 "name": { "type": "string", "description": "Session name" },
-                "command": { "type": "string", "description": "Initial command to run" },
-                "cwd": { "type": "string", "description": "Working directory" }
+                "command": { "type": "string", "description": "Initial command to run on session start" },
+                "cwd": { "type": "string", "description": "Working directory for the shell" }
             },
             "required": ["projectId"]
         })),
-        tool_def("close_session", "Close a terminal session", json!({
+        tool_def("close_session", "Close and terminate a terminal session. The session's shell process is killed and removed from the workspace.", json!({
             "type": "object",
             "properties": {
                 "sessionId": { "type": "string", "description": "Session ID" }
             },
             "required": ["sessionId"]
         })),
-        tool_def("write_to_session", "Write data (keystrokes/text) to a session's terminal. IMPORTANT: To execute a command, you MUST append \\r at the end (e.g. \"ls\\r\"). Without \\r the text is typed but not submitted.", json!({
+        tool_def("write_to_session", "Write raw data (keystrokes/text) directly to a session's terminal PTY. IMPORTANT: To execute a command, you MUST append \\r at the end (e.g. \"ls\\r\"). Without \\r the text is typed but not submitted. Prefer send_command for running commands.", json!({
             "type": "object",
             "properties": {
                 "sessionId": { "type": "string", "description": "Session ID" },
@@ -139,7 +139,7 @@ pub fn tool_list() -> Vec<Value> {
             },
             "required": ["sessionId", "data"]
         })),
-        tool_def("send_command", "Execute a shell command in a terminal session. Sends the command text followed by Enter (\\r) to submit it. This is the preferred way to run commands.", json!({
+        tool_def("send_command", "Execute a shell command in a terminal session. Sends the command text followed by Enter to submit it. This is the preferred way to run commands. Use wait_for_output or read_session_output afterward to capture results.", json!({
             "type": "object",
             "properties": {
                 "sessionId": { "type": "string", "description": "Session ID" },
@@ -147,7 +147,7 @@ pub fn tool_list() -> Vec<Value> {
             },
             "required": ["sessionId", "command"]
         })),
-        tool_def("read_session_output", "Read buffered output from a session and clear the buffer. Returns terminal output since last read.", json!({
+        tool_def("read_session_output", "Read and consume buffered terminal output from a session. Returns all output since the last read. The buffer is cleared after reading. Use raw=true to preserve ANSI escape codes for color/formatting.", json!({
             "type": "object",
             "properties": {
                 "sessionId": { "type": "string", "description": "Session ID" },
@@ -155,7 +155,7 @@ pub fn tool_list() -> Vec<Value> {
             },
             "required": ["sessionId"]
         })),
-        tool_def("wait_for_output", "Wait for new output from a session. Polls the output buffer until data is available or timeout.", json!({
+        tool_def("wait_for_output", "Wait for new terminal output from a session, with configurable timeout. Blocks until output is available or timeout expires. Use after send_command to capture command results. Returns the output text.", json!({
             "type": "object",
             "properties": {
                 "sessionId": { "type": "string", "description": "Session ID" },
@@ -163,7 +163,7 @@ pub fn tool_list() -> Vec<Value> {
             },
             "required": ["sessionId"]
         })),
-        tool_def("activate_session", "Activate/focus a session in the UI", json!({
+        tool_def("activate_session", "Bring a terminal session into focus in the UI. Switches the visible terminal to this session so the user can see its output.", json!({
             "type": "object",
             "properties": {
                 "sessionId": { "type": "string", "description": "Session ID" }
@@ -171,26 +171,26 @@ pub fn tool_list() -> Vec<Value> {
             "required": ["sessionId"]
         })),
         // Projects
-        tool_def("list_projects", "List all projects", json!({
+        tool_def("list_projects", "List all projects in the workspace. Returns project IDs, titles, and base paths. Projects are containers that group terminal sessions together.", json!({
             "type": "object",
             "properties": {}
         })),
-        tool_def("create_project", "Create a new project", json!({
+        tool_def("create_project", "Create a new project in the workspace. A project groups related terminal sessions and has an optional base directory path for file operations.", json!({
             "type": "object",
             "properties": {
                 "title": { "type": "string", "description": "Project title" },
-                "basePath": { "type": "string", "description": "Base directory path" }
+                "basePath": { "type": "string", "description": "Base directory path for the project" }
             },
             "required": ["title"]
         })),
-        tool_def("get_project", "Get details of a specific project", json!({
+        tool_def("get_project", "Get detailed information about a specific project, including its title, base path, and associated sessions.", json!({
             "type": "object",
             "properties": {
                 "projectId": { "type": "string", "description": "Project ID" }
             },
             "required": ["projectId"]
         })),
-        tool_def("update_project", "Update a project's properties", json!({
+        tool_def("update_project", "Update a project's title or base path.", json!({
             "type": "object",
             "properties": {
                 "projectId": { "type": "string", "description": "Project ID" },
@@ -199,21 +199,21 @@ pub fn tool_list() -> Vec<Value> {
             },
             "required": ["projectId"]
         })),
-        tool_def("delete_project", "Delete a project", json!({
+        tool_def("delete_project", "Delete a project and all its associated sessions from the workspace.", json!({
             "type": "object",
             "properties": {
                 "projectId": { "type": "string", "description": "Project ID" }
             },
             "required": ["projectId"]
         })),
-        tool_def("activate_project", "Activate/switch to a project", json!({
+        tool_def("activate_project", "Switch the active project in the UI. Brings the project's sessions into view.", json!({
             "type": "object",
             "properties": {
                 "projectId": { "type": "string", "description": "Project ID" }
             },
             "required": ["projectId"]
         })),
-        tool_def("reorder_projects", "Reorder projects by providing the full list of project IDs in desired order", json!({
+        tool_def("reorder_projects", "Reorder projects in the sidebar by providing the full list of project IDs in the desired display order.", json!({
             "type": "object",
             "properties": {
                 "projectIds": {
@@ -225,96 +225,96 @@ pub fn tool_list() -> Vec<Value> {
             "required": ["projectIds"]
         })),
         // SSH
-        tool_def("ssh_connect", "Connect to an SSH host and create a session", json!({
+        tool_def("ssh_connect", "Connect to a remote host via SSH and create a terminal session for it. Opens an SSH connection in a new PTY session. Use send_command to run remote commands.", json!({
             "type": "object",
             "properties": {
                 "projectId": { "type": "string", "description": "Project ID" },
                 "target": { "type": "string", "description": "SSH target (user@host)" },
-                "remoteDir": { "type": "string", "description": "Remote working directory" },
+                "remoteDir": { "type": "string", "description": "Remote working directory to start in" },
                 "name": { "type": "string", "description": "Session name" }
             },
             "required": ["projectId", "target"]
         })),
-        tool_def("ssh_list_hosts", "List configured SSH hosts from ~/.ssh/config", json!({
+        tool_def("ssh_list_hosts", "List available SSH hosts from the user's ~/.ssh/config. Returns host aliases that can be used with ssh_connect.", json!({
             "type": "object",
             "properties": {}
         })),
         // Files — Local
-        tool_def("list_files", "List files and directories at a path", json!({
+        tool_def("list_files", "List files and directories at a local path. Returns names, types (file/directory), and sizes. Useful for browsing the project file tree.", json!({
             "type": "object",
             "properties": {
-                "root": { "type": "string", "description": "Root directory" },
-                "path": { "type": "string", "description": "Relative path within root" }
+                "root": { "type": "string", "description": "Root directory (absolute path)" },
+                "path": { "type": "string", "description": "Relative path within root to list" }
             },
             "required": ["root", "path"]
         })),
-        tool_def("read_file", "Read the contents of a text file", json!({
+        tool_def("read_file", "Read the full contents of a local text file. Returns the file content as a string.", json!({
             "type": "object",
             "properties": {
-                "root": { "type": "string", "description": "Root directory" },
+                "root": { "type": "string", "description": "Root directory (absolute path)" },
                 "path": { "type": "string", "description": "Relative file path within root" }
             },
             "required": ["root", "path"]
         })),
-        tool_def("write_file", "Write content to a text file", json!({
+        tool_def("write_file", "Write content to a local text file. Creates the file if it doesn't exist, or overwrites if it does.", json!({
             "type": "object",
             "properties": {
-                "root": { "type": "string", "description": "Root directory" },
+                "root": { "type": "string", "description": "Root directory (absolute path)" },
                 "path": { "type": "string", "description": "Relative file path within root" },
                 "content": { "type": "string", "description": "File content to write" }
             },
             "required": ["root", "path", "content"]
         })),
         // Files — SSH
-        tool_def("ssh_files_list", "List files on a remote SSH host", json!({
+        tool_def("ssh_files_list", "List files and directories on a remote SSH host. Requires an active SSH connection to the host.", json!({
             "type": "object",
             "properties": {
-                "host": { "type": "string", "description": "SSH host" },
-                "root": { "type": "string", "description": "Root directory on remote" },
-                "path": { "type": "string", "description": "Relative path within root" }
+                "host": { "type": "string", "description": "SSH host (from ssh_list_hosts or ssh_connect)" },
+                "root": { "type": "string", "description": "Root directory on remote host" },
+                "path": { "type": "string", "description": "Relative path within root to list" }
             },
             "required": ["host", "root", "path"]
         })),
-        tool_def("ssh_files_read", "Read a text file on a remote SSH host", json!({
+        tool_def("ssh_files_read", "Read the contents of a text file on a remote SSH host.", json!({
             "type": "object",
             "properties": {
                 "host": { "type": "string", "description": "SSH host" },
-                "root": { "type": "string", "description": "Root directory on remote" },
+                "root": { "type": "string", "description": "Root directory on remote host" },
                 "path": { "type": "string", "description": "Relative file path within root" }
             },
             "required": ["host", "root", "path"]
         })),
-        tool_def("ssh_files_write", "Write a text file on a remote SSH host", json!({
+        tool_def("ssh_files_write", "Write content to a text file on a remote SSH host. Creates or overwrites the file.", json!({
             "type": "object",
             "properties": {
                 "host": { "type": "string", "description": "SSH host" },
-                "root": { "type": "string", "description": "Root directory on remote" },
+                "root": { "type": "string", "description": "Root directory on remote host" },
                 "path": { "type": "string", "description": "Relative file path within root" },
                 "content": { "type": "string", "description": "File content to write" }
             },
             "required": ["host", "root", "path", "content"]
         })),
         // Prompts
-        tool_def("list_prompts", "List all saved prompts/snippets", json!({
+        tool_def("list_prompts", "List all saved command prompts/snippets. Prompts are reusable command templates that can be sent to terminal sessions.", json!({
             "type": "object",
             "properties": {}
         })),
-        tool_def("send_prompt", "Send a prompt/command to a session", json!({
+        tool_def("send_prompt", "Send a saved prompt or direct content to a terminal session. Can send by prompt ID (for saved prompts) or by providing content directly.", json!({
             "type": "object",
             "properties": {
-                "sessionId": { "type": "string", "description": "Session ID" },
-                "promptId": { "type": "string", "description": "Prompt ID to send" },
+                "sessionId": { "type": "string", "description": "Session ID to send the prompt to" },
+                "promptId": { "type": "string", "description": "Prompt ID of a saved prompt to send" },
                 "content": { "type": "string", "description": "Direct content to send (alternative to promptId)" },
                 "mode": { "type": "string", "description": "Send mode" }
             },
             "required": ["sessionId"]
         })),
         // UI / App
-        tool_def("get_app_info", "Get application info (version, platform, etc.)", json!({
+        tool_def("get_app_info", "Get application info including version, platform, and runtime details.", json!({
             "type": "object",
             "properties": {}
         })),
-        tool_def("get_ui_state", "Get current UI state (active session, panels, etc.)", json!({
+        tool_def("get_ui_state", "Get the current UI state including the active session, active project, visible panels, and window layout.", json!({
             "type": "object",
             "properties": {}
         })),

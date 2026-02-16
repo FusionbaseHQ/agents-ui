@@ -558,7 +558,7 @@ export const SessionsSection = React.memo(function SessionsSection({
                     onOpenAgentShortcuts();
                   }}
                 >
-                  <Icon name="bolt" />
+                  <Icon name="brain" />
                   <span>Agent shortcuts</span>
                 </button>
                 <button

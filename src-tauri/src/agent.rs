@@ -92,7 +92,121 @@ pub async fn write_agent_mcp_config(mcp_port: Option<u16>) -> Result<String, Str
     Ok(path.to_string_lossy().to_string())
 }
 
-/// Spawn a headless claude process and stream NDJSON output via Tauri events.
+/// Build command parts for Claude Code CLI.
+fn build_claude_cmd(
+    prompt: &str,
+    session_id: Option<&str>,
+    settings: &AgentLaunchSettings,
+    mcp_config_path: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    let system_prompt = include_str!("agent_system_prompt.txt");
+
+    let mut parts: Vec<String> = vec![
+        "claude".into(),
+        "-p".into(),
+        shell_escape(prompt),
+        "--output-format".into(),
+        "stream-json".into(),
+        "--verbose".into(),
+        "--include-partial-messages".into(),
+        "--mcp-config".into(),
+        shell_escape(&mcp_config_path.to_string_lossy()),
+    ];
+
+    if let Some(sid) = session_id {
+        parts.push("--resume".into());
+        parts.push(shell_escape(sid));
+    }
+
+    // Always pre-approve our MCP tools so Claude Code doesn't prompt for permission.
+    let default_tools = "mcp__agents-ui__*";
+    let tools_value = match settings.allowed_tools.as_deref() {
+        Some(extra) if !extra.is_empty() => format!("{default_tools},{extra}"),
+        _ => default_tools.to_string(),
+    };
+    parts.push("--allowedTools".into());
+    parts.push(shell_escape(&tools_value));
+
+    if let Some(ref model) = settings.model {
+        parts.push("--model".into());
+        parts.push(shell_escape(model));
+    }
+
+    parts.push("--append-system-prompt".into());
+    parts.push(shell_escape(system_prompt));
+
+    Ok(parts)
+}
+
+/// Build command parts for Codex CLI.
+fn build_codex_cmd(
+    prompt: &str,
+    session_id: Option<&str>,
+    settings: &AgentLaunchSettings,
+) -> Result<Vec<String>, String> {
+    let system_prompt = include_str!("agent_system_prompt.txt");
+
+    // Write system prompt to instructions file for Codex
+    let instructions_path = agents_ui_dir()?.join("codex-instructions.md");
+    std::fs::write(&instructions_path, system_prompt)
+        .map_err(|e| format!("write instructions: {e}"))?;
+
+    let mut parts: Vec<String> = vec!["codex".into(), "exec".into()];
+
+    // Resume uses: codex exec resume <sessionId> <prompt>
+    if let Some(sid) = session_id {
+        parts.push("resume".into());
+        parts.push(shell_escape(sid));
+    }
+
+    parts.push(shell_escape(prompt));
+    parts.push("--json".into());
+    parts.push("--full-auto".into());
+
+    if let Some(ref model) = settings.model {
+        parts.push("-m".into());
+        parts.push(shell_escape(model));
+    }
+
+    parts.push("-c".into());
+    parts.push(format!(
+        "instructions_file={}",
+        shell_escape(&instructions_path.to_string_lossy())
+    ));
+
+    Ok(parts)
+}
+
+/// Ensure the MCP server is registered with Codex before launching.
+fn ensure_codex_mcp_registered(mcp_port: u16) -> Result<(), String> {
+    let url = format!("http://127.0.0.1:{mcp_port}/mcp");
+    let shell = default_user_shell();
+
+    // Remove first (ignore errors if not registered), then add
+    let _ = std::process::Command::new(&shell)
+        .arg("-lc")
+        .arg("codex mcp remove agents-ui")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    let status = std::process::Command::new(&shell)
+        .arg("-lc")
+        .arg(format!("codex mcp add agents-ui --url {}", shell_escape(&url)))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .status()
+        .map_err(|e| format!("failed to register MCP server with codex: {e}"))?;
+
+    if !status.success() {
+        // Non-fatal — Codex may still work if already registered
+        eprintln!("Warning: codex mcp add returned non-zero exit code");
+    }
+
+    Ok(())
+}
+
+/// Spawn a headless agent process and stream NDJSON output via Tauri events.
 #[tauri::command]
 pub async fn start_agent_prompt(
     app: tauri::AppHandle,
@@ -114,40 +228,16 @@ pub async fn start_agent_prompt(
         _ => "claude",
     };
 
-    // Build the full command string to pass to the login shell.
-    // We spawn via `shell -lc "claude ..."` so that shell init files
-    // (.zshrc, .bashrc, etc.) run and set up PATH with nvm, homebrew, etc.
-    let mut cmd_parts: Vec<String> = vec![
-        binary.to_string(),
-        "-p".into(),
-        shell_escape(&prompt),
-        "--output-format".into(),
-        "stream-json".into(),
-        "--verbose".into(),
-        "--include-partial-messages".into(),
-        "--mcp-config".into(),
-        shell_escape(&mcp_config_path.to_string_lossy()),
-    ];
-
-    if let Some(ref sid) = session_id {
-        cmd_parts.push("--resume".into());
-        cmd_parts.push(shell_escape(sid));
-    }
-    // Always pre-approve our MCP tools so Claude Code doesn't prompt for permission.
-    // User-specified tools are appended to the default set.
-    {
-        let default_tools = "mcp__agents-ui__*";
-        let tools_value = match settings.allowed_tools.as_deref() {
-            Some(extra) if !extra.is_empty() => format!("{default_tools},{extra}"),
-            _ => default_tools.to_string(),
-        };
-        cmd_parts.push("--allowedTools".into());
-        cmd_parts.push(shell_escape(&tools_value));
-    }
-    if let Some(ref model) = settings.model {
-        cmd_parts.push("--model".into());
-        cmd_parts.push(shell_escape(model));
-    }
+    // Build provider-specific command parts
+    let cmd_parts = if binary == "codex" {
+        // Register MCP server with Codex before launching
+        // Read port from the existing config to stay in sync
+        let mcp_port = read_mcp_port_from_config(&mcp_config_path).unwrap_or(45557);
+        ensure_codex_mcp_registered(mcp_port)?;
+        build_codex_cmd(&prompt, session_id.as_deref(), &settings)?
+    } else {
+        build_claude_cmd(&prompt, session_id.as_deref(), &settings, &mcp_config_path)?
+    };
 
     let shell_command = cmd_parts.join(" ");
     let shell = default_user_shell();
@@ -277,8 +367,16 @@ pub async fn get_agent_terminal_command(
     }
 
     let mut parts = vec![binary.to_string()];
-    parts.push("--mcp-config".into());
-    parts.push(mcp_config_path.to_string_lossy().to_string());
+
+    if binary == "codex" {
+        // For terminal mode, register MCP and don't pass --mcp-config
+        let mcp_port = read_mcp_port_from_config(&mcp_config_path).unwrap_or(45557);
+        let _ = ensure_codex_mcp_registered(mcp_port);
+    } else {
+        parts.push("--mcp-config".into());
+        parts.push(mcp_config_path.to_string_lossy().to_string());
+    }
+
     if let Some(args) = extra_args {
         parts.extend(args);
     }
@@ -291,6 +389,16 @@ fn agents_ui_dir() -> Result<std::path::PathBuf, String> {
         .or_else(|_| std::env::var("USERPROFILE"))
         .map_err(|_| "cannot determine home directory".to_string())?;
     Ok(std::path::PathBuf::from(home).join(".agents-ui"))
+}
+
+/// Read the MCP port from the existing config file.
+fn read_mcp_port_from_config(path: &std::path::Path) -> Option<u16> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let url = json.get("mcpServers")?.get("agents-ui")?.get("url")?.as_str()?;
+    // URL format: http://127.0.0.1:<port>/mcp
+    let port_str = url.strip_prefix("http://127.0.0.1:")?.strip_suffix("/mcp")?;
+    port_str.parse().ok()
 }
 
 fn generate_run_id() -> String {

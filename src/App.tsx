@@ -7601,7 +7601,7 @@ export default function App() {
               onClick={() => setAgentPanelOpen(prev => !prev)}
               title={`${agentPanelOpen ? "Close" : "Open"} Agent panel (\u2318\u21E7G)`}
             >
-              <Icon name="bolt" />
+              <Icon name="brain" />
             </button>
 
             {/* Replay Button */}

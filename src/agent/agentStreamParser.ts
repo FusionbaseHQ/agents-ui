@@ -32,8 +32,9 @@ export type ParsedUpdate =
   | { kind: "message_start"; messageId: string }
   | { kind: "text_delta"; text: string }
   | { kind: "thinking_delta"; text: string }
-  | { kind: "tool_start"; id: string; name: string }
+  | { kind: "tool_start"; id: string; name: string; input?: Record<string, unknown> }
   | { kind: "tool_input_delta"; id: string; json: string }
+  | { kind: "tool_result"; callId: string; result: string }
   | { kind: "tool_end" }
   | { kind: "message_complete"; messageId: string; text: string; thinking?: string; toolCalls?: AgentToolCall[] }
   | { kind: "done"; sessionId?: string; error?: string; cost?: number }
@@ -75,6 +76,57 @@ export function parseStreamLine(line: string): ParsedUpdate | null {
       const costUsd = event.cost_usd as number | undefined;
       const errText = subtype === "error" ? (event.result as string | undefined) : undefined;
       return { kind: "done", sessionId, error: errText, cost: costUsd };
+    }
+
+    // ── Codex event types ──
+
+    case "thread.started": {
+      const threadId = event.thread_id as string | undefined;
+      return threadId ? { kind: "session", sessionId: threadId } : null;
+    }
+
+    case "turn.started":
+      // Create a new assistant message for this turn — all items accumulate into it
+      return { kind: "message_start", messageId: `codex-turn-${Date.now()}-${++idCounter}` };
+
+    case "item.completed": {
+      return parseCodexItem(event.item as Record<string, unknown>);
+    }
+
+    case "turn.completed": {
+      // Finalize tool calls for this turn; process exit triggers "done" via agent-done event
+      return { kind: "finalize" };
+    }
+
+    default:
+      return null;
+  }
+}
+
+/** Parse a Codex item.completed payload into streaming primitives. */
+function parseCodexItem(item: Record<string, unknown>): ParsedUpdate | null {
+  if (!item) return null;
+
+  switch (item.type) {
+    case "agent_message":
+      return { kind: "text_delta", text: (item.text as string) || "" };
+
+    case "reasoning":
+      return { kind: "thinking_delta", text: (item.text as string) || "" };
+
+    case "tool_call": {
+      let input: Record<string, unknown> = {};
+      try {
+        input = JSON.parse((item.arguments as string) || "{}");
+      } catch { /* arguments may not be valid JSON */ }
+      const id = (item.call_id as string) || `codex-tc-${Date.now()}-${++idCounter}`;
+      return { kind: "tool_start", id, name: (item.name as string) || "unknown", input };
+    }
+
+    case "tool_call_output": {
+      const callId = (item.call_id as string) || "";
+      const output = (item.output as string) || "";
+      return { kind: "tool_result", callId, result: output };
     }
 
     default:
@@ -247,7 +299,7 @@ export class StreamingMessageBuilder {
           toolCalls: [...(msg.toolCalls ?? []), {
             id: update.id,
             name: update.name,
-            input: {},
+            input: update.input ?? {},
             status: "running" as const,
           }],
         }));
@@ -257,6 +309,32 @@ export class StreamingMessageBuilder {
         // We accumulate input JSON but don't parse until tool_end.
         // For now, we can skip this — the complete assistant message will have parsed input.
         return messages;
+      }
+
+      case "tool_result": {
+        // Attach result to the matching tool call by callId
+        const msgId = this.currentMessageId;
+        if (!msgId) {
+          // Find the tool call across all messages
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const tc = messages[i].toolCalls?.find((t) => t.id === update.callId);
+            if (tc) {
+              return updateMessage(messages, messages[i].id, (msg) => ({
+                ...msg,
+                toolCalls: msg.toolCalls?.map((t) =>
+                  t.id === update.callId ? { ...t, result: update.result, status: "done" as const } : t,
+                ),
+              }));
+            }
+          }
+          return messages;
+        }
+        return updateMessage(messages, msgId, (msg) => ({
+          ...msg,
+          toolCalls: msg.toolCalls?.map((t) =>
+            t.id === update.callId ? { ...t, result: update.result, status: "done" as const } : t,
+          ),
+        }));
       }
 
       case "tool_end": {

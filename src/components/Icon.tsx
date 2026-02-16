@@ -11,6 +11,7 @@ export type IconName =
   | "code"
   | "settings"
   | "bolt"
+  | "brain"
   | "layers"
   | "panel"
   | "play"
@@ -129,6 +130,14 @@ export const Icon = React.memo(function Icon({ name, size = 16, className }: Ico
       return (
         <svg {...common}>
           <path d="M13 2L3 14h8l-1 8 10-12h-8l1-8z" />
+        </svg>
+      );
+    case "brain":
+      return (
+        <svg {...common}>
+          <path d="M12 2a6 6 0 0 0-5.2 3A5 5 0 0 0 4 14.8V16a2 2 0 0 0 2 2h2v4h8v-4h2a2 2 0 0 0 2-2v-1.2A5 5 0 0 0 17.2 5 6 6 0 0 0 12 2z" />
+          <path d="M12 2v8" />
+          <path d="M8 10h8" />
         </svg>
       );
     case "layers":

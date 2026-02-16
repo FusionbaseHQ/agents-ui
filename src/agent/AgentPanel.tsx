@@ -260,18 +260,90 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
             </select>
           </label>
 
-          <label className="agentSettingsLabel">
-            Model (optional)
-            <input
-              className="agentSettingsInput"
-              type="text"
-              placeholder="e.g. claude-sonnet-4-5-20250929"
-              value={settings.model ?? ""}
-              onChange={(e) =>
-                setSettings((s) => ({ ...s, model: e.target.value || undefined }))
-              }
-            />
-          </label>
+          {settings.provider === "claude-code" && (
+            <label className="agentSettingsLabel">
+              Model
+              <select
+                className="agentSettingsSelect"
+                value={
+                  settings.model === undefined || settings.model === "" ? ""
+                  : ["opus", "sonnet", "haiku"].includes(settings.model) ? settings.model
+                  : "custom"
+                }
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "custom") {
+                    setSettings((s) => ({ ...s, model: s.model && !["opus", "sonnet", "haiku"].includes(s.model) ? s.model : "" }));
+                  } else {
+                    setSettings((s) => ({ ...s, model: v || undefined }));
+                  }
+                }}
+              >
+                <option value="">Default</option>
+                <option value="opus">Opus 4.6</option>
+                <option value="sonnet">Sonnet 4.5</option>
+                <option value="haiku">Haiku 4.5</option>
+                <option value="custom">Custom...</option>
+              </select>
+            </label>
+          )}
+          {settings.provider === "claude-code" &&
+            settings.model !== undefined &&
+            settings.model !== "" &&
+            !["opus", "sonnet", "haiku"].includes(settings.model) && (
+            <label className="agentSettingsLabel">
+              Custom Model ID
+              <input
+                className="agentSettingsInput"
+                type="text"
+                placeholder="e.g. claude-sonnet-4-5-20250929"
+                value={settings.model}
+                onChange={(e) =>
+                  setSettings((s) => ({ ...s, model: e.target.value || undefined }))
+                }
+              />
+            </label>
+          )}
+
+          {settings.provider === "codex" && (
+            <label className="agentSettingsLabel">
+              Model
+              <select
+                className="agentSettingsSelect"
+                value={
+                  settings.model === undefined || settings.model === "" ? ""
+                  : "custom"
+                }
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "custom") {
+                    setSettings((s) => ({ ...s, model: s.model || "" }));
+                  } else {
+                    setSettings((s) => ({ ...s, model: undefined }));
+                  }
+                }}
+              >
+                <option value="">Default</option>
+                <option value="custom">Custom...</option>
+              </select>
+            </label>
+          )}
+          {settings.provider === "codex" &&
+            settings.model !== undefined &&
+            settings.model !== "" && (
+            <label className="agentSettingsLabel">
+              Custom Model ID
+              <input
+                className="agentSettingsInput"
+                type="text"
+                placeholder="e.g. o3-pro"
+                value={settings.model}
+                onChange={(e) =>
+                  setSettings((s) => ({ ...s, model: e.target.value || undefined }))
+                }
+              />
+            </label>
+          )}
 
           <div className="agentSettingsDivider" />
 
