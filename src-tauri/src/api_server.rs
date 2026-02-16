@@ -2,6 +2,7 @@ use crate::api_bridge::ApiEventBus;
 use crate::api_discovery;
 use crate::api_handlers::HandlerContext;
 use crate::api_types::*;
+use crate::server_control::ServerControl;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use std::time::Instant;
 use tauri::{Listener, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 
 const MAX_CONNECTIONS: usize = 10;
 const MAX_SUBSCRIPTIONS_PER_CONN: usize = 20;
@@ -89,7 +90,27 @@ impl ConnectionState {
 static CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
+#[allow(dead_code)]
 pub async fn start_api_server(app_handle: tauri::AppHandle) {
+    // Legacy entry point — no shutdown control
+    let (_, rx) = watch::channel(false);
+    let sc = app_handle.clone().try_state::<Arc<ServerControl>>().map(|s| s.inner().clone());
+    start_api_server_inner(app_handle, rx, sc).await;
+}
+
+pub async fn start_api_server_with_shutdown(
+    app_handle: tauri::AppHandle,
+    shutdown_rx: watch::Receiver<bool>,
+    sc: Arc<ServerControl>,
+) {
+    start_api_server_inner(app_handle, shutdown_rx, Some(sc)).await;
+}
+
+async fn start_api_server_inner(
+    app_handle: tauri::AppHandle,
+    shutdown_rx: watch::Receiver<bool>,
+    sc: Option<Arc<ServerControl>>,
+) {
     let token = api_discovery::generate_token();
 
     // Clean up stale socket/discovery from a previous crashed instance BEFORE writing ours
@@ -113,12 +134,25 @@ pub async fn start_api_server(app_handle: tauri::AppHandle) {
         }
     }
 
-    if let Err(e) = run_server(app_handle, token, sock_path).await {
+    if let Some(ref sc) = sc {
+        sc.api_running.store(true, Ordering::Relaxed);
+    }
+
+    if let Err(e) = run_server(app_handle, token, sock_path, shutdown_rx).await {
         eprintln!("[api] server error: {e}");
+    }
+
+    if let Some(ref sc) = sc {
+        sc.api_running.store(false, Ordering::Relaxed);
     }
 }
 
-async fn run_server(app_handle: tauri::AppHandle, token: String, sock_path: std::path::PathBuf) -> Result<(), String> {
+async fn run_server(
+    app_handle: tauri::AppHandle,
+    token: String,
+    sock_path: std::path::PathBuf,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), String> {
 
     let listener = UnixListener::bind(&sock_path)
         .map_err(|e| format!("bind failed: {e}"))?;
@@ -169,26 +203,38 @@ async fn run_server(app_handle: tauri::AppHandle, token: String, sock_path: std:
     });
 
     loop {
-        let (stream, _addr) = listener.accept().await
-            .map_err(|e| format!("accept failed: {e}"))?;
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _addr) = result.map_err(|e| format!("accept failed: {e}"))?;
 
-        if ACTIVE_CONNECTIONS.load(Ordering::Relaxed) >= MAX_CONNECTIONS as u64 {
-            // Drop connection immediately
-            drop(stream);
-            continue;
+                if ACTIVE_CONNECTIONS.load(Ordering::Relaxed) >= MAX_CONNECTIONS as u64 {
+                    drop(stream);
+                    continue;
+                }
+
+                ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+
+                let token = token.clone();
+                let ctx = ctx.clone();
+                let event_rx = event_sender.subscribe();
+
+                tokio::spawn(async move {
+                    handle_connection(stream, token, ctx, event_rx).await;
+                    ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+                });
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    eprintln!("[api] shutdown signal received");
+                    // Clean up socket and discovery file
+                    let _ = std::fs::remove_file(&sock_path);
+                    api_discovery::cleanup();
+                    break;
+                }
+            }
         }
-
-        ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-
-        let token = token.clone();
-        let ctx = ctx.clone();
-        let event_rx = event_sender.subscribe();
-
-        tokio::spawn(async move {
-            handle_connection(stream, token, ctx, event_rx).await;
-            ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
-        });
     }
+    Ok(())
 }
 
 async fn handle_connection(

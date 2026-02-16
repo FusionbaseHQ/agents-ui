@@ -131,13 +131,21 @@ pub fn tool_list() -> Vec<Value> {
             },
             "required": ["sessionId"]
         })),
-        tool_def("write_to_session", "Write data (keystrokes/text) to a session's terminal", json!({
+        tool_def("write_to_session", "Write data (keystrokes/text) to a session's terminal. IMPORTANT: To execute a command, you MUST append \\r at the end (e.g. \"ls\\r\"). Without \\r the text is typed but not submitted.", json!({
             "type": "object",
             "properties": {
                 "sessionId": { "type": "string", "description": "Session ID" },
-                "data": { "type": "string", "description": "Data to write (supports escape sequences like \\r for Enter)" }
+                "data": { "type": "string", "description": "Data to write. Use \\r for Enter/Return, \\n for newline, \\t for tab. Example: to run 'ls -la', send \"ls -la\\r\"" }
             },
             "required": ["sessionId", "data"]
+        })),
+        tool_def("send_command", "Execute a shell command in a terminal session. Sends the command text followed by Enter (\\r) to submit it. This is the preferred way to run commands.", json!({
+            "type": "object",
+            "properties": {
+                "sessionId": { "type": "string", "description": "Session ID" },
+                "command": { "type": "string", "description": "The command to execute (e.g. \"ls -la\", \"git status\"). Enter is sent automatically." }
+            },
+            "required": ["sessionId", "command"]
         })),
         tool_def("read_session_output", "Read buffered output from a session and clear the buffer. Returns terminal output since last read.", json!({
             "type": "object",
@@ -330,6 +338,7 @@ fn tool_to_method(name: &str) -> Option<&'static str> {
         "create_session" => Some("sessions.create"),
         "close_session" => Some("sessions.close"),
         "write_to_session" => Some("sessions.write"),
+        "send_command" => None, // handled as special case in call_tool
         "activate_session" => Some("sessions.activate"),
         "list_projects" => Some("projects.list"),
         "get_project" => Some("projects.get"),
@@ -369,6 +378,7 @@ fn map_params(name: &str, args: &Value) -> Value {
         }
         "close_session" => json!({ "id": args.get("sessionId") }),
         "write_to_session" => json!({ "id": args.get("sessionId"), "data": args.get("data") }),
+        "send_command" => json!({}), // handled as special case in call_tool
         "activate_session" => json!({ "id": args.get("sessionId") }),
         "list_projects" => json!({}),
         "get_project" => json!({ "id": args.get("projectId") }),
@@ -468,6 +478,35 @@ pub async fn call_tool(
                 String::new()
             };
             return Ok(mcp_text_result(&text));
+        }
+        "send_command" => {
+            // Special handling: write command text first, then \r separately after a delay.
+            // TUI apps (e.g. Claude Code, Codex) in raw mode need the Enter keystroke
+            // as a separate write event — otherwise they treat \r within the batch as a
+            // newline in their input buffer rather than a submit action.
+            let session_id = args.get("sessionId")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing required parameter: sessionId")?;
+            let command = args.get("command")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing required parameter: command")?;
+
+            // Write the command text
+            if !command.is_empty() {
+                let text_params = json!({ "id": session_id, "data": command });
+                api_handlers::dispatch(ctx, "sessions.write", text_params).await
+                    .map_err(|e| e.message)?;
+            }
+
+            // Small delay so the TUI app processes the text input first
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+            // Write Enter separately
+            let enter_params = json!({ "id": session_id, "data": "\r" });
+            api_handlers::dispatch(ctx, "sessions.write", enter_params).await
+                .map_err(|e| e.message)?;
+
+            return Ok(mcp_text_result("Command sent"));
         }
         _ => {}
     }

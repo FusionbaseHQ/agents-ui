@@ -27,6 +27,7 @@ import type {
   CodeEditorPersistedState,
 } from "./components/CodeEditorPanel";
 import { AgentShortcutsModal } from "./components/AgentShortcutsModal";
+import { AgentPanel } from "./agent/AgentPanel";
 import { NewSessionModal, type NewSessionModalHandle, type NewSessionSubmitData } from "./components/modals/NewSessionModal";
 import {
   PersistentSessionsModal,
@@ -144,6 +145,7 @@ const STORAGE_WORKSPACE_VIEW_BY_KEY = "agents-ui-workspace-view-by-key-v1";
 const STORAGE_RECENT_SESSIONS_KEY = "agents-ui-recent-sessions-v1";
 const STORAGE_SSH_HISTORY_KEY = "agents-ui-ssh-history-v1";
 const STORAGE_SPLIT_VIEWS_KEY = "agents-ui-split-views-v1";
+const STORAGE_AGENT_PANEL_WIDTH_KEY = "agents-ui-agent-panel-width-v1";
 const MAX_SSH_HISTORY = 10;
 
 const MAX_PENDING_SESSIONS = 32;
@@ -163,9 +165,12 @@ const SIDEBAR_RESIZE_BOTTOM_MIN_PX = 200;
 const SIDEBAR_PROJECTS_LIST_AUTO_MAX_VISIBLE = 6;
 const DEFAULT_WORKSPACE_EDITOR_WIDTH = 520;
 const DEFAULT_WORKSPACE_FILE_TREE_WIDTH = 320;
+const DEFAULT_AGENT_PANEL_WIDTH = 420;
 const MIN_WORKSPACE_TERMINAL_WIDTH = 160;
 const MIN_WORKSPACE_EDITOR_WIDTH = 260;
 const MIN_WORKSPACE_FILE_TREE_WIDTH = 200;
+const MIN_AGENT_PANEL_WIDTH = 320;
+const MAX_AGENT_PANEL_WIDTH = 700;
 
 const EMPTY_STRING_SET: ReadonlySet<string> = new Set();
 
@@ -1235,6 +1240,13 @@ export default function App() {
   const [recordingStartTime, setRecordingStartTime] = useState<number | null>(null);
   const [recordingElapsed, setRecordingElapsed] = useState(0);
 
+  // Agent panel state
+  const [agentPanelOpen, setAgentPanelOpen] = useState(false);
+  const [agentPanelWidth, setAgentPanelWidth] = useState(() => {
+    const saved = localStorage.getItem(STORAGE_AGENT_PANEL_WIDTH_KEY);
+    return saved ? Math.max(MIN_AGENT_PANEL_WIDTH, parseInt(saved, 10) || DEFAULT_AGENT_PANEL_WIDTH) : DEFAULT_AGENT_PANEL_WIDTH;
+  });
+
   const [workspaceViewByKey, setWorkspaceViewByKey] = useState<Record<string, WorkspaceView>>({});
   const workspaceRowRef = useRef<HTMLDivElement | null>(null);
 
@@ -1355,9 +1367,14 @@ export default function App() {
     }
   }, [activeProjectId, activeWorkspaceView.treeWidth, workspaceFileTreeWidthStorageKey]);
 
-  const [workspaceResizeMode, setWorkspaceResizeMode] = useState<"editor" | "tree" | null>(null);
+  // Persist agent panel width
+  useEffect(() => {
+    try { localStorage.setItem(STORAGE_AGENT_PANEL_WIDTH_KEY, String(agentPanelWidth)); } catch {}
+  }, [agentPanelWidth]);
+
+  const [workspaceResizeMode, setWorkspaceResizeMode] = useState<"editor" | "tree" | "agent" | null>(null);
   const workspaceResizeStartRef = useRef<
-    { x: number; editorWidth: number; treeWidth: number; projectId: string; workspaceKey: string } | null
+    { x: number; editorWidth: number; treeWidth: number; agentWidth?: number; projectId: string; workspaceKey: string } | null
   >(null);
   const workspaceResizeDraftRef = useRef<{ editorWidth: number; treeWidth: number } | null>(null);
 
@@ -1993,14 +2010,17 @@ export default function App() {
   const workspaceEditorVisible = activeWorkspaceView.codeEditorOpen;
   const workspaceTreeVisible = activeWorkspaceView.fileExplorerOpen;
 
+  const agentPanelWidthRef = useRef(agentPanelWidth);
+  useEffect(() => { agentPanelWidthRef.current = agentPanelWidth; }, [agentPanelWidth]);
+
   const beginWorkspaceResize = useCallback(
-    (mode: "editor" | "tree") => (e: React.MouseEvent) => {
+    (mode: "editor" | "tree" | "agent") => (e: React.MouseEvent) => {
       if (e.button !== 0) return;
       e.preventDefault();
       setWorkspaceResizeMode(mode);
       const editorWidth = workspaceEditorWidthRef.current;
       const treeWidth = workspaceFileTreeWidthRef.current;
-      workspaceResizeStartRef.current = { x: e.clientX, editorWidth, treeWidth, projectId: activeProjectId, workspaceKey: activeWorkspaceKey };
+      workspaceResizeStartRef.current = { x: e.clientX, editorWidth, treeWidth, agentWidth: agentPanelWidthRef.current, projectId: activeProjectId, workspaceKey: activeWorkspaceKey };
       workspaceResizeDraftRef.current = { editorWidth, treeWidth };
       document.body.style.cursor = "ew-resize";
       document.body.style.userSelect = "none";
@@ -2043,13 +2063,31 @@ export default function App() {
         const next = Math.min(max, Math.max(MIN_WORKSPACE_FILE_TREE_WIDTH, start.treeWidth - dx));
         workspaceResizeDraftRef.current = { ...currentDraft, treeWidth: next };
         container.style.setProperty("--workspaceFileTreeWidthPx", `${next}px`);
+        return;
+      }
+
+      if (workspaceResizeMode === "agent" && start.agentWidth != null) {
+        const max = Math.max(MIN_AGENT_PANEL_WIDTH, containerWidth - MIN_WORKSPACE_TERMINAL_WIDTH);
+        const next = Math.min(MAX_AGENT_PANEL_WIDTH, Math.max(MIN_AGENT_PANEL_WIDTH, Math.min(max, start.agentWidth - dx)));
+        container.style.setProperty("--workspaceAgentWidthPx", `${next}px`);
       }
     };
 
     const handleMouseUp = () => {
       const draft = workspaceResizeDraftRef.current;
       const start = workspaceResizeStartRef.current;
-      if (draft && start) {
+
+      // Agent panel resize — just persist the width from the CSS variable
+      if (workspaceResizeMode === "agent" && start) {
+        const container = workspaceRowRef.current;
+        if (container) {
+          const raw = getComputedStyle(container).getPropertyValue("--workspaceAgentWidthPx");
+          const parsed = parseInt(raw, 10);
+          if (parsed && parsed >= MIN_AGENT_PANEL_WIDTH) {
+            setAgentPanelWidth(parsed);
+          }
+        }
+      } else if (draft && start) {
         const editorWidth = Math.max(MIN_WORKSPACE_EDITOR_WIDTH, Math.floor(draft.editorWidth));
         const treeWidth = Math.max(MIN_WORKSPACE_FILE_TREE_WIDTH, Math.floor(draft.treeWidth));
         setWorkspaceViewByKey((prev) => {
@@ -4081,6 +4119,12 @@ export default function App() {
           });
           return;
         }
+        // Cmd+Shift+G - Toggle Agent Panel
+        if (e.metaKey && e.shiftKey && e.key.toLowerCase() === "g") {
+          e.preventDefault();
+          setAgentPanelOpen(prev => !prev);
+          return;
+        }
         // Cmd+1 through Cmd+5 - Quick prompts
         if (e.metaKey && /^[1-5]$/.test(e.key)) {
           const idx = parseInt(e.key) - 1;
@@ -4147,6 +4191,12 @@ export default function App() {
             setSlidePanelTab("assets");
             return true;
           });
+          return;
+        }
+        // Ctrl+Shift+G - Toggle Agent Panel
+        if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "g") {
+          e.preventDefault();
+          setAgentPanelOpen(prev => !prev);
           return;
         }
         // Ctrl+1 through Ctrl+5 - Quick prompts
@@ -7545,6 +7595,15 @@ export default function App() {
               <Icon name="panel" />
             </button>
 
+            {/* Agent Panel Button */}
+            <button
+              className={`iconBtn ${agentPanelOpen ? "iconBtnActive" : ""}`}
+              onClick={() => setAgentPanelOpen(prev => !prev)}
+              title={`${agentPanelOpen ? "Close" : "Open"} Agent panel (\u2318\u21E7G)`}
+            >
+              <Icon name="bolt" />
+            </button>
+
             {/* Replay Button */}
             <button
               className="iconBtn"
@@ -7561,7 +7620,7 @@ export default function App() {
   ), [
     active, activeProject, activeIsSsh, activeSshTarget, activeWorkspaceView,
     error, notice, persistenceDisabledReason, sessionRestoreProgress,
-    secureStorageMode, secureStorageRetrying, slidePanelOpen,
+    secureStorageMode, secureStorageRetrying, slidePanelOpen, agentPanelOpen,
     retrySecureStorage, dismissNotice, reportError,
     handleReconnectSession,
     updateActiveWorkspaceView, stopRecording, openRecordPrompt,
@@ -7576,6 +7635,7 @@ export default function App() {
           {
             "--workspaceEditorWidthPx": `${activeWorkspaceView.editorWidth}px`,
             "--workspaceFileTreeWidthPx": `${activeWorkspaceView.treeWidth}px`,
+            "--workspaceAgentWidthPx": `${agentPanelWidth}px`,
           } as React.CSSProperties
         }
       >
@@ -7737,17 +7797,47 @@ export default function App() {
             </aside>
           </>
         ) : null}
+
+        {agentPanelOpen && (
+          <>
+            <div
+              className="workspaceResize"
+              onMouseDown={beginWorkspaceResize("agent")}
+              aria-hidden="true"
+            />
+            <AgentPanel
+              onClose={() => setAgentPanelOpen(false)}
+              onCreateTerminalSession={async (command) => {
+                try {
+                  const cwd = activeProject?.basePath || homeDirRef.current || "";
+                  const createdRaw = await createSession({
+                    projectId: activeProjectId,
+                    name: "Agent",
+                    launchCommand: command,
+                    cwd,
+                    envVars: envVarsForProjectId(activeProjectId, projects, environments),
+                  });
+                  const s = applyPendingExit(createdRaw);
+                  addSessionWithProjectSafeActivation(s);
+                } catch (err) {
+                  reportError("Failed to create agent terminal", err);
+                }
+              }}
+            />
+          </>
+        )}
       </div>
 	  ), [
 	    terminalPaneSessions, activeId, activeProjectId, splitPane, handleSplitRatioChange, handleCloseSplitPane,
 	    terminalSearchSessions, handleTerminalRegistryChanged, handleSearchClose,
 	    activeWorkspaceView, activeWorkspaceKey,
 	    activeIsSsh, activeSshTarget, activeProject, active,
-	    workspaceResizeMode, activeProjectId,
+	    workspaceResizeMode, activeProjectId, agentPanelOpen, agentPanelWidth,
 	    onCwdChange, onCommandChange, onSessionResize, onSessionTransportError,
 	    beginWorkspaceResize, updateWorkspaceViewForKey,
 	    handleSelectWorkspaceFile, handleOpenTerminalAtPath,
 	    handleRenameWorkspacePath, handleDeleteWorkspacePath, closeCodeEditor,
+	    addSessionWithProjectSafeActivation, applyPendingExit, projects, environments, reportError,
 	  ]);
 
   return (

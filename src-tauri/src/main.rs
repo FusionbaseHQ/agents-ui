@@ -1,3 +1,4 @@
+mod agent;
 mod api_bridge;
 mod api_discovery;
 mod api_handlers;
@@ -6,6 +7,7 @@ mod api_types;
 mod app_menu;
 mod app_info;
 mod assets;
+mod server_control;
 mod files;
 mod file_manager;
 mod fs_watcher;
@@ -42,8 +44,11 @@ use ssh_fs::{
 };
 use fs_watcher::{start_fs_watcher, stop_fs_watcher, watch_directory, unwatch_directory, FsWatcherState};
 use startup::get_startup_flags;
+use agent::{start_agent_prompt, stop_agent, get_agent_terminal_command, write_agent_mcp_config, AgentState};
 use api_bridge::{api_respond, api_notify_state_change, ApiPendingRequests, ApiEventBus};
+use server_control::{get_server_status, set_api_enabled, set_mcp_enabled, ServerControl};
 use tray::{build_status_tray, set_tray_agent_count, set_tray_recent_sessions, set_tray_status};
+use std::sync::Arc;
 use tauri::Manager;
 
 fn main() {
@@ -77,6 +82,7 @@ fn main() {
         .manage(FsWatcherState::default())
         .manage(ApiPendingRequests::default())
         .manage(ApiEventBus::default())
+        .manage(AgentState::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_drag::init())
@@ -92,17 +98,36 @@ fn main() {
             });
             app.manage(tray);
 
-            // Start the external control API server
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                api_server::start_api_server(handle).await;
+            // Server control: create shutdown channels and read persisted settings
+            let settings = server_control::load_settings();
+            let (sc, api_rx, mcp_rx) = ServerControl::new();
+            let sc = Arc::new(sc);
+            app.manage(sc.clone());
+
+            // Write MCP config for agents
+            tauri::async_runtime::spawn(async {
+                if let Err(e) = agent::write_agent_mcp_config(None).await {
+                    eprintln!("[agent] failed to write MCP config: {e}");
+                }
             });
 
-            // Start the MCP server
-            let handle2 = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                mcp_server::start_mcp_server(handle2).await;
-            });
+            // Start the external control API server (if enabled)
+            if settings.api_enabled {
+                let handle = app.handle().clone();
+                let sc_api = sc.clone();
+                tauri::async_runtime::spawn(async move {
+                    api_server::start_api_server_with_shutdown(handle, api_rx, sc_api).await;
+                });
+            }
+
+            // Start the MCP server (if enabled)
+            if settings.mcp_enabled {
+                let handle2 = app.handle().clone();
+                let sc_mcp = sc.clone();
+                tauri::async_runtime::spawn(async move {
+                    mcp_server::start_mcp_server_with_shutdown(handle2, mcp_rx, sc_mcp).await;
+                });
+            }
 
             Ok(())
         })
@@ -162,7 +187,14 @@ fn main() {
             watch_directory,
             unwatch_directory,
             api_respond,
-            api_notify_state_change
+            api_notify_state_change,
+            start_agent_prompt,
+            stop_agent,
+            get_agent_terminal_command,
+            write_agent_mcp_config,
+            get_server_status,
+            set_api_enabled,
+            set_mcp_enabled
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

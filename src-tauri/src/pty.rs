@@ -2025,6 +2025,10 @@ pub fn write_to_session(
         return Ok(());
     }
 
+    // Unescape common terminal escape sequences (e.g. \r, \n, \t) that
+    // MCP tool callers send as literal backslash-letter pairs.
+    let data = unescape_terminal_sequences(&data);
+
     s.writer
         .write_all(data.as_bytes())
         .map_err(|e| format!("write failed: {e}"))?;
@@ -2044,6 +2048,42 @@ pub fn write_to_session(
         }
     }
     Ok(())
+}
+
+/// Unescape common terminal escape sequences that arrive as literal
+/// backslash-letter pairs from MCP tool callers (e.g. `\r` → CR, `\n` → LF).
+fn unescape_terminal_sequences(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('r') => out.push('\r'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('\\') => out.push('\\'),
+                Some('x') => {
+                    // Handle \x1b style hex escapes (e.g. for ESC)
+                    let h: String = chars.by_ref().take(2).collect();
+                    if let Ok(byte) = u8::from_str_radix(&h, 16) {
+                        out.push(byte as char);
+                    } else {
+                        out.push('\\');
+                        out.push('x');
+                        out.push_str(&h);
+                    }
+                }
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[tauri::command]

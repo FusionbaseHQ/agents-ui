@@ -2,15 +2,17 @@ use crate::api_bridge::ApiEventBus;
 use crate::api_handlers::HandlerContext;
 use crate::api_types::StateChangeNotification;
 use crate::mcp_tools::{self, OutputBuffer, OutputBuffers};
+use crate::server_control::ServerControl;
 use axum::http::HeaderMap;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Router};
 use rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 const MCP_PORT: u16 = 45557;
 
@@ -21,7 +23,26 @@ struct McpState {
     app_version: String,
 }
 
+#[allow(dead_code)]
 pub async fn start_mcp_server(app_handle: tauri::AppHandle) {
+    let (_, rx) = watch::channel(false);
+    let sc = app_handle.clone().try_state::<Arc<ServerControl>>().map(|s| s.inner().clone());
+    start_mcp_server_inner(app_handle, rx, sc).await;
+}
+
+pub async fn start_mcp_server_with_shutdown(
+    app_handle: tauri::AppHandle,
+    shutdown_rx: watch::Receiver<bool>,
+    sc: Arc<ServerControl>,
+) {
+    start_mcp_server_inner(app_handle, shutdown_rx, Some(sc)).await;
+}
+
+async fn start_mcp_server_inner(
+    app_handle: tauri::AppHandle,
+    mut shutdown_rx: watch::Receiver<bool>,
+    sc: Option<Arc<ServerControl>>,
+) {
     let ctx = Arc::new(HandlerContext::new(app_handle.clone()));
     let output_buffers: OutputBuffers = Arc::new(Mutex::new(HashMap::new()));
     let app_version = app_handle
@@ -105,12 +126,47 @@ pub async fn start_mcp_server(app_handle: tauri::AppHandle) {
 
     eprintln!("[mcp] listening on http://127.0.0.1:{port}/mcp");
 
+    if let Some(ref sc) = sc {
+        sc.mcp_running.store(true, Ordering::Relaxed);
+    }
+
     let app = Router::new()
         .route("/mcp", post(handle_mcp_request))
         .with_state(state);
 
-    if let Err(e) = axum::serve(listener, app).await {
+    let server = axum::serve(listener, app);
+    let shutdown_signal = async move {
+        loop {
+            if shutdown_rx.changed().await.is_err() {
+                break;
+            }
+            if *shutdown_rx.borrow() {
+                break;
+            }
+        }
+        eprintln!("[mcp] shutdown signal received");
+    };
+
+    if let Err(e) = server.with_graceful_shutdown(shutdown_signal).await {
         eprintln!("[mcp] server error: {e}");
+    }
+
+    if let Some(ref sc) = sc {
+        sc.mcp_running.store(false, Ordering::Relaxed);
+    }
+
+    // Remove mcp_url from discovery file
+    if let Ok(disc_path) = crate::api_discovery::discovery_path() {
+        if disc_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&disc_path) {
+                if let Ok(mut file) = serde_json::from_str::<crate::api_discovery::DiscoveryFile>(&content) {
+                    file.mcp_url = None;
+                    if let Ok(json) = serde_json::to_string_pretty(&file) {
+                        let _ = std::fs::write(&disc_path, &json);
+                    }
+                }
+            }
+        }
     }
 }
 
