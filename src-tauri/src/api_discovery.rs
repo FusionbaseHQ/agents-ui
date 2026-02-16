@@ -1,0 +1,125 @@
+use serde::Serialize;
+use std::fs;
+use std::path::PathBuf;
+
+#[derive(Serialize)]
+pub struct DiscoveryFile {
+    pub socket: String,
+    pub version: String,
+    pub pid: u32,
+    pub token: String,
+}
+
+fn agents_ui_dir() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| "cannot determine home directory".to_string())?;
+    Ok(PathBuf::from(home).join(".agents-ui"))
+}
+
+pub fn socket_path() -> Result<PathBuf, String> {
+    Ok(agents_ui_dir()?.join("api.sock"))
+}
+
+pub fn discovery_path() -> Result<PathBuf, String> {
+    Ok(agents_ui_dir()?.join("api.json"))
+}
+
+pub fn generate_token() -> String {
+    use rand_core::{OsRng, RngCore};
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn write_discovery_file(token: &str) -> Result<PathBuf, String> {
+    let dir = agents_ui_dir()?;
+    fs::create_dir_all(&dir).map_err(|e| format!("create dir failed: {e}"))?;
+
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    }
+
+    let sock = socket_path()?;
+    let disc = discovery_path()?;
+
+    let file = DiscoveryFile {
+        socket: sock.to_string_lossy().to_string(),
+        version: "1".to_string(),
+        pid: std::process::id(),
+        token: token.to_string(),
+    };
+
+    let json = serde_json::to_string_pretty(&file)
+        .map_err(|e| format!("serialize failed: {e}"))?;
+
+    fs::write(&disc, &json).map_err(|e| format!("write failed: {e}"))?;
+
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&disc, fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(disc)
+}
+
+pub fn cleanup_stale_socket() -> Result<(), String> {
+    let disc = discovery_path()?;
+    if !disc.exists() {
+        return Ok(());
+    }
+
+    let content = match fs::read_to_string(&disc) {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = fs::remove_file(&disc);
+            return Ok(());
+        }
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = fs::remove_file(&disc);
+            return Ok(());
+        }
+    };
+
+    if let Some(pid) = parsed.get("pid").and_then(|v| v.as_u64()) {
+        if !is_process_alive(pid as u32) {
+            let sock = socket_path()?;
+            let _ = fs::remove_file(&sock);
+            let _ = fs::remove_file(&disc);
+        }
+    }
+
+    Ok(())
+}
+
+pub fn cleanup() {
+    let _ = fs::remove_file(socket_path().unwrap_or_default());
+    let _ = fs::remove_file(discovery_path().unwrap_or_default());
+}
+
+fn is_process_alive(pid: u32) -> bool {
+    #[cfg(target_family = "unix")]
+    {
+        // Check if process exists via /proc on Linux, or kill(0) signal check.
+        // Using std::process::Command to avoid libc dependency.
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_family = "unix"))]
+    {
+        let _ = pid;
+        false
+    }
+}

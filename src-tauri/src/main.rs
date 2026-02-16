@@ -1,3 +1,8 @@
+mod api_bridge;
+mod api_discovery;
+mod api_handlers;
+mod api_server;
+mod api_types;
 mod app_menu;
 mod app_info;
 mod assets;
@@ -35,6 +40,7 @@ use ssh_fs::{
 };
 use fs_watcher::{start_fs_watcher, stop_fs_watcher, watch_directory, unwatch_directory, FsWatcherState};
 use startup::get_startup_flags;
+use api_bridge::{api_respond, api_notify_state_change, ApiPendingRequests, ApiEventBus};
 use tray::{build_status_tray, set_tray_agent_count, set_tray_recent_sessions, set_tray_status};
 use tauri::Manager;
 
@@ -67,6 +73,8 @@ fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
         .manage(FsWatcherState::default())
+        .manage(ApiPendingRequests::default())
+        .manage(ApiEventBus::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_drag::init())
@@ -81,6 +89,13 @@ fn main() {
                 tray::StatusTrayState::disabled()
             });
             app.manage(tray);
+
+            // Start the external control API server
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                api_server::start_api_server(handle).await;
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -137,8 +152,15 @@ fn main() {
             start_fs_watcher,
             stop_fs_watcher,
             watch_directory,
-            unwatch_directory
+            unwatch_directory,
+            api_respond,
+            api_notify_state_change
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                api_discovery::cleanup();
+            }
+        });
 }

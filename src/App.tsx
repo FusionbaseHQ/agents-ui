@@ -1,6 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { homeDir } from "@tauri-apps/api/path";
+import { initBridge, registerHandlers, destroyBridge, notifyStateChange } from "./apiBridge";
 import React, { useEffect, useMemo, useRef, useState, useCallback, useLayoutEffect } from "react";
 import { type PendingDataBuffer, type TerminalRegistry } from "./SessionTerminal";
 import {
@@ -2657,6 +2658,415 @@ export default function App() {
 
   useEffect(() => {
     hydratedRef.current = hydrated;
+  }, [hydrated]);
+
+  // ── External Control API bridge ──
+  useEffect(() => {
+    if (!hydrated) return;
+    registerHandlers({
+      // ── sessions ──
+      "sessions.list": (p) => {
+        const pid = p.projectId as string | undefined;
+        const all = sessionsRef.current;
+        return pid ? all.filter((s) => s.projectId === pid) : all;
+      },
+      "sessions.get": (p) => {
+        const s = sessionsRef.current.find((s) => s.id === p.id);
+        if (!s) throw new Error("session not found");
+        return s;
+      },
+      "sessions.create": async (p) => {
+        const projectId = p.projectId as string;
+        const proj = projectsRef.current.find((pr) => pr.id === projectId);
+        if (!proj) throw new Error("project not found");
+        const envVars = envVarsForProjectId(projectId, projectsRef.current, environmentsRef.current);
+        const createdRaw = await createSession({
+          projectId,
+          name: (p.name as string) || undefined,
+          launchCommand: (p.command as string) || undefined,
+          cwd: (p.cwd as string) || proj.basePath || undefined,
+          envVars,
+          persistent: p.persistent as boolean | undefined,
+          persistId: p.persistId as string | undefined,
+        });
+        const s = applyPendingExit(createdRaw);
+        addSessionWithProjectSafeActivation(s);
+        return s;
+      },
+      "sessions.close": async (p) => {
+        const id = p.id as string;
+        await closeSession(id);
+        return null;
+      },
+      "sessions.rename": (p) => {
+        const id = p.id as string;
+        const name = p.name as string;
+        setSessions((prev) => prev.map((s) => s.id === id ? { ...s, name } : s));
+        invoke("rename_session", { id, name }).catch(() => {});
+        const s = sessionsRef.current.find((s) => s.id === id);
+        return s ? { ...s, name } : null;
+      },
+      "sessions.set_symbol": (p) => {
+        const id = p.id as string;
+        const symbol = (p.symbol as string) || null;
+        setSessions((prev) => prev.map((s) => s.id === id ? { ...s, symbol } : s));
+        return null;
+      },
+      "sessions.set_color": (p) => {
+        const id = p.id as string;
+        const color = (p.color as string) || null;
+        setSessions((prev) => prev.map((s) => s.id === id ? { ...s, color } : s));
+        return null;
+      },
+      "sessions.activate": (p) => {
+        const id = p.id as string;
+        const s = sessionsRef.current.find((s) => s.id === id);
+        if (!s) throw new Error("session not found");
+        if (activeProjectIdRef.current !== s.projectId) {
+          setActiveProjectId(s.projectId);
+        }
+        setActiveId(id);
+        setActiveSplitViewId(null);
+        return { activeSessionId: id };
+      },
+      "sessions.start_recording": (p) => {
+        throw new Error("use recordings.start instead");
+      },
+      "sessions.stop_recording": (p) => {
+        throw new Error("use recordings.stop instead");
+      },
+      // ── persistent_sessions ──
+      "persistent_sessions.attach": async (p) => {
+        const projectId = p.projectId as string;
+        const proj = projectsRef.current.find((pr) => pr.id === projectId);
+        if (!proj) throw new Error("project not found");
+        const envVars = envVarsForProjectId(projectId, projectsRef.current, environmentsRef.current);
+        const createdRaw = await createSession({
+          projectId,
+          name: (p.name as string) || undefined,
+          cwd: proj.basePath || undefined,
+          envVars,
+          persistent: true,
+          persistId: p.persistId as string,
+        });
+        const s = applyPendingExit(createdRaw);
+        addSessionWithProjectSafeActivation(s);
+        return s;
+      },
+      // ── projects ──
+      "projects.list": () => projectsRef.current,
+      "projects.get": (p) => {
+        const proj = projectsRef.current.find((pr) => pr.id === p.id);
+        if (!proj) throw new Error("project not found");
+        return proj;
+      },
+      "projects.create": async (p) => {
+        const title = (p.title as string).trim();
+        if (!title) throw new Error("title is required");
+        const desiredBasePath = (p.basePath as string | undefined) || "";
+        const validatedBasePath = desiredBasePath
+          ? await invoke<string | null>("validate_directory", { path: desiredBasePath }).catch(() => null)
+          : null;
+        const id = makeId();
+        const project: Project = {
+          id,
+          title,
+          basePath: validatedBasePath,
+          environmentId: (p.environmentId as string) || null,
+          assetsEnabled: p.assetsEnabled !== false,
+        };
+        setProjects((prev) => [...prev, project]);
+        return project;
+      },
+      "projects.update": (p) => {
+        const id = p.id as string;
+        setProjects((prev) => prev.map((proj) => {
+          if (proj.id !== id) return proj;
+          return {
+            ...proj,
+            ...(p.title !== undefined && { title: (p.title as string).trim() }),
+            ...(p.basePath !== undefined && { basePath: p.basePath as string | null }),
+            ...(p.environmentId !== undefined && { environmentId: p.environmentId as string | null }),
+            ...(p.assetsEnabled !== undefined && { assetsEnabled: p.assetsEnabled as boolean }),
+            ...(p.symbol !== undefined && { symbol: p.symbol as string | null }),
+            ...(p.color !== undefined && { color: p.color as string | null }),
+          };
+        }));
+        return projectsRef.current.find((pr) => pr.id === id) ?? null;
+      },
+      "projects.delete": async (p) => {
+        const id = p.id as string;
+        const idsToClose = sessionsRef.current.filter((s) => s.projectId === id).map((s) => s.id);
+        for (const sid of idsToClose) {
+          await closeSession(sid).catch(() => {});
+        }
+        setSessions((prev) => prev.filter((s) => s.projectId !== id));
+        setProjects((prev) => {
+          const next = prev.filter((pr) => pr.id !== id);
+          if (next.length === 0) {
+            const fallback = makeId();
+            next.push({ id: fallback, title: "Default", basePath: null, environmentId: null, assetsEnabled: true });
+            setActiveProjectId(fallback);
+          } else if (activeProjectIdRef.current === id) {
+            setActiveProjectId(next[0].id);
+          }
+          return next;
+        });
+        return null;
+      },
+      "projects.activate": (p) => {
+        const id = p.id as string;
+        if (!projectsRef.current.some((pr) => pr.id === id)) throw new Error("project not found");
+        setActiveProjectId(id);
+        const lastSession = sessionsRef.current.find((s) => s.projectId === id);
+        if (lastSession) setActiveId(lastSession.id);
+        return { activeProjectId: id };
+      },
+      "projects.reorder": (p) => {
+        const ids = p.ids as string[];
+        setProjects((prev) => {
+          const byId = new Map(prev.map((pr) => [pr.id, pr]));
+          const reordered = ids.map((id) => byId.get(id)).filter(Boolean) as Project[];
+          for (const pr of prev) {
+            if (!ids.includes(pr.id)) reordered.push(pr);
+          }
+          return reordered;
+        });
+        return null;
+      },
+      // ── prompts ──
+      "prompts.list": () => {
+        // Read from a snapshot via state setter to avoid needing a ref
+        let result: Prompt[] = [];
+        setPrompts((prev) => { result = prev; return prev; });
+        return result;
+      },
+      "prompts.get": (p) => {
+        let result: Prompt | null = null;
+        setPrompts((prev) => {
+          result = prev.find((pr) => pr.id === p.id) ?? null;
+          return prev;
+        });
+        if (!result) throw new Error("prompt not found");
+        return result;
+      },
+      "prompts.create": (p) => {
+        const id = makeId();
+        const prompt: Prompt = {
+          id,
+          title: (p.title as string).trim(),
+          content: p.content as string,
+          createdAt: Date.now(),
+        };
+        setPrompts((prev) => [...prev, prompt]);
+        return prompt;
+      },
+      "prompts.update": (p) => {
+        const id = p.id as string;
+        let updated: Prompt | null = null;
+        setPrompts((prev) => prev.map((pr) => {
+          if (pr.id !== id) return pr;
+          updated = {
+            ...pr,
+            ...(p.title !== undefined && { title: (p.title as string).trim() }),
+            ...(p.content !== undefined && { content: p.content as string }),
+            ...(p.pinned !== undefined && { pinned: p.pinned as boolean }),
+          };
+          return updated!;
+        }));
+        return updated;
+      },
+      "prompts.delete": (p) => {
+        setPrompts((prev) => prev.filter((pr) => pr.id !== (p.id as string)));
+        return null;
+      },
+      "prompts.search": (p) => {
+        const q = ((p.q as string) || "").toLowerCase();
+        let result: Prompt[] = [];
+        setPrompts((prev) => { result = prev; return prev; });
+        return result.filter((pr) => pr.title.toLowerCase().includes(q) || pr.content.toLowerCase().includes(q));
+      },
+      // ── environments ──
+      "environments.list": () => environmentsRef.current,
+      "environments.get": (p) => {
+        const env = environmentsRef.current.find((e) => e.id === p.id);
+        if (!env) throw new Error("environment not found");
+        return env;
+      },
+      "environments.create": (p) => {
+        const id = makeId();
+        const env: EnvironmentConfig = {
+          id,
+          name: (p.name as string).trim(),
+          content: p.content as string,
+          createdAt: Date.now(),
+        };
+        setEnvironments((prev) => [...prev, env]);
+        return env;
+      },
+      "environments.update": (p) => {
+        const id = p.id as string;
+        let updated: EnvironmentConfig | null = null;
+        setEnvironments((prev) => prev.map((e) => {
+          if (e.id !== id) return e;
+          updated = {
+            ...e,
+            ...(p.name !== undefined && { name: (p.name as string).trim() }),
+            ...(p.content !== undefined && { content: p.content as string }),
+          };
+          return updated!;
+        }));
+        return updated;
+      },
+      "environments.delete": (p) => {
+        setEnvironments((prev) => prev.filter((e) => e.id !== (p.id as string)));
+        return null;
+      },
+      // ── assets ──
+      "assets.list": () => {
+        let result: AssetTemplate[] = [];
+        let settings: AssetSettings = { autoApplyEnabled: true };
+        setAssets((prev) => { result = prev; return prev; });
+        setAssetSettings((prev) => { settings = prev; return prev; });
+        return { settings, assets: result };
+      },
+      "assets.get": (p) => {
+        let result: AssetTemplate | null = null;
+        setAssets((prev) => { result = prev.find((a) => a.id === p.id) ?? null; return prev; });
+        if (!result) throw new Error("asset not found");
+        return result;
+      },
+      "assets.create": (p) => {
+        const id = makeId();
+        const asset: AssetTemplate = {
+          id,
+          name: (p.name as string).trim(),
+          relativePath: p.relativePath as string,
+          content: p.content as string,
+          createdAt: Date.now(),
+          autoApply: (p.autoApply as boolean) || false,
+        };
+        setAssets((prev) => [...prev, asset]);
+        return asset;
+      },
+      "assets.update": (p) => {
+        const id = p.id as string;
+        let updated: AssetTemplate | null = null;
+        setAssets((prev) => prev.map((a) => {
+          if (a.id !== id) return a;
+          updated = {
+            ...a,
+            ...(p.name !== undefined && { name: (p.name as string).trim() }),
+            ...(p.relativePath !== undefined && { relativePath: p.relativePath as string }),
+            ...(p.content !== undefined && { content: p.content as string }),
+            ...(p.autoApply !== undefined && { autoApply: p.autoApply as boolean }),
+          };
+          return updated!;
+        }));
+        return updated;
+      },
+      "assets.delete": (p) => {
+        setAssets((prev) => prev.filter((a) => a.id !== (p.id as string)));
+        return null;
+      },
+      "assets.update_settings": (p) => {
+        const settings: AssetSettings = { autoApplyEnabled: p.autoApplyEnabled as boolean };
+        setAssetSettings(settings);
+        return settings;
+      },
+      // ── split_views ──
+      "split_views.list": (p) => {
+        const pid = p.projectId as string | undefined;
+        const all = splitViewsRef.current;
+        return pid ? all.filter((sv) => sv.projectId === pid) : all;
+      },
+      "split_views.create": (p) => {
+        const sv: SplitView = {
+          id: makeId(),
+          projectId: p.projectId as string,
+          aId: p.aId as string,
+          bId: p.bId as string,
+          direction: p.direction as "horizontal" | "vertical",
+          ratio: (p.ratio as number) ?? 0.5,
+          createdAt: Date.now(),
+          lastFocusedId: p.aId as string,
+        };
+        setSplitViews((prev) => [...prev, sv]);
+        setActiveSplitViewId(sv.id);
+        return sv;
+      },
+      "split_views.update": (p) => {
+        const id = p.id as string;
+        let updated: SplitView | null = null;
+        setSplitViews((prev) => prev.map((sv) => {
+          if (sv.id !== id) return sv;
+          updated = {
+            ...sv,
+            ...(p.ratio !== undefined && { ratio: p.ratio as number }),
+            ...(p.lastFocusedId !== undefined && { lastFocusedId: p.lastFocusedId as string }),
+          };
+          return updated!;
+        }));
+        return updated;
+      },
+      "split_views.close": (p) => {
+        setSplitViews((prev) => prev.filter((sv) => sv.id !== (p.id as string)));
+        if (activeSplitViewIdRef.current === (p.id as string)) setActiveSplitViewId(null);
+        return null;
+      },
+      // ── ui ──
+      "ui.state": () => ({
+        activeProjectId: activeProjectIdRef.current,
+        activeSessionId: activeIdRef.current,
+        activeSplitViewId: activeSplitViewIdRef.current,
+      }),
+      "ui.activate_session": (p) => {
+        const id = p.sessionId as string;
+        const s = sessionsRef.current.find((s) => s.id === id);
+        if (!s) throw new Error("session not found");
+        if (activeProjectIdRef.current !== s.projectId) setActiveProjectId(s.projectId);
+        setActiveId(id);
+        setActiveSplitViewId(null);
+        return { activeSessionId: id };
+      },
+      "ui.navigate_session": (p) => {
+        const dir = p.direction as "next" | "prev";
+        const projectSessions = sessionsRef.current.filter((s) => s.projectId === activeProjectIdRef.current);
+        if (projectSessions.length === 0) return { activeSessionId: null };
+        const curIdx = projectSessions.findIndex((s) => s.id === activeIdRef.current);
+        const nextIdx = dir === "next"
+          ? (curIdx + 1) % projectSessions.length
+          : (curIdx - 1 + projectSessions.length) % projectSessions.length;
+        const nextId = projectSessions[nextIdx].id;
+        setActiveId(nextId);
+        return { activeSessionId: nextId };
+      },
+      // ── app ──
+      "app.state": async () => {
+        const state = await invoke("load_persisted_state");
+        return state;
+      },
+      // ── recordings (bridge-routed start/stop) ──
+      "recordings.start": (p) => {
+        throw new Error("recordings.start requires full session context — use sessions.start_recording via the bridge or invoke directly");
+      },
+      "recordings.stop": (p) => {
+        throw new Error("recordings.stop requires full session context — use sessions.stop_recording via the bridge or invoke directly");
+      },
+      // ── ssh (bridge-routed) ──
+      "ssh.history": () => {
+        let result: SshHistoryEntry[] = [];
+        setSshHistory((prev) => { result = prev; return prev; });
+        return result;
+      },
+      "ssh.delete_history": (p) => {
+        const index = p.index as number;
+        setSshHistory((prev) => prev.filter((_, i) => i !== index));
+        return null;
+      },
+    });
+    initBridge();
+    return () => { destroyBridge(); };
   }, [hydrated]);
 
   useEffect(() => {
