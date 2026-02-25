@@ -23,13 +23,17 @@ export type AgentConversation = {
   sessionId: string | null; // claude --resume session ID
   messages: AgentMessage[];
   provider: AgentProvider;
+  model?: string;
   createdAt: number;
 };
+
+export type ReasoningEffort = "low" | "medium" | "high";
 
 export type AgentSettings = {
   mode: AgentMode;
   provider: AgentProvider;
   model?: string;
+  effort?: ReasoningEffort;
   allowedTools?: string;
   apiEnabled: boolean;
   mcpEnabled: boolean;
@@ -39,4 +43,5 @@ export type AgentLaunchSettings = {
   provider?: string;
   allowedTools?: string;
   model?: string;
+  effort?: string;
 };

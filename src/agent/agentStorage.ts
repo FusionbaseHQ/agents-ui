@@ -2,7 +2,7 @@ import type { AgentConversation, AgentSettings } from "./agentTypes";
 
 const SETTINGS_KEY = "agents-ui-agent-settings-v1";
 const CONVERSATIONS_KEY = "agents-ui-agent-conversations-v1";
-const MAX_CONVERSATIONS = 10;
+const MAX_CONVERSATIONS = 20;
 
 export function loadAgentSettings(): AgentSettings {
   try {

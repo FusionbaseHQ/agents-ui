@@ -491,15 +491,19 @@ pub async fn call_tool(
                 .and_then(|v| v.as_str())
                 .ok_or("Missing required parameter: command")?;
 
-            // Write the command text
+            // Write the command text wrapped in bracketed paste markers so TUI apps
+            // that enable bracketed paste mode process the text as an atomic paste.
+            // This is safe: if the app hasn't enabled the mode, the CSI sequences
+            // are silently ignored as unrecognized escape sequences.
             if !command.is_empty() {
-                let text_params = json!({ "id": session_id, "data": command });
+                let wrapped = format!("\x1b[200~{}\x1b[201~", command);
+                let text_params = json!({ "id": session_id, "data": wrapped });
                 api_handlers::dispatch(ctx, "sessions.write", text_params).await
                     .map_err(|e| e.message)?;
             }
 
             // Small delay so the TUI app processes the text input first
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             // Write Enter separately
             let enter_params = json!({ "id": session_id, "data": "\r" });

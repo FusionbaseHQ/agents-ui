@@ -57,6 +57,7 @@ pub struct AgentLaunchSettings {
     pub provider: Option<String>,
     pub allowed_tools: Option<String>,
     pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 impl Default for AgentLaunchSettings {
@@ -65,6 +66,7 @@ impl Default for AgentLaunchSettings {
             provider: Some("claude-code".to_string()),
             allowed_tools: None,
             model: None,
+            effort: None,
         }
     }
 }
@@ -132,6 +134,11 @@ fn build_claude_cmd(
         parts.push(shell_escape(model));
     }
 
+    if let Some(ref effort) = settings.effort {
+        parts.push("--effort".into());
+        parts.push(shell_escape(effort));
+    }
+
     parts.push("--append-system-prompt".into());
     parts.push(shell_escape(system_prompt));
 
@@ -153,6 +160,12 @@ fn build_codex_cmd(
 
     let mut parts: Vec<String> = vec!["codex".into(), "exec".into()];
 
+    // -m is a subcommand flag for `codex exec`, must come before the prompt
+    if let Some(ref model) = settings.model {
+        parts.push("-m".into());
+        parts.push(shell_escape(model));
+    }
+
     // Resume uses: codex exec resume <sessionId> <prompt>
     if let Some(sid) = session_id {
         parts.push("resume".into());
@@ -162,11 +175,6 @@ fn build_codex_cmd(
     parts.push(shell_escape(prompt));
     parts.push("--json".into());
     parts.push("--full-auto".into());
-
-    if let Some(ref model) = settings.model {
-        parts.push("-m".into());
-        parts.push(shell_escape(model));
-    }
 
     parts.push("-c".into());
     parts.push(format!(
@@ -178,6 +186,7 @@ fn build_codex_cmd(
 }
 
 /// Ensure the MCP server is registered with Codex before launching.
+#[allow(dead_code)]
 fn ensure_codex_mcp_registered(mcp_port: u16) -> Result<(), String> {
     let url = format!("http://127.0.0.1:{mcp_port}/mcp");
     let shell = default_user_shell();
@@ -230,10 +239,6 @@ pub async fn start_agent_prompt(
 
     // Build provider-specific command parts
     let cmd_parts = if binary == "codex" {
-        // Register MCP server with Codex before launching
-        // Read port from the existing config to stay in sync
-        let mcp_port = read_mcp_port_from_config(&mcp_config_path).unwrap_or(45557);
-        ensure_codex_mcp_registered(mcp_port)?;
         build_codex_cmd(&prompt, session_id.as_deref(), &settings)?
     } else {
         build_claude_cmd(&prompt, session_id.as_deref(), &settings, &mcp_config_path)?
@@ -369,9 +374,7 @@ pub async fn get_agent_terminal_command(
     let mut parts = vec![binary.to_string()];
 
     if binary == "codex" {
-        // For terminal mode, register MCP and don't pass --mcp-config
-        let mcp_port = read_mcp_port_from_config(&mcp_config_path).unwrap_or(45557);
-        let _ = ensure_codex_mcp_registered(mcp_port);
+        // Codex uses its own global MCP registry (registered at MCP server startup)
     } else {
         parts.push("--mcp-config".into());
         parts.push(mcp_config_path.to_string_lossy().to_string());
@@ -392,6 +395,7 @@ fn agents_ui_dir() -> Result<std::path::PathBuf, String> {
 }
 
 /// Read the MCP port from the existing config file.
+#[allow(dead_code)]
 fn read_mcp_port_from_config(path: &std::path::Path) -> Option<u16> {
     let content = std::fs::read_to_string(path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -409,4 +413,211 @@ fn generate_run_id() -> String {
         "agent-{}",
         bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
     )
+}
+
+// ── MCP registration with agent CLIs ────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpRegistrationResult {
+    pub mcp_config_ok: bool,
+    pub claude_code: RegistrationStatus,
+    pub codex: RegistrationStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistrationStatus {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+/// Register the MCP server with both Claude Code and Codex CLIs.
+/// Writes the mcp-config.json with the actual port, then runs CLI commands
+/// in parallel with a 10-second timeout per provider.
+pub fn do_register_mcp_with_agents(port: u16) -> McpRegistrationResult {
+    // Step 1: Write mcp-config.json with the actual port
+    let mcp_config_ok = match write_mcp_config_sync(port) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("[mcp-reg] failed to write mcp-config.json: {e}");
+            false
+        }
+    };
+
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let shell = default_user_shell();
+    let timeout = std::time::Duration::from_secs(10);
+
+    // Step 2: Register with Claude Code and Codex in parallel
+    let url_cc = url.clone();
+    let shell_cc = shell.clone();
+    let cc_handle = std::thread::spawn(move || {
+        register_claude_code(&shell_cc, &url_cc, timeout)
+    });
+
+    let url_cx = url.clone();
+    let shell_cx = shell.clone();
+    let cx_handle = std::thread::spawn(move || {
+        register_codex(&shell_cx, &url_cx, timeout)
+    });
+
+    let claude_code = cc_handle.join().unwrap_or(RegistrationStatus {
+        success: false,
+        error: Some("thread panicked".into()),
+    });
+
+    let codex = cx_handle.join().unwrap_or(RegistrationStatus {
+        success: false,
+        error: Some("thread panicked".into()),
+    });
+
+    McpRegistrationResult {
+        mcp_config_ok,
+        claude_code,
+        codex,
+    }
+}
+
+fn write_mcp_config_sync(port: u16) -> Result<(), String> {
+    let dir = agents_ui_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create dir: {e}"))?;
+    let path = dir.join("mcp-config.json");
+
+    let config = serde_json::json!({
+        "mcpServers": {
+            "agents-ui": {
+                "type": "http",
+                "url": format!("http://127.0.0.1:{port}/mcp")
+            }
+        }
+    });
+
+    let json = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(&path, &json).map_err(|e| format!("write: {e}"))?;
+    Ok(())
+}
+
+fn register_claude_code(
+    shell: &str,
+    url: &str,
+    timeout: std::time::Duration,
+) -> RegistrationStatus {
+    // Remove first, ignore errors
+    let _ = run_with_timeout(
+        shell,
+        "claude mcp remove agents-ui -s user",
+        timeout,
+    );
+
+    let add_cmd = format!(
+        "claude mcp add --transport http -s user agents-ui {}",
+        shell_escape(url)
+    );
+
+    match run_with_timeout(shell, &add_cmd, timeout) {
+        Ok(output) => parse_cli_output(output),
+        Err(e) => RegistrationStatus {
+            success: false,
+            error: Some(e),
+        },
+    }
+}
+
+fn register_codex(
+    shell: &str,
+    url: &str,
+    timeout: std::time::Duration,
+) -> RegistrationStatus {
+    // Remove first, ignore errors
+    let _ = run_with_timeout(shell, "codex mcp remove agents-ui", timeout);
+
+    let add_cmd = format!(
+        "codex mcp add agents-ui --url {}",
+        shell_escape(url)
+    );
+
+    match run_with_timeout(shell, &add_cmd, timeout) {
+        Ok(output) => parse_cli_output(output),
+        Err(e) => RegistrationStatus {
+            success: false,
+            error: Some(e),
+        },
+    }
+}
+
+/// Parse CLI output, detecting "not found" / "not installed" patterns in stderr.
+fn parse_cli_output(output: std::process::Output) -> RegistrationStatus {
+    if output.status.success() {
+        return RegistrationStatus { success: true, error: None };
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let combined = format!(
+        "{}{}",
+        stderr,
+        String::from_utf8_lossy(&output.stdout).to_lowercase()
+    );
+    let is_not_installed = combined.contains("not found")
+        || combined.contains("no such file")
+        || combined.contains("command not found");
+    let error_msg = if is_not_installed {
+        "not installed".to_string()
+    } else if stderr.is_empty() {
+        format!("exit code {}", output.status.code().unwrap_or(-1))
+    } else {
+        stderr
+    };
+    RegistrationStatus {
+        success: false,
+        error: Some(error_msg),
+    }
+}
+
+/// Run a shell command with a timeout. Returns an error string for
+/// "not installed" (binary not found) or timeout scenarios.
+fn run_with_timeout(
+    shell: &str,
+    cmd: &str,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    let mut child = std::process::Command::new(shell)
+        .arg("-lc")
+        .arg(cmd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "not installed".to_string()
+            } else {
+                format!("spawn error: {e}")
+            }
+        })?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                return child.wait_with_output().map_err(|e| format!("wait: {e}"));
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return Err("timed out".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("wait error: {e}")),
+        }
+    }
+}
+
+/// Tauri command to register MCP server with agent CLIs.
+#[tauri::command]
+pub async fn register_mcp_with_agents(port: Option<u16>) -> Result<McpRegistrationResult, String> {
+    let port = port.unwrap_or(45557);
+    let result = tokio::task::spawn_blocking(move || do_register_mcp_with_agents(port))
+        .await
+        .map_err(|e| format!("join error: {e}"))?;
+    Ok(result)
 }

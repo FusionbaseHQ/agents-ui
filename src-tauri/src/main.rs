@@ -44,7 +44,7 @@ use ssh_fs::{
 };
 use fs_watcher::{start_fs_watcher, stop_fs_watcher, watch_directory, unwatch_directory, FsWatcherState};
 use startup::get_startup_flags;
-use agent::{start_agent_prompt, stop_agent, get_agent_terminal_command, write_agent_mcp_config, AgentState};
+use agent::{start_agent_prompt, stop_agent, get_agent_terminal_command, write_agent_mcp_config, register_mcp_with_agents, AgentState};
 use api_bridge::{api_respond, api_notify_state_change, ApiPendingRequests, ApiEventBus};
 use server_control::{get_server_status, set_api_enabled, set_mcp_enabled, ServerControl};
 use tray::{build_status_tray, set_tray_agent_count, set_tray_recent_sessions, set_tray_status};
@@ -103,13 +103,6 @@ fn main() {
             let (sc, api_rx, mcp_rx) = ServerControl::new();
             let sc = Arc::new(sc);
             app.manage(sc.clone());
-
-            // Write MCP config for agents
-            tauri::async_runtime::spawn(async {
-                if let Err(e) = agent::write_agent_mcp_config(None).await {
-                    eprintln!("[agent] failed to write MCP config: {e}");
-                }
-            });
 
             // Start the external control API server (if enabled)
             if settings.api_enabled {
@@ -194,7 +187,8 @@ fn main() {
             write_agent_mcp_config,
             get_server_status,
             set_api_enabled,
-            set_mcp_enabled
+            set_mcp_enabled,
+            register_mcp_with_agents
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

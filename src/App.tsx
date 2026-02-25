@@ -4948,9 +4948,17 @@ export default function App() {
     try {
       registry.current.get(sessionId)?.term.focus();
       if (text) {
-        await invoke("write_to_session", { id: sessionId, data: text, source: "user" });
+        // Check if the terminal app has enabled bracketed paste mode.
+        // If so, wrap text in paste markers so the app treats it as an
+        // atomic paste rather than character-by-character raw input.
+        const entry = registry.current.get(sessionId);
+        const useBracketedPaste = entry?.term.modes.bracketedPasteMode ?? false;
+        const payload = useBracketedPaste
+          ? `\x1b[200~${text}\x1b[201~`
+          : text;
+        await invoke("write_to_session", { id: sessionId, data: payload, source: "user" });
       }
-      if (text) await sleep(30);
+      if (text) await sleep(50);
       await invoke("write_to_session", { id: sessionId, data: "\r", source: "user" });
     } catch (err) {
       reportError("Failed to send prompt", err);

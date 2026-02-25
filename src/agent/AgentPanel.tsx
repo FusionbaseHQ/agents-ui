@@ -3,7 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Icon } from "../components/Icon";
 import { AgentMessageView, AgentTypingIndicator } from "./AgentMessage";
-import { parseStreamLine, StreamingMessageBuilder } from "./agentStreamParser";
+import { ConversationList } from "./ConversationList";
+import { parseStreamLine, StreamingMessageBuilder, resetCodexTracking } from "./agentStreamParser";
 import {
   loadAgentSettings,
   saveAgentSettings,
@@ -17,6 +18,7 @@ import type {
   AgentProvider,
   AgentSettings,
   AgentLaunchSettings,
+  ReasoningEffort,
 } from "./agentTypes";
 
 type Props = {
@@ -29,6 +31,51 @@ function nextMsgId() {
   return `umsg-${Date.now()}-${++msgIdCounter}`;
 }
 
+type McpRegistrationResult = {
+  mcpConfigOk: boolean;
+  claudeCode: { success: boolean; error: string | null };
+  codex: { success: boolean; error: string | null };
+};
+
+const CLAUDE_MODELS = [
+  { value: "", label: "Default" },
+  { value: "opus", label: "Opus 4.6" },
+  { value: "sonnet", label: "Sonnet 4.6" },
+  { value: "haiku", label: "Haiku 4.5" },
+];
+
+const CODEX_MODELS = [
+  { value: "", label: "Default" },
+  { value: "gpt-5.3-codex", label: "GPT-5.3 Codex" },
+  { value: "gpt-5.3-codex-spark", label: "GPT-5.3 Spark" },
+  { value: "gpt-5.2-codex", label: "GPT-5.2 Codex" },
+];
+
+const ALL_MODELS = [...CLAUDE_MODELS, ...CODEX_MODELS];
+
+function modelsForProvider(provider: string): { value: string; label: string }[] {
+  return provider === "codex" ? CODEX_MODELS : CLAUDE_MODELS;
+}
+
+function modelDisplayLabel(model: string | undefined, provider: string): string {
+  if (!model) return "Default";
+  const opt = ALL_MODELS.find((o) => o.value === model);
+  return opt ? opt.label : model;
+}
+
+const EFFORT_OPTIONS: { value: ReasoningEffort | ""; label: string; short: string }[] = [
+  { value: "", label: "Default", short: "Auto" },
+  { value: "high", label: "High", short: "High" },
+  { value: "medium", label: "Medium", short: "Med" },
+  { value: "low", label: "Low", short: "Low" },
+];
+
+function effortDisplayLabel(effort: ReasoningEffort | undefined): string {
+  if (!effort) return "Auto";
+  const opt = EFFORT_OPTIONS.find((o) => o.value === effort);
+  return opt ? opt.short : effort;
+}
+
 export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
   const [settings, setSettings] = useState<AgentSettings>(loadAgentSettings);
   const [conversations, setConversations] = useState<AgentConversation[]>(() => loadConversations());
@@ -39,11 +86,38 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
   const [input, setInput] = useState("");
   const [running, setRunning] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showConvList, setShowConvList] = useState(false);
+  const [showModelDropdown, setShowModelDropdown] = useState(false);
+  const [providerSwitchNotice, setProviderSwitchNotice] = useState<string | null>(null);
+  const [showEffortDropdown, setShowEffortDropdown] = useState(false);
+  const [mcpRegResult, setMcpRegResult] = useState<McpRegistrationResult | null>(null);
+  const [mcpRegLoading, setMcpRegLoading] = useState(false);
   const runIdRef = useRef<string | null>(null);
+  const stderrRef = useRef<string[]>([]);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const modelDropdownRef = useRef<HTMLDivElement | null>(null);
+  const effortDropdownRef = useRef<HTMLDivElement | null>(null);
   const builderRef = useRef(new StreamingMessageBuilder());
+  const activeConvIdRef = useRef(activeConvId);
 
+  const doMcpRegistration = useCallback(async () => {
+    setMcpRegLoading(true);
+    try {
+      const result = await invoke<McpRegistrationResult>("register_mcp_with_agents", {});
+      setMcpRegResult(result);
+    } catch (err) {
+      setMcpRegResult({
+        mcpConfigOk: false,
+        claudeCode: { success: false, error: String(err) },
+        codex: { success: false, error: String(err) },
+      });
+    } finally {
+      setMcpRegLoading(false);
+    }
+  }, []);
+
+  activeConvIdRef.current = activeConvId;
   const activeConv = conversations.find((c) => c.id === activeConvId) ?? null;
 
   // Persist settings
@@ -56,25 +130,79 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
     saveConversations(conversations);
   }, [conversations]);
 
+  // Sync provider/model to active conversation when switching
+  useEffect(() => {
+    if (activeConv) {
+      setSettings((s) => {
+        const convProvider = activeConv.provider === "codex" ? "codex" : "claude-code";
+        const convModel = activeConv.model;
+        if (s.provider === convProvider && s.model === convModel) return s;
+        return { ...s, provider: convProvider as AgentProvider, model: convModel };
+      });
+    }
+  }, [activeConvId]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Auto-scroll messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [activeConv?.messages]);
 
-  // Listen for agent events
+  // Close model dropdown on click outside
   useEffect(() => {
-    const unlistenOutput = listen<{ runId: string; data: string }>("agent-output", (event) => {
+    if (!showModelDropdown) return;
+    function handleClick(e: MouseEvent) {
+      if (modelDropdownRef.current && !modelDropdownRef.current.contains(e.target as Node)) {
+        setShowModelDropdown(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [showModelDropdown]);
+
+  // Close effort dropdown on click outside
+  useEffect(() => {
+    if (!showEffortDropdown) return;
+    function handleClick(e: MouseEvent) {
+      if (effortDropdownRef.current && !effortDropdownRef.current.contains(e.target as Node)) {
+        setShowEffortDropdown(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [showEffortDropdown]);
+
+  // Auto-dismiss provider switch notice
+  useEffect(() => {
+    if (!providerSwitchNotice) return;
+    const timer = setTimeout(() => setProviderSwitchNotice(null), 4000);
+    return () => clearTimeout(timer);
+  }, [providerSwitchNotice]);
+
+  // Auto-resize textarea
+  const autoResize = useCallback(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 150) + "px";
+  }, []);
+
+  // Listen for agent events. Uses refs to avoid stale closures.
+  useEffect(() => {
+    let disposed = false;
+    const cleanups: (() => void)[] = [];
+
+    listen<{ runId: string; data: string }>("agent-output", (event) => {
       if (event.payload.runId !== runIdRef.current) return;
       const update = parseStreamLine(event.payload.data);
       if (!update) return;
 
       setConversations((prev) => {
-        const idx = prev.findIndex((c) => c.id === activeConvId);
+        const convId = activeConvIdRef.current;
+        const idx = prev.findIndex((c) => c.id === convId);
         if (idx < 0) return prev;
         const conv = prev[idx];
         const newMessages = builderRef.current.apply(conv.messages, update);
 
-        // Extract sessionId from session or done events
         let sessionId = conv.sessionId;
         if (update.kind === "session") sessionId = update.sessionId;
         else if (update.kind === "done" && update.sessionId) sessionId = update.sessionId;
@@ -85,30 +213,52 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
         result[idx] = { ...conv, messages: newMessages, sessionId };
         return result;
       });
-    });
+    }).then((fn) => { if (disposed) fn(); else cleanups.push(fn); });
 
-    const unlistenDone = listen<{ runId: string; exitCode: number | null }>("agent-done", (event) => {
+    listen<{ runId: string; data: string }>("agent-stderr", (event) => {
       if (event.payload.runId !== runIdRef.current) return;
+      stderrRef.current.push(event.payload.data);
+    }).then((fn) => { if (disposed) fn(); else cleanups.push(fn); });
+
+    listen<{ runId: string; exitCode: number | null }>("agent-done", (event) => {
+      if (event.payload.runId !== runIdRef.current) return;
+      const exitCode = event.payload.exitCode;
+      const stderr = stderrRef.current.join("\n").trim();
       runIdRef.current = null;
+      stderrRef.current = [];
       setRunning(false);
-      // Finalize all tool calls on process exit
       setConversations((prev) => {
-        const idx = prev.findIndex((c) => c.id === activeConvId);
+        const convId = activeConvIdRef.current;
+        const idx = prev.findIndex((c) => c.id === convId);
         if (idx < 0) return prev;
         const conv = prev[idx];
-        const finalized = builderRef.current.apply(conv.messages, { kind: "finalize" });
-        if (finalized === conv.messages) return prev;
+        let messages = builderRef.current.apply(conv.messages, { kind: "finalize" });
+        const hasAssistantContent = messages.some(
+          (m) => m.role === "assistant" && (m.content || m.toolCalls?.length),
+        );
+        if (exitCode !== 0 && !hasAssistantContent && stderr) {
+          messages = [
+            ...messages,
+            {
+              id: `err-${Date.now()}`,
+              role: "system" as const,
+              content: stderr,
+              timestamp: Date.now(),
+            },
+          ];
+        }
+        if (messages === conv.messages) return prev;
         const result = [...prev];
-        result[idx] = { ...conv, messages: finalized };
+        result[idx] = { ...conv, messages };
         return result;
       });
-    });
+    }).then((fn) => { if (disposed) fn(); else cleanups.push(fn); });
 
     return () => {
-      unlistenOutput.then((fn) => fn());
-      unlistenDone.then((fn) => fn());
+      disposed = true;
+      cleanups.forEach((fn) => fn());
     };
-  }, [activeConvId]);
+  }, []);
 
   const createConversation = useCallback((): AgentConversation => {
     const conv: AgentConversation = {
@@ -116,12 +266,23 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
       sessionId: null,
       messages: [],
       provider: settings.provider === "terminal" ? "claude-code" : settings.provider,
+      model: settings.model,
       createdAt: Date.now(),
     };
     setConversations((prev) => [conv, ...prev]);
     setActiveConvId(conv.id);
     return conv;
-  }, [settings.provider]);
+  }, [settings.provider, settings.model]);
+
+  const deleteConversation = useCallback((id: string) => {
+    setConversations((prev) => {
+      const filtered = prev.filter((c) => c.id !== id);
+      if (id === activeConvId) {
+        setActiveConvId(filtered.length > 0 ? filtered[0].id : null);
+      }
+      return filtered;
+    });
+  }, [activeConvId]);
 
   const sendMessage = useCallback(async () => {
     const text = input.trim();
@@ -139,14 +300,14 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
       conv = createConversation();
     }
 
-    // Reset builder for new agent run
     builderRef.current = new StreamingMessageBuilder();
+    resetCodexTracking();
+    stderrRef.current = [];
 
-    // Add user message
     setConversations((prev) => {
       const idx = prev.findIndex((c) => c.id === conv!.id);
       if (idx < 0) return prev;
-      const updated = { ...prev[idx], messages: [...prev[idx].messages, userMsg] };
+      const updated = { ...prev[idx], messages: [...prev[idx].messages, userMsg], model: settings.model };
       const result = [...prev];
       result[idx] = updated;
       return result;
@@ -154,10 +315,16 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
     setInput("");
     setRunning(true);
 
+    // Reset textarea height
+    if (inputRef.current) {
+      inputRef.current.style.height = "auto";
+    }
+
     try {
       const launchSettings: AgentLaunchSettings = {
         provider: conv.provider === "codex" ? "codex" : "claude-code",
         model: settings.model,
+        effort: settings.effort,
         allowedTools: settings.allowedTools,
       };
 
@@ -194,6 +361,37 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
       setRunning(false);
     }
   }, []);
+
+  const switchProvider = useCallback((newProvider: AgentProvider) => {
+    if (settings.provider === newProvider) return;
+    // If current conversation has messages, create a new one for the new provider
+    const needsNewConv = activeConv && activeConv.messages.length > 0;
+    setSettings((s) => ({ ...s, provider: newProvider, model: undefined }));
+    if (needsNewConv) {
+      const providerLabel = newProvider === "codex" ? "Codex" : "Claude Code";
+      setProviderSwitchNotice(`Switched to ${providerLabel}. Previous chat moved to history.`);
+      // Create a new conversation with the new provider
+      const conv: AgentConversation = {
+        id: `conv-${Date.now()}`,
+        sessionId: null,
+        messages: [],
+        provider: newProvider,
+        model: undefined, // reset model when switching provider
+        createdAt: Date.now(),
+      };
+      setConversations((prev) => [conv, ...prev]);
+      setActiveConvId(conv.id);
+    } else if (activeConv) {
+      // Empty conversation — just update its provider
+      setConversations((prev) => {
+        const idx = prev.findIndex((c) => c.id === activeConv.id);
+        if (idx < 0) return prev;
+        const result = [...prev];
+        result[idx] = { ...prev[idx], provider: newProvider };
+        return result;
+      });
+    }
+  }, [settings.provider, activeConv]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -281,7 +479,7 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
               >
                 <option value="">Default</option>
                 <option value="opus">Opus 4.6</option>
-                <option value="sonnet">Sonnet 4.5</option>
+                <option value="sonnet">Sonnet 4.6</option>
                 <option value="haiku">Haiku 4.5</option>
                 <option value="custom">Custom...</option>
               </select>
@@ -312,31 +510,36 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
                 className="agentSettingsSelect"
                 value={
                   settings.model === undefined || settings.model === "" ? ""
+                  : CODEX_MODELS.some((o) => o.value === settings.model) ? settings.model
                   : "custom"
                 }
                 onChange={(e) => {
                   const v = e.target.value;
                   if (v === "custom") {
-                    setSettings((s) => ({ ...s, model: s.model || "" }));
+                    setSettings((s) => ({ ...s, model: s.model && !CODEX_MODELS.some((o) => o.value === s.model) ? s.model : "" }));
                   } else {
-                    setSettings((s) => ({ ...s, model: undefined }));
+                    setSettings((s) => ({ ...s, model: v || undefined }));
                   }
                 }}
               >
                 <option value="">Default</option>
+                <option value="gpt-5.3-codex">GPT-5.3 Codex</option>
+                <option value="gpt-5.3-codex-spark">GPT-5.3 Spark</option>
+                <option value="gpt-5.2-codex">GPT-5.2 Codex</option>
                 <option value="custom">Custom...</option>
               </select>
             </label>
           )}
           {settings.provider === "codex" &&
             settings.model !== undefined &&
-            settings.model !== "" && (
+            settings.model !== "" &&
+            !CODEX_MODELS.some((o) => o.value === settings.model) && (
             <label className="agentSettingsLabel">
               Custom Model ID
               <input
                 className="agentSettingsInput"
                 type="text"
-                placeholder="e.g. o3-pro"
+                placeholder="e.g. gpt-5.1-codex-max"
                 value={settings.model}
                 onChange={(e) =>
                   setSettings((s) => ({ ...s, model: e.target.value || undefined }))
@@ -350,30 +553,76 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
           <h4 className="agentSettingsSectionTitle">External Control Servers</h4>
 
           <label className="agentSettingsToggle">
-            <input
-              type="checkbox"
-              checked={settings.apiEnabled}
-              onChange={(e) => {
-                const enabled = e.target.checked;
-                setSettings((s) => ({ ...s, apiEnabled: enabled }));
-                void invoke("set_api_enabled", { enabled }).catch(console.error);
-              }}
-            />
+            <span className="toggleSwitch">
+              <input
+                type="checkbox"
+                checked={settings.apiEnabled}
+                onChange={(e) => {
+                  const enabled = e.target.checked;
+                  setSettings((s) => ({ ...s, apiEnabled: enabled }));
+                  void invoke("set_api_enabled", { enabled }).catch(console.error);
+                }}
+              />
+              <span className="toggleTrack" />
+            </span>
             <span>JSON-RPC API (Unix socket)</span>
           </label>
 
           <label className="agentSettingsToggle">
-            <input
-              type="checkbox"
-              checked={settings.mcpEnabled}
-              onChange={(e) => {
-                const enabled = e.target.checked;
-                setSettings((s) => ({ ...s, mcpEnabled: enabled }));
-                void invoke("set_mcp_enabled", { enabled }).catch(console.error);
-              }}
-            />
+            <span className="toggleSwitch">
+              <input
+                type="checkbox"
+                checked={settings.mcpEnabled}
+                onChange={(e) => {
+                  const enabled = e.target.checked;
+                  setSettings((s) => ({ ...s, mcpEnabled: enabled }));
+                  void invoke("set_mcp_enabled", { enabled }).catch(console.error);
+                }}
+              />
+              <span className="toggleTrack" />
+            </span>
             <span>MCP Server (HTTP)</span>
           </label>
+
+          <div className="agentSettingsDivider" />
+
+          <h4 className="agentSettingsSectionTitle">MCP Registration</h4>
+          <p className="agentSettingsHint">
+            Register the MCP server with agent CLIs so it's available in all sessions.
+          </p>
+
+          {mcpRegResult && (
+            <div className="agentMcpRegStatus">
+              <div className="agentMcpRegRow">
+                <span className={mcpRegResult.claudeCode.success ? "agentMcpRegOk" : "agentMcpRegErr"}>
+                  {mcpRegResult.claudeCode.success ? "\u2713" : "\u2717"}
+                </span>
+                <span>Claude Code</span>
+                {mcpRegResult.claudeCode.error && (
+                  <span className="agentMcpRegErrMsg">{mcpRegResult.claudeCode.error}</span>
+                )}
+              </div>
+              <div className="agentMcpRegRow">
+                <span className={mcpRegResult.codex.success ? "agentMcpRegOk" : "agentMcpRegErr"}>
+                  {mcpRegResult.codex.success ? "\u2713" : "\u2717"}
+                </span>
+                <span>Codex</span>
+                {mcpRegResult.codex.error && (
+                  <span className="agentMcpRegErrMsg">{mcpRegResult.codex.error}</span>
+                )}
+              </div>
+            </div>
+          )}
+
+          <button
+            type="button"
+            className="btnSmall"
+            onClick={() => void doMcpRegistration()}
+            disabled={mcpRegLoading}
+            style={{ marginTop: 6 }}
+          >
+            {mcpRegLoading ? "Registering\u2026" : mcpRegResult ? "Re-register" : "Register MCP"}
+          </button>
         </div>
       </aside>
     );
@@ -415,18 +664,26 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
 
   // Chat mode
   const messages = activeConv?.messages ?? [];
-  // Show typing indicator only when running and no assistant message has appeared yet
   const lastMsg = messages[messages.length - 1];
   const showTyping = running && (!lastMsg || lastMsg.role !== "assistant");
+  const providerName = settings.provider === "codex" ? "Codex" : "Claude Code";
 
   return (
     <aside className="agentPanel">
       <div className="agentHeader">
         <div className="agentHeaderLeft">
           {running && <span className="agentSpinner" />}
-          <span className="agentHeaderTitle">{running ? "Agent working…" : "Agent"}</span>
+          <span className="agentHeaderTitle">{running ? "Agent working\u2026" : "Agent"}</span>
         </div>
         <div className="agentHeaderActions">
+          <button
+            type="button"
+            className="btnSmall btnIcon"
+            onClick={() => setShowConvList((p) => !p)}
+            title="Conversations"
+          >
+            <Icon name="history" />
+          </button>
           <button
             type="button"
             className="btnSmall btnIcon"
@@ -452,13 +709,35 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
       </div>
       {running && <div className="agentProgressBar" />}
 
+      {showConvList && (
+        <ConversationList
+          conversations={conversations}
+          activeConvId={activeConvId}
+          onSelect={(id) => setActiveConvId(id)}
+          onDelete={deleteConversation}
+          onClose={() => setShowConvList(false)}
+        />
+      )}
+
       <div className="agentMessages">
+        {providerSwitchNotice && (
+          <div className="agentSwitchNotice">
+            <Icon name="history" size={13} />
+            <span>{providerSwitchNotice}</span>
+            <button type="button" className="agentSwitchNoticeClose" onClick={() => setProviderSwitchNotice(null)}>&times;</button>
+          </div>
+        )}
         {messages.length === 0 && !running && (
           <div className="agentEmpty">
-            Send a message to start a conversation with{" "}
-            {settings.provider === "codex" ? "Codex" : "Claude Code"}.
-            <br />
-            The agent can control this app via MCP tools.
+            <div className="agentEmptyIcon">
+              <Icon name="brain" size={28} />
+            </div>
+            <div className="agentEmptyTitle">{providerName}</div>
+            <div className="agentEmptyHint">
+              Send a message to start a conversation.
+              <br />
+              The agent can control this app via MCP tools.
+            </div>
           </div>
         )}
         {messages.map((msg) => (
@@ -469,36 +748,119 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
       </div>
 
       <div className="agentInputArea">
-        <textarea
-          ref={inputRef}
-          className="agentInput"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="Message the agent…"
-          rows={2}
-          disabled={running}
-        />
-        <div className="agentInputActions">
-          {running ? (
+        <div className="agentInputControls">
+          <div className="agentProviderToggle">
             <button
               type="button"
-              className="btnSmall agentStopBtn"
-              onClick={() => void stopAgent()}
+              className={`agentProviderBtn ${settings.provider !== "codex" ? "agentProviderBtnActive" : ""}`}
+              onClick={() => switchProvider("claude-code")}
+              disabled={running}
             >
-              <Icon name="stop" size={14} />
-              Stop
+              Claude Code
             </button>
-          ) : (
             <button
               type="button"
-              className="btnSmall agentSendBtn"
-              onClick={() => void sendMessage()}
-              disabled={!input.trim()}
+              className={`agentProviderBtn ${settings.provider === "codex" ? "agentProviderBtnActive" : ""}`}
+              onClick={() => switchProvider("codex")}
+              disabled={running}
             >
-              Send
+              Codex
             </button>
+          </div>
+
+          <div className="agentModelChipWrap" ref={modelDropdownRef}>
+            <button
+              type="button"
+              className="agentModelChip"
+              onClick={() => setShowModelDropdown((p) => !p)}
+              disabled={running}
+            >
+              {modelDisplayLabel(settings.model, settings.provider)}
+              <Icon name="chevron-down" size={12} />
+            </button>
+            {showModelDropdown && (
+              <div className="agentModelDropdown">
+                {modelsForProvider(settings.provider).map((opt) => (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    className={`agentModelDropdownItem ${(settings.model ?? "") === opt.value ? "agentModelDropdownItemActive" : ""}`}
+                    onClick={() => {
+                      setSettings((s) => ({ ...s, model: opt.value || undefined }));
+                      setShowModelDropdown(false);
+                    }}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {settings.provider !== "codex" && (
+            <div className="agentModelChipWrap" ref={effortDropdownRef}>
+              <button
+                type="button"
+                className="agentModelChip"
+                onClick={() => setShowEffortDropdown((p) => !p)}
+                disabled={running}
+                title="Reasoning effort"
+              >
+                {effortDisplayLabel(settings.effort)}
+                <Icon name="chevron-down" size={12} />
+              </button>
+              {showEffortDropdown && (
+                <div className="agentModelDropdown">
+                  {EFFORT_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      className={`agentModelDropdownItem ${(settings.effort ?? "") === opt.value ? "agentModelDropdownItemActive" : ""}`}
+                      onClick={() => {
+                        setSettings((s) => ({ ...s, effort: (opt.value || undefined) as ReasoningEffort | undefined }));
+                        setShowEffortDropdown(false);
+                      }}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
+        </div>
+
+        <div className="agentInputRow">
+          <textarea
+            ref={inputRef}
+            className="agentInput"
+            value={input}
+            onChange={(e) => { setInput(e.target.value); autoResize(); }}
+            onKeyDown={handleKeyDown}
+            placeholder="Message the agent..."
+            disabled={running}
+          />
+          <div className="agentInputActions">
+            {running ? (
+              <button
+                type="button"
+                className="btnSmall agentStopBtn"
+                onClick={() => void stopAgent()}
+              >
+                <Icon name="stop" size={14} />
+                Stop
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="btnSmall agentSendBtn"
+                onClick={() => void sendMessage()}
+                disabled={!input.trim()}
+              >
+                Send
+              </button>
+            )}
+          </div>
         </div>
       </div>
     </aside>

@@ -22,8 +22,10 @@ export type IconName =
   | "grip"
   | "chevron-left"
   | "chevron-right"
+  | "chevron-down"
   | "download"
-  | "upload";
+  | "upload"
+  | "history";
 
 type IconProps = {
   name: IconName;
@@ -224,6 +226,20 @@ export const Icon = React.memo(function Icon({ name, size = 16, className }: Ico
           <path d="M12 19V9" />
           <path d="M8 11l4-4 4 4" />
           <path d="M5 19h14" />
+        </svg>
+      );
+    case "chevron-down":
+      return (
+        <svg {...common}>
+          <path d="M6 9l6 6 6-6" />
+        </svg>
+      );
+    case "history":
+      return (
+        <svg {...common}>
+          <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+          <path d="M3 3v5h5" />
+          <path d="M12 7v5l4 2" />
         </svg>
       );
     default:

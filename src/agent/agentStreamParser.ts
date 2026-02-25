@@ -38,11 +38,20 @@ export type ParsedUpdate =
   | { kind: "tool_end" }
   | { kind: "message_complete"; messageId: string; text: string; thinking?: string; toolCalls?: AgentToolCall[] }
   | { kind: "done"; sessionId?: string; error?: string; cost?: number }
-  | { kind: "finalize" };
+  | { kind: "finalize" }
+  | { kind: "batch"; updates: ParsedUpdate[] };
 
 let idCounter = 0;
 function nextId(): string {
   return `tc-${Date.now()}-${++idCounter}`;
+}
+
+/** Track Codex item IDs that have had item.started events. */
+const codexStartedItems = new Set<string>();
+
+/** Reset tracking state (call when starting a new agent run). */
+export function resetCodexTracking(): void {
+  codexStartedItems.clear();
 }
 
 /** Parse a single NDJSON line from Claude Code stream-json output. */
@@ -89,6 +98,10 @@ export function parseStreamLine(line: string): ParsedUpdate | null {
       // Create a new assistant message for this turn — all items accumulate into it
       return { kind: "message_start", messageId: `codex-turn-${Date.now()}-${++idCounter}` };
 
+    case "item.started": {
+      return parseCodexItemStarted(event.item as Record<string, unknown>);
+    }
+
     case "item.completed": {
       return parseCodexItem(event.item as Record<string, unknown>);
     }
@@ -96,6 +109,39 @@ export function parseStreamLine(line: string): ParsedUpdate | null {
     case "turn.completed": {
       // Finalize tool calls for this turn; process exit triggers "done" via agent-done event
       return { kind: "finalize" };
+    }
+
+    default:
+      return null;
+  }
+}
+
+/** Parse a Codex item.started payload — show in-progress tool calls. */
+function parseCodexItemStarted(item: Record<string, unknown>): ParsedUpdate | null {
+  if (!item) return null;
+  const id = item.id as string | undefined;
+  if (id) codexStartedItems.add(id);
+
+  switch (item.type) {
+    case "command_execution": {
+      const itemId = id || `codex-cmd-${Date.now()}-${++idCounter}`;
+      const command = (item.command as string) || "";
+      return { kind: "tool_start", id: itemId, name: "shell", input: { command } };
+    }
+
+    case "mcp_tool_call": {
+      const itemId = id || `codex-mcp-${Date.now()}-${++idCounter}`;
+      const server = (item.server as string) || "";
+      const tool = (item.tool as string) || (item.name as string) || "mcp_tool";
+      const mcpName = server ? `mcp__${server}__${tool}` : tool;
+      let input: Record<string, unknown> = {};
+      const args = item.arguments;
+      if (args && typeof args === "object" && !Array.isArray(args)) {
+        input = args as Record<string, unknown>;
+      } else if (typeof args === "string") {
+        try { input = JSON.parse(args); } catch { /* */ }
+      }
+      return { kind: "tool_start", id: itemId, name: mcpName, input };
     }
 
     default:
@@ -114,6 +160,25 @@ function parseCodexItem(item: Record<string, unknown>): ParsedUpdate | null {
     case "reasoning":
       return { kind: "thinking_delta", text: (item.text as string) || "" };
 
+    case "command_execution": {
+      const id = (item.id as string) || `codex-cmd-${Date.now()}-${++idCounter}`;
+      const output = (item.aggregated_output as string) || "";
+      const exitCode = item.exit_code as number | null;
+      const result = exitCode === 0 ? output : `${output}\n[exit code ${exitCode}]`;
+      // If we never saw item.started for this, emit both start + result
+      if (!codexStartedItems.has(id)) {
+        const command = (item.command as string) || "";
+        return {
+          kind: "batch",
+          updates: [
+            { kind: "tool_start", id, name: "shell", input: { command } },
+            { kind: "tool_result", callId: id, result },
+          ],
+        };
+      }
+      return { kind: "tool_result", callId: id, result };
+    }
+
     case "tool_call": {
       let input: Record<string, unknown> = {};
       try {
@@ -127,6 +192,58 @@ function parseCodexItem(item: Record<string, unknown>): ParsedUpdate | null {
       const callId = (item.call_id as string) || "";
       const output = (item.output as string) || "";
       return { kind: "tool_result", callId, result: output };
+    }
+
+    case "mcp_tool_call": {
+      const id = (item.id as string) || `codex-mcp-${Date.now()}-${++idCounter}`;
+      const server = (item.server as string) || "";
+      const tool = (item.tool as string) || (item.name as string) || "mcp_tool";
+      const mcpName = server ? `mcp__${server}__${tool}` : tool;
+
+      // Extract result text from structured content
+      const rawResult = item.result as Record<string, unknown> | string | null;
+      let output = "";
+      if (typeof rawResult === "string") {
+        output = rawResult;
+      } else if (rawResult && typeof rawResult === "object") {
+        const content = (rawResult as Record<string, unknown>).content;
+        if (Array.isArray(content)) {
+          output = content
+            .filter((c: Record<string, unknown>) => c.type === "text")
+            .map((c: Record<string, unknown>) => c.text as string)
+            .join("\n");
+        }
+      }
+
+      if (output) {
+        // If we never saw item.started for this, emit both start + result
+        if (!codexStartedItems.has(id)) {
+          let input: Record<string, unknown> = {};
+          const args = item.arguments;
+          if (args && typeof args === "object" && !Array.isArray(args)) {
+            input = args as Record<string, unknown>;
+          } else if (typeof args === "string") {
+            try { input = JSON.parse(args); } catch { /* */ }
+          }
+          return {
+            kind: "batch",
+            updates: [
+              { kind: "tool_start", id, name: mcpName, input },
+              { kind: "tool_result", callId: id, result: output },
+            ],
+          };
+        }
+        return { kind: "tool_result", callId: id, result: output };
+      }
+
+      let input: Record<string, unknown> = {};
+      const args = item.arguments;
+      if (args && typeof args === "object" && !Array.isArray(args)) {
+        input = args as Record<string, unknown>;
+      } else if (typeof args === "string") {
+        try { input = JSON.parse(args); } catch { /* */ }
+      }
+      return { kind: "tool_start", id, name: mcpName, input };
     }
 
     default:
@@ -396,6 +513,14 @@ export class StreamingMessageBuilder {
 
       case "finalize":
         return finalizeAllToolCalls(messages);
+
+      case "batch": {
+        let result = messages;
+        for (const sub of update.updates) {
+          result = this.apply(result, sub);
+        }
+        return result;
+      }
 
       default:
         return messages;

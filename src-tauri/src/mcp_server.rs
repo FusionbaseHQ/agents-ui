@@ -126,6 +126,30 @@ async fn start_mcp_server_inner(
 
     eprintln!("[mcp] listening on http://127.0.0.1:{port}/mcp");
 
+    // Register MCP server with agent CLIs (non-blocking)
+    let reg_port = port;
+    tokio::task::spawn_blocking(move || {
+        let result = crate::agent::do_register_mcp_with_agents(reg_port);
+        if result.claude_code.success {
+            eprintln!("[mcp-reg] Claude Code: registered");
+        } else if let Some(ref e) = result.claude_code.error {
+            if e == "not installed" {
+                eprintln!("[mcp-reg] Claude Code: not installed (skipped)");
+            } else {
+                eprintln!("[mcp-reg] Claude Code: {e}");
+            }
+        }
+        if result.codex.success {
+            eprintln!("[mcp-reg] Codex: registered");
+        } else if let Some(ref e) = result.codex.error {
+            if e == "not installed" {
+                eprintln!("[mcp-reg] Codex: not installed (skipped)");
+            } else {
+                eprintln!("[mcp-reg] Codex: {e}");
+            }
+        }
+    });
+
     if let Some(ref sc) = sc {
         sc.mcp_running.store(true, Ordering::Relaxed);
     }
