@@ -7815,6 +7815,7 @@ export default function App() {
             />
             <AgentPanel
               onClose={() => setAgentPanelOpen(false)}
+              projectBasePath={activeProject?.basePath || homeDirRef.current || undefined}
               onCreateTerminalSession={async (command) => {
                 try {
                   const cwd = activeProject?.basePath || homeDirRef.current || "";
@@ -7830,6 +7831,22 @@ export default function App() {
                 } catch (err) {
                   reportError("Failed to create agent terminal", err);
                 }
+              }}
+              onCreateTaskSession={async (command, name) => {
+                const cwd = activeProject?.basePath || homeDirRef.current || "";
+                const createdRaw = await createSession({
+                  projectId: activeProjectId,
+                  name,
+                  launchCommand: command,
+                  cwd,
+                  envVars: envVarsForProjectId(activeProjectId, projects, environments),
+                });
+                const s = applyPendingExit(createdRaw);
+                addSessionWithProjectSafeActivation(s);
+                return s.id;
+              }}
+              onActivateSession={(sessionId) => {
+                setActiveId(sessionId);
               }}
             />
           </>

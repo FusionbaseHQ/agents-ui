@@ -1,5 +1,38 @@
 export type AgentProvider = "claude-code" | "codex" | "terminal";
-export type AgentMode = "chat" | "terminal";
+export type AgentMode = "chat" | "terminal" | "orchestrate";
+
+// ── Orchestration types ──
+
+export type PlanTaskStatus = "pending" | "blocked" | "ready" | "running" | "done" | "failed";
+export type PlanStatus = "draft" | "running" | "paused" | "completed" | "failed";
+
+export type PlanTask = {
+  id: string;
+  title: string;
+  description: string;
+  dependencies: string[];
+  status: PlanTaskStatus;
+  assignee: AgentProvider;
+  model?: string;
+  terminalSessionId: string | null;
+  resultFilePath: string | null;
+  output: string | null;
+  error: string | null;
+  startedAt: number | null;
+  completedAt: number | null;
+  exitCode: number | null;
+};
+
+export type Plan = {
+  id: string;
+  goal: string;
+  status: PlanStatus;
+  tasks: PlanTask[];
+  createdAt: number;
+  updatedAt: number;
+  maxConcurrency: number;
+  resultDir: string;
+};
 
 export type AgentMessage = {
   id: string;

@@ -612,6 +612,136 @@ fn run_with_timeout(
     }
 }
 
+/// Build a CLI command for a task that runs in a visible terminal (non-interactive, human-readable).
+/// Unlike start_agent_prompt which streams JSON, this produces a command string for PTY sessions.
+#[tauri::command]
+pub async fn build_agent_task_command(
+    prompt: String,
+    settings: Option<AgentLaunchSettings>,
+) -> Result<String, String> {
+    let settings = settings.unwrap_or_default();
+    let mcp_config_path = agents_ui_dir()?.join("mcp-config.json");
+    if !mcp_config_path.exists() {
+        write_agent_mcp_config(None).await?;
+    }
+
+    let binary = match settings.provider.as_deref() {
+        Some("codex") => "codex",
+        _ => "claude",
+    };
+
+    let parts = if binary == "codex" {
+        build_codex_task_cmd(&prompt, &settings)?
+    } else {
+        build_claude_task_cmd(&prompt, &settings, &mcp_config_path)?
+    };
+
+    Ok(parts.join(" "))
+}
+
+/// Build Claude Code command for visible terminal task (no --output-format stream-json).
+fn build_claude_task_cmd(
+    prompt: &str,
+    settings: &AgentLaunchSettings,
+    mcp_config_path: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    let mut parts: Vec<String> = vec![
+        "claude".into(),
+        "-p".into(),
+        shell_escape(prompt),
+        "--verbose".into(),
+        "--mcp-config".into(),
+        shell_escape(&mcp_config_path.to_string_lossy()),
+    ];
+
+    let default_tools = "mcp__agents-ui__*";
+    let tools_value = match settings.allowed_tools.as_deref() {
+        Some(extra) if !extra.is_empty() => format!("{default_tools},{extra}"),
+        _ => default_tools.to_string(),
+    };
+    parts.push("--allowedTools".into());
+    parts.push(shell_escape(&tools_value));
+
+    if let Some(ref model) = settings.model {
+        parts.push("--model".into());
+        parts.push(shell_escape(model));
+    }
+
+    if let Some(ref effort) = settings.effort {
+        parts.push("--effort".into());
+        parts.push(shell_escape(effort));
+    }
+
+    Ok(parts)
+}
+
+/// Build Codex command for visible terminal task (no --json).
+fn build_codex_task_cmd(
+    prompt: &str,
+    settings: &AgentLaunchSettings,
+) -> Result<Vec<String>, String> {
+    let system_prompt = include_str!("agent_system_prompt.txt");
+    let instructions_path = agents_ui_dir()?.join("codex-instructions.md");
+    std::fs::write(&instructions_path, system_prompt)
+        .map_err(|e| format!("write instructions: {e}"))?;
+
+    let mut parts: Vec<String> = vec!["codex".into(), "exec".into()];
+
+    if let Some(ref model) = settings.model {
+        parts.push("-m".into());
+        parts.push(shell_escape(model));
+    }
+
+    parts.push(shell_escape(prompt));
+    parts.push("--full-auto".into());
+
+    parts.push("-c".into());
+    parts.push(format!(
+        "instructions_file={}",
+        shell_escape(&instructions_path.to_string_lossy())
+    ));
+
+    Ok(parts)
+}
+
+/// Read and clear the MCP output buffer for a given session.
+/// This bridges the MCP output buffer to the frontend for orchestration context passing.
+#[tauri::command]
+pub async fn read_agent_session_output(
+    buffers: tauri::State<'_, crate::mcp_tools::OutputBuffers>,
+    session_id: String,
+) -> Result<String, String> {
+    let mut bufs = buffers.lock().await;
+    let text = if let Some(buf) = bufs.get_mut(&session_id) {
+        buf.read_and_clear(false)
+    } else {
+        String::new()
+    };
+    Ok(text)
+}
+
+/// Create a directory (and all parent directories) at an absolute path.
+/// Used by the orchestrator to create result directories for plans.
+#[tauri::command]
+pub async fn orchestrate_ensure_dir(path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&path).map_err(|e| format!("create_dir_all failed: {e}"))
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+/// Read a text file at an absolute path.
+/// Used by the orchestrator to poll task result files.
+#[tauri::command]
+pub async fn orchestrate_read_file(path: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        std::fs::read_to_string(&path).map_err(|e| format!("read failed: {e}"))
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
 /// Tauri command to register MCP server with agent CLIs.
 #[tauri::command]
 pub async fn register_mcp_with_agents(port: Option<u16>) -> Result<McpRegistrationResult, String> {

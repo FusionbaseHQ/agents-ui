@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Icon } from "../components/Icon";
 import { AgentMessageView, AgentTypingIndicator } from "./AgentMessage";
 import { ConversationList } from "./ConversationList";
+import { OrchestratePanel } from "./OrchestratePanel";
 import { parseStreamLine, StreamingMessageBuilder, resetCodexTracking } from "./agentStreamParser";
 import {
   loadAgentSettings,
@@ -23,7 +24,10 @@ import type {
 
 type Props = {
   onClose: () => void;
+  projectBasePath?: string;
   onCreateTerminalSession?: (command: string) => void;
+  onCreateTaskSession?: (command: string, name: string) => Promise<string>;
+  onActivateSession?: (sessionId: string) => void;
 };
 
 let msgIdCounter = 0;
@@ -76,7 +80,7 @@ function effortDisplayLabel(effort: ReasoningEffort | undefined): string {
   return opt ? opt.short : effort;
 }
 
-export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
+export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, onCreateTaskSession, onActivateSession }: Props) {
   const [settings, setSettings] = useState<AgentSettings>(loadAgentSettings);
   const [conversations, setConversations] = useState<AgentConversation[]>(() => loadConversations());
   const [activeConvId, setActiveConvId] = useState<string | null>(() => {
@@ -92,6 +96,9 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
   const [showEffortDropdown, setShowEffortDropdown] = useState(false);
   const [mcpRegResult, setMcpRegResult] = useState<McpRegistrationResult | null>(null);
   const [mcpRegLoading, setMcpRegLoading] = useState(false);
+  const [inputAreaHeight, setInputAreaHeight] = useState<number | null>(null);
+  const inputAreaResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
+  const inputAreaRef = useRef<HTMLDivElement | null>(null);
   const runIdRef = useRef<string | null>(null);
   const stderrRef = useRef<string[]>([]);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -184,6 +191,29 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
     if (!el) return;
     el.style.height = "auto";
     el.style.height = Math.min(el.scrollHeight, 150) + "px";
+  }, []);
+
+  // Input area drag-to-resize
+  const onInputAreaResizeStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const el = inputAreaRef.current;
+    if (!el) return;
+    inputAreaResizeRef.current = { startY: e.clientY, startHeight: el.offsetHeight };
+
+    const onMove = (ev: MouseEvent) => {
+      const drag = inputAreaResizeRef.current;
+      if (!drag) return;
+      const delta = drag.startY - ev.clientY;
+      const newHeight = Math.max(80, Math.min(drag.startHeight + delta, 500));
+      setInputAreaHeight(newHeight);
+    };
+    const onUp = () => {
+      inputAreaResizeRef.current = null;
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
   }, []);
 
   // Listen for agent events. Uses refs to avoid stale closures.
@@ -453,7 +483,8 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
                 setSettings((s) => ({ ...s, mode: e.target.value as AgentMode }))
               }
             >
-              <option value="chat">Chat (Headless)</option>
+              <option value="chat">Agent (Headless Chat)</option>
+              <option value="orchestrate">Orchestrator (Multi-Agent, Alpha)</option>
               <option value="terminal">Terminal (Interactive)</option>
             </select>
           </label>
@@ -662,6 +693,53 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
     );
   }
 
+  // ── Orchestrate mode ──
+  if (settings.mode === "orchestrate") {
+    return (
+      <aside className="agentPanel">
+        <div className="agentHeader">
+          <span className="agentHeaderTitle">Agent</span>
+          <div className="agentHeaderActions">
+            <button
+              type="button"
+              className="btnSmall btnIcon"
+              onClick={() => setShowSettings(true)}
+              title="Settings"
+            >
+              <Icon name="settings" />
+            </button>
+            <button type="button" className="btnSmall btnIcon" onClick={onClose} title="Close">
+              <Icon name="close" />
+            </button>
+          </div>
+        </div>
+        <div className="agentModeBar">
+          <button
+            type="button"
+            className="agentModeTab"
+            onClick={() => setSettings((s) => ({ ...s, mode: "chat" }))}
+          >
+            Agent
+          </button>
+          <button
+            type="button"
+            className="agentModeTab agentModeTabActive"
+          >
+            Orchestrator (Alpha)
+          </button>
+        </div>
+        {onCreateTaskSession && onActivateSession && projectBasePath && (
+          <OrchestratePanel
+            settings={settings}
+            projectBasePath={projectBasePath}
+            onCreateTaskSession={onCreateTaskSession}
+            onActivateSession={onActivateSession}
+          />
+        )}
+      </aside>
+    );
+  }
+
   // Chat mode
   const messages = activeConv?.messages ?? [];
   const lastMsg = messages[messages.length - 1];
@@ -707,6 +785,21 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
           </button>
         </div>
       </div>
+      <div className="agentModeBar">
+        <button
+          type="button"
+          className="agentModeTab agentModeTabActive"
+        >
+          Agent
+        </button>
+        <button
+          type="button"
+          className="agentModeTab"
+          onClick={() => setSettings((s) => ({ ...s, mode: "orchestrate" }))}
+        >
+          Orchestrator (Alpha)
+        </button>
+      </div>
       {running && <div className="agentProgressBar" />}
 
       {showConvList && (
@@ -747,7 +840,14 @@ export function AgentPanel({ onClose, onCreateTerminalSession }: Props) {
         <div ref={messagesEndRef} />
       </div>
 
-      <div className="agentInputArea">
+      <div
+        className="agentInputArea"
+        ref={inputAreaRef}
+        style={inputAreaHeight ? { height: inputAreaHeight } : undefined}
+      >
+        <div className="agentInputResizeHandle" onMouseDown={onInputAreaResizeStart}>
+          <div className="agentInputResizeGrip" />
+        </div>
         <div className="agentInputControls">
           <div className="agentProviderToggle">
             <button

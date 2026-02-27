@@ -7,12 +7,11 @@ use axum::http::HeaderMap;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Router};
 use rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::net::TcpListener;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::watch;
 
 const MCP_PORT: u16 = 45557;
 
@@ -44,7 +43,7 @@ async fn start_mcp_server_inner(
     sc: Option<Arc<ServerControl>>,
 ) {
     let ctx = Arc::new(HandlerContext::new(app_handle.clone()));
-    let output_buffers: OutputBuffers = Arc::new(Mutex::new(HashMap::new()));
+    let output_buffers: OutputBuffers = app_handle.state::<OutputBuffers>().inner().clone();
     let app_version = app_handle
         .config()
         .version

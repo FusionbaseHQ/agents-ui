@@ -3843,7 +3843,7 @@ select.input {
 .agentMessages {
   flex: 1;
   overflow-y: auto;
-  padding: 12px 10px;
+  padding: 12px 18px;
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -4041,20 +4041,43 @@ select.input {
 .agentInputArea {
   flex-shrink: 0;
   border-top: 1px solid var(--border);
-  padding: 8px 10px;
+  padding: 0 10px 8px;
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-height: 80px;
+}
+.agentInputResizeHandle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 11px;
+  cursor: ns-resize;
+  flex-shrink: 0;
+  user-select: none;
+}
+.agentInputResizeHandle:hover .agentInputResizeGrip,
+.agentInputResizeHandle:active .agentInputResizeGrip {
+  background: var(--text-secondary);
+}
+.agentInputResizeGrip {
+  width: 32px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border);
+  transition: background 0.15s;
 }
 .agentInputControls {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
 }
 .agentInputRow {
   display: flex;
-  align-items: flex-end;
   gap: 6px;
+  flex: 1;
+  min-height: 0;
 }
 .agentInput {
   flex: 1;
@@ -4069,7 +4092,6 @@ select.input {
   line-height: 1.5;
   outline: none;
   min-height: 38px;
-  max-height: 150px;
   overflow-y: auto;
 }
 .agentInput:focus {
@@ -4081,7 +4103,7 @@ select.input {
 .agentInputActions {
   display: flex;
   flex-shrink: 0;
-  align-items: flex-end;
+  align-self: flex-end;
 }
 .agentSendBtn {
   padding: 4px 14px !important;
@@ -4533,7 +4555,7 @@ select.input {
 .agentMessageContent-md ul,
 .agentMessageContent-md ol {
   margin: 4px 0 8px;
-  padding-left: 20px;
+  padding-left: 28px;
 }
 .agentMessageContent-md li {
   margin-bottom: 2px;
@@ -4628,6 +4650,392 @@ select.input {
 }
 .agentTable td {
   color: var(--text);
+}
+
+/* ─── Agent Mode Tab Bar ─── */
+.agentModeBar {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.agentModeTab {
+  flex: 1;
+  padding: 7px 0;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.agentModeTab:hover {
+  color: var(--text);
+}
+.agentModeTabActive {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+/* ─── Orchestrate Panel ─── */
+.orchestratePanel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Empty state */
+.orchestrateEmpty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 48px 12px 32px;
+  text-align: center;
+}
+.orchestrateEmptyIcon {
+  width: 52px;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(var(--accent-rgb), 0.1);
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+.orchestrateEmptyTitle {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-bright);
+}
+.orchestrateEmptyHint {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+/* Error state */
+.orchestrateError {
+  margin: 0 10px;
+  padding: 10px;
+  background: rgba(229, 115, 115, 0.08);
+  border: 1px solid rgba(229, 115, 115, 0.2);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+.orchestrateErrorText {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+  width: 100%;
+}
+
+/* Input area */
+.orchestrateInputArea {
+  padding: 0 10px 10px;
+  border-top: 1px solid var(--border);
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  min-height: 80px;
+}
+.orchestrateResizeHandle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 10px;
+  cursor: ns-resize;
+  flex-shrink: 0;
+  user-select: none;
+}
+.orchestrateResizeHandle:hover .orchestrateResizeGrip,
+.orchestrateResizeHandle:active .orchestrateResizeGrip {
+  background: var(--text-secondary);
+}
+.orchestrateResizeGrip {
+  width: 32px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border);
+  transition: background 0.15s;
+}
+.orchestrateInputControls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  flex-shrink: 0;
+}
+.orchestrateControlLabel {
+  font-size: 10.5px;
+  color: var(--text-secondary);
+  margin-right: 2px;
+}
+.orchestrateInputRow {
+  display: flex;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+}
+.orchestrateInputRow .agentInput {
+  flex: 1;
+  height: auto;
+  min-height: 36px;
+  resize: none;
+}
+.orchestrateInputRow .agentSendBtn {
+  align-self: flex-end;
+  flex-shrink: 0;
+}
+
+/* Generating state */
+.orchestrateGenerating {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px;
+  text-align: center;
+}
+.orchestrateGeneratingText {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-bright);
+}
+.orchestrateGeneratingHint {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin: 0;
+}
+.orchestrateGenerating .agentProgressBar {
+  width: 100%;
+  max-width: 200px;
+  border-radius: 2px;
+}
+
+/* History */
+.orchestrateHistorySection {
+  margin-top: 8px;
+  flex-shrink: 0;
+}
+.orchestrateHistoryToggle {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 0;
+}
+.orchestrateHistoryToggle:hover {
+  color: var(--text);
+}
+.orchestrateHistoryList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.orchestrateHistoryItem {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.orchestrateHistoryItem:hover {
+  background: var(--hover-bg);
+}
+.orchestrateHistoryGoal {
+  font-size: 12px;
+  color: var(--text);
+}
+.orchestrateHistoryMeta {
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+
+/* ─── Plan Board ─── */
+.planBoard {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.planBoardHeader {
+  padding: 12px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.planBoardGoal {
+  font-size: 12.5px;
+  color: var(--text);
+  font-style: italic;
+  line-height: 1.4;
+  margin-bottom: 4px;
+}
+.planBoardStatus {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+.planBoardActions {
+  display: flex;
+  gap: 6px;
+}
+.planBoardBtn {
+  font-size: 11px;
+}
+.planBoardBtnSecondary {
+  opacity: 0.7;
+}
+
+/* Task list */
+.planBoardTasks {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 0;
+}
+
+/* ─── Plan Task Card ─── */
+.planTaskCard {
+  border-bottom: 1px solid var(--border);
+}
+.planTaskCardHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.planTaskCardHeader:hover {
+  background: var(--hover-bg);
+}
+.planTaskStatusDot {
+  font-size: 14px;
+  flex-shrink: 0;
+  width: 16px;
+  text-align: center;
+}
+.planTaskStatusPending { color: var(--text-secondary); }
+.planTaskStatusBlocked { color: var(--text-secondary); opacity: 0.5; }
+.planTaskStatusReady { color: var(--accent); }
+.planTaskStatusRunning { color: var(--accent); animation: planTaskPulse 1.5s ease-in-out infinite; }
+.planTaskStatusDone { color: #4caf50; }
+.planTaskStatusFailed { color: #e57373; }
+
+@keyframes planTaskPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.planTaskCardInfo {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.planTaskTitle {
+  font-size: 12px;
+  color: var(--text);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.planTaskMeta {
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}
+.planTaskRunningIcon {
+  display: inline-block;
+  animation: planTaskSpin 1s linear infinite;
+}
+@keyframes planTaskSpin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.planTaskExpandIcon {
+  color: var(--text-secondary);
+  transition: transform 0.15s;
+  flex-shrink: 0;
+}
+.planTaskExpandIconOpen {
+  transform: rotate(180deg);
+}
+
+/* Expanded body */
+.planTaskCardBody {
+  padding: 0 10px 10px 34px;
+}
+.planTaskDescription {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  margin-bottom: 8px;
+  white-space: pre-wrap;
+}
+.planTaskOutput {
+  margin-bottom: 8px;
+}
+.planTaskOutputLabel {
+  font-size: 10px;
+  color: var(--text-secondary);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+.planTaskOutputText {
+  font-size: 11px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  margin: 0;
+  max-height: 150px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-secondary);
+}
+.planTaskError {
+  font-size: 11px;
+  color: #e57373;
+  margin-bottom: 8px;
+}
+.planTaskActions {
+  display: flex;
+  gap: 6px;
+}
+.planTaskActionBtn {
+  font-size: 11px;
+}
+.planTaskCancelBtn {
+  color: #e57373;
 }
 
 /* ─── MCP Tool Cards (agents-ui) ─── */

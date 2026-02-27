@@ -44,8 +44,9 @@ use ssh_fs::{
 };
 use fs_watcher::{start_fs_watcher, stop_fs_watcher, watch_directory, unwatch_directory, FsWatcherState};
 use startup::get_startup_flags;
-use agent::{start_agent_prompt, stop_agent, get_agent_terminal_command, write_agent_mcp_config, register_mcp_with_agents, AgentState};
+use agent::{start_agent_prompt, stop_agent, get_agent_terminal_command, build_agent_task_command, write_agent_mcp_config, register_mcp_with_agents, read_agent_session_output, orchestrate_ensure_dir, orchestrate_read_file, AgentState};
 use api_bridge::{api_respond, api_notify_state_change, ApiPendingRequests, ApiEventBus};
+use mcp_tools::OutputBuffers;
 use server_control::{get_server_status, set_api_enabled, set_mcp_enabled, ServerControl};
 use tray::{build_status_tray, set_tray_agent_count, set_tray_recent_sessions, set_tray_status};
 use std::sync::Arc;
@@ -83,6 +84,7 @@ fn main() {
         .manage(ApiPendingRequests::default())
         .manage(ApiEventBus::default())
         .manage(AgentState::default())
+        .manage(OutputBuffers::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_drag::init())
@@ -184,7 +186,11 @@ fn main() {
             start_agent_prompt,
             stop_agent,
             get_agent_terminal_command,
+            build_agent_task_command,
             write_agent_mcp_config,
+            read_agent_session_output,
+            orchestrate_ensure_dir,
+            orchestrate_read_file,
             get_server_status,
             set_api_enabled,
             set_mcp_enabled,
