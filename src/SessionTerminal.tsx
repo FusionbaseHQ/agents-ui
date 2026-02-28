@@ -4,8 +4,10 @@ import { Terminal } from "xterm";
 import { CanvasAddon } from "xterm-addon-canvas";
 import { FitAddon } from "xterm-addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
+import { SessionShellIntegration, type CommandBlock } from "./shellIntegration";
+import { notifyStateChange } from "./apiBridge";
 
-export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon; search: SearchAddon }>;
+export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon; search: SearchAddon; shellInt?: SessionShellIntegration }>;
 export type PendingDataBuffer = Map<string, string[]>;
 
 type RenderDimension = { width: number; height: number };
@@ -133,6 +135,67 @@ function formatInvokeError(err: unknown): string {
   }
 }
 
+// --- OSC 133 context menu (pure DOM, appended to document.body) ---
+
+function dismissOsc133ContextMenu() {
+  document.getElementById("osc133-context-menu")?.remove();
+}
+
+function showOsc133ContextMenu(
+  event: MouseEvent,
+  block: CommandBlock,
+  term: Terminal,
+  shellInt: SessionShellIntegration,
+  rerunCommand: (cmd: string) => void,
+) {
+  dismissOsc133ContextMenu();
+
+  const items: Array<{ label: string; action: () => void }> = [];
+
+  const commandText = shellInt.getCommandText(term, block);
+  if (commandText) {
+    items.push({ label: "Copy Command", action: () => void copyToClipboard(commandText) });
+    items.push({ label: "Re-run Command", action: () => rerunCommand(commandText) });
+  }
+
+  const outputText = shellInt.getOutputText(term, block);
+  if (outputText !== null) {
+    items.push({ label: "Copy Output", action: () => void copyToClipboard(outputText) });
+  }
+
+  if (items.length === 0) return;
+
+  const menu = document.createElement("div");
+  menu.id = "osc133-context-menu";
+  menu.className = "osc133-context-menu";
+  menu.style.left = `${event.clientX}px`;
+  menu.style.top = `${event.clientY}px`;
+
+  for (const item of items) {
+    const row = document.createElement("div");
+    row.className = "osc133-context-menu-item";
+    row.textContent = item.label;
+    row.addEventListener("click", (e) => {
+      e.stopPropagation();
+      item.action();
+      menu.remove();
+      cleanup();
+    });
+    menu.appendChild(row);
+  }
+
+  document.body.appendChild(menu);
+
+  const cleanup = () => document.removeEventListener("mousedown", onDocClick, true);
+  const onDocClick = (e: MouseEvent) => {
+    if (!menu.contains(e.target as Node)) {
+      menu.remove();
+      cleanup();
+    }
+  };
+  setTimeout(() => document.addEventListener("mousedown", onDocClick, true), 0);
+}
+
 type SessionTerminalProps = {
   id: string;
   active: boolean;
@@ -168,6 +231,7 @@ function SessionTerminal(props: SessionTerminalProps) {
   }>({ active: false, wheelRemainder: 0 });
   const commandBufferRef = useRef<string>("");
   const flushPendingRef = useRef<(attemptsLeft: number) => void>(() => {});
+  const shellIntRef = useRef<SessionShellIntegration | null>(null);
 
   const onCwdChangeRef = useRef(props.onCwdChange);
   onCwdChangeRef.current = props.onCwdChange;
@@ -357,11 +421,20 @@ function SessionTerminal(props: SessionTerminalProps) {
           scrollZellijLines(term.rows);
           return false;
         }
-        if (event.metaKey && isUp) {
+        if (event.metaKey && event.shiftKey && (isUp || isDown)) {
+          const si = shellIntRef.current;
+          if (si?.activated) {
+            const row = term.buffer.active.viewportY;
+            const block = isUp ? si.getPreviousBlock(row + 1) : si.getNextBlock(row);
+            if (block) si.navigateToBlock(term, block);
+            return false;
+          }
+        }
+        if (event.metaKey && !event.shiftKey && isUp) {
           scrollZellijLines(-term.rows);
           return false;
         }
-        if (event.metaKey && isDown) {
+        if (event.metaKey && !event.shiftKey && isDown) {
           scrollZellijLines(term.rows);
           return false;
         }
@@ -404,6 +477,19 @@ function SessionTerminal(props: SessionTerminalProps) {
           void copyToClipboard(term.getSelection());
           return false;
         }
+        if (event.metaKey && event.shiftKey) {
+          const isUp = key === "ArrowUp";
+          const isDown = key === "ArrowDown";
+          if (isUp || isDown) {
+            const si = shellIntRef.current;
+            if (si?.activated) {
+              const row = term.buffer.active.viewportY;
+              const block = isUp ? si.getPreviousBlock(row + 1) : si.getNextBlock(row);
+              if (block) si.navigateToBlock(term, block);
+              return false;
+            }
+          }
+        }
         return true;
       });
       term.onData((data) => {
@@ -440,6 +526,74 @@ function SessionTerminal(props: SessionTerminalProps) {
       }
     };
 
+    // --- OSC 133 (FinalTerm) shell integration ---
+    const shellInt = new SessionShellIntegration();
+    shellIntRef.current = shellInt;
+    const osc133Decorations: Array<{ dispose: () => void }> = [];
+    let osc133Disposed = false;
+
+    const createExitDecoration = (block: CommandBlock) => {
+      if (osc133Disposed) return;
+      try {
+        const deco = term.registerDecoration({
+          marker: block.promptMarker,
+          x: 0,
+          width: 1,
+          height: 1,
+          layer: "top",
+        });
+        if (!deco) return;
+        osc133Decorations.push(deco);
+        const isSuccess = block.exitCode === 0;
+        deco.onRender((el) => {
+          if (el.dataset.osc133Init) return;
+          el.dataset.osc133Init = "1";
+          el.classList.add("osc133-exit-dot", isSuccess ? "osc133-success" : "osc133-error");
+          el.addEventListener("contextmenu", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            showOsc133ContextMenu(e, block, term, shellInt, (cmd) =>
+              void writeToSession(cmd + "\r", "ui"),
+            );
+          });
+        });
+      } catch {
+        // Decoration creation failed — non-fatal, skip silently
+      }
+    };
+
+    let pendingWorkingDeco: { dispose: () => void } | null = null;
+
+    const disposeWorkingDeco = () => {
+      if (!pendingWorkingDeco) return;
+      pendingWorkingDeco.dispose();
+      const idx = osc133Decorations.indexOf(pendingWorkingDeco);
+      if (idx >= 0) osc133Decorations.splice(idx, 1);
+      pendingWorkingDeco = null;
+    };
+
+    const createWorkingDecoration = (block: CommandBlock) => {
+      if (osc133Disposed) return;
+      disposeWorkingDeco();
+      try {
+        const deco = term.registerDecoration({
+          marker: block.promptMarker,
+          x: 0,
+          width: 1,
+          height: 1,
+          layer: "top",
+        });
+        if (!deco) return;
+        pendingWorkingDeco = deco;
+        osc133Decorations.push(deco);
+        deco.onRender((el) => {
+          if (el.dataset.osc133Init) return;
+          el.dataset.osc133Init = "1";
+          el.classList.add("osc133-exit-dot", "osc133-working");
+        });
+      } catch {}
+    };
+
 	    if (term.parser) {
 	      oscDisposables.push(
 	        term.parser.registerOscHandler(7, (data) => {
@@ -465,6 +619,56 @@ function SessionTerminal(props: SessionTerminalProps) {
           }
 
           return false;
+        }),
+      );
+
+      oscDisposables.push(
+        term.parser.registerOscHandler(133, (data) => {
+          const code = data.charAt(0);
+          switch (code) {
+            case "A":
+              disposeWorkingDeco();
+              shellInt.handlePromptStart(term);
+              // Defer React callback out of the write pipeline
+              queueMicrotask(() => reportCommand(""));
+              // Notify MCP/API listeners that the shell is idle at prompt
+              notifyStateChange("shell.prompt_ready", {
+                sessionId: props.id,
+                timestamp: Date.now(),
+              });
+              break;
+            case "B":
+              shellInt.handleCommandStart(term);
+              break;
+            case "C": {
+              shellInt.handleOutputStart(term);
+              const pending = shellInt.pendingBlock;
+              if (pending) {
+                requestAnimationFrame(() => createWorkingDecoration(pending));
+              }
+              break;
+            }
+            case "D": {
+              disposeWorkingDeco();
+              const exitStr = data.length > 2 ? data.slice(2) : "0";
+              const exitCode = parseInt(exitStr, 10) || 0;
+              shellInt.handleCommandFinished(term, exitCode);
+              // Defer decoration creation fully outside the write pipeline
+              const completed = shellInt.completedBlocks;
+              if (completed.length > 0) {
+                const lastBlock = completed[completed.length - 1];
+                requestAnimationFrame(() => createExitDecoration(lastBlock));
+                // Notify MCP/API listeners of command completion
+                const serialized = shellInt.serializeBlock(term, lastBlock);
+                notifyStateChange("shell.command_complete", {
+                  sessionId: props.id,
+                  ...serialized,
+                });
+              }
+              break;
+            }
+          }
+          return true;
         }),
       );
 
@@ -537,7 +741,7 @@ function SessionTerminal(props: SessionTerminalProps) {
 	    }
 
 	    // Register BEFORE flushing to avoid race with incoming events
-	    props.registry.current.set(props.id, { term, fit, search: searchAddon });
+	    props.registry.current.set(props.id, { term, fit, search: searchAddon, shellInt });
     onRegistryChangedRef.current?.();
 
 	    // Flush any buffered data that arrived before we were ready (but wait for renderer readiness)
@@ -635,6 +839,11 @@ function SessionTerminal(props: SessionTerminalProps) {
 	      if (resizeTimeoutRef.current !== null) {
 	        window.clearTimeout(resizeTimeoutRef.current);
 	      }
+	      osc133Disposed = true;
+	      dismissOsc133ContextMenu();
+	      for (const d of osc133Decorations) d.dispose();
+	      shellInt.dispose();
+	      shellIntRef.current = null;
 	      for (const d of oscDisposables) d.dispose();
 	      props.registry.current.delete(props.id);
       onRegistryChangedRef.current?.();

@@ -1,7 +1,7 @@
 use crate::api_bridge::ApiEventBus;
 use crate::api_handlers::HandlerContext;
 use crate::api_types::StateChangeNotification;
-use crate::mcp_tools::{self, OutputBuffer, OutputBuffers};
+use crate::mcp_tools::{self, CommandCompletion, CommandCompletionBuffers, IdleNotifications, OutputBuffer, OutputBuffers};
 use crate::server_control::ServerControl;
 use axum::http::HeaderMap;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Router};
@@ -18,6 +18,8 @@ const MCP_PORT: u16 = 45557;
 struct McpState {
     ctx: Arc<HandlerContext>,
     output_buffers: OutputBuffers,
+    completion_buffers: CommandCompletionBuffers,
+    idle_notifications: IdleNotifications,
     session_id: String,
     app_version: String,
 }
@@ -44,6 +46,8 @@ async fn start_mcp_server_inner(
 ) {
     let ctx = Arc::new(HandlerContext::new(app_handle.clone()));
     let output_buffers: OutputBuffers = app_handle.state::<OutputBuffers>().inner().clone();
+    let completion_buffers: CommandCompletionBuffers = Default::default();
+    let idle_notifications: IdleNotifications = Default::default();
     let app_version = app_handle
         .config()
         .version
@@ -58,12 +62,16 @@ async fn start_mcp_server_inner(
     let state = Arc::new(McpState {
         ctx,
         output_buffers: output_buffers.clone(),
+        completion_buffers: completion_buffers.clone(),
+        idle_notifications: idle_notifications.clone(),
         session_id,
         app_version,
     });
 
     // Spawn output buffer background task
     let buffers_clone = output_buffers.clone();
+    let completions_clone = completion_buffers.clone();
+    let idle_clone = idle_notifications.clone();
     let event_bus = app_handle.state::<ApiEventBus>().inner().clone();
     let mut event_rx = event_bus.sender().subscribe();
 
@@ -71,7 +79,7 @@ async fn start_mcp_server_inner(
         loop {
             match event_rx.recv().await {
                 Ok(notification) => {
-                    handle_event_notification(&buffers_clone, &notification).await;
+                    handle_event_notification(&buffers_clone, &completions_clone, &idle_clone, &notification).await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     eprintln!("[mcp] output buffer lagged, missed {n} events");
@@ -193,7 +201,12 @@ async fn start_mcp_server_inner(
     }
 }
 
-async fn handle_event_notification(buffers: &OutputBuffers, notification: &StateChangeNotification) {
+async fn handle_event_notification(
+    buffers: &OutputBuffers,
+    completion_buffers: &CommandCompletionBuffers,
+    idle_notifications: &IdleNotifications,
+    notification: &StateChangeNotification,
+) {
     match notification.event.as_str() {
         "sessions.output" => {
             if let (Some(session_id), Some(output)) = (
@@ -204,6 +217,36 @@ async fn handle_event_notification(buffers: &OutputBuffers, notification: &State
                 bufs.entry(session_id.to_string())
                     .or_insert_with(OutputBuffer::new)
                     .append(output.to_string());
+            }
+        }
+        "shell.command_complete" => {
+            if let Some(session_id) = notification.data.get("sessionId").and_then(|v| v.as_str()) {
+                let completion = CommandCompletion {
+                    command: notification.data.get("command").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    exit_code: notification.data.get("exitCode").and_then(|v| v.as_i64()),
+                    output: notification.data.get("output").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    duration_ms: notification.data.get("durationMs").and_then(|v| v.as_i64()),
+                };
+                let mut bufs = completion_buffers.lock().await;
+                let entries = bufs.entry(session_id.to_string()).or_insert_with(Vec::new);
+                entries.push(completion);
+                // Cap at MAX_COMPLETIONS_PER_SESSION
+                while entries.len() > mcp_tools::MAX_COMPLETIONS_PER_SESSION {
+                    entries.remove(0);
+                }
+            }
+        }
+        "shell.prompt_ready" => {
+            if let (Some(session_id), Some(timestamp)) = (
+                notification.data.get("sessionId").and_then(|v| v.as_str()),
+                notification.data.get("timestamp").and_then(|v| v.as_u64()),
+            ) {
+                let mut notifs = idle_notifications.lock().await;
+                let entries = notifs.entry(session_id.to_string()).or_insert_with(Vec::new);
+                entries.push(timestamp);
+                while entries.len() > mcp_tools::MAX_IDLE_NOTIFICATIONS_PER_SESSION {
+                    entries.remove(0);
+                }
             }
         }
         "sessions.exit" => {
@@ -295,7 +338,7 @@ async fn process_mcp_message(state: &McpState, msg: &Value) -> (Option<Value>, b
             let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-            match mcp_tools::call_tool(&state.ctx, &state.output_buffers, tool_name, arguments).await {
+            match mcp_tools::call_tool(&state.ctx, &state.output_buffers, &state.completion_buffers, &state.idle_notifications, tool_name, arguments).await {
                 Ok(result) => result,
                 Err(err) => {
                     json!({

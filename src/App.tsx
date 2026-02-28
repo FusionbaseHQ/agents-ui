@@ -3281,6 +3281,95 @@ export default function App() {
         notifyStateChange("ui.command_palette_toggled", { open: shouldOpen });
         return { open: shouldOpen };
       },
+      // ── shell integration ──
+      "shell.command_history": (p) => {
+        const sessionId = p.sessionId as string;
+        const limit = (p.limit as number) || 20;
+        const entry = registry.current.get(sessionId);
+        if (!entry?.shellInt) return [];
+        const blocks = entry.shellInt.completedBlocks;
+        const sliced = blocks.slice(-limit);
+        return sliced.map((b) => entry.shellInt!.serializeBlock(entry.term, b));
+      },
+      "shell.last_result": (p) => {
+        const sessionId = p.sessionId as string;
+        const entry = registry.current.get(sessionId);
+        if (!entry?.shellInt) return null;
+        const blocks = entry.shellInt.completedBlocks;
+        if (blocks.length === 0) return null;
+        return entry.shellInt.serializeBlock(entry.term, blocks[blocks.length - 1]);
+      },
+      "shell.read_screen": (p) => {
+        const sessionId = p.sessionId as string;
+        const entry = registry.current.get(sessionId);
+        if (!entry) throw new Error("session not found in terminal registry");
+        const term = entry.term;
+        const buf = term.buffer.active;
+        const lines: string[] = [];
+        for (let i = 0; i < term.rows; i++) {
+          const line = buf.getLine(buf.viewportY + i);
+          lines.push(line ? line.translateToString(true) : "");
+        }
+        return {
+          content: lines.join("\n"),
+          rows: term.rows,
+          cols: term.cols,
+          cursorX: buf.cursorX,
+          cursorY: buf.cursorY,
+        };
+      },
+      "shell.read_scrollback": (p) => {
+        const sessionId = p.sessionId as string;
+        const requestedLines = (p.lines as number) || 100;
+        const offset = (p.offset as number) || 0;
+        const entry = registry.current.get(sessionId);
+        if (!entry) throw new Error("session not found in terminal registry");
+        const buf = entry.term.buffer.active;
+        const totalLines = buf.length;
+        const endLine = Math.max(0, totalLines - offset);
+        const startLine = Math.max(0, endLine - requestedLines);
+        const lines: string[] = [];
+        for (let i = startLine; i < endLine; i++) {
+          const line = buf.getLine(i);
+          lines.push(line ? line.translateToString(true) : "");
+        }
+        return {
+          content: lines.join("\n"),
+          startLine,
+          endLine,
+          totalLines,
+        };
+      },
+      "shell.get_status": (p) => {
+        const sessionId = p.sessionId as string;
+        const session = sessionsRef.current.find((s) => s.id === sessionId);
+        if (!session) throw new Error("session not found");
+        const entry = registry.current.get(sessionId);
+        const shellInt = entry?.shellInt;
+        let shellState: "idle" | "running" | "unknown" = "unknown";
+        let shellIntegration = false;
+        if (shellInt?.activated) {
+          shellIntegration = true;
+          // If there's a pending block with a commandMarker (B fired) but no endMarker (D),
+          // a command is running. We check commandMarker rather than outputMarker because
+          // commands like `sleep` may block without producing output (no C marker).
+          const pending = shellInt.pendingBlock;
+          if (pending && pending.commandMarker && !pending.endMarker) {
+            shellState = "running";
+          } else {
+            shellState = "idle";
+          }
+        }
+        return {
+          sessionId,
+          shell: session.command ?? null,
+          cwd: session.cwd ?? null,
+          shellIntegration,
+          shellState,
+          exited: session.exited ?? false,
+          exitCode: session.exitCode ?? null,
+        };
+      },
       // ── app ──
       "app.state": async () => {
         const state = await invoke("load_persisted_state");

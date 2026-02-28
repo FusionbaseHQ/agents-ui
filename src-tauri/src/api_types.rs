@@ -363,7 +363,9 @@ pub fn is_bridge_method(method: &str) -> bool {
         "split_views.list" | "split_views.create" | "split_views.update" | "split_views.close" |
         "ui.state" | "ui.activate_session" | "ui.toggle_panel" | "ui.command_palette" |
         "ui.navigate_session" |
-        "app.state"
+        "app.state" |
+        "shell.command_history" | "shell.last_result" |
+        "shell.read_screen" | "shell.read_scrollback" | "shell.get_status"
     )
 }
 

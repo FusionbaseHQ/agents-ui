@@ -1,4 +1,5 @@
 use crate::api_handlers::{self, HandlerContext};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,6 +49,27 @@ impl OutputBuffer {
 }
 
 pub type OutputBuffers = Arc<Mutex<HashMap<String, OutputBuffer>>>;
+
+// ── Idle notification buffer types ──
+
+pub type IdleNotifications = Arc<Mutex<HashMap<String, Vec<u64>>>>;
+
+pub const MAX_IDLE_NOTIFICATIONS_PER_SESSION: usize = 100;
+
+// ── Command completion buffer types ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandCompletion {
+    pub command: Option<String>,
+    pub exit_code: Option<i64>,
+    pub output: Option<String>,
+    pub duration_ms: Option<i64>,
+}
+
+pub type CommandCompletionBuffers = Arc<Mutex<HashMap<String, Vec<CommandCompletion>>>>;
+
+pub const MAX_COMPLETIONS_PER_SESSION: usize = 50;
 
 pub fn strip_ansi(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
@@ -318,6 +340,70 @@ pub fn tool_list() -> Vec<Value> {
             "type": "object",
             "properties": {}
         })),
+        // Shell integration
+        tool_def("wait_for_command_complete", "Wait for a shell command to finish executing (detected via OSC 133 shell integration markers). Blocks until the command's exit marker fires or timeout expires. Returns structured result with command text, exit code, output, and duration. Requires shell integration to be active in the session.", json!({
+            "type": "object",
+            "properties": {
+                "sessionId": { "type": "string", "description": "Session ID" },
+                "timeout": { "type": "number", "description": "Max wait time in milliseconds (default: 30000)" }
+            },
+            "required": ["sessionId"]
+        })),
+        tool_def("get_command_history", "Get recent completed command results from a session (via OSC 133 shell integration). Returns an array of structured results with command text, exit code, output, and duration.", json!({
+            "type": "object",
+            "properties": {
+                "sessionId": { "type": "string", "description": "Session ID" },
+                "limit": { "type": "number", "description": "Max number of results to return (default: 20)" }
+            },
+            "required": ["sessionId"]
+        })),
+        tool_def("get_last_command_result", "Get the most recent completed command result from a session (via OSC 133 shell integration). Returns a single structured result with command text, exit code, output, and duration, or null if no commands have completed.", json!({
+            "type": "object",
+            "properties": {
+                "sessionId": { "type": "string", "description": "Session ID" }
+            },
+            "required": ["sessionId"]
+        })),
+        // Agent assistance
+        tool_def("read_screen", "Read the visible terminal viewport content. Returns the currently displayed text, dimensions, and cursor position. Useful for understanding what the user or a running program is showing right now.", json!({
+            "type": "object",
+            "properties": {
+                "sessionId": { "type": "string", "description": "Session ID" }
+            },
+            "required": ["sessionId"]
+        })),
+        tool_def("read_scrollback", "Read lines from the terminal scrollback buffer. Returns historical output that has scrolled off the visible viewport. Use offset to page through history.", json!({
+            "type": "object",
+            "properties": {
+                "sessionId": { "type": "string", "description": "Session ID" },
+                "lines": { "type": "number", "description": "Number of lines to read (default: 100)" },
+                "offset": { "type": "number", "description": "Line offset from the end of the buffer. 0 = most recent lines (default: 0)" }
+            },
+            "required": ["sessionId"]
+        })),
+        tool_def("get_session_status", "Get the current status of a terminal session including the shell program (e.g. nu, zsh), shell state (idle/running/unknown), working directory, and exit info. Uses OSC 133 shell integration markers when available. Note: nu shell may report 'idle' during blocking builtins like sleep — use read_screen to verify.", json!({
+            "type": "object",
+            "properties": {
+                "sessionId": { "type": "string", "description": "Session ID" }
+            },
+            "required": ["sessionId"]
+        })),
+        tool_def("send_signal", "Send a control signal to a terminal session. Sends the corresponding control character to the PTY: SIGINT (Ctrl+C), EOF (Ctrl+D), SIGTSTP (Ctrl+Z), SIGQUIT (Ctrl+\\). Works in any shell.", json!({
+            "type": "object",
+            "properties": {
+                "sessionId": { "type": "string", "description": "Session ID" },
+                "signal": { "type": "string", "enum": ["SIGINT", "EOF", "SIGTSTP", "SIGQUIT"], "description": "Signal to send" }
+            },
+            "required": ["sessionId", "signal"]
+        })),
+        tool_def("wait_for_idle", "Wait for a terminal session to return to an idle shell prompt. Blocks until an OSC 133 'A' (prompt start) marker is received or timeout expires. Requires shell integration. Note: nu shell may not re-emit prompt markers after SIGINT — if this times out, fall back to polling get_session_status.", json!({
+            "type": "object",
+            "properties": {
+                "sessionId": { "type": "string", "description": "Session ID" },
+                "timeout": { "type": "number", "description": "Max wait time in milliseconds (default: 30000)" }
+            },
+            "required": ["sessionId"]
+        })),
     ]
 }
 
@@ -359,6 +445,14 @@ fn tool_to_method(name: &str) -> Option<&'static str> {
         "send_prompt" => Some("prompts.send"),
         "get_app_info" => Some("app.info"),
         "get_ui_state" => Some("ui.state"),
+        "wait_for_command_complete" => None, // handled as special case in call_tool
+        "get_command_history" => Some("shell.command_history"),
+        "get_last_command_result" => Some("shell.last_result"),
+        "read_screen" => Some("shell.read_screen"),
+        "read_scrollback" => Some("shell.read_scrollback"),
+        "get_session_status" => Some("shell.get_status"),
+        "send_signal" => None,     // handled as special case in call_tool
+        "wait_for_idle" => None,   // handled as special case in call_tool
         _ => None,
     }
 }
@@ -419,6 +513,23 @@ fn map_params(name: &str, args: &Value) -> Value {
         }
         "get_app_info" => json!({}),
         "get_ui_state" => json!({}),
+        "wait_for_command_complete" => json!({}), // handled as special case
+        "get_command_history" => {
+            let mut p = json!({ "sessionId": args.get("sessionId") });
+            if let Some(v) = args.get("limit") { p["limit"] = v.clone(); }
+            p
+        }
+        "get_last_command_result" => json!({ "sessionId": args.get("sessionId") }),
+        "read_screen" => json!({ "sessionId": args.get("sessionId") }),
+        "read_scrollback" => {
+            let mut p = json!({ "sessionId": args.get("sessionId") });
+            if let Some(v) = args.get("lines") { p["lines"] = v.clone(); }
+            if let Some(v) = args.get("offset") { p["offset"] = v.clone(); }
+            p
+        }
+        "get_session_status" => json!({ "sessionId": args.get("sessionId") }),
+        "send_signal" => json!({}),     // handled as special case
+        "wait_for_idle" => json!({}),   // handled as special case
         _ => args.clone(),
     }
 }
@@ -428,6 +539,8 @@ fn map_params(name: &str, args: &Value) -> Value {
 pub async fn call_tool(
     ctx: &Arc<HandlerContext>,
     buffers: &OutputBuffers,
+    completion_buffers: &CommandCompletionBuffers,
+    idle_notifications: &IdleNotifications,
     name: &str,
     args: Value,
 ) -> Result<Value, String> {
@@ -511,6 +624,104 @@ pub async fn call_tool(
                 .map_err(|e| e.message)?;
 
             return Ok(mcp_text_result("Command sent"));
+        }
+        "wait_for_command_complete" => {
+            let session_id = args.get("sessionId")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing required parameter: sessionId")?
+                .to_string();
+            let timeout_ms = args.get("timeout")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(30000);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+            loop {
+                {
+                    let bufs = completion_buffers.lock().await;
+                    if let Some(completions) = bufs.get(&session_id) {
+                        if !completions.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+
+            let mut bufs = completion_buffers.lock().await;
+            if let Some(completions) = bufs.get_mut(&session_id) {
+                if !completions.is_empty() {
+                    let completion = completions.remove(0);
+                    let text = serde_json::to_string_pretty(&completion).unwrap_or_default();
+                    return Ok(mcp_text_result(&text));
+                }
+            }
+            return Ok(mcp_text_result("Timeout: no command completed within the deadline"));
+        }
+        "send_signal" => {
+            let session_id = args.get("sessionId")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing required parameter: sessionId")?;
+            let signal = args.get("signal")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing required parameter: signal")?;
+            let ctrl_char = match signal {
+                "SIGINT"  => "\x03",
+                "EOF"     => "\x04",
+                "SIGTSTP" => "\x1a",
+                "SIGQUIT" => "\x1c",
+                _ => return Err(format!("Unknown signal: {signal}. Must be one of: SIGINT, EOF, SIGTSTP, SIGQUIT")),
+            };
+            let params = json!({ "id": session_id, "data": ctrl_char });
+            api_handlers::dispatch(ctx, "sessions.write", params).await
+                .map_err(|e| e.message)?;
+            return Ok(mcp_text_result(&format!("Signal {signal} sent")));
+        }
+        "wait_for_idle" => {
+            let session_id = args.get("sessionId")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing required parameter: sessionId")?
+                .to_string();
+            let timeout_ms = args.get("timeout")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(30000);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+            // Drain any stale notifications for this session before waiting
+            {
+                let mut notifs = idle_notifications.lock().await;
+                if let Some(entries) = notifs.get_mut(&session_id) {
+                    entries.clear();
+                }
+            }
+
+            loop {
+                {
+                    let mut notifs = idle_notifications.lock().await;
+                    if let Some(entries) = notifs.get_mut(&session_id) {
+                        if !entries.is_empty() {
+                            let ts = entries.remove(0);
+                            return Ok(mcp_text_result(&json!({
+                                "status": "idle",
+                                "sessionId": session_id,
+                                "timestamp": ts
+                            }).to_string()));
+                        }
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+
+            return Ok(mcp_text_result(&json!({
+                "status": "timeout",
+                "sessionId": session_id,
+                "message": "No prompt detected within the timeout period"
+            }).to_string()));
         }
         _ => {}
     }
