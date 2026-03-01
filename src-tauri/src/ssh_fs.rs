@@ -361,11 +361,13 @@ fn parse_sftp_ls(dir_path: &str, stdout: &str) -> Vec<FsEntry> {
         if name_field.is_empty() {
             continue;
         }
-        let name = name_field
+        let raw_name = name_field
             .split(" -> ")
             .next()
             .unwrap_or(name_field)
             .trim();
+        // Some SFTP servers return full absolute paths; extract just the basename.
+        let name = raw_name.rsplit('/').next().unwrap_or(raw_name);
         if name.is_empty() || name == "." || name == ".." {
             continue;
         }
