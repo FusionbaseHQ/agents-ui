@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useImperativeHandle, forwardRef } from "react";
+import React, { useState, useRef, useEffect, useMemo, useImperativeHandle, forwardRef } from "react";
 
 function normalizeSmartQuotes(input: string): string {
   return input.replace(/[""„‟«»]/g, '"').replace(/[''‚‛‹›]/g, "'");
@@ -9,15 +9,25 @@ type EnvironmentConfig = {
   name: string;
 };
 
+export type SshHostEntry = {
+  alias: string;
+  hostName?: string | null;
+  user?: string | null;
+  port?: number | null;
+};
+
 export type ProjectSubmitData = {
   title: string;
   basePath: string;
   environmentId: string;
   assetsEnabled: boolean;
+  sshTarget: string;
+  sshRemotePath: string;
 };
 
 export type ProjectModalHandle = {
   setBasePath: (basePath: string) => void;
+  setSshRemotePath: (remotePath: string) => void;
 };
 
 type ProjectModalProps = {
@@ -27,6 +37,10 @@ type ProjectModalProps = {
   basePathPlaceholder: string;
   initialEnvironmentId: string;
   initialAssetsEnabled: boolean;
+  initialSshTarget: string;
+  initialSshRemotePath: string;
+  sshHosts: SshHostEntry[];
+  sshHostsLoading: boolean;
   canUseCurrentTab: boolean;
   currentTabCwd: string | null;
   canUseHome: boolean;
@@ -34,35 +48,91 @@ type ProjectModalProps = {
   environments: EnvironmentConfig[];
   onOpenEnvironments: () => void;
   onBrowseBasePath: (currentBasePath: string) => void;
+  onBrowseRemotePath: (sshTarget: string, currentPath: string) => void;
   onClose: () => void;
   onSubmit: (data: ProjectSubmitData) => void;
 };
+
+function formatHostDetails(entry: SshHostEntry): string | null {
+  const hostName = entry.hostName?.trim() || null;
+  const user = entry.user?.trim() || null;
+  const port = entry.port ?? null;
+  const parts: string[] = [];
+  if (user && hostName) parts.push(`${user}@${hostName}`);
+  else if (hostName) parts.push(hostName);
+  else if (user) parts.push(`${user}@`);
+  if (port && port !== 22) parts.push(`:${port}`);
+  return parts.length ? parts.join("") : null;
+}
 
 export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
   function ProjectModal(props, ref) {
     const {
       mode, initialTitle, initialBasePath, basePathPlaceholder,
       initialEnvironmentId, initialAssetsEnabled,
+      initialSshTarget, initialSshRemotePath,
+      sshHosts, sshHostsLoading,
       canUseCurrentTab, currentTabCwd, canUseHome, homeDir,
-      environments, onOpenEnvironments, onBrowseBasePath, onClose, onSubmit,
+      environments, onOpenEnvironments, onBrowseBasePath, onBrowseRemotePath, onClose, onSubmit,
     } = props;
 
     const [title, setTitle] = useState(initialTitle);
     const [basePath, setBasePath] = useState(initialBasePath);
     const [environmentId, setEnvironmentId] = useState(initialEnvironmentId);
     const [assetsEnabled, setAssetsEnabled] = useState(initialAssetsEnabled);
+    const [projectType, setProjectType] = useState<"local" | "ssh">(initialSshTarget ? "ssh" : "local");
+    const [sshTarget, setSshTarget] = useState(initialSshTarget);
+    const [sshRemotePath, setSshRemotePath] = useState(initialSshRemotePath);
     const titleRef = useRef<HTMLInputElement>(null);
 
-    useImperativeHandle(ref, () => ({ setBasePath }));
+    useImperativeHandle(ref, () => ({ setBasePath, setSshRemotePath }));
 
     useEffect(() => {
       const t = window.setTimeout(() => titleRef.current?.focus(), 0);
       return () => clearTimeout(t);
     }, []);
 
+    const isSsh = projectType === "ssh";
+
+    const hostCandidates = useMemo(() => {
+      const q = sshTarget.trim().toLowerCase();
+      if (!q) return [];
+      const scored = sshHosts
+        .map((h) => {
+          const alias = h.alias.toLowerCase();
+          const hostName = (h.hostName ?? "").toLowerCase();
+          let score = 0;
+          if (alias === q) score = 100;
+          else if (alias.startsWith(q)) score = 90;
+          else if (alias.includes(q)) score = 70;
+          else if (hostName.includes(q)) score = 50;
+          else return null;
+          return { h, score };
+        })
+        .filter((x): x is { h: SshHostEntry; score: number } => Boolean(x))
+        .sort((a, b) => b.score - a.score || a.h.alias.localeCompare(b.h.alias))
+        .slice(0, 6)
+        .map((x) => x.h);
+      return scored;
+    }, [sshHosts, sshTarget]);
+
+    const selectedHostDetails = useMemo(() => {
+      const q = sshTarget.trim().toLowerCase();
+      if (!q) return null;
+      const match = sshHosts.find((h) => h.alias.toLowerCase() === q);
+      return match ? formatHostDetails(match) : null;
+    }, [sshHosts, sshTarget]);
+
     const handleSubmit = (e: React.FormEvent) => {
       e.preventDefault();
-      onSubmit({ title, basePath, environmentId, assetsEnabled });
+      onSubmit({
+        title,
+        basePath,
+        environmentId,
+        assetsEnabled,
+        sshTarget: isSsh ? sshTarget : "",
+        sshRemotePath: isSsh ? sshRemotePath : "",
+      });
     };
 
     return (
@@ -81,38 +151,136 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
               />
             </div>
             <div className="formRow">
-              <div className="label">Base path</div>
-              <div className="pathRow">
-                <input
-                  className="input"
-                  value={basePath}
-                  onChange={(e) => setBasePath(normalizeSmartQuotes(e.target.value))}
-                  placeholder={basePathPlaceholder}
-                />
-                <button type="button" className="btn" onClick={() => onBrowseBasePath(basePath)}>
-                  Browse
-                </button>
-              </div>
-              <div className="pathActions">
+              <div className="label">Type</div>
+              <div className="segmentedControl">
                 <button
                   type="button"
-                  className="btnSmall"
-                  onClick={() => setBasePath(currentTabCwd ?? "")}
-                  disabled={!canUseCurrentTab}
+                  className={`segmentedBtn segmentedBtnLocal ${!isSsh ? "segmentedBtnActive" : ""}`}
+                  onClick={() => setProjectType("local")}
                 >
-                  Use current tab
+                  Local
                 </button>
                 <button
                   type="button"
-                  className="btnSmall"
-                  onClick={() => setBasePath(homeDir ?? "")}
-                  disabled={!canUseHome}
+                  className={`segmentedBtn segmentedBtnSsh ${isSsh ? "segmentedBtnActive" : ""}`}
+                  onClick={() => setProjectType("ssh")}
                 >
-                  Home
+                  SSH
                 </button>
               </div>
-              <div className="hint">New sessions in this project start here.</div>
             </div>
+
+            {isSsh ? (
+              <>
+                <div className="formRow">
+                  <div className="label">SSH host</div>
+                  <input
+                    className="input"
+                    value={sshTarget}
+                    onChange={(e) => setSshTarget(e.target.value)}
+                    placeholder="Start typing an SSH host…"
+                    autoComplete="off"
+                    autoCapitalize="off"
+                    autoCorrect="off"
+                    spellCheck={false}
+                  />
+                  {!sshHostsLoading && sshTarget.trim() && (
+                    <div className="sshHostList" aria-label="SSH config hosts">
+                      {hostCandidates.length === 0 ? (
+                        <div className="sshHostListEmpty">
+                          No matches. You can still type a hostname directly.
+                        </div>
+                      ) : (
+                        <div className="sshHostListItems" role="listbox" aria-label="Matches">
+                          {hostCandidates.map((h) => {
+                            const isSelected = h.alias === sshTarget.trim();
+                            const meta = formatHostDetails(h);
+                            return (
+                              <button
+                                key={h.alias}
+                                type="button"
+                                className={`sshHostItem ${isSelected ? "sshHostItemActive" : ""}`}
+                                onClick={() => setSshTarget(h.alias)}
+                                title={meta ? `${h.alias}\n${meta}` : h.alias}
+                              >
+                                <div className="sshHostItemMain">
+                                  <div className="sshHostAlias">{h.alias}</div>
+                                  {meta && <div className="sshHostMeta">{meta}</div>}
+                                </div>
+                                <div className="sshHostPick" aria-hidden="true">
+                                  {isSelected ? "✓" : ""}
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {sshHostsLoading ? (
+                    <div className="hint">Loading hosts…</div>
+                  ) : selectedHostDetails ? (
+                    <div className="hint">Resolves to: {selectedHostDetails}</div>
+                  ) : (
+                    <div className="hint">Tip: type a hostname or choose from ~/.ssh/config.</div>
+                  )}
+                </div>
+                <div className="formRow">
+                  <div className="label">Remote path</div>
+                  <div className="pathRow">
+                    <input
+                      className="input"
+                      value={sshRemotePath}
+                      onChange={(e) => setSshRemotePath(normalizeSmartQuotes(e.target.value))}
+                      placeholder="~ (remote home)"
+                    />
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={!sshTarget.trim()}
+                      onClick={() => onBrowseRemotePath(sshTarget.trim(), sshRemotePath.trim())}
+                    >
+                      Browse
+                    </button>
+                  </div>
+                  <div className="hint">Remote working directory for new sessions.</div>
+                </div>
+              </>
+            ) : (
+              <div className="formRow">
+                <div className="label">Base path</div>
+                <div className="pathRow">
+                  <input
+                    className="input"
+                    value={basePath}
+                    onChange={(e) => setBasePath(normalizeSmartQuotes(e.target.value))}
+                    placeholder={basePathPlaceholder}
+                  />
+                  <button type="button" className="btn" onClick={() => onBrowseBasePath(basePath)}>
+                    Browse
+                  </button>
+                </div>
+                <div className="pathActions">
+                  <button
+                    type="button"
+                    className="btnSmall"
+                    onClick={() => setBasePath(currentTabCwd ?? "")}
+                    disabled={!canUseCurrentTab}
+                  >
+                    Use current tab
+                  </button>
+                  <button
+                    type="button"
+                    className="btnSmall"
+                    onClick={() => setBasePath(homeDir ?? "")}
+                    disabled={!canUseHome}
+                  >
+                    Home
+                  </button>
+                </div>
+                <div className="hint">New sessions in this project start here.</div>
+              </div>
+            )}
             <div className="formRow">
               <div className="label">Environment (.env)</div>
               <div className="pathRow">

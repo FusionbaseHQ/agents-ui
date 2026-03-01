@@ -27,6 +27,8 @@ type Project = {
   environmentId: string | null;
   symbol?: string | null;
   color?: string | null;
+  sshTarget?: string | null;
+  sshRemotePath?: string | null;
 };
 
 type EnvironmentConfig = {
@@ -345,8 +347,10 @@ export const ProjectsSection = React.memo(function ProjectsSection({
                 title={
                   [
                     p.title,
+                    p.sshTarget ? `SSH: ${p.sshTarget}` : null,
+                    p.sshRemotePath ? `Remote: ${p.sshRemotePath}` : null,
                     workingCount ? `Agents working: ${workingCount}` : null,
-                    p.basePath ? `Base: ${p.basePath}` : null,
+                    !p.sshTarget && p.basePath ? `Base: ${p.basePath}` : null,
                     envName ? `Env: ${envName}` : null,
                   ]
                     .filter(Boolean)
@@ -369,7 +373,10 @@ export const ProjectsSection = React.memo(function ProjectsSection({
                     autoFocus
                   />
                 ) : (
-                  <span className="projectTitle">{p.title}</span>
+                  <>
+                    <span className="projectTitle">{p.title}</span>
+                    {p.sshTarget && <span className="projectSshBadge" title={`SSH: ${p.sshTarget}`}>SSH</span>}
+                  </>
                 )}
                 <span className="projectBadges">
                   {workingCount > 0 && (

@@ -57,6 +57,8 @@ type Project = {
   assetsEnabled?: boolean;
   symbol?: string | null;
   color?: string | null;
+  sshTarget?: string | null;
+  sshRemotePath?: string | null;
 };
 
 type SessionInfo = {
@@ -291,6 +293,10 @@ function basenamePath(input: string): string {
   if (normalized === "/") return "/";
   const parts = normalized.replace(/\\/g, "/").split("/");
   return parts[parts.length - 1] ?? "";
+}
+
+function isProjectSsh(project: Project | null | undefined): boolean {
+  return Boolean(project?.sshTarget?.trim());
 }
 
 function buildSshCommandAtRemoteDir(input: {
@@ -768,6 +774,8 @@ function loadLegacyProjectState(): { projects: Project[]; activeProjectId: strin
             assetsEnabled: true,
             symbol: (p as { symbol?: string | null }).symbol ?? null,
             color: (p as { color?: string | null }).color ?? null,
+            sshTarget: (p as { sshTarget?: string | null }).sshTarget ?? null,
+            sshRemotePath: (p as { sshRemotePath?: string | null }).sshRemotePath ?? null,
           }));
       }
     }
@@ -1149,7 +1157,7 @@ export default function App() {
   const [confirmDeleteEnvironmentId, setConfirmDeleteEnvironmentId] = useState<string | null>(null);
   const [confirmDeleteAssetId, setConfirmDeleteAssetId] = useState<string | null>(null);
   const [pathPickerOpen, setPathPickerOpen] = useState(false);
-  const [pathPickerTarget, setPathPickerTarget] = useState<"project" | "session" | null>(null);
+  const [pathPickerTarget, setPathPickerTarget] = useState<"project" | "session" | "ssh-remote" | null>(null);
   const [replayOpen, setReplayOpen] = useState(false);
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayError, setReplayError] = useState<string | null>(null);
@@ -1478,8 +1486,9 @@ export default function App() {
   const lastActiveByProject = useRef<Map<string, string>>(new Map());
   const newSessionModalRef = useRef<NewSessionModalHandle>(null);
   const projectModalRef = useRef<ProjectModalHandle>(null);
-  const projectModalInitialRef = useRef({ mode: "new" as "new" | "rename", title: "", basePath: "", environmentId: "", assetsEnabled: true });
+  const projectModalInitialRef = useRef({ mode: "new" as "new" | "rename", title: "", basePath: "", environmentId: "", assetsEnabled: true, sshTarget: "", sshRemotePath: "" });
   const pathPickerInitialPathRef = useRef<string | null>(null);
+  const sshPathPickerTargetRef = useRef<string | null>(null);
   const recordNameRef = useRef<HTMLInputElement | null>(null);
   const promptTitleRef = useRef<HTMLInputElement | null>(null);
   const envNameRef = useRef<HTMLInputElement | null>(null);
@@ -1888,8 +1897,10 @@ export default function App() {
 
   const sshRootResolveInFlightRef = useRef<Set<string>>(new Set());
   useEffect(() => {
-    if (!activeIsSsh || !active) return;
-    if (active.exited || active.closing) return;
+    const curProject = projectByIdRef.current.get(activeProjectId) ?? null;
+    const projectSsh = isProjectSsh(curProject);
+    if (!activeIsSsh && !projectSsh) return;
+    if (active && (active.exited || active.closing) && !projectSsh) return;
     if (!activeWorkspaceView.fileExplorerOpen && !activeWorkspaceView.codeEditorOpen) return;
 
     const currentRoot = (
@@ -1899,7 +1910,7 @@ export default function App() {
     ).trim();
     if (currentRoot) return;
 
-    const persistedRoot = (active.sshRootDir ?? "").trim();
+    const persistedRoot = (active?.sshRootDir ?? curProject?.sshRemotePath ?? "").trim();
     if (persistedRoot) {
       updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => {
         const existing = (prev.fileExplorerRootDir ?? prev.codeEditorRootDir ?? "").trim();
@@ -1909,7 +1920,7 @@ export default function App() {
       return;
     }
 
-    const target = activeSshTarget;
+    const target = activeSshTarget ?? curProject?.sshTarget?.trim() ?? null;
     if (!target) return;
     if (sshRootResolveInFlightRef.current.has(activeWorkspaceKey)) return;
 
@@ -1924,13 +1935,15 @@ export default function App() {
           if (existing) return prev;
           return { ...prev, fileExplorerRootDir: root, codeEditorRootDir: root };
         });
-        setSessions((prev) =>
-          prev.map((s) =>
-            s.id === active.id
-              ? { ...s, sshTarget: s.sshTarget ?? target, sshRootDir: root }
-              : s,
-          ),
-        );
+        if (active) {
+          setSessions((prev) =>
+            prev.map((s) =>
+              s.id === active.id
+                ? { ...s, sshTarget: s.sshTarget ?? target, sshRootDir: root }
+                : s,
+            ),
+          );
+        }
       } catch (err) {
         if (!cancelled) reportError(`Failed to load remote files for ${target}`, err);
       } finally {
@@ -2917,6 +2930,8 @@ export default function App() {
         const validatedBasePath = desiredBasePath
           ? await invoke<string | null>("validate_directory", { path: desiredBasePath }).catch(() => null)
           : null;
+        const sshTarget = ((p.sshTarget as string | undefined) ?? "").trim() || null;
+        const sshRemotePath = ((p.sshRemotePath as string | undefined) ?? "").trim() || null;
         const id = makeId();
         const project: Project = {
           id,
@@ -2924,6 +2939,8 @@ export default function App() {
           basePath: validatedBasePath,
           environmentId: (p.environmentId as string) || null,
           assetsEnabled: p.assetsEnabled !== false,
+          sshTarget,
+          sshRemotePath,
         };
         setProjects((prev) => [...prev, project]);
         notifyStateChange("projects.created", { projectId: id });
@@ -2941,6 +2958,8 @@ export default function App() {
             ...(p.assetsEnabled !== undefined && { assetsEnabled: p.assetsEnabled as boolean }),
             ...(p.symbol !== undefined && { symbol: p.symbol as string | null }),
             ...(p.color !== undefined && { color: p.color as string | null }),
+            ...(p.sshTarget !== undefined && { sshTarget: (p.sshTarget as string | null)?.trim() || null }),
+            ...(p.sshRemotePath !== undefined && { sshRemotePath: (p.sshRemotePath as string | null)?.trim() || null }),
           };
         }));
         notifyStateChange("projects.updated", { projectId: id });
@@ -3705,7 +3724,7 @@ export default function App() {
     try {
       localStorage.setItem(
         STORAGE_PROJECTS_KEY,
-        JSON.stringify(projects.map((p) => ({ id: p.id, title: p.title, symbol: p.symbol ?? null, color: p.color ?? null }))),
+        JSON.stringify(projects.map((p) => ({ id: p.id, title: p.title, symbol: p.symbol ?? null, color: p.color ?? null, sshTarget: p.sshTarget ?? null, sshRemotePath: p.sshRemotePath ?? null }))),
       );
       localStorage.setItem(STORAGE_ACTIVE_PROJECT_KEY, activeProjectId);
     } catch {
@@ -3882,8 +3901,7 @@ export default function App() {
     }
 
     if (action.id === "new-terminal") {
-      setProjectOpen(false);
-      setNewOpen(true);
+      handleOpenNewSession();
       return;
     }
 
@@ -4175,8 +4193,7 @@ export default function App() {
 	      if (isMac) {
 	        if (e.metaKey && e.key.toLowerCase() === "t") {
 	          e.preventDefault();
-	          setProjectOpen(false);
-	          setNewOpen(true);
+	          handleOpenNewSession();
 	          return;
 	        }
         if (e.metaKey && e.key.toLowerCase() === "w") {
@@ -4249,8 +4266,7 @@ export default function App() {
 	      } else {
 	        if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "t") {
 	          e.preventDefault();
-	          setProjectOpen(false);
-	          setNewOpen(true);
+	          handleOpenNewSession();
 	          return;
 	        }
         if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "w") {
@@ -5427,6 +5443,29 @@ export default function App() {
     [],
   );
 
+  const loadRemoteDirectoryForPicker = useCallback(
+    async (path: string | null): Promise<DirectoryListing> => {
+      const target = sshPathPickerTargetRef.current;
+      if (!target) throw new Error("No SSH target");
+      const resolvedPath = path ?? await invoke<string>("ssh_default_root", { target });
+      type FsEntry = { name: string; path: string; isDir: boolean; size: number };
+      const entries = await invoke<FsEntry[]>("ssh_list_fs_entries", {
+        target,
+        root: resolvedPath,
+        path: resolvedPath,
+      });
+      const dirs = entries
+        .filter((e) => e.isDir)
+        .map((e) => ({ name: e.name, path: e.path }));
+      const parent =
+        resolvedPath === "/"
+          ? null
+          : resolvedPath.replace(/\/[^/]+\/?$/, "") || "/";
+      return { path: resolvedPath, parent, entries: dirs };
+    },
+    [],
+  );
+
   const updateSessionById = useCallback(
     (id: string, updater: (session: Session) => Session) => {
       setSessions((prev) => {
@@ -5443,7 +5482,7 @@ export default function App() {
     [],
   );
 
-  function openPathPicker(target: "project" | "session", initial: string | null) {
+  function openPathPicker(target: "project" | "session" | "ssh-remote", initial: string | null) {
     setPathPickerTarget(target);
     pathPickerInitialPathRef.current = initial;
     setPathPickerOpen(true);
@@ -5648,8 +5687,11 @@ export default function App() {
       basePath: activeSession?.cwd ?? curProject?.basePath ?? homeDirRef.current ?? "",
       environmentId: curProject?.environmentId ?? "",
       assetsEnabled: curProject?.assetsEnabled ?? true,
+      sshTarget: "",
+      sshRemotePath: "",
     };
     setProjectOpen(true);
+    void refreshSshHosts();
   }, []);
 
   const openProjectSettings = useCallback((projectId: string) => {
@@ -5663,8 +5705,11 @@ export default function App() {
       basePath: project.basePath ?? "",
       environmentId: project.environmentId ?? "",
       assetsEnabled: project.assetsEnabled ?? true,
+      sshTarget: project.sshTarget ?? "",
+      sshRemotePath: project.sshRemotePath ?? "",
     };
     setProjectOpen(true);
+    void refreshSshHosts();
   }, []);
 
   const openRenameProject = useCallback(() => {
@@ -5673,16 +5718,39 @@ export default function App() {
     openProjectSettings(curProject.id);
   }, [openProjectSettings]);
 
+  async function createSshSessionForProject(project: Project, allProjects?: Project[]) {
+    const target = project.sshTarget!.trim();
+    const remoteDir = project.sshRemotePath?.trim() || "";
+    const launchCommand = remoteDir
+      ? buildSshCommandAtRemoteDir({ baseCommandLine: null, target, remoteDir })
+      : ensureSshKeepAliveOptions(`ssh ${target}`);
+    const localCwd = project.basePath ?? homeDirRef.current ?? "";
+    const validatedCwd = await invoke<string | null>("validate_directory", { path: localCwd }).catch(() => localCwd);
+    const createdRaw = await createSession({
+      projectId: project.id,
+      name: `ssh ${target}`,
+      launchCommand,
+      sshTarget: target,
+      sshRootDir: remoteDir || null,
+      cwd: validatedCwd,
+      envVars: envVarsForProjectId(project.id, allProjects ?? projects, environments),
+    });
+    const s = applyPendingExit(createdRaw);
+    addSessionWithProjectSafeActivation(s);
+  }
+
   async function onProjectSubmit(data: ProjectSubmitData) {
     const title = data.title.trim();
     if (!title) return;
 
+    const isSshProject = Boolean(data.sshTarget?.trim());
+
     const desiredBasePath =
       data.basePath.trim() || activeProject?.basePath || homeDirRef.current || "";
-    const validatedBasePath = await invoke<string | null>("validate_directory", {
-      path: desiredBasePath,
-    }).catch(() => null);
-    if (!validatedBasePath) {
+    const validatedBasePath = isSshProject
+      ? (await invoke<string | null>("validate_directory", { path: desiredBasePath }).catch(() => null) ?? homeDirRef.current ?? "")
+      : await invoke<string | null>("validate_directory", { path: desiredBasePath }).catch(() => null);
+    if (!isSshProject && !validatedBasePath) {
       setError("Project base path must be an existing directory.");
       return;
     }
@@ -5698,9 +5766,11 @@ export default function App() {
             ? {
                 ...p,
                 title,
-                basePath: validatedBasePath,
+                basePath: validatedBasePath || p.basePath,
                 environmentId,
                 assetsEnabled: data.assetsEnabled,
+                sshTarget: isSshProject ? data.sshTarget.trim() : null,
+                sshRemotePath: isSshProject ? data.sshRemotePath.trim() || null : null,
               }
             : p,
         ),
@@ -5713,9 +5783,11 @@ export default function App() {
     const project: Project = {
       id,
       title,
-      basePath: validatedBasePath,
+      basePath: validatedBasePath || null,
       environmentId,
       assetsEnabled: data.assetsEnabled,
+      sshTarget: isSshProject ? data.sshTarget.trim() : null,
+      sshRemotePath: isSshProject ? data.sshRemotePath.trim() || null : null,
     };
     setProjects((prev) => [...prev, project]);
     setProjectOpen(false);
@@ -5723,14 +5795,18 @@ export default function App() {
     setActiveId(null); // No sessions yet; prevents flash of previous project's terminal
 
     try {
-      await ensureAutoAssets(validatedBasePath, id, data.assetsEnabled);
-      const createdRaw = await createSession({
-        projectId: id,
-        cwd: validatedBasePath,
-        envVars: envVarsForProjectId(id, [...projects, project], environments),
-      });
-      const s = applyPendingExit(createdRaw);
-      addSessionWithProjectSafeActivation(s);
+      if (isSshProject) {
+        await createSshSessionForProject(project, [...projects, project]);
+      } else {
+        await ensureAutoAssets(validatedBasePath!, id, data.assetsEnabled);
+        const createdRaw = await createSession({
+          projectId: id,
+          cwd: validatedBasePath!,
+          envVars: envVarsForProjectId(id, [...projects, project], environments),
+        });
+        const s = applyPendingExit(createdRaw);
+        addSessionWithProjectSafeActivation(s);
+      }
     } catch (err) {
       reportError("Failed to create session", err);
       setActiveId(null);
@@ -7299,6 +7375,11 @@ export default function App() {
   );
 
   const handleOpenNewSession = useCallback(() => {
+    const project = projectByIdRef.current.get(activeProjectIdRef.current ?? "");
+    if (isProjectSsh(project)) {
+      void createSshSessionForProject(project!);
+      return;
+    }
     setProjectOpen(false);
     setNewOpen(true);
   }, []);
@@ -7846,7 +7927,7 @@ export default function App() {
         (
           activeWorkspaceView.fileExplorerRootDir ??
           activeWorkspaceView.codeEditorRootDir ??
-          (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
+          (!(activeIsSsh || isProjectSsh(activeProject)) ? activeProject?.basePath ?? active?.cwd ?? "" : activeProject?.sshRemotePath ?? "")
         ).trim() ? (
           <>
             <div
@@ -7857,14 +7938,14 @@ export default function App() {
             <FileExplorerPanel
               key={`file-tree:${activeWorkspaceKey}`}
               isOpen
-              provider={activeIsSsh ? "ssh" : "local"}
-              sshTarget={activeIsSsh ? activeSshTarget : null}
-              sshConnectionState={activeIsSsh ? (active?.connectionState ?? "connected") : undefined}
+              provider={(activeIsSsh || isProjectSsh(activeProject)) ? "ssh" : "local"}
+              sshTarget={(activeIsSsh || isProjectSsh(activeProject)) ? (activeSshTarget ?? activeProject?.sshTarget ?? null) : null}
+              sshConnectionState={(activeIsSsh || isProjectSsh(activeProject)) ? (active?.connectionState ?? "connected") : undefined}
               rootDir={
                 (
                   activeWorkspaceView.fileExplorerRootDir ??
                   activeWorkspaceView.codeEditorRootDir ??
-                  (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
+                  (!(activeIsSsh || isProjectSsh(activeProject)) ? activeProject?.basePath ?? active?.cwd ?? "" : activeProject?.sshRemotePath ?? "")
                 ).trim()
               }
               persistedState={activeWorkspaceView.fileExplorerPersistedState}
@@ -8123,9 +8204,17 @@ export default function App() {
             basePathPlaceholder={homeDirRef.current ?? "~"}
             initialEnvironmentId={projectModalInitialRef.current.environmentId}
             initialAssetsEnabled={projectModalInitialRef.current.assetsEnabled}
+            initialSshTarget={projectModalInitialRef.current.sshTarget}
+            initialSshRemotePath={projectModalInitialRef.current.sshRemotePath}
+            sshHosts={sshHosts}
+            sshHostsLoading={sshHostsLoading}
             onBrowseBasePath={(currentBasePath) =>
               openPathPicker("project", currentBasePath.trim() || activeProject?.basePath || null)
             }
+            onBrowseRemotePath={(target, currentPath) => {
+              sshPathPickerTargetRef.current = target;
+              openPathPicker("ssh-remote", currentPath || null);
+            }}
             canUseCurrentTab={Boolean(active?.cwd)}
             currentTabCwd={active?.cwd ?? null}
             canUseHome={Boolean(homeDirRef.current)}
@@ -8227,17 +8316,20 @@ export default function App() {
 
           {pathPickerOpen && <PathPickerModal
             initialPath={pathPickerInitialPathRef.current}
-            placeholder={homeDirRef.current ?? "~"}
-            loadDirectory={loadDirectoryForPicker}
+            placeholder={pathPickerTarget === "ssh-remote" ? "~ (remote)" : (homeDirRef.current ?? "~")}
+            loadDirectory={pathPickerTarget === "ssh-remote" ? loadRemoteDirectoryForPicker : loadDirectoryForPicker}
             onClose={() => {
               setPathPickerOpen(false);
               setPathPickerTarget(null);
+              sshPathPickerTargetRef.current = null;
             }}
             onSelect={(selectedPath) => {
               if (pathPickerTarget === "project") projectModalRef.current?.setBasePath(selectedPath);
               if (pathPickerTarget === "session") newSessionModalRef.current?.setCwd(selectedPath);
+              if (pathPickerTarget === "ssh-remote") projectModalRef.current?.setSshRemotePath(selectedPath);
               setPathPickerOpen(false);
               setPathPickerTarget(null);
+              sshPathPickerTargetRef.current = null;
             }}
           />}
 
@@ -9341,7 +9433,7 @@ export default function App() {
         onEditPrompt={openPromptEditor}
         onOpenRecording={(id, mode) => void openReplay(id, mode)}
         onSwitchSession={setActiveId}
-        onNewSession={() => setNewOpen(true)}
+        onNewSession={handleOpenNewSession}
         onOpenSshManager={() => {
           setProjectOpen(false);
           setNewOpen(false);

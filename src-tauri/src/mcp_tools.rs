@@ -201,7 +201,9 @@ pub fn tool_list() -> Vec<Value> {
             "type": "object",
             "properties": {
                 "title": { "type": "string", "description": "Project title" },
-                "basePath": { "type": "string", "description": "Base directory path for the project" }
+                "basePath": { "type": "string", "description": "Base directory path for the project" },
+                "sshTarget": { "type": "string", "description": "SSH host alias or user@host for SSH-based projects. When set, new terminals open SSH sessions to this host." },
+                "sshRemotePath": { "type": "string", "description": "Remote working directory on the SSH host. Used as the default directory for new SSH sessions." }
             },
             "required": ["title"]
         })),
@@ -212,12 +214,14 @@ pub fn tool_list() -> Vec<Value> {
             },
             "required": ["projectId"]
         })),
-        tool_def("update_project", "Update a project's title or base path.", json!({
+        tool_def("update_project", "Update a project's title, base path, or SSH settings.", json!({
             "type": "object",
             "properties": {
                 "projectId": { "type": "string", "description": "Project ID" },
                 "title": { "type": "string", "description": "New project title" },
-                "basePath": { "type": "string", "description": "New base directory path" }
+                "basePath": { "type": "string", "description": "New base directory path" },
+                "sshTarget": { "type": ["string", "null"], "description": "SSH host alias or user@host. Set to null to convert back to a local project." },
+                "sshRemotePath": { "type": ["string", "null"], "description": "Remote working directory on the SSH host." }
             },
             "required": ["projectId"]
         })),
@@ -479,12 +483,16 @@ fn map_params(name: &str, args: &Value) -> Value {
         "create_project" => {
             let mut p = json!({ "title": args.get("title") });
             if let Some(v) = args.get("basePath") { p["basePath"] = v.clone(); }
+            if let Some(v) = args.get("sshTarget") { p["sshTarget"] = v.clone(); }
+            if let Some(v) = args.get("sshRemotePath") { p["sshRemotePath"] = v.clone(); }
             p
         }
         "update_project" => {
             let mut p = json!({ "id": args.get("projectId") });
             if let Some(v) = args.get("title") { p["title"] = v.clone(); }
             if let Some(v) = args.get("basePath") { p["basePath"] = v.clone(); }
+            if let Some(v) = args.get("sshTarget") { p["sshTarget"] = v.clone(); }
+            if let Some(v) = args.get("sshRemotePath") { p["sshRemotePath"] = v.clone(); }
             p
         }
         "delete_project" => json!({ "id": args.get("projectId") }),
