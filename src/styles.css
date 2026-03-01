@@ -1327,6 +1327,132 @@ body {
   flex-direction: column;
 }
 
+/* ── History quick-switch bar ── */
+.historyBar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(17, 17, 19, 0.65);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.historyBar::-webkit-scrollbar {
+  display: none;
+}
+
+.historyTab {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  cursor: pointer;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.7);
+  background: rgba(255, 255, 255, 0.02);
+  transition: background 0.12s ease, border-color 0.12s ease;
+  white-space: nowrap;
+  max-width: 200px;
+}
+
+.historyTab:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+.historyTabActive {
+  border-color: rgba(var(--accent-rgb), 0.5);
+  background: rgba(var(--accent-rgb), 0.14);
+  color: rgba(255, 255, 255, 0.92);
+}
+
+
+.historyTab.sessionItemSsh:not(.historyTabActive):hover {
+  border-color: rgba(var(--ssh-rgb), 0.24);
+  background: rgba(var(--ssh-rgb), 0.055);
+}
+
+.historyTab.sessionItemSsh.historyTabActive {
+  border-color: rgba(var(--ssh-rgb), 0.55);
+  background: rgba(var(--ssh-rgb), 0.085);
+}
+
+.historyTab.sessionItemPersistent:not(.historyTabActive):hover {
+  border-color: rgba(200, 120, 152, 0.24);
+  background: rgba(200, 120, 152, 0.06);
+}
+
+.historyTab.sessionItemPersistent.historyTabActive {
+  border-color: rgba(200, 120, 152, 0.55);
+  background: rgba(200, 120, 152, 0.085);
+}
+
+.historyTab.sessionItemColored:not(.historyTabActive) {
+  border-color: rgba(var(--tab-color), 0.25);
+  background: rgba(var(--tab-color), 0.10);
+}
+
+.historyTab.sessionItemColored:not(.historyTabActive):hover {
+  border-color: rgba(var(--tab-color), 0.40);
+  background: rgba(var(--tab-color), 0.16);
+}
+
+.historyTab.sessionItemColored.historyTabActive {
+  border-color: rgba(var(--tab-color), 0.55);
+  background: rgba(var(--tab-color), 0.20);
+}
+
+.historyTabProject {
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 80px;
+}
+
+.historyTabSep {
+  color: rgba(255, 255, 255, 0.2);
+  font-size: 10px;
+}
+
+.historyTabName {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.historyTabClose {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.3);
+  padding: 0 2px;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  opacity: 0;
+  transition: opacity 0.1s ease, color 0.1s ease, background 0.1s ease;
+}
+
+.historyTab:hover .historyTabClose {
+  opacity: 1;
+}
+
+.historyTabClose:hover {
+  color: rgba(208, 88, 88, 0.9);
+  background: rgba(208, 88, 88, 0.12);
+}
+
 .workspaceRow {
   flex: 1;
   min-height: 0;

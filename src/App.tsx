@@ -1091,6 +1091,7 @@ export default function App() {
     return DEFAULT_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT;
   });
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [sessionHistory, setSessionHistory] = useState<string[]>([]);
   const [splitViews, setSplitViews] = useState<SplitView[]>(() => loadPersistedSplitViews());
   const splitViewsRef = useRef(splitViews);
   useEffect(() => {
@@ -2667,6 +2668,25 @@ export default function App() {
 	      }
 	    }
 	  }, [activeId, flushQueuedOutput]);
+
+  // Track session history for the quick-switch bar (prepend new, stable order)
+  useEffect(() => {
+    if (!activeId) return;
+    setSessionHistory((prev) => {
+      if (prev.includes(activeId)) return prev;
+      const next = [activeId, ...prev];
+      return next.length > 10 ? next.slice(0, 10) : next;
+    });
+  }, [activeId]);
+
+  // Prune history entries for sessions that no longer exist
+  useEffect(() => {
+    const ids = new Set(sessions.map((s) => s.id));
+    setSessionHistory((prev) => {
+      const pruned = prev.filter((id) => ids.has(id));
+      return pruned.length === prev.length ? prev : pruned;
+    });
+  }, [sessions]);
 
   // Split view invariant: while a split view is active, the focused session must be a member.
   // If the user switches to a different session (sidebar click, Ctrl+Tab, etc), exit the split view
@@ -5590,6 +5610,16 @@ export default function App() {
     setActiveSplitViewId(null);
   }, []);
 
+  const selectSessionById = useCallback((sessionId: string) => {
+    const session = sessionsRef.current.find((s) => s.id === sessionId);
+    if (!session) return;
+    if (session.projectId !== activeProjectIdRef.current) {
+      setActiveProjectId(session.projectId);
+    }
+    setActiveId(sessionId);
+    setActiveSplitViewId(null);
+  }, []);
+
   const moveProject = useCallback((projectId: string, targetProjectId: string, position: "before" | "after") => {
     setProjects((prev) => {
       if (projectId === targetProjectId) return prev;
@@ -7963,7 +7993,50 @@ export default function App() {
 
         <div className="terminalArea">
           {workspaceRowJsx}
-	
+
+          {sessionHistory.length > 1 && (
+            <div className="historyBar">
+              {sessionHistory.map((sid) => {
+                const s = sessions.find((x) => x.id === sid);
+                if (!s) return null;
+                const proj = projects.find((p) => p.id === s.projectId);
+                const isActive = sid === activeId;
+                const isSsh = isSshCommandLine(s.launchCommand ?? s.restoreCommand ?? null);
+                const isPersistent = Boolean(s.persistent);
+                const isSshType = isSsh && !isPersistent;
+                const isDefaultType = !isPersistent && !isSshType;
+                return (
+                  <div
+                    key={sid}
+                    className={`historyTab ${isActive ? "historyTabActive" : ""} ${
+                      isSshType ? "sessionItemSsh" : ""
+                    } ${isPersistent ? "sessionItemPersistent" : ""} ${
+                      isDefaultType ? "sessionItemDefault" : ""
+                    } ${s.color ? "sessionItemColored" : ""} ${
+                      s.exited ? "sessionItemExited" : ""
+                    }`}
+                    style={s.color ? { "--tab-color": s.color } as React.CSSProperties : undefined}
+                    onClick={() => selectSessionById(sid)}
+                  >
+                    {s.symbol && <span className="sessionSymbol">{s.symbol}</span>}
+                    <span className="historyTabProject">{proj?.title ?? "?"}</span>
+                    <span className="historyTabSep">/</span>
+                    <span className="historyTabName">{s.name}</span>
+                    <button
+                      className="historyTabClose"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setSessionHistory((prev) => prev.filter((id) => id !== sid));
+                      }}
+                    >
+                      ×
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
           {newOpen && <NewSessionModal
             ref={newSessionModalRef}
             projectTitle={activeProject?.title ?? null}
