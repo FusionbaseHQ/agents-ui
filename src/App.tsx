@@ -158,6 +158,7 @@ const SSH_RECONNECT_MAX_MS = 30_000;
 const SSH_RECONNECT_MAX_ATTEMPTS = 6;
 const SESSION_HEALTHCHECK_VISIBLE_INTERVAL_MS = 30_000;
 const SESSION_HEALTHCHECK_MIN_GAP_MS = 5_000;
+const SLEEP_DETECTION_GAP_MS = 15_000;
 
 const DEFAULT_AGENT_SHORTCUT_IDS = ["codex", "claude", "gemini"];
 const DEFAULT_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT = 290;
@@ -2505,12 +2506,36 @@ export default function App() {
   useEffect(() => {
     if (!hydrated) return;
 
+    let lastActiveAt = Date.now();
+
+    const recoverAllCanvases = () => {
+      for (const [id, entry] of registry.current.entries()) {
+        try { entry.recoverCanvas(); } catch { console.warn("[agents-ui] Failed to recover canvas for session", id); }
+      }
+    };
+
+    const maybeTriggerCanvasRecovery = (elapsed: number, source: string) => {
+      if (elapsed > SLEEP_DETECTION_GAP_MS) {
+        console.warn(`[agents-ui] Detected possible wake from sleep via ${source} (gap=${elapsed}ms). Recovering canvases.`);
+        window.setTimeout(recoverAllCanvases, 500);
+      }
+    };
+
     const onVisibility = () => {
-      if (document.visibilityState !== "visible") return;
+      if (document.visibilityState !== "visible") {
+        lastActiveAt = Date.now();
+        return;
+      }
+      const elapsed = Date.now() - lastActiveAt;
+      lastActiveAt = Date.now();
       runSessionHealthCheckRef.current("visibility", true);
+      maybeTriggerCanvasRecovery(elapsed, "visibilitychange");
     };
     const onFocus = () => {
+      const elapsed = Date.now() - lastActiveAt;
+      lastActiveAt = Date.now();
       runSessionHealthCheckRef.current("focus", true);
+      maybeTriggerCanvasRecovery(elapsed, "focus");
     };
     const interval = window.setInterval(() => {
       if (document.visibilityState !== "visible") return;
@@ -2521,10 +2546,18 @@ export default function App() {
     window.addEventListener("focus", onFocus);
     runSessionHealthCheckRef.current("startup", true);
 
+    // Tauri emits "system-resumed" when macOS wakes from sleep — more reliable than timestamp gaps
+    let unlistenResumed: (() => void) | null = null;
+    listen("system-resumed", () => {
+      console.warn("[agents-ui] System resumed from sleep (Tauri event). Recovering canvases.");
+      window.setTimeout(recoverAllCanvases, 500);
+    }).then((fn) => { unlistenResumed = fn; });
+
     return () => {
       window.clearInterval(interval);
       document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener("focus", onFocus);
+      unlistenResumed?.();
     };
   }, [hydrated]);
 
@@ -7809,7 +7842,7 @@ export default function App() {
               onClick={() => setAgentPanelOpen(prev => !prev)}
               title={`${agentPanelOpen ? "Close" : "Open"} Agent panel (\u2318\u21E7G)`}
             >
-              <Icon name="brain" />
+              <Icon name="wand" />
             </button>
 
             {/* Replay Button */}

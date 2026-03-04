@@ -7,7 +7,7 @@ import { SearchAddon } from "@xterm/addon-search";
 import { SessionShellIntegration, type CommandBlock } from "./shellIntegration";
 import { notifyStateChange } from "./apiBridge";
 
-export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon; search: SearchAddon; shellInt?: SessionShellIntegration }>;
+export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon; search: SearchAddon; shellInt?: SessionShellIntegration; recoverCanvas: () => void }>;
 export type PendingDataBuffer = Map<string, string[]>;
 
 type RenderDimension = { width: number; height: number };
@@ -216,6 +216,8 @@ function SessionTerminal(props: SessionTerminalProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const canvasAddonRef = useRef<CanvasAddon | null>(null);
+  const lastCanvasRecoveryRef = useRef(0);
   const resizeRafRef = useRef<number | null>(null);
   const resizeTimeoutRef = useRef<number | null>(null);
   const resizeRetryCountRef = useRef(0);
@@ -273,10 +275,34 @@ function SessionTerminal(props: SessionTerminalProps) {
     term.loadAddon(fit);
     term.open(container);
     const canvasAddon = new CanvasAddon();
+    canvasAddonRef.current = canvasAddon;
     term.loadAddon(canvasAddon);
     term.loadAddon(searchAddon);
     patchXtermRenderServiceDimensions(term);
     patchXtermPausedResizeTask(term);
+
+    // Recovery function for canvas context loss (e.g. after macOS sleep/GPU reset).
+    // Disposes the stale CanvasAddon and loads a fresh one with valid 2D contexts.
+    const recoverCanvas = () => {
+      const now = Date.now();
+      if (now - lastCanvasRecoveryRef.current < 5_000) return;
+      lastCanvasRecoveryRef.current = now;
+
+      const t = termRef.current;
+      if (!t || !t.element) return;
+      try { canvasAddonRef.current?.dispose(); } catch { /* best-effort */ }
+      try {
+        const fresh = new CanvasAddon();
+        canvasAddonRef.current = fresh;
+        t.loadAddon(fresh);
+        patchXtermRenderServiceDimensions(t);
+        patchXtermPausedResizeTask(t);
+        t.refresh(0, Math.max(0, t.rows - 1));
+      } catch {
+        // CanvasAddon failed — terminal falls back to DOM renderer which still works
+        canvasAddonRef.current = null;
+      }
+    };
 
     const reportTransportError = (operation: "write" | "resize", err: unknown) => {
       onTransportErrorRef.current?.(props.id, operation, formatInvokeError(err));
@@ -741,7 +767,7 @@ function SessionTerminal(props: SessionTerminalProps) {
 	    }
 
 	    // Register BEFORE flushing to avoid race with incoming events
-	    props.registry.current.set(props.id, { term, fit, search: searchAddon, shellInt });
+	    props.registry.current.set(props.id, { term, fit, search: searchAddon, shellInt, recoverCanvas });
     onRegistryChangedRef.current?.();
 
 	    // Flush any buffered data that arrived before we were ready (but wait for renderer readiness)
@@ -850,7 +876,8 @@ function SessionTerminal(props: SessionTerminalProps) {
 	      props.pendingData.current.delete(props.id);
 	      wheelCleanup?.();
 	      searchAddon.dispose();
-	      canvasAddon.dispose();
+	      try { canvasAddonRef.current?.dispose(); } catch { /* best-effort */ }
+	      canvasAddonRef.current = null;
 	      term.dispose();
 	      termRef.current = null;
 	      fitRef.current = null;

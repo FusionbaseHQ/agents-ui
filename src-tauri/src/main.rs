@@ -50,7 +50,7 @@ use mcp_tools::OutputBuffers;
 use server_control::{get_server_status, set_api_enabled, set_mcp_enabled, ServerControl};
 use tray::{build_status_tray, set_tray_agent_count, set_tray_recent_sessions, set_tray_status};
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 fn main() {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -198,9 +198,17 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app, event| {
-            if let tauri::RunEvent::Exit = event {
-                api_discovery::cleanup();
+        .run(|app, event| {
+            match event {
+                tauri::RunEvent::Exit => {
+                    api_discovery::cleanup();
+                }
+                tauri::RunEvent::Resumed { .. } => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.emit("system-resumed", ());
+                    }
+                }
+                _ => {}
             }
         });
 }

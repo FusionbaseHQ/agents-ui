@@ -484,7 +484,7 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
               }
             >
               <option value="chat">Agent (Headless Chat)</option>
-              <option value="orchestrate">Orchestrator (Multi-Agent, Alpha)</option>
+              {/* <option value="orchestrate">Orchestrator (Multi-Agent, Alpha)</option> */}
               <option value="terminal">Terminal (Interactive)</option>
             </select>
           </label>
@@ -792,13 +792,13 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
         >
           Agent
         </button>
-        <button
+        {/* <button
           type="button"
           className="agentModeTab"
           onClick={() => setSettings((s) => ({ ...s, mode: "orchestrate" }))}
         >
           Orchestrator (Alpha)
-        </button>
+        </button> */}
       </div>
       {running && <div className="agentProgressBar" />}
 
@@ -823,7 +823,7 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
         {messages.length === 0 && !running && (
           <div className="agentEmpty">
             <div className="agentEmptyIcon">
-              <Icon name="brain" size={28} />
+              <Icon name="wand" size={28} />
             </div>
             <div className="agentEmptyTitle">{providerName}</div>
             <div className="agentEmptyHint">
