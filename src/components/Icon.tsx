@@ -146,11 +146,10 @@ export const Icon = React.memo(function Icon({ name, size = 16, className }: Ico
     case "wand":
       return (
         <svg {...common}>
-          <path d="M15 4V2m0 2v2m0-2h2m-2 0h-2" />
-          <path d="M20 9v-1m0 1v1m0-1h1m-1 0h-1" />
-          <path d="M9 4V3m0 1v1m0-1h1M9 4H8" />
-          <path d="M3 21l10-10" />
-          <path d="M12.5 11.5l1 1" />
+          <path d="M12 4v16" />
+          <path d="M4 12h16" />
+          <path d="M6 6l12 12" />
+          <path d="M18 6L6 18" />
         </svg>
       );
     case "layers":

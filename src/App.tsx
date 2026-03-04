@@ -135,6 +135,7 @@ type RecentSessionKey = { projectId: string; persistId: string };
 type TrayRecentSession = { label: string; projectId: string; persistId: string };
 type OutputQueueBySession = Map<string, string[]>;
 type SessionRestoreProgress = { remaining: number; total: number };
+type UiTheme = "paper-light" | "paper-dark";
 
 const STORAGE_PROJECTS_KEY = "agents-ui-projects";
 const STORAGE_ACTIVE_PROJECT_KEY = "agents-ui-active-project-id";
@@ -148,6 +149,8 @@ const STORAGE_RECENT_SESSIONS_KEY = "agents-ui-recent-sessions-v1";
 const STORAGE_SSH_HISTORY_KEY = "agents-ui-ssh-history-v1";
 const STORAGE_SPLIT_VIEWS_KEY = "agents-ui-split-views-v1";
 const STORAGE_AGENT_PANEL_WIDTH_KEY = "agents-ui-agent-panel-width-v1";
+const STORAGE_UI_THEME_KEY = "agents-ui-ui-theme-v1";
+const DEFAULT_UI_THEME: UiTheme = "paper-light";
 const MAX_SSH_HISTORY = 10;
 
 const MAX_PENDING_SESSIONS = 32;
@@ -186,6 +189,10 @@ function makeId(): string {
 
 function normalizeSmartQuotes(input: string): string {
   return input.replace(/[“”„‟«»]/g, '"').replace(/[‘’‚‛‹›]/g, "'");
+}
+
+function parseUiTheme(input: string | null): UiTheme {
+  return input === "paper-dark" ? "paper-dark" : DEFAULT_UI_THEME;
 }
 
 function parseGithubRepo(value: string | null | undefined): { owner: string; repo: string } | null {
@@ -1064,6 +1071,13 @@ export default function App() {
   const [projects, setProjects] = useState<Project[]>(initialProjectState.projects);
   const [activeProjectId, setActiveProjectId] = useState<string>(initialProjectState.activeProjectId);
   const [activeSessionByProject, setActiveSessionByProject] = useState<Record<string, string>>({});
+  const [uiTheme, setUiTheme] = useState<UiTheme>(() => {
+    try {
+      return parseUiTheme(localStorage.getItem(STORAGE_UI_THEME_KEY));
+    } catch {
+      return DEFAULT_UI_THEME;
+    }
+  });
 
   const [sessions, setSessions] = useState<Session[]>([]);
   const [agentWorkingIds, setAgentWorkingIds] = useState<ReadonlySet<string>>(EMPTY_STRING_SET);
@@ -1073,6 +1087,8 @@ export default function App() {
   const [assetSettings, setAssetSettings] = useState<AssetSettings>({ autoApplyEnabled: true });
   const [agentShortcutIds, setAgentShortcutIds] = useState<string[]>(DEFAULT_AGENT_SHORTCUT_IDS);
   const [agentShortcutsOpen, setAgentShortcutsOpen] = useState(false);
+  const [appSettingsOpen, setAppSettingsOpen] = useState(false);
+  const appSettingsMenuRef = useRef<HTMLDivElement | null>(null);
   const sidebarRef = useRef<HTMLElement | null>(null);
   const [projectsListHeightMode, setProjectsListHeightMode] = useState<"auto" | "manual">(() => {
     try {
@@ -1107,6 +1123,25 @@ export default function App() {
     splitViewsRef.current = splitViews;
     persistSplitViews(splitViews);
   }, [splitViews]);
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", uiTheme);
+    try {
+      localStorage.setItem(STORAGE_UI_THEME_KEY, uiTheme);
+    } catch {
+      // Best-effort: localStorage may be unavailable in some contexts.
+    }
+  }, [uiTheme]);
+  useEffect(() => {
+    if (!appSettingsOpen) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (appSettingsMenuRef.current?.contains(target)) return;
+      setAppSettingsOpen(false);
+    };
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [appSettingsOpen]);
 
   const [activeSplitViewId, setActiveSplitViewId] = useState<string | null>(null);
   const activeSplitViewIdRef = useRef(activeSplitViewId);
@@ -7697,6 +7732,50 @@ export default function App() {
             </button>
           </div>
         )}
+        <div className="topbarSettingsMenu sidebarActionMenu" ref={appSettingsMenuRef}>
+          <button
+            type="button"
+            className={`iconBtn ${appSettingsOpen ? "iconBtnActive" : ""}`}
+            onClick={() => setAppSettingsOpen((prev) => !prev)}
+            title="Application settings"
+            aria-label="Application settings"
+            aria-haspopup="menu"
+            aria-expanded={appSettingsOpen}
+          >
+            <Icon name="settings" />
+          </button>
+          {appSettingsOpen ? (
+            <div className="sidebarActionMenuDropdown topbarSettingsMenuDropdown" role="menu">
+              <div className="topbarSettingsLabel">Theme</div>
+              <button
+                type="button"
+                className={`sidebarActionMenuItem topbarSettingsItem ${uiTheme === "paper-light" ? "topbarSettingsItemActive" : ""}`}
+                onClick={() => {
+                  setUiTheme("paper-light");
+                  setAppSettingsOpen(false);
+                }}
+                role="menuitemradio"
+                aria-checked={uiTheme === "paper-light"}
+              >
+                <span className={`topbarSettingsDot ${uiTheme === "paper-light" ? "active" : ""}`} aria-hidden="true" />
+                Paper Light
+              </button>
+              <button
+                type="button"
+                className={`sidebarActionMenuItem topbarSettingsItem ${uiTheme === "paper-dark" ? "topbarSettingsItemActive" : ""}`}
+                onClick={() => {
+                  setUiTheme("paper-dark");
+                  setAppSettingsOpen(false);
+                }}
+                role="menuitemradio"
+                aria-checked={uiTheme === "paper-dark"}
+              >
+                <span className={`topbarSettingsDot ${uiTheme === "paper-dark" ? "active" : ""}`} aria-hidden="true" />
+                Paper Dark
+              </button>
+            </div>
+          ) : null}
+        </div>
 
         {!error && !notice && (
           <div className="shortcutHint">
@@ -7842,7 +7921,7 @@ export default function App() {
               onClick={() => setAgentPanelOpen(prev => !prev)}
               title={`${agentPanelOpen ? "Close" : "Open"} Agent panel (\u2318\u21E7G)`}
             >
-              <Icon name="wand" />
+              <Icon name="wand" size={19} />
             </button>
 
             {/* Replay Button */}
@@ -7862,6 +7941,8 @@ export default function App() {
     active, activeProject, activeIsSsh, activeSshTarget, activeWorkspaceView,
     error, notice, persistenceDisabledReason, sessionRestoreProgress,
     secureStorageMode, secureStorageRetrying, slidePanelOpen, agentPanelOpen,
+    appSettingsOpen,
+    uiTheme,
     retrySecureStorage, dismissNotice, reportError,
     handleReconnectSession,
     updateActiveWorkspaceView, stopRecording, openRecordPrompt,
@@ -7884,6 +7965,7 @@ export default function App() {
           sessions={terminalPaneSessions}
           activeId={activeId}
           activeProjectId={activeProjectId}
+          uiTheme={uiTheme}
           splitPane={splitPane}
           onSplitRatioChange={handleSplitRatioChange}
           onCloseSplitPane={handleCloseSplitPane}
@@ -7921,6 +8003,7 @@ export default function App() {
                 key={`code-editor:${activeWorkspaceKey}`}
                 ref={codeEditorPanelRef}
                 provider={activeIsSsh ? "ssh" : "local"}
+                editorTheme={uiTheme === "paper-dark" ? "vs-dark" : "vs"}
                 sshTarget={activeIsSsh ? activeSshTarget : null}
                 rootDir={
                   (
@@ -8091,6 +8174,7 @@ export default function App() {
 	    activeWorkspaceView, activeWorkspaceKey,
 	    activeIsSsh, activeSshTarget, activeProject, active,
 	    workspaceResizeMode, activeProjectId, agentPanelOpen, agentPanelWidth,
+	    uiTheme,
 	    onCwdChange, onCommandChange, onSessionResize, onSessionTransportError,
 	    beginWorkspaceResize, updateWorkspaceViewForKey,
 	    handleSelectWorkspaceFile, handleOpenTerminalAtPath,
@@ -8119,6 +8203,15 @@ export default function App() {
                 const isPersistent = Boolean(s.persistent);
                 const isSshType = isSsh && !isPersistent;
                 const isDefaultType = !isPersistent && !isSshType;
+                const historyEffect =
+                  getProcessEffectById(s.effectId) ??
+                  detectProcessEffect({
+                    command:
+                      s.launchCommand ??
+                      (s.restoreCommand?.trim() ? s.restoreCommand.trim() : null) ??
+                      null,
+                    name: s.name,
+                  });
                 return (
                   <div
                     key={sid}
@@ -8132,7 +8225,13 @@ export default function App() {
                     style={s.color ? { "--tab-color": s.color } as React.CSSProperties : undefined}
                     onClick={() => selectSessionById(sid)}
                   >
-                    {s.symbol && <span className="sessionSymbol">{s.symbol}</span>}
+                    {s.symbol ? (
+                      <span className="sessionSymbol">{s.symbol}</span>
+                    ) : historyEffect?.iconSrc ? (
+                      <span className={`agentBadge historyAgentBadge chip-${historyEffect.id}`} title={historyEffect.label}>
+                        <img className="agentIcon" src={historyEffect.iconSrc} alt={historyEffect.label} />
+                      </span>
+                    ) : null}
                     <span className="historyTabProject">{proj?.title ?? "?"}</span>
                     <span className="historyTabSep">/</span>
                     <span className="historyTabName">{s.name}</span>

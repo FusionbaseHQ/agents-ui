@@ -18,6 +18,9 @@ export class SessionShellIntegration {
   private blocks: CommandBlock[] = [];
   private currentBlock: CommandBlock | null = null;
   private disposed = false;
+  private static hasCommandLifecycle(block: CommandBlock): boolean {
+    return Boolean(block.commandMarker || block.outputMarker || block.endMarker);
+  }
 
   get activated(): boolean {
     return this.blocks.length > 0 || this.currentBlock !== null;
@@ -43,7 +46,11 @@ export class SessionShellIntegration {
     if (this.disposed) return;
 
     // If there's an incomplete current block (no D marker), finalize it
-    if (this.currentBlock && !this.currentBlock.endMarker) {
+    if (
+      this.currentBlock &&
+      !this.currentBlock.endMarker &&
+      SessionShellIntegration.hasCommandLifecycle(this.currentBlock)
+    ) {
       this.blocks.push(this.currentBlock);
     }
 
@@ -72,6 +79,8 @@ export class SessionShellIntegration {
   handleOutputStart(term: Terminal): void {
     if (this.disposed) return;
     if (!this.currentBlock) return;
+    // Some shells can emit prompt redraw markers; ignore output-start until a command exists.
+    if (!this.currentBlock.commandMarker) return;
     const marker = term.registerMarker(0);
     if (!marker) return;
     this.currentBlock.outputMarker = marker;
@@ -81,6 +90,7 @@ export class SessionShellIntegration {
   handleCommandFinished(term: Terminal, exitCode: number): void {
     if (this.disposed) return;
     if (!this.currentBlock) return;
+    if (!this.currentBlock.commandMarker) return;
     const marker = term.registerMarker(0);
     if (!marker) return;
     this.currentBlock.endMarker = marker;

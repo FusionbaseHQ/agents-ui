@@ -50,6 +50,24 @@ type VisibleItem =
   | { type: "loading"; path: string; depth: number }
   | { type: "error"; path: string; depth: number; message: string };
 
+type FileTypeBadgeKind =
+  | "python"
+  | "shell"
+  | "json"
+  | "yaml"
+  | "toml"
+  | "ts"
+  | "js"
+  | "markup"
+  | "styles"
+  | "markdown"
+  | "sql"
+  | "image"
+  | "archive"
+  | "config";
+
+type FileTypeBadge = { label: string; kind: FileTypeBadgeKind };
+
 function normalizePath(input: string): string {
   const trimmed = input.trim();
   if (!trimmed) return "";
@@ -84,6 +102,40 @@ function basename(input: string): string {
   const idx = path.lastIndexOf("/");
   if (idx < 0) return path;
   return path.slice(idx + 1);
+}
+
+function getFileTypeBadge(name: string): FileTypeBadge | null {
+  const lower = name.toLowerCase();
+  const dot = lower.lastIndexOf(".");
+  const ext = dot >= 0 ? lower.slice(dot + 1) : "";
+
+  if (["py", "pyw"].includes(ext)) return { label: "PY", kind: "python" };
+  if (["sh", "bash", "zsh", "fish", "ksh"].includes(ext)) return { label: "SH", kind: "shell" };
+  if (["json", "jsonc", "json5"].includes(ext)) return { label: "{}", kind: "json" };
+  if (["yaml", "yml"].includes(ext)) return { label: "YML", kind: "yaml" };
+  if (["toml"].includes(ext)) return { label: "TOML", kind: "toml" };
+  if (["ts", "tsx"].includes(ext)) return { label: "TS", kind: "ts" };
+  if (["js", "jsx", "cjs", "mjs"].includes(ext)) return { label: "JS", kind: "js" };
+  if (["html", "htm", "xml", "svg"].includes(ext)) return { label: "HTML", kind: "markup" };
+  if (["css", "scss", "less"].includes(ext)) return { label: "CSS", kind: "styles" };
+  if (["md", "mdx", "rst", "txt"].includes(ext)) return { label: "MD", kind: "markdown" };
+  if (["sql"].includes(ext)) return { label: "SQL", kind: "sql" };
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff"].includes(ext)) {
+    return { label: "IMG", kind: "image" };
+  }
+  if (lower.endsWith(".tar.gz") || lower.endsWith(".tar.xz") || lower.endsWith(".tar.bz2")) {
+    return { label: "ARC", kind: "archive" };
+  }
+  if (["zip", "7z", "rar", "tar", "gz", "xz", "bz2"].includes(ext)) {
+    return { label: "ARC", kind: "archive" };
+  }
+  if (
+    ["env", "ini", "cfg", "conf", "lock"].includes(ext) ||
+    ["dockerfile", "makefile", "justfile", "procfile"].includes(lower)
+  ) {
+    return { label: "CFG", kind: "config" };
+  }
+  return null;
 }
 
 function joinPath(dir: string, name: string): string {
@@ -195,6 +247,7 @@ const FileRow = React.memo(function FileRow({
   onMouseUp,
 }: FileRowProps) {
   const indent = 12 + depth * 14;
+  const fileTypeBadge = entry.isDir ? null : getFileTypeBadge(entry.name);
   let cn = "fileExplorerRow";
   if (isActive) cn += " fileExplorerRowActive";
   if (isContextTarget) cn += " fileExplorerRowContext";
@@ -238,7 +291,15 @@ const FileRow = React.memo(function FileRow({
         </span>
       )}
       <span className="fileExplorerIcon" aria-hidden="true">
-        <Icon name={entry.isDir ? "folder" : "file"} size={14} />
+        {entry.isDir ? (
+          <Icon name="folder" size={14} />
+        ) : fileTypeBadge ? (
+          <span className={`fileExplorerTypeBadge fileExplorerTypeBadge-${fileTypeBadge.kind}`}>
+            {fileTypeBadge.label}
+          </span>
+        ) : (
+          <Icon name="file" size={14} />
+        )}
       </span>
       <span className="fileExplorerName">{entry.name}</span>
     </button>

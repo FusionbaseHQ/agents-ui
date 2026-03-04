@@ -3,6 +3,7 @@ import type { SearchAddon } from "@xterm/addon-search";
 
 type TerminalSearchBarProps = {
   searchAddon: SearchAddon;
+  uiTheme: "paper-light" | "paper-dark";
   query: string;
   onQueryChange: (value: string) => void;
   caseSensitive: boolean;
@@ -11,17 +12,28 @@ type TerminalSearchBarProps = {
   autoFocus?: boolean;
 };
 
-const DECORATIONS = {
-  matchBackground: "#1e2a3b",
-  matchBorder: "#2f4f7a",
-  matchOverviewRuler: "#3f74c9",
-  activeMatchBackground: "#5FAFFF",
-  activeMatchBorder: "#CFE7FF",
-  activeMatchColorOverviewRuler: "#5FAFFF",
+const DECORATIONS_BY_THEME = {
+  "paper-light": {
+    matchBackground: "#2b2420",
+    matchBorder: "#5e4f43",
+    matchOverviewRuler: "#7d6e61",
+    activeMatchBackground: "#2a669c",
+    activeMatchBorder: "#d3e4f4",
+    activeMatchColorOverviewRuler: "#2a669c",
+  },
+  "paper-dark": {
+    matchBackground: "#5b4730",
+    matchBorder: "#b59260",
+    matchOverviewRuler: "#d2a566",
+    activeMatchBackground: "#d2a566",
+    activeMatchBorder: "#fff0d8",
+    activeMatchColorOverviewRuler: "#d2a566",
+  },
 };
 
 export function TerminalSearchBar({
   searchAddon,
+  uiTheme,
   query,
   onQueryChange,
   caseSensitive,
@@ -32,6 +44,7 @@ export function TerminalSearchBar({
   const [resultIndex, setResultIndex] = React.useState(-1);
   const [resultCount, setResultCount] = React.useState(0);
   const inputRef = React.useRef<HTMLInputElement | null>(null);
+  const decorations = DECORATIONS_BY_THEME[uiTheme];
 
   React.useEffect(() => {
     if (!autoFocus) return;
@@ -55,8 +68,8 @@ export function TerminalSearchBar({
       setResultCount(0);
       return;
     }
-    searchAddon.findNext(query, { caseSensitive, incremental: true, decorations: DECORATIONS });
-  }, [query, caseSensitive, searchAddon]);
+    searchAddon.findNext(query, { caseSensitive, incremental: true, decorations });
+  }, [query, caseSensitive, searchAddon, decorations]);
 
   const doClose = React.useCallback(() => {
     onClose();
@@ -73,14 +86,14 @@ export function TerminalSearchBar({
         e.preventDefault();
         if (!query) return;
         if (e.shiftKey) {
-          searchAddon.findPrevious(query, { caseSensitive, decorations: DECORATIONS });
+          searchAddon.findPrevious(query, { caseSensitive, decorations });
         } else {
-          searchAddon.findNext(query, { caseSensitive, decorations: DECORATIONS });
+          searchAddon.findNext(query, { caseSensitive, decorations });
         }
         return;
       }
     },
-    [caseSensitive, doClose, query, searchAddon],
+    [caseSensitive, decorations, doClose, query, searchAddon],
   );
 
   // Use onMouseDown+preventDefault for all button actions to prevent focus
@@ -123,7 +136,7 @@ export function TerminalSearchBar({
         type="button"
         className="terminalSearchNavBtn"
         onMouseDown={(e) => onButtonMouseDown(e, () => {
-          if (query) searchAddon.findPrevious(query, { caseSensitive, decorations: DECORATIONS });
+          if (query) searchAddon.findPrevious(query, { caseSensitive, decorations });
         })}
         title="Previous match (Shift+Enter)"
       >
@@ -133,7 +146,7 @@ export function TerminalSearchBar({
         type="button"
         className="terminalSearchNavBtn"
         onMouseDown={(e) => onButtonMouseDown(e, () => {
-          if (query) searchAddon.findNext(query, { caseSensitive, decorations: DECORATIONS });
+          if (query) searchAddon.findNext(query, { caseSensitive, decorations });
         })}
         title="Next match (Enter)"
       >

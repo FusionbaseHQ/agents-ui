@@ -118,6 +118,7 @@ function inferLanguageId(path: string): string {
 
 type CodeEditorPanelProps = {
   provider: "local" | "ssh";
+  editorTheme: "vs" | "vs-dark";
   sshTarget?: string | null;
   rootDir: string;
   openFileRequest: CodeEditorOpenFileRequest | null;
@@ -132,6 +133,7 @@ type CodeEditorPanelProps = {
 export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEditorPanelProps>(function CodeEditorPanel(
   {
     provider,
+    editorTheme,
     sshTarget,
     rootDir,
     openFileRequest,
@@ -995,7 +997,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
         {tabs.length ? (
           <div className="codeEditorMonaco">
           <Editor
-            theme="vs-dark"
+            theme={editorTheme}
             onMount={onMount}
             keepCurrentModel
             defaultLanguage="plaintext"

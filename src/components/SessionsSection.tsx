@@ -1,6 +1,6 @@
 import React from "react";
 import { createPortal } from "react-dom";
-import { getProcessEffectById, type ProcessEffect } from "../processEffects";
+import { detectProcessEffect, getProcessEffectById, type ProcessEffect } from "../processEffects";
 import { shortenPathSmart } from "../pathDisplay";
 import { Icon } from "./Icon";
 
@@ -99,15 +99,17 @@ const SessionItem = React.memo(function SessionItem({
   const connectionState = s.connectionState ?? "connected";
   const isReconnecting = connectionState === "reconnecting";
   const isDisconnected = connectionState === "disconnected";
-  const effect = getProcessEffectById(s.effectId);
-  const chipLabel = effect?.label ?? s.processTag ?? null;
-  const hasAgentIcon = Boolean(effect?.iconSrc);
-  const isWorking = Boolean(effect && isAgentWorking && !isExited && !isClosing);
-  const isRecording = Boolean(s.recordingActive && !isExited && !isClosing);
   const launchOrRestore =
     s.launchCommand ??
     (s.restoreCommand?.trim() ? s.restoreCommand.trim() : null) ??
     null;
+  const effect =
+    getProcessEffectById(s.effectId) ??
+    detectProcessEffect({ command: launchOrRestore, name: s.name });
+  const chipLabel = effect?.label ?? s.processTag ?? null;
+  const hasAgentIcon = Boolean(effect?.iconSrc);
+  const isWorking = Boolean(effect && isAgentWorking && !isExited && !isClosing);
+  const isRecording = Boolean(s.recordingActive && !isExited && !isClosing);
   const isSsh = isSshCommand(launchOrRestore);
   const isPersistent = Boolean(s.persistent);
   const isSshType = isSsh && !isPersistent;
@@ -716,7 +718,24 @@ export const SessionsSection = React.memo(function SessionsSection({
                       <span className="sessionSplitTag" aria-hidden="true">
                         A
                       </span>
-                      {aSession.symbol && <span className="sessionSymbol">{aSession.symbol}</span>}
+                      {(() => {
+                        const aLaunchOrRestore =
+                          aSession.launchCommand ??
+                          (aSession.restoreCommand?.trim() ? aSession.restoreCommand.trim() : null) ??
+                          null;
+                        const aEffect =
+                          getProcessEffectById(aSession.effectId) ??
+                          detectProcessEffect({ command: aLaunchOrRestore, name: aSession.name });
+                        if (aSession.symbol) return <span className="sessionSymbol">{aSession.symbol}</span>;
+                        if (aEffect?.iconSrc) {
+                          return (
+                            <span className={`agentBadge sessionSplitViewAgentBadge chip-${aEffect.id}`} title={aEffect.label}>
+                              <img className="agentIcon" src={aEffect.iconSrc} alt={aEffect.label} />
+                            </span>
+                          );
+                        }
+                        return null;
+                      })()}
                       <span className="sessionSplitViewMemberName">{aSession.name}</span>
                     </button>
                     <button
@@ -752,7 +771,24 @@ export const SessionsSection = React.memo(function SessionsSection({
                       <span className="sessionSplitTag" aria-hidden="true">
                         B
                       </span>
-                      {bSession.symbol && <span className="sessionSymbol">{bSession.symbol}</span>}
+                      {(() => {
+                        const bLaunchOrRestore =
+                          bSession.launchCommand ??
+                          (bSession.restoreCommand?.trim() ? bSession.restoreCommand.trim() : null) ??
+                          null;
+                        const bEffect =
+                          getProcessEffectById(bSession.effectId) ??
+                          detectProcessEffect({ command: bLaunchOrRestore, name: bSession.name });
+                        if (bSession.symbol) return <span className="sessionSymbol">{bSession.symbol}</span>;
+                        if (bEffect?.iconSrc) {
+                          return (
+                            <span className={`agentBadge sessionSplitViewAgentBadge chip-${bEffect.id}`} title={bEffect.label}>
+                              <img className="agentIcon" src={bEffect.iconSrc} alt={bEffect.label} />
+                            </span>
+                          );
+                        }
+                        return null;
+                      })()}
                       <span className="sessionSplitViewMemberName">{bSession.name}</span>
                     </button>
                   </div>

@@ -8,6 +8,7 @@ export type SplitPane = {
   direction: "horizontal" | "vertical";
   ratio: number;
 } | null;
+type UiTheme = "paper-light" | "paper-dark";
 
 export type TerminalPaneSession = {
   id: string;
@@ -25,6 +26,7 @@ type TerminalPaneProps = {
   sessions: TerminalPaneSession[];
   activeId: string | null;
   activeProjectId: string;
+  uiTheme: UiTheme;
   splitPane: SplitPane;
   onSplitRatioChange: (ratio: number) => void;
   onCloseSplitPane: (closedSessionId: string) => void;
@@ -45,6 +47,7 @@ function TerminalPaneImpl({
   sessions,
   activeId,
   activeProjectId,
+  uiTheme,
   splitPane,
   onSplitRatioChange,
   onCloseSplitPane,
@@ -226,6 +229,7 @@ function TerminalPaneImpl({
             {searchAddon && (
               <TerminalSearchBar
                 searchAddon={searchAddon}
+                uiTheme={uiTheme}
                 query={searchQuery}
                 onQueryChange={setSearchQuery}
                 caseSensitive={searchCaseSensitive}
@@ -236,6 +240,7 @@ function TerminalPaneImpl({
             )}
             <SessionTerminal
               id={session.id}
+              uiTheme={uiTheme}
               active={isPrimary || isSecondary}
               shouldFocus={isPrimary}
               readOnly={Boolean(
@@ -266,6 +271,7 @@ function arePropsEqual(prev: TerminalPaneProps, next: TerminalPaneProps): boolea
     prev.sessions === next.sessions &&
     prev.activeId === next.activeId &&
     prev.activeProjectId === next.activeProjectId &&
+    prev.uiTheme === next.uiTheme &&
     prev.splitPane === next.splitPane &&
     prev.onSplitRatioChange === next.onSplitRatioChange &&
     prev.onCloseSplitPane === next.onCloseSplitPane &&

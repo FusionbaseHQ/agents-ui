@@ -11,6 +11,13 @@ export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon; sear
 export type PendingDataBuffer = Map<string, string[]>;
 
 type RenderDimension = { width: number; height: number };
+type UiTheme = "paper-light" | "paper-dark";
+type TerminalTheme = {
+  background: string;
+  foreground: string;
+  cursor: string;
+  selectionBackground: string;
+};
 type RenderDimensionsFallback = {
   css: { canvas: RenderDimension; cell: RenderDimension };
   device: {
@@ -24,6 +31,30 @@ const KNOWN_XTERM_RESIZE_RACE_SIGNATURES = [
   "this._renderer.value.handleresize",
   "undefined is not an object (evaluating 'this._renderer.value.handleresize')",
 ];
+const TERMINAL_THEME_BY_UI_THEME: Record<UiTheme, TerminalTheme> = {
+  "paper-light": {
+    background: "#1f1915",
+    foreground: "#f4ead3",
+    cursor: "#2a669c",
+    selectionBackground: "rgba(42,102,156,0.24)",
+  },
+  "paper-dark": {
+    background: "#18120c",
+    foreground: "#f7ead1",
+    cursor: "#d2a566",
+    selectionBackground: "rgba(210,165,102,0.26)",
+  },
+};
+
+function terminalThemeForUiTheme(uiTheme: UiTheme): TerminalTheme {
+  const selected = TERMINAL_THEME_BY_UI_THEME[uiTheme];
+  return {
+    background: selected.background,
+    foreground: selected.foreground,
+    cursor: selected.cursor,
+    selectionBackground: selected.selectionBackground,
+  };
+}
 
 function createEmptyRenderDimensions(): RenderDimensionsFallback {
   const dim = (): RenderDimension => ({ width: 0, height: 0 });
@@ -141,6 +172,14 @@ function dismissOsc133ContextMenu() {
   document.getElementById("osc133-context-menu")?.remove();
 }
 
+function fallbackCommandTextForBlock(term: Terminal, block: CommandBlock): string | null {
+  const row = block.commandMarker?.line ?? block.promptMarker.line;
+  const line = term.buffer.active.getLine(row);
+  if (!line) return null;
+  const text = line.translateToString(true).replace(/^[>$%#❯]\s+/, "").trim();
+  return text || null;
+}
+
 function showOsc133ContextMenu(
   event: MouseEvent,
   block: CommandBlock,
@@ -150,9 +189,9 @@ function showOsc133ContextMenu(
 ) {
   dismissOsc133ContextMenu();
 
-  const items: Array<{ label: string; action: () => void }> = [];
+  const items: Array<{ label: string; action: () => void; disabled?: boolean }> = [];
 
-  const commandText = shellInt.getCommandText(term, block);
+  const commandText = shellInt.getCommandText(term, block) ?? fallbackCommandTextForBlock(term, block);
   if (commandText) {
     items.push({ label: "Copy Command", action: () => void copyToClipboard(commandText) });
     items.push({ label: "Re-run Command", action: () => rerunCommand(commandText) });
@@ -163,19 +202,29 @@ function showOsc133ContextMenu(
     items.push({ label: "Copy Output", action: () => void copyToClipboard(outputText) });
   }
 
-  if (items.length === 0) return;
+  if (items.length === 0) {
+    items.push({
+      label: "No command details available",
+      action: () => {},
+      disabled: true,
+    });
+  }
 
   const menu = document.createElement("div");
   menu.id = "osc133-context-menu";
   menu.className = "osc133-context-menu";
-  menu.style.left = `${event.clientX}px`;
-  menu.style.top = `${event.clientY}px`;
+  menu.style.left = `${Math.max(8, event.clientX)}px`;
+  menu.style.top = `${Math.max(8, event.clientY)}px`;
 
   for (const item of items) {
     const row = document.createElement("div");
-    row.className = "osc133-context-menu-item";
+    row.className = item.disabled
+      ? "osc133-context-menu-item osc133-context-menu-item-disabled"
+      : "osc133-context-menu-item";
     row.textContent = item.label;
+    if (item.disabled) row.setAttribute("aria-disabled", "true");
     row.addEventListener("click", (e) => {
+      if (item.disabled) return;
       e.stopPropagation();
       item.action();
       menu.remove();
@@ -185,6 +234,11 @@ function showOsc133ContextMenu(
   }
 
   document.body.appendChild(menu);
+  const rect = menu.getBoundingClientRect();
+  const clampedX = Math.min(Math.max(8, event.clientX), Math.max(8, window.innerWidth - rect.width - 8));
+  const clampedY = Math.min(Math.max(8, event.clientY), Math.max(8, window.innerHeight - rect.height - 8));
+  menu.style.left = `${clampedX}px`;
+  menu.style.top = `${clampedY}px`;
 
   const cleanup = () => document.removeEventListener("mousedown", onDocClick, true);
   const onDocClick = (e: MouseEvent) => {
@@ -198,6 +252,7 @@ function showOsc133ContextMenu(
 
 type SessionTerminalProps = {
   id: string;
+  uiTheme: UiTheme;
   active: boolean;
   shouldFocus?: boolean;
   readOnly: boolean;
@@ -262,12 +317,7 @@ function SessionTerminal(props: SessionTerminalProps) {
       fontFamily:
         'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
       fontSize: 13,
-      theme: {
-        background: "#0b0b0c",
-        foreground: "#e6e2d9",
-        cursor: "#5FAFFF",
-        selectionBackground: "rgba(95,175,255,0.28)",
-      },
+      theme: terminalThemeForUiTheme(props.uiTheme),
       scrollback: 5000,
     });
     const fit = new FitAddon();
@@ -575,13 +625,15 @@ function SessionTerminal(props: SessionTerminalProps) {
           if (el.dataset.osc133Init) return;
           el.dataset.osc133Init = "1";
           el.classList.add("osc133-exit-dot", isSuccess ? "osc133-success" : "osc133-error");
-          el.addEventListener("contextmenu", (e) => {
+          const openContextMenu = (e: MouseEvent) => {
             e.preventDefault();
             e.stopPropagation();
             showOsc133ContextMenu(e, block, term, shellInt, (cmd) =>
               void writeToSession(cmd + "\r", "ui"),
             );
-          });
+          };
+          el.addEventListener("contextmenu", openContextMenu);
+          el.addEventListener("click", openContextMenu);
         });
       } catch {
         // Decoration creation failed — non-fatal, skip silently
@@ -669,7 +721,7 @@ function SessionTerminal(props: SessionTerminalProps) {
             case "C": {
               shellInt.handleOutputStart(term);
               const pending = shellInt.pendingBlock;
-              if (pending) {
+              if (pending?.commandMarker) {
                 requestAnimationFrame(() => createWorkingDecoration(pending));
               }
               break;
@@ -957,6 +1009,17 @@ function SessionTerminal(props: SessionTerminalProps) {
       cancelled = true;
     };
   }, [props.active, props.shouldFocus, props.id]);
+
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    term.options.theme = terminalThemeForUiTheme(props.uiTheme);
+    try {
+      term.refresh(0, Math.max(0, term.rows - 1));
+    } catch {
+      // best-effort redraw
+    }
+  }, [props.uiTheme]);
 
   useEffect(() => {
     const term = termRef.current;
