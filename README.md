@@ -21,7 +21,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-AGPL%203.0-blue.svg" alt="License">
   <img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-0.5.0-green.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.6.0-green.svg" alt="Version">
   <img src="https://img.shields.io/badge/tauri-v2-orange.svg" alt="Tauri">
 </p>
 
@@ -36,8 +36,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/FusionbaseHQ/agents-ui/releases/tag/v0.5.0">
-    <img src="https://img.shields.io/badge/Download-v0.5.0%20(macOS)-brightgreen" alt="Download v0.5.0 for macOS">
+  <a href="https://github.com/FusionbaseHQ/agents-ui/releases/tag/v0.6.0">
+    <img src="https://img.shields.io/badge/Download-v0.6.0%20(macOS)-brightgreen" alt="Download v0.6.0 for macOS">
   </a>
 </p>
 
@@ -51,11 +51,16 @@
 - Persistent zellij sessions
 - Split views (saved terminal layouts)
 - SSH host picker (and port forwards)
+- SSH-based projects with remote session creation
 - Projects, prompts & assets
 - Recording & replay
 - Local + SSH file explorer + Monaco editor
 - Context-aware `Cmd/Ctrl+F`: terminal find vs editor find
 - Drag & drop file transfers: **Finder ↔ local ↔ SSH**
+- 8 built-in themes (Dawn, Sepia, Ember, Slate, Midnight, Cobalt, Neon, Forest)
+- Shell integration with command markers (OSC 133)
+- MCP server for AI agent integration
+- Session history quick-switch bar
 
 ## Features
 
@@ -66,12 +71,15 @@
 - Split views: saved 2-pane layouts per project (switch via sidebar)
 - In-terminal find (`Cmd/Ctrl+F`), synced across split panes
 - Working directory tracking and session status (exit codes, closed state)
+- Shell integration via OSC 133 markers (command start/end indicators, exit code dots)
+- Session history quick-switch bar at the bottom of the terminal
 - Session recording and replay
 
 ### Multi-Agent Support
 - Quick-start shortcuts for **Claude**, **Codex**, and **Gemini** (and configurable shortcuts for other agents)
 - Activity indicators show when agents are working
 - Automatic agent detection with branded icons
+- Built-in MCP server for programmatic control by AI agents (sessions, projects, files, themes)
 
 ### Projects & Workspace
 - Project-based organization (sessions, base paths, and environment sets)
@@ -104,8 +112,14 @@
 - Paste or send-with-enter modes
 - Asset templates for one-click file creation
 
+### Themes
+- 8 built-in themes: **Dawn** (light), **Sepia** (warm light), **Ember** (warm dark), **Slate** (cool dark), **Midnight** (deep dark), **Cobalt** (blue dark), **Neon** (cyberpunk), **Forest** (green dark)
+- Switchable via settings menu or programmatically via MCP/API
+- Each theme provides coordinated colors for the UI, terminal, editor, and search decorations
+
 ### SSH (Remote Sessions + Port Forwards)
 - Host picker backed by `~/.ssh/config`
+- SSH-based projects with automatic remote session creation
 - Port forwards: local (`-L`), remote (`-R`), dynamic (`-D`)
 - “Forward-only” mode (port-forward without starting an interactive shell)
 
@@ -274,13 +288,19 @@ npm run tauri build
 ├── src/                      # React frontend
 │   ├── App.tsx               # Main application component
 │   ├── SessionTerminal.tsx   # Terminal embedding (xterm.js)
+│   ├── shellIntegration.ts   # OSC 133 shell integration state machine
+│   ├── apiBridge.ts          # API/MCP bridge (command dispatch)
 │   ├── CommandPalette.tsx    # Command palette UI
 │   ├── SlidePanel.tsx        # Side panel component
 │   ├── components/           # Editor, file explorer, modals, sections
 │   ├── processEffects.ts     # Agent detection + shortcut definitions
-│   └── styles.css            # Application styles
+│   └── styles.css            # Application styles + theme definitions
 ├── src-tauri/                # Rust backend (Tauri)
-│   ├── src/                  # Commands + PTY + SSH + persistence
+│   ├── src/                  # Commands + PTY + SSH + MCP + persistence
+│   │   ├── mcp_server.rs     # MCP server (stdio transport)
+│   │   ├── mcp_tools.rs      # MCP tool definitions + dispatch
+│   │   ├── api_server.rs     # JSON-RPC API server (Unix socket)
+│   │   └── pty.rs            # PTY management + shell integration setup
 │   └── bin/                  # Bundled sidecars (macOS)
 ├── scripts/                  # Dev + packaging utilities
 └── docs/                     # Demo assets
@@ -386,7 +406,7 @@ Ensure the CLI commands are available in your PATH.
 <details>
 <summary><strong>Can I customize the appearance?</strong></summary>
 
-The app uses a dark gray + gold theme by default. Custom theming is planned for future releases; you can modify `src/styles.css` for development builds.
+Agents UI ships with 8 themes — switch via the settings menu (gear icon) or programmatically through the MCP `set_theme` tool. Available themes: Dawn, Sepia, Ember, Slate, Midnight, Cobalt, Neon, and Forest. You can also add custom themes by editing `src/styles.css`.
 </details>
 
 ## Contributing
