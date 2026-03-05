@@ -18,6 +18,7 @@ export class SessionShellIntegration {
   private blocks: CommandBlock[] = [];
   private currentBlock: CommandBlock | null = null;
   private disposed = false;
+  private onBlockEvicted: ((blockId: number) => void) | null = null;
   private static hasCommandLifecycle(block: CommandBlock): boolean {
     return Boolean(block.commandMarker || block.outputMarker || block.endMarker);
   }
@@ -69,34 +70,43 @@ export class SessionShellIntegration {
   handleCommandStart(term: Terminal): void {
     if (this.disposed) return;
     if (!this.currentBlock) return;
+    const block = this.currentBlock;
+    if (block.commandMarker) return;
     const marker = term.registerMarker(0);
     if (!marker) return;
-    this.currentBlock.commandMarker = marker;
+    block.commandMarker = marker;
     // Capture cursor column — this is where user input begins (after the prompt)
-    this.currentBlock.commandStartCol = term.buffer.active.cursorX;
+    block.commandStartCol = term.buffer.active.cursorX;
   }
 
   handleOutputStart(term: Terminal): void {
     if (this.disposed) return;
-    if (!this.currentBlock) return;
-    // Some shells can emit prompt redraw markers; ignore output-start until a command exists.
-    if (!this.currentBlock.commandMarker) return;
+    const block = this.currentBlock;
+    if (!block) return;
+    if (!block.commandMarker) return;
+    if (block.outputMarker) return;
     const marker = term.registerMarker(0);
     if (!marker) return;
-    this.currentBlock.outputMarker = marker;
-    this.currentBlock.startedAt = Date.now();
+    block.outputMarker = marker;
+    block.startedAt = Date.now();
   }
 
   handleCommandFinished(term: Terminal, exitCode: number): void {
     if (this.disposed) return;
-    if (!this.currentBlock) return;
-    if (!this.currentBlock.commandMarker) return;
+    const block = this.currentBlock;
+    if (!block) return;
+    if (!block.commandMarker) return;
+    if (block.endMarker) return;
+    if (!block.outputMarker) {
+      block.outputMarker = block.commandMarker;
+      block.startedAt = Date.now();
+    }
     const marker = term.registerMarker(0);
     if (!marker) return;
-    this.currentBlock.endMarker = marker;
-    this.currentBlock.exitCode = exitCode;
-    this.currentBlock.finishedAt = Date.now();
-    this.blocks.push(this.currentBlock);
+    block.endMarker = marker;
+    block.exitCode = exitCode;
+    block.finishedAt = Date.now();
+    this.blocks.push(block);
     this.currentBlock = null;
   }
 
@@ -204,6 +214,11 @@ export class SessionShellIntegration {
     if (this.currentBlock?.id === blockId) {
       this.currentBlock = null;
     }
+    this.onBlockEvicted?.(blockId);
+  }
+
+  setOnBlockEvicted(cb: ((blockId: number) => void) | null): void {
+    this.onBlockEvicted = cb;
   }
 
   dispose(): void {

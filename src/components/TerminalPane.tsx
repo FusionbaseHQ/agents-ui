@@ -8,7 +8,15 @@ export type SplitPane = {
   direction: "horizontal" | "vertical";
   ratio: number;
 } | null;
-type UiTheme = "paper-light" | "paper-dark";
+type UiTheme =
+  | "dawn"
+  | "sepia"
+  | "ember"
+  | "slate"
+  | "midnight"
+  | "cobalt"
+  | "neon"
+  | "forest";
 
 export type TerminalPaneSession = {
   id: string;

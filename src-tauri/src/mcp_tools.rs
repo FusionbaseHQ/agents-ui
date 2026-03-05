@@ -340,9 +340,20 @@ pub fn tool_list() -> Vec<Value> {
             "type": "object",
             "properties": {}
         })),
-        tool_def("get_ui_state", "Get the current UI state including the active session, active project, visible panels, and window layout.", json!({
+        tool_def("get_ui_state", "Get the current UI state including the active session, active project, theme, visible panels, and window layout.", json!({
             "type": "object",
             "properties": {}
+        })),
+        tool_def("get_theme", "Get the current UI theme.", json!({
+            "type": "object",
+            "properties": {}
+        })),
+        tool_def("set_theme", "Set the UI theme. Available themes: dawn, sepia, ember, slate, midnight, cobalt, neon, forest.", json!({
+            "type": "object",
+            "properties": {
+                "theme": { "type": "string", "description": "Theme name (dawn, sepia, ember, slate, midnight, cobalt, neon, forest)" }
+            },
+            "required": ["theme"]
         })),
         // Shell integration
         tool_def("wait_for_command_complete", "Wait for a shell command to finish executing (detected via OSC 133 shell integration markers). Blocks until the command's exit marker fires or timeout expires. Returns structured result with command text, exit code, output, and duration. Requires shell integration to be active in the session.", json!({
@@ -449,6 +460,8 @@ fn tool_to_method(name: &str) -> Option<&'static str> {
         "send_prompt" => Some("prompts.send"),
         "get_app_info" => Some("app.info"),
         "get_ui_state" => Some("ui.state"),
+        "get_theme" => Some("ui.get_theme"),
+        "set_theme" => Some("ui.set_theme"),
         "wait_for_command_complete" => None, // handled as special case in call_tool
         "get_command_history" => Some("shell.command_history"),
         "get_last_command_result" => Some("shell.last_result"),
@@ -521,6 +534,8 @@ fn map_params(name: &str, args: &Value) -> Value {
         }
         "get_app_info" => json!({}),
         "get_ui_state" => json!({}),
+        "get_theme" => json!({}),
+        "set_theme" => json!({ "theme": args.get("theme") }),
         "wait_for_command_complete" => json!({}), // handled as special case
         "get_command_history" => {
             let mut p = json!({ "sessionId": args.get("sessionId") });

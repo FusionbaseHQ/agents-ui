@@ -3,7 +3,15 @@ import type { SearchAddon } from "@xterm/addon-search";
 
 type TerminalSearchBarProps = {
   searchAddon: SearchAddon;
-  uiTheme: "paper-light" | "paper-dark";
+  uiTheme:
+    | "dawn"
+    | "sepia"
+    | "ember"
+    | "slate"
+    | "midnight"
+    | "cobalt"
+    | "neon"
+    | "forest";
   query: string;
   onQueryChange: (value: string) => void;
   caseSensitive: boolean;
@@ -13,7 +21,7 @@ type TerminalSearchBarProps = {
 };
 
 const DECORATIONS_BY_THEME = {
-  "paper-light": {
+  dawn: {
     matchBackground: "#2b2420",
     matchBorder: "#5e4f43",
     matchOverviewRuler: "#7d6e61",
@@ -21,13 +29,61 @@ const DECORATIONS_BY_THEME = {
     activeMatchBorder: "#d3e4f4",
     activeMatchColorOverviewRuler: "#2a669c",
   },
-  "paper-dark": {
+  sepia: {
+    matchBackground: "#4d3523",
+    matchBorder: "#8f5f37",
+    matchOverviewRuler: "#a77345",
+    activeMatchBackground: "#8f5f37",
+    activeMatchBorder: "#f3ddbd",
+    activeMatchColorOverviewRuler: "#8f5f37",
+  },
+  ember: {
     matchBackground: "#5b4730",
     matchBorder: "#b59260",
     matchOverviewRuler: "#d2a566",
     activeMatchBackground: "#d2a566",
     activeMatchBorder: "#fff0d8",
     activeMatchColorOverviewRuler: "#d2a566",
+  },
+  slate: {
+    matchBackground: "#313a43",
+    matchBorder: "#6f869f",
+    matchOverviewRuler: "#8ca3bb",
+    activeMatchBackground: "#8ca3bb",
+    activeMatchBorder: "#edf2f8",
+    activeMatchColorOverviewRuler: "#8ca3bb",
+  },
+  midnight: {
+    matchBackground: "#2a2f36",
+    matchBorder: "#6c7887",
+    matchOverviewRuler: "#7d93ad",
+    activeMatchBackground: "#7d93ad",
+    activeMatchBorder: "#e7edf5",
+    activeMatchColorOverviewRuler: "#7d93ad",
+  },
+  cobalt: {
+    matchBackground: "#1b3553",
+    matchBorder: "#3f79b2",
+    matchOverviewRuler: "#5ea4ff",
+    activeMatchBackground: "#5ea4ff",
+    activeMatchBorder: "#d6e8ff",
+    activeMatchColorOverviewRuler: "#5ea4ff",
+  },
+  neon: {
+    matchBackground: "#1f1841",
+    matchBorder: "#a75cff",
+    matchOverviewRuler: "#2cf9ff",
+    activeMatchBackground: "#2cf9ff",
+    activeMatchBorder: "#e8fffd",
+    activeMatchColorOverviewRuler: "#2cf9ff",
+  },
+  forest: {
+    matchBackground: "#1a3326",
+    matchBorder: "#3d8a5c",
+    matchOverviewRuler: "#4eca7a",
+    activeMatchBackground: "#4eca7a",
+    activeMatchBorder: "#d4f5e1",
+    activeMatchColorOverviewRuler: "#4eca7a",
   },
 };
 

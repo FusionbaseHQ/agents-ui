@@ -11,7 +11,15 @@ export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon; sear
 export type PendingDataBuffer = Map<string, string[]>;
 
 type RenderDimension = { width: number; height: number };
-type UiTheme = "paper-light" | "paper-dark";
+type UiTheme =
+  | "dawn"
+  | "sepia"
+  | "ember"
+  | "slate"
+  | "midnight"
+  | "cobalt"
+  | "neon"
+  | "forest";
 type TerminalTheme = {
   background: string;
   foreground: string;
@@ -32,17 +40,53 @@ const KNOWN_XTERM_RESIZE_RACE_SIGNATURES = [
   "undefined is not an object (evaluating 'this._renderer.value.handleresize')",
 ];
 const TERMINAL_THEME_BY_UI_THEME: Record<UiTheme, TerminalTheme> = {
-  "paper-light": {
+  dawn: {
     background: "#1f1915",
     foreground: "#f4ead3",
     cursor: "#2a669c",
     selectionBackground: "rgba(42,102,156,0.24)",
   },
-  "paper-dark": {
+  sepia: {
+    background: "#221912",
+    foreground: "#f1e1c1",
+    cursor: "#8f5f37",
+    selectionBackground: "rgba(143,95,55,0.3)",
+  },
+  ember: {
     background: "#18120c",
     foreground: "#f7ead1",
     cursor: "#d2a566",
     selectionBackground: "rgba(210,165,102,0.26)",
+  },
+  slate: {
+    background: "#13171b",
+    foreground: "#e7e8e9",
+    cursor: "#8ca3bb",
+    selectionBackground: "rgba(140,163,187,0.28)",
+  },
+  midnight: {
+    background: "#0d0f12",
+    foreground: "#e2dfd7",
+    cursor: "#7d93ad",
+    selectionBackground: "rgba(125,147,173,0.28)",
+  },
+  cobalt: {
+    background: "#08111d",
+    foreground: "#dbe7f7",
+    cursor: "#5ea4ff",
+    selectionBackground: "rgba(94,164,255,0.28)",
+  },
+  neon: {
+    background: "#070b14",
+    foreground: "#dcfff9",
+    cursor: "#2cf9ff",
+    selectionBackground: "rgba(44,249,255,0.3)",
+  },
+  forest: {
+    background: "#0a110c",
+    foreground: "#d4e8db",
+    cursor: "#4eca7a",
+    selectionBackground: "rgba(78,202,122,0.26)",
   },
 };
 
@@ -272,6 +316,7 @@ function SessionTerminal(props: SessionTerminalProps) {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const canvasAddonRef = useRef<CanvasAddon | null>(null);
+  const recoverCanvasRef = useRef<() => void>(() => {});
   const lastCanvasRecoveryRef = useRef(0);
   const resizeRafRef = useRef<number | null>(null);
   const resizeTimeoutRef = useRef<number | null>(null);
@@ -353,6 +398,7 @@ function SessionTerminal(props: SessionTerminalProps) {
         canvasAddonRef.current = null;
       }
     };
+    recoverCanvasRef.current = recoverCanvas;
 
     const reportTransportError = (operation: "write" | "resize", err: unknown) => {
       onTransportErrorRef.current?.(props.id, operation, formatInvokeError(err));
@@ -606,10 +652,12 @@ function SessionTerminal(props: SessionTerminalProps) {
     const shellInt = new SessionShellIntegration();
     shellIntRef.current = shellInt;
     const osc133Decorations: Array<{ dispose: () => void }> = [];
+    const blockDecoMap = new Map<number, { dispose: () => void }>();
     let osc133Disposed = false;
 
     const createExitDecoration = (block: CommandBlock) => {
       if (osc133Disposed) return;
+      if (blockDecoMap.has(block.id)) return;
       try {
         const deco = term.registerDecoration({
           marker: block.promptMarker,
@@ -619,6 +667,7 @@ function SessionTerminal(props: SessionTerminalProps) {
           layer: "top",
         });
         if (!deco) return;
+        blockDecoMap.set(block.id, deco);
         osc133Decorations.push(deco);
         const isSuccess = block.exitCode === 0;
         deco.onRender((el) => {
@@ -633,7 +682,6 @@ function SessionTerminal(props: SessionTerminalProps) {
             );
           };
           el.addEventListener("contextmenu", openContextMenu);
-          el.addEventListener("click", openContextMenu);
         });
       } catch {
         // Decoration creation failed — non-fatal, skip silently
@@ -641,6 +689,18 @@ function SessionTerminal(props: SessionTerminalProps) {
     };
 
     let pendingWorkingDeco: { dispose: () => void } | null = null;
+    let workingDecoBlockId: number | null = null;
+
+    shellInt.setOnBlockEvicted((blockId) => {
+      const deco = blockDecoMap.get(blockId);
+      if (deco) {
+        blockDecoMap.delete(blockId);
+        const idx = osc133Decorations.indexOf(deco);
+        if (idx >= 0) osc133Decorations.splice(idx, 1);
+        // Defer disposal to avoid re-entrant issues during xterm marker teardown
+        queueMicrotask(() => { try { deco.dispose(); } catch {} });
+      }
+    });
 
     const disposeWorkingDeco = () => {
       if (!pendingWorkingDeco) return;
@@ -705,8 +765,8 @@ function SessionTerminal(props: SessionTerminalProps) {
           const code = data.charAt(0);
           switch (code) {
             case "A":
-              disposeWorkingDeco();
               shellInt.handlePromptStart(term);
+              disposeWorkingDeco();
               // Defer React callback out of the write pipeline
               queueMicrotask(() => reportCommand(""));
               // Notify MCP/API listeners that the shell is idle at prompt
@@ -722,11 +782,18 @@ function SessionTerminal(props: SessionTerminalProps) {
               shellInt.handleOutputStart(term);
               const pending = shellInt.pendingBlock;
               if (pending?.commandMarker) {
-                requestAnimationFrame(() => createWorkingDecoration(pending));
+                workingDecoBlockId = pending.id;
+                const expectedId = pending.id;
+                requestAnimationFrame(() => {
+                  if (workingDecoBlockId === expectedId) {
+                    createWorkingDecoration(pending);
+                  }
+                });
               }
               break;
             }
             case "D": {
+              workingDecoBlockId = null;
               disposeWorkingDeco();
               const exitStr = data.length > 2 ? data.slice(2) : "0";
               const exitCode = parseInt(exitStr, 10) || 0;
@@ -919,7 +986,9 @@ function SessionTerminal(props: SessionTerminalProps) {
 	      }
 	      osc133Disposed = true;
 	      dismissOsc133ContextMenu();
+	      blockDecoMap.clear();
 	      for (const d of osc133Decorations) d.dispose();
+	      shellInt.setOnBlockEvicted(null);
 	      shellInt.dispose();
 	      shellIntRef.current = null;
 	      for (const d of oscDisposables) d.dispose();
@@ -930,6 +999,7 @@ function SessionTerminal(props: SessionTerminalProps) {
 	      searchAddon.dispose();
 	      try { canvasAddonRef.current?.dispose(); } catch { /* best-effort */ }
 	      canvasAddonRef.current = null;
+        recoverCanvasRef.current = () => {};
 	      term.dispose();
 	      termRef.current = null;
 	      fitRef.current = null;
@@ -1014,7 +1084,11 @@ function SessionTerminal(props: SessionTerminalProps) {
     const term = termRef.current;
     if (!term) return;
     term.options.theme = terminalThemeForUiTheme(props.uiTheme);
+    // Theme switches can desync the canvas renderer on some GPUs/sleep cycles.
+    // Rebind canvas and repaint without touching terminal buffer content.
+    recoverCanvasRef.current();
     try {
+      fitRef.current?.fit();
       term.refresh(0, Math.max(0, term.rows - 1));
     } catch {
       // best-effort redraw

@@ -135,7 +135,15 @@ type RecentSessionKey = { projectId: string; persistId: string };
 type TrayRecentSession = { label: string; projectId: string; persistId: string };
 type OutputQueueBySession = Map<string, string[]>;
 type SessionRestoreProgress = { remaining: number; total: number };
-type UiTheme = "paper-light" | "paper-dark";
+type UiTheme =
+  | "dawn"
+  | "sepia"
+  | "ember"
+  | "slate"
+  | "midnight"
+  | "cobalt"
+  | "neon"
+  | "forest";
 
 const STORAGE_PROJECTS_KEY = "agents-ui-projects";
 const STORAGE_ACTIVE_PROJECT_KEY = "agents-ui-active-project-id";
@@ -150,7 +158,7 @@ const STORAGE_SSH_HISTORY_KEY = "agents-ui-ssh-history-v1";
 const STORAGE_SPLIT_VIEWS_KEY = "agents-ui-split-views-v1";
 const STORAGE_AGENT_PANEL_WIDTH_KEY = "agents-ui-agent-panel-width-v1";
 const STORAGE_UI_THEME_KEY = "agents-ui-ui-theme-v1";
-const DEFAULT_UI_THEME: UiTheme = "paper-light";
+const DEFAULT_UI_THEME: UiTheme = "dawn";
 const MAX_SSH_HISTORY = 10;
 
 const MAX_PENDING_SESSIONS = 32;
@@ -191,8 +199,35 @@ function normalizeSmartQuotes(input: string): string {
   return input.replace(/[“”„‟«»]/g, '"').replace(/[‘’‚‛‹›]/g, "'");
 }
 
+const VALID_THEMES = new Set<UiTheme>(["dawn", "sepia", "ember", "slate", "midnight", "cobalt", "neon", "forest"]);
+const LEGACY_THEME_MAP: Record<string, UiTheme> = {
+  "paper-light": "dawn",
+  "paper-sepia": "sepia",
+  "paper-dark": "ember",
+  "paper-slate": "slate",
+  "paper-black": "midnight",
+  "paper-blueprint": "cobalt",
+  "paper-neon": "neon",
+};
 function parseUiTheme(input: string | null): UiTheme {
-  return input === "paper-dark" ? "paper-dark" : DEFAULT_UI_THEME;
+  if (!input) return DEFAULT_UI_THEME;
+  if (VALID_THEMES.has(input as UiTheme)) return input as UiTheme;
+  const legacy = LEGACY_THEME_MAP[input];
+  if (legacy) return legacy;
+  return DEFAULT_UI_THEME;
+}
+
+function readStoredUiTheme(): UiTheme {
+  try {
+    return parseUiTheme(localStorage.getItem(STORAGE_UI_THEME_KEY));
+  } catch {
+    return DEFAULT_UI_THEME;
+  }
+}
+
+const INITIAL_UI_THEME: UiTheme = readStoredUiTheme();
+if (typeof document !== "undefined") {
+  document.documentElement.setAttribute("data-theme", INITIAL_UI_THEME);
 }
 
 function parseGithubRepo(value: string | null | undefined): { owner: string; repo: string } | null {
@@ -1071,13 +1106,9 @@ export default function App() {
   const [projects, setProjects] = useState<Project[]>(initialProjectState.projects);
   const [activeProjectId, setActiveProjectId] = useState<string>(initialProjectState.activeProjectId);
   const [activeSessionByProject, setActiveSessionByProject] = useState<Record<string, string>>({});
-  const [uiTheme, setUiTheme] = useState<UiTheme>(() => {
-    try {
-      return parseUiTheme(localStorage.getItem(STORAGE_UI_THEME_KEY));
-    } catch {
-      return DEFAULT_UI_THEME;
-    }
-  });
+  const [uiTheme, setUiTheme] = useState<UiTheme>(INITIAL_UI_THEME);
+  const uiThemeRef = useRef<UiTheme>(INITIAL_UI_THEME);
+  uiThemeRef.current = uiTheme;
 
   const [sessions, setSessions] = useState<Session[]>([]);
   const [agentWorkingIds, setAgentWorkingIds] = useState<ReadonlySet<string>>(EMPTY_STRING_SET);
@@ -3338,7 +3369,15 @@ export default function App() {
         activeProjectId: activeProjectIdRef.current,
         activeSessionId: activeIdRef.current,
         activeSplitViewId: activeSplitViewIdRef.current,
+        theme: uiThemeRef.current,
       }),
+      "ui.get_theme": () => ({ theme: uiThemeRef.current }),
+      "ui.set_theme": (p) => {
+        const theme = parseUiTheme(p.theme as string | null);
+        setUiTheme(theme);
+        notifyStateChange("ui.theme_changed", { theme });
+        return { theme };
+      },
       "ui.activate_session": (p) => {
         const id = p.sessionId as string;
         const s = sessionsRef.current.find((s) => s.id === id);
@@ -7747,32 +7786,31 @@ export default function App() {
           {appSettingsOpen ? (
             <div className="sidebarActionMenuDropdown topbarSettingsMenuDropdown" role="menu">
               <div className="topbarSettingsLabel">Theme</div>
-              <button
-                type="button"
-                className={`sidebarActionMenuItem topbarSettingsItem ${uiTheme === "paper-light" ? "topbarSettingsItemActive" : ""}`}
-                onClick={() => {
-                  setUiTheme("paper-light");
-                  setAppSettingsOpen(false);
-                }}
-                role="menuitemradio"
-                aria-checked={uiTheme === "paper-light"}
-              >
-                <span className={`topbarSettingsDot ${uiTheme === "paper-light" ? "active" : ""}`} aria-hidden="true" />
-                Paper Light
-              </button>
-              <button
-                type="button"
-                className={`sidebarActionMenuItem topbarSettingsItem ${uiTheme === "paper-dark" ? "topbarSettingsItemActive" : ""}`}
-                onClick={() => {
-                  setUiTheme("paper-dark");
-                  setAppSettingsOpen(false);
-                }}
-                role="menuitemradio"
-                aria-checked={uiTheme === "paper-dark"}
-              >
-                <span className={`topbarSettingsDot ${uiTheme === "paper-dark" ? "active" : ""}`} aria-hidden="true" />
-                Paper Dark
-              </button>
+              {([
+                ["dawn", "Dawn"],
+                ["sepia", "Sepia"],
+                ["ember", "Ember"],
+                ["slate", "Slate"],
+                ["midnight", "Midnight"],
+                ["cobalt", "Cobalt"],
+                ["neon", "Neon"],
+                ["forest", "Forest"],
+              ] as const).map(([id, label]) => (
+                <button
+                  key={id}
+                  type="button"
+                  className={`sidebarActionMenuItem topbarSettingsItem ${uiTheme === id ? "topbarSettingsItemActive" : ""}`}
+                  onClick={() => {
+                    setUiTheme(id);
+                    setAppSettingsOpen(false);
+                  }}
+                  role="menuitemradio"
+                  aria-checked={uiTheme === id}
+                >
+                  <span className={`topbarSettingsDot ${uiTheme === id ? "active" : ""}`} aria-hidden="true" />
+                  {label}
+                </button>
+              ))}
             </div>
           ) : null}
         </div>
@@ -8003,7 +8041,7 @@ export default function App() {
                 key={`code-editor:${activeWorkspaceKey}`}
                 ref={codeEditorPanelRef}
                 provider={activeIsSsh ? "ssh" : "local"}
-                editorTheme={uiTheme === "paper-dark" ? "vs-dark" : "vs"}
+                editorTheme={uiTheme === "dawn" || uiTheme === "sepia" ? "vs" : "vs-dark"}
                 sshTarget={activeIsSsh ? activeSshTarget : null}
                 rootDir={
                   (
