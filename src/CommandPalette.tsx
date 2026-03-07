@@ -34,6 +34,14 @@ type Session = {
   projectId: string;
 };
 
+type Project = {
+  id: string;
+  title: string;
+  basePath: string | null;
+  symbol?: string | null;
+  sshTarget?: string | null;
+};
+
 type QuickStartPreset = {
   id: string;
   title: string;
@@ -43,7 +51,7 @@ type QuickStartPreset = {
 
 type CommandItem = {
   id: string;
-  type: "quickstart" | "prompt" | "recording" | "session" | "action";
+  type: "quickstart" | "prompt" | "recording" | "session" | "project" | "action";
   title: string;
   subtitle?: string;
   icon?: string;
@@ -52,6 +60,8 @@ type CommandItem = {
   shortcut?: string;
   pinned?: boolean;
   data?: unknown;
+  /** For session items: cached terminal text snippet matching the query */
+  terminalMatch?: string;
 };
 
 type CommandPaletteProps = {
@@ -60,13 +70,16 @@ type CommandPaletteProps = {
   prompts: Prompt[];
   recordings: RecordingIndexEntry[];
   sessions: Session[];
+  projects: Project[];
   activeSessionId: string | null;
+  activeProjectId: string | null;
   quickStarts?: QuickStartPreset[];
   onQuickStart?: (preset: QuickStartPreset) => void;
   onSendPrompt: (prompt: Prompt, mode: "paste" | "send") => void;
   onEditPrompt: (prompt: Prompt) => void;
   onOpenRecording: (recordingId: string, mode: "step" | "all") => void;
   onSwitchSession: (sessionId: string) => void;
+  onSelectProject: (projectId: string) => void;
   onNewSession: () => void;
   onOpenSshManager: () => void;
   onNewPrompt: () => void;
@@ -77,6 +90,8 @@ type CommandPaletteProps = {
   onOpenPromptsPanel: () => void;
   onOpenRecordingsPanel: () => void;
   onOpenAssetsPanel: () => void;
+  /** Returns visible terminal text for a session, or empty string if unavailable */
+  getTerminalText?: (sessionId: string) => string;
 };
 
 function fuzzyMatch(text: string, query: string): { match: boolean; score: number } {
@@ -136,13 +151,16 @@ export function CommandPalette({
   prompts,
   recordings,
   sessions,
+  projects,
   activeSessionId,
+  activeProjectId,
   quickStarts,
   onQuickStart,
   onSendPrompt,
   onEditPrompt,
   onOpenRecording,
   onSwitchSession,
+  onSelectProject,
   onNewSession,
   onOpenSshManager,
   onNewPrompt,
@@ -153,6 +171,7 @@ export function CommandPalette({
   onOpenPromptsPanel,
   onOpenRecordingsPanel,
   onOpenAssetsPanel,
+  getTerminalText,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -209,13 +228,27 @@ export function CommandPalette({
       });
     });
 
+    // Projects
+    const projectMap = new Map(projects.map(p => [p.id, p]));
+    projects.forEach(p => {
+      items.push({
+        id: `project-${p.id}`,
+        type: "project",
+        title: p.title,
+        subtitle: [p.sshTarget ? `SSH: ${p.sshTarget}` : null, p.basePath].filter(Boolean).join(" • ") || undefined,
+        icon: p.id === activeProjectId ? "active" : "folder",
+        data: p,
+      });
+    });
+
     // Active sessions
     sessions.forEach(s => {
+      const proj = projectMap.get(s.projectId);
       items.push({
         id: `session-${s.id}`,
         type: "session",
         title: s.name,
-        subtitle: s.command || s.cwd || undefined,
+        subtitle: [proj?.title, s.cwd || s.command].filter(Boolean).join(" • ") || undefined,
         icon: s.id === activeSessionId ? "active" : "session",
         data: s,
       });
@@ -297,36 +330,68 @@ export function CommandPalette({
     });
 
     return items;
-  }, [prompts, recordings, sessions, activeSessionId, isRecording, quickStarts]);
+  }, [prompts, recordings, sessions, projects, activeSessionId, activeProjectId, isRecording, quickStarts]);
 
-  // Filter and sort by query
+  // Filter and sort by query (including terminal content search for sessions)
   const filteredItems = useMemo(() => {
     if (!query.trim()) return allItems;
 
+    const q = query.trim();
+    const qLower = q.toLowerCase();
+
     return allItems
-      .map(item => ({
-        item,
-        ...fuzzyMatch(item.title, query),
-      }))
+      .map(item => {
+        // Match against title + subtitle
+        const titleResult = fuzzyMatch(item.title, q);
+        const subtitleResult = item.subtitle ? fuzzyMatch(item.subtitle, q) : { match: false, score: 0 };
+        let best = titleResult.score >= subtitleResult.score ? titleResult : subtitleResult;
+
+        // For session items, also search terminal content
+        let terminalSnippet: string | undefined;
+        if (item.type === "session" && getTerminalText && q.length >= 2) {
+          const session = item.data as Session;
+          const text = getTerminalText(session.id);
+          if (text) {
+            const idx = text.toLowerCase().lastIndexOf(qLower);
+            if (idx >= 0) {
+              // Extract a context snippet around the match
+              const start = Math.max(0, idx - 30);
+              const end = Math.min(text.length, idx + q.length + 30);
+              let snippet = text.slice(start, end).replace(/\s+/g, " ").trim();
+              if (start > 0) snippet = "…" + snippet;
+              if (end < text.length) snippet = snippet + "…";
+              terminalSnippet = snippet;
+              // Terminal content match: score 55 (below "contains" 70, above fuzzy 30-50)
+              if (!best.match || best.score < 55) {
+                best = { match: true, score: 55 };
+              }
+            }
+          }
+        }
+
+        return { item: { ...item, terminalMatch: terminalSnippet }, ...best };
+      })
       .filter(r => r.match)
       .sort((a, b) => b.score - a.score)
       .map(r => r.item);
-  }, [allItems, query]);
+  }, [allItems, query, getTerminalText]);
 
   // Group items by type
   const groupedItems = useMemo(() => {
     const groups: { label: string; items: CommandItem[] }[] = [];
 
+    const projectItems = filteredItems.filter(i => i.type === "project");
+    const sessionItems = filteredItems.filter(i => i.type === "session");
     const quickStartItems = filteredItems.filter(i => i.type === "quickstart");
     const promptItems = filteredItems.filter(i => i.type === "prompt");
     const recordingItems = filteredItems.filter(i => i.type === "recording");
-    const sessionItems = filteredItems.filter(i => i.type === "session");
     const actionItems = filteredItems.filter(i => i.type === "action");
 
+    if (projectItems.length) groups.push({ label: "Projects", items: projectItems });
+    if (sessionItems.length) groups.push({ label: "Sessions", items: sessionItems });
     if (quickStartItems.length) groups.push({ label: "New Sessions", items: quickStartItems });
     if (promptItems.length) groups.push({ label: "Prompts", items: promptItems });
     if (recordingItems.length) groups.push({ label: "Recordings", items: recordingItems });
-    if (sessionItems.length) groups.push({ label: "Sessions", items: sessionItems });
     if (actionItems.length) groups.push({ label: "Actions", items: actionItems });
 
     return groups;
@@ -381,6 +446,11 @@ export function CommandPalette({
         onSwitchSession(session.id);
         break;
       }
+      case "project": {
+        const project = item.data as Project;
+        onSelectProject(project.id);
+        break;
+      }
       case "action": {
         switch (item.id) {
           case "action-new-session":
@@ -414,7 +484,7 @@ export function CommandPalette({
         break;
       }
     }
-  }, [onClose, onSendPrompt, onOpenRecording, onSwitchSession, onNewSession, onOpenSshManager, onNewPrompt, onStartRecording, onStopRecording, onOpenSecureStorageSettings, onOpenPromptsPanel, onOpenRecordingsPanel, onOpenAssetsPanel, onQuickStart]);
+  }, [onClose, onSendPrompt, onOpenRecording, onSwitchSession, onSelectProject, onNewSession, onOpenSshManager, onNewPrompt, onStartRecording, onStopRecording, onOpenSecureStorageSettings, onOpenPromptsPanel, onOpenRecordingsPanel, onOpenAssetsPanel, onQuickStart]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     e.stopPropagation();
@@ -464,6 +534,7 @@ export function CommandPalette({
       case "plus": return <Icon name="plus" />;
       case "panel": return <Icon name="panel" />;
       case "settings": return <Icon name="settings" />;
+      case "folder": return <Icon name="folder" />;
       case "active": return "\u25CF";
       case "session": return "\u25CB";
       case "ssh": return <Icon name="ssh" />;
@@ -485,7 +556,7 @@ export function CommandPalette({
             value={query}
             onChange={e => setQuery(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Search prompts, recordings, sessions..."
+            placeholder="Search projects, sessions, terminal content..."
           />
         </div>
         <div className="commandPaletteList" ref={listRef}>
@@ -523,6 +594,9 @@ export function CommandPalette({
                       <div className="commandPaletteItemTitle">{item.title}</div>
                       {item.subtitle && (
                         <div className="commandPaletteItemSubtitle">{item.subtitle}</div>
+                      )}
+                      {item.terminalMatch && (
+                        <div className="commandPaletteItemTerminalMatch">{item.terminalMatch}</div>
                       )}
                     </div>
                     {item.shortcut && (

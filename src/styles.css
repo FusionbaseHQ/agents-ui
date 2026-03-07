@@ -3989,6 +3989,16 @@ select.input {
   margin-top: 2px;
 }
 
+.commandPaletteItemTerminalMatch {
+  font-size: 10px;
+  color: rgba(var(--accent-rgb), 0.7);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 1px;
+  font-family: var(--font-mono, monospace);
+}
+
 .commandPaletteItemShortcut {
   font-size: 11px;
   color: var(--muted);

@@ -5585,6 +5585,18 @@ export default function App() {
     await openReplay(activeSession.lastRecordingId);
   }, [openReplay]);
 
+  const getTerminalText = useCallback((sessionId: string): string => {
+    const entry = registry.current.get(sessionId);
+    if (!entry) return "";
+    const buf = entry.term.buffer.active;
+    const lines: string[] = [];
+    for (let i = 0; i < buf.length; i++) {
+      const line = buf.getLine(i);
+      if (line) lines.push(line.translateToString(true));
+    }
+    return lines.join("\n");
+  }, []);
+
   function requestDeleteRecording(recordingId: string) {
     setRecordingsOpen(false);
     setConfirmDeleteRecordingId(recordingId);
@@ -10415,15 +10427,25 @@ export default function App() {
         onClose={() => setCommandPaletteOpen(false)}
         prompts={prompts}
         recordings={recordings}
-        sessions={projectSessions}
+        sessions={sessions}
+        projects={projects}
         activeSessionId={activeId}
+        activeProjectId={activeProjectId}
         quickStarts={quickStarts}
         onQuickStart={(preset) => void quickStart(preset)}
         onSendPrompt={(prompt, mode) => void sendPromptFromCommandPalette(prompt, mode)}
         onEditPrompt={openPromptEditor}
         onOpenRecording={(id, mode) => void openReplay(id, mode)}
-        onSwitchSession={setActiveId}
+        onSwitchSession={(sessionId) => {
+          const s = sessions.find(x => x.id === sessionId);
+          if (s && s.projectId !== activeProjectId) {
+            setActiveProjectId(s.projectId);
+          }
+          setActiveId(sessionId);
+        }}
+        onSelectProject={setActiveProjectId}
         onNewSession={handleOpenNewSession}
+        getTerminalText={getTerminalText}
         onOpenSshManager={() => {
           setProjectOpen(false);
           setNewOpen(false);
