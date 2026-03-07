@@ -302,7 +302,7 @@ type SessionTerminalProps = {
   readOnly: boolean;
   persistent?: boolean;
   onCwdChange?: (id: string, cwd: string) => void;
-  onCommandChange?: (id: string, commandLine: string, source?: "osc" | "input") => void;
+  onCommandChange?: (id: string, commandLine: string, source?: "osc" | "osc133" | "input") => void;
   onResize?: (id: string, size: { cols: number; rows: number }) => void;
   onUserEnter?: (id: string) => void;
   onTransportError?: (id: string, operation: "write" | "resize", errorMessage: string) => void;
@@ -332,7 +332,7 @@ function SessionTerminal(props: SessionTerminalProps) {
     wheelRemainder: number;
   }>({ active: false, wheelRemainder: 0 });
   const commandBufferRef = useRef<string>("");
-  const flushPendingRef = useRef<(attemptsLeft: number) => void>(() => {});
+  const flushPendingRef = useRef<() => void>(() => {});
   const shellIntRef = useRef<SessionShellIntegration | null>(null);
 
   const onCwdChangeRef = useRef(props.onCwdChange);
@@ -412,92 +412,92 @@ function SessionTerminal(props: SessionTerminalProps) {
         reportTransportError("resize", err);
       });
 
-    if (props.persistent) {
-      const sendZellij = (data: string) => writeToSession(data, "ui");
-
-      const skipEscapeSequence = (data: string, start: number): number => {
-        const next = data[start];
-        if (!next) return start;
-        if (next === "[") {
-          let i = start + 1;
-          while (i < data.length) {
-            const ch = data[i];
-            if (ch >= "@" && ch <= "~") return i + 1;
-            i += 1;
-          }
-          return i;
-        }
-        if (next === "]") {
-          let i = start + 1;
-          while (i < data.length) {
-            const ch = data[i];
-            if (ch === "\u0007") return i + 1;
-            if (ch === "\u001b" && data[i + 1] === "\\") return i + 2;
-            i += 1;
-          }
-          return i;
-        }
-        if (next === "P" || next === "^" || next === "_") {
-          let i = start + 1;
-          while (i < data.length) {
-            if (data[i] === "\u001b" && data[i + 1] === "\\") return i + 2;
-            i += 1;
-          }
-          return i;
-        }
-        return start + 1;
-      };
-
-      const ingestUserInputForCommandDetection = (data: string) => {
-        let buffer = commandBufferRef.current;
-        const submitted: string[] = [];
-
-        let i = 0;
+    const skipEscapeSequence = (data: string, start: number): number => {
+      const next = data[start];
+      if (!next) return start;
+      if (next === "[") {
+        let i = start + 1;
         while (i < data.length) {
           const ch = data[i];
-          if (ch === "\r") {
-            if (data[i + 1] === "\n") i += 1;
-            submitted.push(buffer);
-            buffer = "";
-            i += 1;
-            continue;
-          }
-          if (ch === "\n") {
-            submitted.push(buffer);
-            buffer = "";
-            i += 1;
-            continue;
-          }
-          if (ch === "\u007f" || ch === "\b") {
-            buffer = buffer.slice(0, -1);
-            i += 1;
-            continue;
-          }
-          if (ch === "\u0015") {
-            buffer = "";
-            i += 1;
-            continue;
-          }
-          if (ch === "\u001b") {
-            i = skipEscapeSequence(data, i + 1);
-            continue;
-          }
-          if (ch < " " || ch === "\u007f") {
-            i += 1;
-            continue;
-          }
-          buffer += ch;
+          if (ch >= "@" && ch <= "~") return i + 1;
           i += 1;
         }
-
-        commandBufferRef.current = buffer;
-
-        for (const line of submitted) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          onCommandChangeRef.current?.(props.id, trimmed, "input");
+        return i;
+      }
+      if (next === "]") {
+        let i = start + 1;
+        while (i < data.length) {
+          const ch = data[i];
+          if (ch === "\u0007") return i + 1;
+          if (ch === "\u001b" && data[i + 1] === "\\") return i + 2;
+          i += 1;
         }
-      };
+        return i;
+      }
+      if (next === "P" || next === "^" || next === "_") {
+        let i = start + 1;
+        while (i < data.length) {
+          if (data[i] === "\u001b" && data[i + 1] === "\\") return i + 2;
+          i += 1;
+        }
+        return i;
+      }
+      return start + 1;
+    };
+
+    const ingestUserInputForCommandDetection = (data: string) => {
+      let buffer = commandBufferRef.current;
+      const submitted: string[] = [];
+
+      let i = 0;
+      while (i < data.length) {
+        const ch = data[i];
+        if (ch === "\r") {
+          if (data[i + 1] === "\n") i += 1;
+          submitted.push(buffer);
+          buffer = "";
+          i += 1;
+          continue;
+        }
+        if (ch === "\n") {
+          submitted.push(buffer);
+          buffer = "";
+          i += 1;
+          continue;
+        }
+        if (ch === "\u007f" || ch === "\b") {
+          buffer = buffer.slice(0, -1);
+          i += 1;
+          continue;
+        }
+        if (ch === "\u0015") {
+          buffer = "";
+          i += 1;
+          continue;
+        }
+        if (ch === "\u001b") {
+          i = skipEscapeSequence(data, i + 1);
+          continue;
+        }
+        if (ch < " " || ch === "\u007f") {
+          i += 1;
+          continue;
+        }
+        buffer += ch;
+        i += 1;
+      }
+
+      commandBufferRef.current = buffer;
+
+      for (const line of submitted) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        onCommandChangeRef.current?.(props.id, trimmed, "input");
+      }
+    };
+
+    if (props.persistent) {
+      const sendZellij = (data: string) => writeToSession(data, "ui");
 
       const ensureZellijScrollModePrefix = () => {
         const state = zellijAutoScrollRef.current;
@@ -619,6 +619,7 @@ function SessionTerminal(props: SessionTerminalProps) {
         if (data.includes("\r") || data.includes("\n")) {
           onUserEnterRef.current?.(props.id);
         }
+        ingestUserInputForCommandDetection(data);
       });
     }
 
@@ -631,8 +632,8 @@ function SessionTerminal(props: SessionTerminalProps) {
       if (!trimmed) return;
       onCwdChangeRef.current?.(props.id, trimmed);
     };
-    const reportCommand = (commandLine: string) => {
-      onCommandChangeRef.current?.(props.id, commandLine, "osc");
+    const reportCommand = (commandLine: string, source: "osc" | "osc133" = "osc") => {
+      onCommandChangeRef.current?.(props.id, commandLine, source);
     };
 
     const parseFileUrlPath = (data: string): string | null => {
@@ -752,7 +753,7 @@ function SessionTerminal(props: SessionTerminalProps) {
           const cmdPrefix = "Command=";
           if (data.startsWith(cmdPrefix)) {
             const cmd = data.slice(cmdPrefix.length);
-            reportCommand(cmd);
+            reportCommand(cmd, "osc");
             return true;
           }
 
@@ -768,7 +769,7 @@ function SessionTerminal(props: SessionTerminalProps) {
               shellInt.handlePromptStart(term);
               disposeWorkingDeco();
               // Defer React callback out of the write pipeline
-              queueMicrotask(() => reportCommand(""));
+              queueMicrotask(() => reportCommand("", "osc133"));
               // Notify MCP/API listeners that the shell is idle at prompt
               notifyStateChange("shell.prompt_ready", {
                 sessionId: props.id,
@@ -777,6 +778,12 @@ function SessionTerminal(props: SessionTerminalProps) {
               break;
             case "B":
               shellInt.handleCommandStart(term);
+              queueMicrotask(() => {
+                const block = shellInt.pendingBlock;
+                const nextCommand =
+                  block ? shellInt.getCommandText(term, block) : commandBufferRef.current;
+                if (nextCommand?.trim()) reportCommand(nextCommand, "osc133");
+              });
               break;
             case "C": {
               shellInt.handleOutputStart(term);
@@ -810,6 +817,7 @@ function SessionTerminal(props: SessionTerminalProps) {
                   ...serialized,
                 });
               }
+              queueMicrotask(() => reportCommand("", "osc133"));
               break;
             }
           }
@@ -890,7 +898,7 @@ function SessionTerminal(props: SessionTerminalProps) {
     onRegistryChangedRef.current?.();
 
 	    // Flush any buffered data that arrived before we were ready (but wait for renderer readiness)
-	    const flushPending = (attemptsLeft: number) => {
+	    const flushPending = () => {
 	      const term = termRef.current;
 	      if (!term) return;
 	      const buffered = props.pendingData.current.get(props.id);
@@ -898,30 +906,14 @@ function SessionTerminal(props: SessionTerminalProps) {
 	        props.pendingData.current.delete(props.id);
 	        return;
 	      }
-	      if (!isXtermRendererReady(term)) {
-	        if (attemptsLeft > 0) {
-	          window.requestAnimationFrame(() => flushPending(attemptsLeft - 1));
-	        }
-	        return;
+	      // xterm 5 safely queues writes before renderer init — no gate needed
+	      for (const chunk of buffered) {
+	        term.write(chunk);
 	      }
-
-	      let index = 0;
-	      try {
-	        for (; index < buffered.length; index += 1) {
-	          term.write(buffered[index]);
-	        }
-	        props.pendingData.current.delete(props.id);
-	      } catch {
-	        if (index > 0) {
-	          props.pendingData.current.set(props.id, buffered.slice(index));
-	        }
-	        if (attemptsLeft > 0) {
-	          window.requestAnimationFrame(() => flushPending(attemptsLeft - 1));
-	        }
-	      }
+	      props.pendingData.current.delete(props.id);
 	    };
 	    flushPendingRef.current = flushPending;
-	    flushPending(20);
+	    flushPending();
 
 		    // Create ResizeObserver inside useEffect for proper cleanup
 		    const resizeObserver = new ResizeObserver(() => scheduleResize());
@@ -1018,7 +1010,7 @@ function SessionTerminal(props: SessionTerminalProps) {
   useEffect(() => {
     if (!props.active) return;
     needsResizeRef.current = false;
-    flushPendingRef.current(20);
+    flushPendingRef.current();
     const term = termRef.current;
     const fit = fitRef.current;
     const container = containerRef.current;
