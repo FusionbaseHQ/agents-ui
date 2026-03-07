@@ -1456,28 +1456,94 @@ function agentProviderLabel(provider: string | undefined): string {
   return provider === "codex" ? "Codex" : "Claude Code";
 }
 
-function buildSessionAutoRenamePrompt(projectId: string, projectTitle: string | null | undefined): string {
+function buildSessionAgentPrompt(projectId: string, projectTitle: string | null | undefined, instruction: string): string {
   const scope = projectTitle?.trim()
     ? `the project "${projectTitle}" (${projectId})`
     : `project ${projectId}`;
 
-  return [
-    `Rename terminal sessions for ${scope}.`,
-    "",
+  const preamble = [
     "Use MCP tools only.",
     `1. Call list_sessions with {\"projectId\":\"${projectId}\"}.`,
     "2. For every session in that list, inspect the current terminal output with read_screen and recent terminal history with read_scrollback.",
-    "3. Infer a short semantic name that reflects the work currently shown in the terminal.",
-    "4. Use rename_session only when the new name is meaningfully better than the current one.",
+  ];
+
+  const safety = [
     "",
-    "Constraints:",
-    "- Keep names in Title Case.",
-    "- Prefer 2 to 4 words and keep names under 28 characters.",
-    "- Avoid generic names like Terminal, Shell, Session, Codex, Claude, Working, or Untitled.",
-    "- If a session is empty, ambiguous, or already clearly named, leave it unchanged.",
+    "Safety constraints:",
     "- Do not send commands, write to sessions, create or close sessions, edit files, or change projects.",
+  ];
+
+  if (instruction === "rename") {
+    return [
+      `Rename terminal sessions for ${scope}.`,
+      "",
+      ...preamble,
+      "3. Infer a short semantic name that reflects the work currently shown in the terminal.",
+      "4. Use rename_session only when the new name is meaningfully better than the current one.",
+      "",
+      "Naming constraints:",
+      "- Keep names in Title Case.",
+      "- Prefer 2 to 4 words and keep names under 28 characters.",
+      "- Avoid generic names like Terminal, Shell, Session, Codex, Claude, Working, or Untitled.",
+      "- If a session is empty, ambiguous, or already clearly named, leave it unchanged.",
+      ...safety,
+      "",
+      "Return a brief summary of renamed sessions and skipped sessions.",
+    ].join("\n");
+  }
+
+  if (instruction === "reorder") {
+    return [
+      `Reorder terminal sessions for ${scope}.`,
+      "",
+      ...preamble,
+      "3. Determine a logical order based on the purpose, activity, and relationships between sessions.",
+      "4. Use reorder_session to move sessions into the determined order.",
+      "",
+      "Ordering guidelines:",
+      "- Group related sessions together (e.g. server + client, build + test).",
+      "- Place primary/active sessions before secondary/idle ones.",
+      "- Pin important long-running sessions if appropriate.",
+      ...safety,
+      "",
+      "Return a brief summary of the new order.",
+    ].join("\n");
+  }
+
+  if (instruction === "rename-and-reorder") {
+    return [
+      `Rename and reorder terminal sessions for ${scope}.`,
+      "",
+      ...preamble,
+      "3. First rename: infer a short semantic name that reflects the work currently shown. Use rename_session only when the new name is meaningfully better.",
+      "4. Then reorder: arrange sessions in a logical order based on purpose and relationships. Use reorder_session to apply.",
+      "",
+      "Naming constraints:",
+      "- Keep names in Title Case.",
+      "- Prefer 2 to 4 words and keep names under 28 characters.",
+      "- Avoid generic names like Terminal, Shell, Session, Codex, Claude, Working, or Untitled.",
+      "- If a session is empty, ambiguous, or already clearly named, leave it unchanged.",
+      "",
+      "Ordering guidelines:",
+      "- Group related sessions together.",
+      "- Place primary/active sessions before secondary/idle ones.",
+      ...safety,
+      "",
+      "Return a brief summary of changes.",
+    ].join("\n");
+  }
+
+  // Custom instruction
+  return [
+    `Perform the following task on terminal sessions for ${scope}:`,
     "",
-    "Return a brief summary of renamed sessions and skipped sessions.",
+    instruction,
+    "",
+    ...preamble,
+    "3. Follow the user instruction above using available MCP tools (rename_session, reorder_session, etc.).",
+    ...safety,
+    "",
+    "Return a brief summary of what you did.",
   ].join("\n");
 }
 
@@ -7932,7 +7998,7 @@ export default function App() {
     setAutoRenameActivity(null);
   }, []);
 
-  const handleAutoRenameSessions = useCallback(async () => {
+  const handleAgentInstruction = useCallback(async (instruction: string) => {
     if (autoRenamingSessions) return;
     const projectId = activeProjectIdRef.current;
     if (!projectId) return;
@@ -7946,7 +8012,11 @@ export default function App() {
     const agentSettings = loadAgentSettings();
     const provider = agentSettings.provider === "codex" ? "codex" : "claude-code";
     const providerLabel = agentProviderLabel(provider);
-    const prompt = buildSessionAutoRenamePrompt(projectId, projectTitle);
+    const prompt = buildSessionAgentPrompt(projectId, projectTitle, instruction);
+    const taskLabel = instruction === "rename" ? "Renaming"
+      : instruction === "reorder" ? "Reordering"
+      : instruction === "rename-and-reorder" ? "Renaming & reordering"
+      : "Running agent on";
     const launchSettings: AgentLaunchSettings = {
       provider,
       model: agentSettings.model,
@@ -7964,7 +8034,7 @@ export default function App() {
       projectId,
       providerLabel,
       status: "running",
-      summary: `Renaming ${projectSessions.length} session${projectSessions.length === 1 ? "" : "s"} with ${providerLabel}`,
+      summary: `${taskLabel} ${projectSessions.length} session${projectSessions.length === 1 ? "" : "s"} with ${providerLabel}`,
       entries: [
         {
           id: makeId(),
@@ -8011,7 +8081,7 @@ export default function App() {
           ],
         };
       });
-      reportError(`Failed to rename sessions with ${providerLabel}`, err);
+      reportError(`Agent task failed with ${providerLabel}`, err);
     } finally {
       setAutoRenamingSessions(false);
     }
@@ -8562,8 +8632,8 @@ export default function App() {
         onSetSessionColor={handleSetSessionColor}
         onQuickStart={handleQuickStartFromSidebar}
         onOpenNewSession={handleOpenNewSession}
-        onAutoRenameSessions={handleAutoRenameSessions}
-        autoRenameRunning={
+        onAgentInstruction={handleAgentInstruction}
+        agentInstructionRunning={
           autoRenamingSessions || autoRenameActivity?.status === "running"
         }
         onOpenPersistentSessions={handleOpenPersistentSessions}
@@ -8582,7 +8652,7 @@ export default function App() {
     handleCloseSession, handleToggleSessionPin, handleReorderSession, handleReconnectSession,
     handleRenameSession, handleSetSessionSymbol, handleSetSessionColor,
     handleSplitSession, handleUnsplit, handleActivateSplitView, handleRemoveSplitView, handleQuickStartFromSidebar,
-    handleOpenNewSession, handleAutoRenameSessions, handleOpenPersistentSessions,
+    handleOpenNewSession, handleAgentInstruction, handleOpenPersistentSessions,
     handleOpenSshManager, handleOpenAgentShortcuts,
     resetProjectsListMaxHeight, handleProjectsDividerKeyDown,
     handleProjectsDividerPointerDown,

@@ -506,6 +506,109 @@ body::after {
   animation: spin 1s linear infinite;
 }
 
+/* Agent instruction modal */
+.agentInstructionBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: min(20vh, 140px);
+}
+
+.agentInstructionModal {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg, 10px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  width: 340px;
+  max-width: 90vw;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.agentInstructionTitle {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.agentInstructionPresets {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.agentInstructionPresetBtn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(var(--ink-rgb), 0.02);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.agentInstructionPresetBtn:hover {
+  background: rgba(var(--ink-rgb), 0.06);
+  border-color: rgba(var(--ink-rgb), 0.12);
+}
+
+.agentInstructionCustom {
+  display: flex;
+  gap: 6px;
+}
+
+.agentInstructionInput {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(var(--ink-rgb), 0.02);
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+}
+
+.agentInstructionInput:focus {
+  border-color: rgba(var(--accent-rgb), 0.5);
+}
+
+.agentInstructionInput::placeholder {
+  color: var(--muted);
+}
+
+.agentInstructionSendBtn {
+  flex: 0 0 auto;
+  padding: 7px 14px;
+  border: 1px solid rgba(var(--accent-rgb), 0.4);
+  border-radius: var(--radius-sm);
+  background: rgba(var(--accent-rgb), 0.1);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+.agentInstructionSendBtn:hover:not(:disabled) {
+  background: rgba(var(--accent-rgb), 0.2);
+}
+
+.agentInstructionSendBtn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 .sessionAutoRenameLog {
   margin: 8px 0 4px;
   padding: 8px 10px;

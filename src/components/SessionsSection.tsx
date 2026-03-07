@@ -284,8 +284,8 @@ type SessionsSectionProps = {
   onSetSessionColor: (sessionId: string, color: string | null) => void;
   onQuickStart: (effect: ProcessEffect) => void;
   onOpenNewSession: () => void;
-  onAutoRenameSessions: () => void;
-  autoRenameRunning: boolean;
+  onAgentInstruction: (instruction: string) => void;
+  agentInstructionRunning: boolean;
   onOpenAgentShortcuts: () => void;
   onOpenPersistentSessions: () => void;
   onOpenSshManager: () => void;
@@ -313,8 +313,8 @@ export const SessionsSection = React.memo(function SessionsSection({
   onSetSessionColor,
   onQuickStart,
   onOpenNewSession,
-  onAutoRenameSessions,
-  autoRenameRunning,
+  onAgentInstruction,
+  agentInstructionRunning,
   onOpenAgentShortcuts,
   onOpenPersistentSessions,
   onOpenSshManager,
@@ -360,6 +360,11 @@ export const SessionsSection = React.memo(function SessionsSection({
     x: number;
     y: number;
   } | null>(null);
+
+  // Agent instruction modal state
+  const [agentModalOpen, setAgentModalOpen] = React.useState(false);
+  const [agentCustomInstruction, setAgentCustomInstruction] = React.useState("");
+  const agentModalRef = React.useRef<HTMLDivElement | null>(null);
 
   const handleContextMenu = React.useCallback(
     (sessionId: string, x: number, y: number) => {
@@ -818,23 +823,28 @@ export const SessionsSection = React.memo(function SessionsSection({
 
           <button
             type="button"
-            className={`btnSmall btnIcon ${autoRenameRunning ? "btnIconActive" : ""}`}
-            onClick={onAutoRenameSessions}
+            className={`btnSmall btnIcon ${agentInstructionRunning ? "btnIconActive" : ""}`}
+            onClick={() => {
+              if (!agentInstructionRunning) {
+                setAgentCustomInstruction("");
+                setAgentModalOpen(true);
+              }
+            }}
             title={
-              autoRenameRunning
-                ? "Renaming sessions with the configured agent"
-                : "Rename all sessions with the configured agent"
+              agentInstructionRunning
+                ? "Agent is working…"
+                : "Agent actions"
             }
             aria-label={
-              autoRenameRunning
-                ? "Renaming sessions with the configured agent"
-                : "Rename all sessions with the configured agent"
+              agentInstructionRunning
+                ? "Agent is working…"
+                : "Agent actions"
             }
-            disabled={autoRenameRunning || sessions.length === 0}
+            disabled={agentInstructionRunning || sessions.length === 0}
           >
             <Icon
-              name={autoRenameRunning ? "refresh" : "wand"}
-              className={autoRenameRunning ? "sessionAutoRenameIconSpin" : undefined}
+              name={agentInstructionRunning ? "refresh" : "wand"}
+              className={agentInstructionRunning ? "sessionAutoRenameIconSpin" : undefined}
             />
           </button>
         </div>
@@ -1232,6 +1242,91 @@ export const SessionsSection = React.memo(function SessionsSection({
               style={{ background: `rgb(${c.value})` }}
             />
           ))}
+        </div>,
+        document.body,
+      )}
+
+      {/* Agent instruction modal */}
+      {agentModalOpen && createPortal(
+        <div
+          className="agentInstructionBackdrop"
+          onClick={() => setAgentModalOpen(false)}
+        >
+          <div
+            ref={agentModalRef}
+            className="agentInstructionModal"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setAgentModalOpen(false);
+            }}
+          >
+            <div className="agentInstructionTitle">Agent Actions</div>
+            <div className="agentInstructionPresets">
+              <button
+                type="button"
+                className="agentInstructionPresetBtn"
+                onClick={() => {
+                  setAgentModalOpen(false);
+                  onAgentInstruction("rename");
+                }}
+              >
+                <Icon name="wand" size={14} />
+                <span>Rename Sessions</span>
+              </button>
+              <button
+                type="button"
+                className="agentInstructionPresetBtn"
+                onClick={() => {
+                  setAgentModalOpen(false);
+                  onAgentInstruction("reorder");
+                }}
+              >
+                <Icon name="grip" size={14} />
+                <span>Reorder Sessions</span>
+              </button>
+              <button
+                type="button"
+                className="agentInstructionPresetBtn"
+                onClick={() => {
+                  setAgentModalOpen(false);
+                  onAgentInstruction("rename-and-reorder");
+                }}
+              >
+                <Icon name="layers" size={14} />
+                <span>Rename &amp; Reorder</span>
+              </button>
+            </div>
+            <div className="agentInstructionCustom">
+              <input
+                className="agentInstructionInput"
+                type="text"
+                placeholder="Or type a custom instruction…"
+                value={agentCustomInstruction}
+                onChange={(e) => setAgentCustomInstruction(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && agentCustomInstruction.trim()) {
+                    setAgentModalOpen(false);
+                    onAgentInstruction(agentCustomInstruction.trim());
+                  }
+                  e.stopPropagation();
+                }}
+                autoFocus
+              />
+              <button
+                type="button"
+                className="agentInstructionSendBtn"
+                disabled={!agentCustomInstruction.trim()}
+                onClick={() => {
+                  if (agentCustomInstruction.trim()) {
+                    setAgentModalOpen(false);
+                    onAgentInstruction(agentCustomInstruction.trim());
+                  }
+                }}
+              >
+                Run
+              </button>
+            </div>
+          </div>
         </div>,
         document.body,
       )}
