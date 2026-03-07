@@ -19,6 +19,7 @@ import { QuickPromptsSection } from "./components/QuickPromptsSection";
 import { SessionsSection } from "./components/SessionsSection";
 import { TerminalPane, type TerminalPaneSession } from "./components/TerminalPane";
 import { Icon } from "./components/Icon";
+import { ActivityCenter, type ActivityCenterItem } from "./components/ActivityCenter";
 import { FileExplorerPanel, type FileExplorerPersistedState } from "./components/FileExplorerPanel";
 import type {
   CodeEditorFsEvent,
@@ -28,6 +29,9 @@ import type {
 } from "./components/CodeEditorPanel";
 import { AgentShortcutsModal } from "./components/AgentShortcutsModal";
 import { AgentPanel } from "./agent/AgentPanel";
+import { parseStreamLine, type ParsedUpdate } from "./agent/agentStreamParser";
+import { loadAgentSettings } from "./agent/agentStorage";
+import type { AgentLaunchSettings } from "./agent/agentTypes";
 import { NewSessionModal, type NewSessionModalHandle, type NewSessionSubmitData } from "./components/modals/NewSessionModal";
 import {
   PersistentSessionsModal,
@@ -73,6 +77,8 @@ type Session = SessionInfo & {
   persistId: string;
   persistent: boolean;
   createdAt: number;
+  pinned?: boolean;
+  sidebarOrder?: number | null;
   launchCommand: string | null;
   restoreCommand?: string | null;
   sshTarget: string | null;
@@ -82,6 +88,7 @@ type Session = SessionInfo & {
   cwd: string | null;
   effectId?: string | null;
   processTag?: string | null;
+  runningCommand?: string | null;
   symbol?: string | null;
   color?: string | null;
   exited?: boolean;
@@ -122,6 +129,9 @@ type SplitView = {
 
 type PtyOutput = { id: string; data: string };
 type PtyExit = { id: string; exit_code?: number | null };
+type AgentOutputPayload = { runId: string; data: string };
+type AgentDonePayload = { runId: string; exitCode: number | null };
+type AgentStderrPayload = { runId: string; data: string };
 type AppInfo = { name: string; version: string; homepage?: string | null };
 type AppMenuEventPayload = { id: string };
 type StartupFlags = { clearData: boolean };
@@ -170,6 +180,7 @@ const SSH_RECONNECT_MAX_ATTEMPTS = 6;
 const SESSION_HEALTHCHECK_VISIBLE_INTERVAL_MS = 30_000;
 const SESSION_HEALTHCHECK_MIN_GAP_MS = 5_000;
 const SLEEP_DETECTION_GAP_MS = 15_000;
+const COMMAND_ACTIVITY_IDLE_MS = 3_000;
 
 const DEFAULT_AGENT_SHORTCUT_IDS = ["codex", "claude", "gemini"];
 const DEFAULT_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT = 290;
@@ -185,6 +196,21 @@ const MIN_WORKSPACE_EDITOR_WIDTH = 260;
 const MIN_WORKSPACE_FILE_TREE_WIDTH = 200;
 const MIN_AGENT_PANEL_WIDTH = 320;
 const MAX_AGENT_PANEL_WIDTH = 700;
+const AUTO_RENAME_LOG_ENTRY_LIMIT = 6;
+const AGENTS_UI_MCP_PREFIX = "mcp__agents-ui__";
+
+type AutoRenameLogTone = "info" | "success" | "error";
+type AutoRenameActivity = {
+  projectId: string;
+  providerLabel: string;
+  status: "running" | "success" | "error";
+  summary: string;
+  entries: Array<{
+    id: string;
+    text: string;
+    tone: AutoRenameLogTone;
+  }>;
+};
 
 const EMPTY_STRING_SET: ReadonlySet<string> = new Set();
 
@@ -197,6 +223,60 @@ function makeId(): string {
 
 function normalizeSmartQuotes(input: string): string {
   return input.replace(/[“”„‟«»]/g, '"').replace(/[‘’‚‛‹›]/g, "'");
+}
+
+function truncateInlineText(input: string, max: number): string {
+  const compact = input.replace(/\s+/g, " ").trim();
+  if (compact.length <= max) return compact;
+  return `${compact.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
+}
+
+function resolveSessionLogLabel(sessionId: string | undefined, sessions: Session[]): string {
+  if (!sessionId) return "session";
+  const session = sessions.find((entry) => entry.id === sessionId);
+  if (session?.name?.trim()) return session.name.trim();
+  return sessionId;
+}
+
+function summarizeAutoRenameUpdate(update: ParsedUpdate, sessions: Session[]): Array<{
+  text: string;
+  tone: AutoRenameLogTone;
+}> {
+  if (update.kind === "batch") {
+    return update.updates.flatMap((nested) => summarizeAutoRenameUpdate(nested, sessions));
+  }
+
+  if (update.kind === "message_complete") {
+    const text = truncateInlineText(update.text, 140);
+    return text ? [{ text, tone: "success" }] : [];
+  }
+
+  if (update.kind !== "tool_start") return [];
+
+  const toolName = update.name.startsWith(AGENTS_UI_MCP_PREFIX)
+    ? update.name.slice(AGENTS_UI_MCP_PREFIX.length)
+    : update.name;
+  const input = update.input ?? {};
+  const sessionId = typeof input.sessionId === "string" ? input.sessionId : undefined;
+  const sessionLabel = resolveSessionLogLabel(sessionId, sessions);
+
+  switch (toolName) {
+    case "list_sessions":
+      return [{ text: "Listing project sessions", tone: "info" }];
+    case "read_screen":
+      return [{ text: `Reading screen: ${sessionLabel}`, tone: "info" }];
+    case "read_scrollback":
+      return [{ text: `Reading scrollback: ${sessionLabel}`, tone: "info" }];
+    case "get_session_status":
+      return [{ text: `Checking session state: ${sessionLabel}`, tone: "info" }];
+    case "rename_session": {
+      const nextName = typeof input.name === "string" ? input.name.trim() : "";
+      if (!nextName) return [];
+      return [{ text: `${sessionLabel} → ${nextName}`, tone: "success" }];
+    }
+    default:
+      return [];
+  }
 }
 
 const VALID_THEMES = new Set<UiTheme>(["dawn", "sepia", "ember", "slate", "midnight", "cobalt", "neon", "forest"]);
@@ -338,6 +418,164 @@ function basenamePath(input: string): string {
   return parts[parts.length - 1] ?? "";
 }
 
+function formatCommandTokenLabel(token: string): string {
+  const normalized = token.trim().toLowerCase();
+  if (!normalized) return "Shell";
+
+  const known: Record<string, string> = {
+    bash: "Shell",
+    bun: "Bun",
+    bunx: "Bunx",
+    cargo: "Cargo",
+    claude: "Claude",
+    codex: "Codex",
+    deno: "Deno",
+    gemini: "Gemini",
+    git: "Git",
+    go: "Go",
+    node: "Node",
+    npm: "npm",
+    nu: "Shell",
+    pnpm: "pnpm",
+    python: "Python",
+    python3: "Python",
+    rails: "Rails",
+    ruby: "Ruby",
+    sh: "Shell",
+    ssh: "SSH",
+    uv: "uv",
+    yarn: "Yarn",
+    zsh: "Shell",
+  };
+  if (known[normalized]) return known[normalized];
+
+  return normalized
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function buildSmartSessionName(input: {
+  explicitName?: string | null;
+  launchCommand?: string | null;
+  restoreCommand?: string | null;
+  sshTarget?: string | null;
+  cwd?: string | null;
+  persistent?: boolean;
+}): string {
+  const explicitName = input.explicitName?.trim();
+  if (explicitName) return explicitName;
+
+  const commandLine = (input.launchCommand ?? input.restoreCommand ?? "").trim();
+  const cwdLabel = basenamePath(input.cwd ?? "");
+  const effect = detectProcessEffect({ command: commandLine || null, name: null });
+  const sshTarget =
+    input.sshTarget?.trim() ||
+    sshTargetFromCommandLine(commandLine || null) ||
+    null;
+
+  if (sshTarget) return `SSH ${sshTarget}`;
+
+  if (effect) {
+    const effectLabel = formatCommandTokenLabel(effect.id);
+    if (
+      cwdLabel &&
+      cwdLabel !== "/" &&
+      cwdLabel.toLowerCase() !== effectLabel.toLowerCase()
+    ) {
+      return `${effectLabel} - ${cwdLabel}`;
+    }
+    return effectLabel;
+  }
+
+  const commandToken = commandTagFromCommandLine(commandLine);
+  if (commandToken) {
+    const commandLabel = formatCommandTokenLabel(commandToken);
+    if (
+      cwdLabel &&
+      cwdLabel !== "/" &&
+      cwdLabel.toLowerCase() !== commandToken.toLowerCase()
+    ) {
+      return `${commandLabel} - ${cwdLabel}`;
+    }
+    return commandLabel;
+  }
+
+  if (cwdLabel && cwdLabel !== "/") return cwdLabel;
+  return input.persistent ? "Persistent Shell" : "Shell";
+}
+
+function sessionSidebarOrderValue(input: { sidebarOrder?: number | null; createdAt: number }): number {
+  return typeof input.sidebarOrder === "number" && Number.isFinite(input.sidebarOrder)
+    ? input.sidebarOrder
+    : input.createdAt;
+}
+
+function compareSessionsForSidebar(
+  a: Pick<Session, "pinned" | "sidebarOrder" | "createdAt" | "name" | "id">,
+  b: Pick<Session, "pinned" | "sidebarOrder" | "createdAt" | "name" | "id">,
+): number {
+  const aPinned = Boolean(a.pinned);
+  const bPinned = Boolean(b.pinned);
+  if (aPinned !== bPinned) return aPinned ? -1 : 1;
+
+  const byOrder = sessionSidebarOrderValue(a) - sessionSidebarOrderValue(b);
+  if (byOrder !== 0) return byOrder;
+
+  const byCreatedAt = a.createdAt - b.createdAt;
+  if (byCreatedAt !== 0) return byCreatedAt;
+
+  const byName = a.name.localeCompare(b.name);
+  if (byName !== 0) return byName;
+
+  return a.id.localeCompare(b.id);
+}
+
+function sortProjectSessionsForSidebar(sessions: Session[], projectId: string): Session[] {
+  return sessions
+    .filter((session) => session.projectId === projectId)
+    .slice()
+    .sort(compareSessionsForSidebar);
+}
+
+function normalizeProjectSessionLayout(projectSessions: Session[]): Session[] {
+  return projectSessions.map((session, index) => {
+    const nextPinned = Boolean(session.pinned);
+    if (nextPinned === Boolean(session.pinned) && (session.sidebarOrder ?? null) === index) {
+      return session;
+    }
+    return {
+      ...session,
+      pinned: nextPinned,
+      sidebarOrder: index,
+    };
+  });
+}
+
+function mergeProjectSessionLayout(
+  sessions: Session[],
+  projectId: string,
+  projectSessions: Session[],
+): Session[] {
+  const byId = new Map(projectSessions.map((session) => [session.id, session] as const));
+  let changed = false;
+  const next = sessions.map((session) => {
+    if (session.projectId !== projectId) return session;
+    const replacement = byId.get(session.id);
+    if (!replacement) return session;
+    if (
+      Boolean(session.pinned) === Boolean(replacement.pinned) &&
+      (session.sidebarOrder ?? null) === (replacement.sidebarOrder ?? null)
+    ) {
+      return session;
+    }
+    changed = true;
+    return replacement;
+  });
+  return changed ? next : sessions;
+}
+
 function isProjectSsh(project: Project | null | undefined): boolean {
   return Boolean(project?.sshTarget?.trim());
 }
@@ -376,6 +614,31 @@ function isSshCommandLine(commandLine: string | null | undefined): boolean {
   const token = trimmed.split(/\s+/)[0];
   const base = token.split(/[\\/]/).pop() ?? token;
   return base.toLowerCase().replace(/\.exe$/, "") === "ssh";
+}
+
+function shouldTrackLaunchCommandAsRunning(
+  commandLine: string | null | undefined,
+  persistent: boolean,
+): boolean {
+  if (persistent) return false;
+  const trimmed = commandLine?.trim() ?? "";
+  if (!trimmed) return false;
+  if (isSshCommandLine(trimmed)) return false;
+  const token = commandTagFromCommandLine(trimmed);
+  if (!token) return false;
+  return !new Set([
+    "bash",
+    "sh",
+    "zsh",
+    "fish",
+    "nu",
+    "pwsh",
+    "powershell",
+    "cmd",
+    "tmux",
+    "screen",
+    "zellij",
+  ]).has(token);
 }
 
 function hasSshOption(parts: string[], keyLower: string): boolean {
@@ -441,6 +704,69 @@ function isSshSession(session: {
     Boolean((session.sshTarget ?? "").trim()) ||
     isSshCommandLine(session.launchCommand ?? session.restoreCommand ?? null)
   );
+}
+
+type SessionActivityState = {
+  effect: ProcessEffect | null;
+  command: string | null;
+  processTag: string | null;
+  isAgentWorking: boolean;
+  isRunningCommand: boolean;
+  isRecording: boolean;
+  isReconnecting: boolean;
+  isDisconnected: boolean;
+  isActive: boolean;
+};
+
+function getSessionActivityState(
+  session: Session,
+  agentWorkingIds: ReadonlySet<string>,
+): SessionActivityState {
+  const inactive =
+    Boolean(session.exited) ||
+    Boolean(session.closing);
+  const connectionState = session.connectionState ?? "connected";
+  const launchOrRestore =
+    session.launchCommand ??
+    (session.restoreCommand?.trim() ? session.restoreCommand.trim() : null) ??
+    null;
+  const activeCommand = session.runningCommand?.trim() || "";
+  const command =
+    activeCommand ||
+    (launchOrRestore?.trim() || "") ||
+    "";
+  const processTag =
+    session.processTag?.trim() ||
+    commandTagFromCommandLine(activeCommand || launchOrRestore || null) ||
+    null;
+  const sessionEffect =
+    getProcessEffectById(session.effectId) ??
+    detectProcessEffect({ command: launchOrRestore, name: session.name });
+  const effect =
+    detectProcessEffect({ command: command || null, name: null }) ??
+    sessionEffect;
+  const isConnected = connectionState !== "reconnecting" && connectionState !== "disconnected";
+  const isAgentWorking = !inactive && isConnected && Boolean(sessionEffect) && agentWorkingIds.has(session.id);
+  const isRunningCommand = !inactive && isConnected && Boolean(activeCommand);
+  const isRecording = !inactive && isConnected && Boolean(session.recordingActive);
+  const isReconnecting = !inactive && connectionState === "reconnecting" && isSshSession(session);
+  const isDisconnected =
+    !inactive &&
+    connectionState === "disconnected" &&
+    Boolean(session.manualReconnectAvailable) &&
+    isSshSession(session);
+
+  return {
+    effect,
+    command: command || null,
+    processTag,
+    isAgentWorking,
+    isRunningCommand,
+    isRecording,
+    isReconnecting,
+    isDisconnected,
+    isActive: isAgentWorking || isRecording || isReconnecting,
+  };
 }
 
 function reconnectDelayMsForAttempt(attempt: number): number {
@@ -519,6 +845,8 @@ type PersistedSession = {
   persistId: string;
   projectId: string;
   name: string;
+  pinned?: boolean;
+  sidebarOrder?: number | null;
   launchCommand: string | null;
   restoreCommand?: string | null;
   sshTarget?: string | null;
@@ -626,6 +954,8 @@ function toPersistedSession(session: Session): PersistedSession {
     persistId: session.persistId,
     projectId: session.projectId,
     name: session.name,
+    pinned: Boolean(session.pinned),
+    sidebarOrder: session.sidebarOrder ?? null,
     launchCommand: session.launchCommand,
     restoreCommand: session.restoreCommand ?? null,
     sshTarget: session.sshTarget ?? null,
@@ -651,6 +981,8 @@ function persistedSessionEquals(a: PersistedSession, b: PersistedSession): boole
     (a.lastRecordingId ?? null) === (b.lastRecordingId ?? null) &&
     a.cwd === b.cwd &&
     Boolean(a.persistent) === Boolean(b.persistent) &&
+    Boolean(a.pinned) === Boolean(b.pinned) &&
+    (a.sidebarOrder ?? null) === (b.sidebarOrder ?? null) &&
     (a.symbol ?? null) === (b.symbol ?? null) &&
     (a.color ?? null) === (b.color ?? null) &&
     a.createdAt === b.createdAt
@@ -689,6 +1021,8 @@ function loadLegacyPersistedSessions(): PersistedSession[] {
         persistId: s.persistId,
         projectId: s.projectId,
         name: s.name,
+        pinned: false,
+        sidebarOrder: s.createdAt,
         launchCommand: s.launchCommand,
         restoreCommand: null,
         lastRecordingId: null,
@@ -1040,9 +1374,12 @@ async function createSession(input: {
   persistent?: boolean;
   persistId?: string;
   createdAt?: number;
+  pinned?: boolean;
+  sidebarOrder?: number | null;
 }): Promise<Session> {
   const persistent = Boolean(input.persistent);
   const persistId = input.persistId ?? makeId();
+  const createdAt = input.createdAt ?? Date.now();
 
   const trimmedCommand = (input.launchCommand ?? "").trim();
   const launchCommandRaw = persistent ? null : trimmedCommand ? trimmedCommand : null;
@@ -1057,13 +1394,21 @@ async function createSession(input: {
     ? (explicitSshTarget || sshTargetFromCommandLine(commandForDetection))
     : null;
   const sshRootDir = isSshSession ? input.sshRootDir?.trim() || null : null;
+  const sessionName = buildSmartSessionName({
+    explicitName: input.name ?? null,
+    launchCommand,
+    restoreCommand,
+    sshTarget,
+    cwd: input.cwd ?? null,
+    persistent,
+  });
   const processTag = commandForDetection ? commandTagFromCommandLine(commandForDetection) : null;
   const effect = detectProcessEffect({
     command: commandForDetection,
-    name: input.name ?? null,
+    name: sessionName,
   });
   const info = await invoke<SessionInfo>("create_session", {
-    name: input.name ?? null,
+    name: sessionName,
     command: launchCommand,
     cwd: input.cwd ?? null,
     envVars: input.envVars ?? null,
@@ -1075,7 +1420,12 @@ async function createSession(input: {
     projectId: input.projectId,
     persistId,
     persistent,
-    createdAt: input.createdAt ?? Date.now(),
+    createdAt,
+    pinned: Boolean(input.pinned),
+    sidebarOrder:
+      typeof input.sidebarOrder === "number" && Number.isFinite(input.sidebarOrder)
+        ? input.sidebarOrder
+        : createdAt,
     launchCommand,
     restoreCommand,
     sshTarget,
@@ -1085,6 +1435,7 @@ async function createSession(input: {
     cwd: info.cwd ?? input.cwd ?? null,
     effectId: effect?.id ?? null,
     processTag,
+    runningCommand: shouldTrackLaunchCommandAsRunning(launchCommand, persistent) ? launchCommand : null,
     connectionState: "connected",
     reconnectAttempt: 0,
     nextReconnectAt: null,
@@ -1099,6 +1450,35 @@ async function closeSession(id: string): Promise<void> {
 
 async function detachSession(id: string): Promise<void> {
   await invoke("detach_session", { id });
+}
+
+function agentProviderLabel(provider: string | undefined): string {
+  return provider === "codex" ? "Codex" : "Claude Code";
+}
+
+function buildSessionAutoRenamePrompt(projectId: string, projectTitle: string | null | undefined): string {
+  const scope = projectTitle?.trim()
+    ? `the project "${projectTitle}" (${projectId})`
+    : `project ${projectId}`;
+
+  return [
+    `Rename terminal sessions for ${scope}.`,
+    "",
+    "Use MCP tools only.",
+    `1. Call list_sessions with {\"projectId\":\"${projectId}\"}.`,
+    "2. For every session in that list, inspect the current terminal output with read_screen and recent terminal history with read_scrollback.",
+    "3. Infer a short semantic name that reflects the work currently shown in the terminal.",
+    "4. Use rename_session only when the new name is meaningfully better than the current one.",
+    "",
+    "Constraints:",
+    "- Keep names in Title Case.",
+    "- Prefer 2 to 4 words and keep names under 28 characters.",
+    "- Avoid generic names like Terminal, Shell, Session, Codex, Claude, Working, or Untitled.",
+    "- If a session is empty, ambiguous, or already clearly named, leave it unchanged.",
+    "- Do not send commands, write to sessions, create or close sessions, edit files, or change projects.",
+    "",
+    "Return a brief summary of renamed sessions and skipped sessions.",
+  ].join("\n");
 }
 
 export default function App() {
@@ -1118,6 +1498,11 @@ export default function App() {
   const [assetSettings, setAssetSettings] = useState<AssetSettings>({ autoApplyEnabled: true });
   const [agentShortcutIds, setAgentShortcutIds] = useState<string[]>(DEFAULT_AGENT_SHORTCUT_IDS);
   const [agentShortcutsOpen, setAgentShortcutsOpen] = useState(false);
+  const [activityCenterOpen, setActivityCenterOpen] = useState(false);
+  const [activityCenterAutoOpenSource, setActivityCenterAutoOpenSource] = useState<"auto-rename" | null>(
+    null,
+  );
+  const activityCenterMenuRef = useRef<HTMLDivElement | null>(null);
   const [appSettingsOpen, setAppSettingsOpen] = useState(false);
   const appSettingsMenuRef = useRef<HTMLDivElement | null>(null);
   const sidebarRef = useRef<HTMLElement | null>(null);
@@ -1173,6 +1558,18 @@ export default function App() {
     document.addEventListener("mousedown", handlePointerDown);
     return () => document.removeEventListener("mousedown", handlePointerDown);
   }, [appSettingsOpen]);
+  useEffect(() => {
+    if (!activityCenterOpen) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (activityCenterMenuRef.current?.contains(target)) return;
+      setActivityCenterOpen(false);
+      setActivityCenterAutoOpenSource(null);
+    };
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [activityCenterOpen]);
 
   const [activeSplitViewId, setActiveSplitViewId] = useState<string | null>(null);
   const activeSplitViewIdRef = useRef(activeSplitViewId);
@@ -1272,6 +1669,14 @@ export default function App() {
   const [secureStorageRetrying, setSecureStorageRetrying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [autoRenamingSessions, setAutoRenamingSessions] = useState(false);
+  const [autoRenameActivity, setAutoRenameActivity] = useState<AutoRenameActivity | null>(null);
+  useEffect(() => {
+    if (activityCenterAutoOpenSource !== "auto-rename") return;
+    if (autoRenameActivity) return;
+    setActivityCenterOpen(false);
+    setActivityCenterAutoOpenSource(null);
+  }, [activityCenterAutoOpenSource, autoRenameActivity]);
   const noticeTimerRef = useRef<number | null>(null);
   const secureStoragePromptedRef = useRef(false);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
@@ -1566,6 +1971,7 @@ export default function App() {
   const workspaceViewSaveTimerRef = useRef<number | null>(null);
   const pendingWorkspaceViewSaveRef = useRef<WorkspaceViewStorageV1 | null>(null);
   const agentIdleTimersRef = useRef<Map<string, number>>(new Map());
+  const commandActivityTimersRef = useRef<Map<string, number>>(new Map());
   const agentWorkingMapRef = useRef<Map<string, boolean>>(new Map());
   const keyHandlerStateRef = useRef({
     newOpen: false,
@@ -1623,6 +2029,14 @@ export default function App() {
     }
   }, []);
 
+  const clearCommandActivityTimer = useCallback((id: string) => {
+    const existing = commandActivityTimersRef.current.get(id);
+    if (existing !== undefined) {
+      window.clearTimeout(existing);
+      commandActivityTimersRef.current.delete(id);
+    }
+  }, []);
+
   const syncAgentWorkingToState = useCallback(() => {
     agentWorkingSyncTimerRef.current = null;
     const map = agentWorkingMapRef.current;
@@ -1659,6 +2073,28 @@ export default function App() {
     }, idleAfterMs);
     agentIdleTimersRef.current.set(id, timeout);
   }, [clearAgentIdleTimer, scheduleAgentWorkingSync]);
+
+  const scheduleRunningCommandActivityTimeout = useCallback((id: string) => {
+    clearCommandActivityTimer(id);
+    // OSC 133 sessions get a longer fallback timeout as safety net
+    // (e.g. if user enters subshell/SSH where OSC 133 stops working)
+    const timeoutMs = commandLifecycleSessionsRef.current.has(id)
+      ? 10_000
+      : COMMAND_ACTIVITY_IDLE_MS;
+    const timeout = window.setTimeout(() => {
+      commandActivityTimersRef.current.delete(id);
+      setSessions((prev) => {
+        const index = prev.findIndex((session) => session.id === id);
+        if (index < 0) return prev;
+        const current = prev[index];
+        if (!(current.runningCommand ?? "").trim()) return prev;
+        const next = prev.slice();
+        next[index] = { ...current, runningCommand: null };
+        return next;
+      });
+    }, timeoutMs);
+    commandActivityTimersRef.current.set(id, timeout);
+  }, [clearCommandActivityTimer, setSessions]);
 
   const RESIZE_OUTPUT_SUPPRESS_MS = 900;
 
@@ -1903,6 +2339,7 @@ export default function App() {
 
   const clearSessionRuntimeBuffers = useCallback((id: string) => {
     clearAgentIdleTimer(id);
+    clearCommandActivityTimer(id);
     agentWorkingMapRef.current.set(id, false);
     lastResizeAtRef.current.delete(id);
     pendingData.current.delete(id);
@@ -1910,7 +2347,7 @@ export default function App() {
     pendingExitCodes.current.delete(id);
     clearReconnectTimer(id);
     reconnectInFlightRef.current.delete(id);
-  }, [clearAgentIdleTimer, clearReconnectTimer]);
+  }, [clearAgentIdleTimer, clearCommandActivityTimer, clearReconnectTimer]);
 
   const markSessionAliveFromOutput = useCallback((id: string) => {
     const current = sessionByIdRef.current.get(id);
@@ -2214,7 +2651,7 @@ export default function App() {
   );
 
   const projectSessions = useMemo(
-    () => sessions.filter((s) => s.projectId === activeProjectId),
+    () => sortProjectSessionsForSidebar(sessions, activeProjectId),
     [sessions, activeProjectId],
   );
 
@@ -2223,14 +2660,8 @@ export default function App() {
     const workingCounts = new Map<string, number>();
     for (const s of sessions) {
       sessionCounts.set(s.projectId, (sessionCounts.get(s.projectId) ?? 0) + 1);
-      if (
-        s.effectId &&
-        !s.exited &&
-        !s.closing &&
-        s.connectionState !== "reconnecting" &&
-        s.connectionState !== "disconnected" &&
-        agentWorkingIds.has(s.id)
-      ) {
+      const activity = getSessionActivityState(s, agentWorkingIds);
+      if (activity.isActive) {
         workingCounts.set(s.projectId, (workingCounts.get(s.projectId) ?? 0) + 1);
       }
     }
@@ -2637,6 +3068,9 @@ export default function App() {
       }
       return [...prev, session];
     });
+    if ((session.runningCommand ?? "").trim()) {
+      scheduleRunningCommandActivityTimeout(session.id);
+    }
     if (activeProjectIdRef.current === session.projectId) {
       setActiveId(session.id);
       return;
@@ -2648,7 +3082,7 @@ export default function App() {
       );
     }
     lastActiveByProject.current.set(session.projectId, session.id);
-  }, []);
+  }, [scheduleRunningCommandActivityTimeout]);
 
   const handleOpenTerminalAtPath = useCallback(
     async (path: string, provider: "local" | "ssh", sshTarget: string | null) => {
@@ -2763,6 +3197,33 @@ export default function App() {
     sessionsRef.current = sessions;
     sessionByIdRef.current = new Map(sessions.map((session) => [session.id, session]));
   }, [sessions]);
+
+  useEffect(() => {
+    const activeRunningCommands = new Set<string>();
+    for (const session of sessions) {
+      const hasRunningCommand = Boolean((session.runningCommand ?? "").trim());
+      const canTrack =
+        hasRunningCommand &&
+        !session.exited &&
+        !session.closing &&
+        session.connectionState !== "reconnecting" &&
+        session.connectionState !== "disconnected";
+      if (!canTrack) {
+        clearCommandActivityTimer(session.id);
+        continue;
+      }
+      activeRunningCommands.add(session.id);
+      if (!commandActivityTimersRef.current.has(session.id)) {
+        scheduleRunningCommandActivityTimeout(session.id);
+      }
+    }
+
+    for (const id of Array.from(commandActivityTimersRef.current.keys())) {
+      if (!activeRunningCommands.has(id)) {
+        clearCommandActivityTimer(id);
+      }
+    }
+  }, [sessions, clearCommandActivityTimer, scheduleRunningCommandActivityTimeout]);
 
 	  useLayoutEffect(() => {
 	    activeIdRef.current = activeId;
@@ -3208,6 +3669,7 @@ export default function App() {
             await sleep(30);
           }
           await invoke("write_to_session", { id: sessionId, data: "\r", source: "user" });
+          if (text) onCommandChange(sessionId, text, "input");
         }
         notifyStateChange("prompts.sent", { sessionId, promptId: prompt.id, mode });
         return { sessionId, promptId: prompt.id, mode };
@@ -3876,24 +4338,24 @@ export default function App() {
   }, [hydrated, projects]);
 
   const trayStatus = useMemo(() => {
-    let workingCount = 0;
+    let runningCount = 0;
     let sessionsOpen = 0;
     let recordingCount = 0;
 
     for (const session of sessions) {
       if (session.exited || session.closing) continue;
-      if (session.connectionState === "reconnecting" || session.connectionState === "disconnected") continue;
       sessionsOpen += 1;
-      if (session.effectId && agentWorkingIds.has(session.id)) {
-        workingCount += 1;
+      const activity = getSessionActivityState(session, agentWorkingIds);
+      if (activity.isActive) {
+        runningCount += 1;
       }
-      if (session.recordingActive) {
+      if (activity.isRecording) {
         recordingCount += 1;
       }
     }
 
     return {
-      workingCount,
+      runningCount,
       sessionsOpen,
       recordingCount,
       activeProject: activeProject?.title ?? null,
@@ -3914,7 +4376,7 @@ export default function App() {
     trayStatusTimerRef.current = window.setTimeout(() => {
       trayStatusTimerRef.current = null;
       void invoke("set_tray_status", {
-        workingCount: trayStatus.workingCount,
+        workingCount: trayStatus.runningCount,
         sessionsOpen: trayStatus.sessionsOpen,
         activeProject: trayStatus.activeProject,
         activeSession: trayStatus.activeSession,
@@ -4559,6 +5021,81 @@ export default function App() {
     }, timeoutMs);
   }, []);
 
+  const runBackgroundAgentPrompt = useCallback(
+    async (
+      prompt: string,
+      settings: AgentLaunchSettings,
+      options?: {
+        onOutputLine?: (line: string) => void;
+      },
+    ) => {
+      let runId: string | null = null;
+      const stderrLines: string[] = [];
+      let resolveDone: (() => void) | null = null;
+      let rejectDone: ((error: Error) => void) | null = null;
+      let unlistenOutput: (() => void) | null = null;
+      let unlistenDone: (() => void) | null = null;
+      let unlistenStderr: (() => void) | null = null;
+
+      const completion = new Promise<void>((resolve, reject) => {
+        resolveDone = resolve;
+        rejectDone = (error: Error) => reject(error);
+      });
+
+      const cleanup = () => {
+        if (unlistenOutput) {
+          unlistenOutput();
+          unlistenOutput = null;
+        }
+        if (unlistenDone) {
+          unlistenDone();
+          unlistenDone = null;
+        }
+        if (unlistenStderr) {
+          unlistenStderr();
+          unlistenStderr = null;
+        }
+      };
+
+      try {
+        const handleOutput = options?.onOutputLine;
+        unlistenOutput = await listen<AgentOutputPayload>("agent-output", (event) => {
+          if (event.payload.runId !== runId) return;
+          handleOutput?.(event.payload.data);
+        });
+
+        unlistenStderr = await listen<AgentStderrPayload>("agent-stderr", (event) => {
+          if (event.payload.runId !== runId) return;
+          stderrLines.push(event.payload.data);
+        });
+
+        unlistenDone = await listen<AgentDonePayload>("agent-done", (event) => {
+          if (event.payload.runId !== runId) return;
+          cleanup();
+          if (event.payload.exitCode === 0) {
+            resolveDone?.();
+            return;
+          }
+          const stderr = stderrLines.join("\n").trim();
+          const exitCode =
+            event.payload.exitCode == null ? "unknown" : String(event.payload.exitCode);
+          rejectDone?.(new Error(stderr || `Agent exited with code ${exitCode}`));
+        });
+
+        runId = await invoke<string>("start_agent_prompt", {
+          prompt,
+          settings,
+        });
+
+        await completion;
+      } catch (err) {
+        cleanup();
+        throw err;
+      }
+    },
+    [],
+  );
+
   function openSecureStorageSettings() {
     setSecureStorageSettingsError(null);
     setSecureStorageSettingsMode(secureStorageMode ?? "keychain");
@@ -5192,6 +5729,7 @@ export default function App() {
       }
       if (text) await sleep(50);
       await invoke("write_to_session", { id: sessionId, data: "\r", source: "user" });
+      if (text) onCommandChange(sessionId, text, "input");
     } catch (err) {
       reportError("Failed to send prompt", err);
     }
@@ -5589,6 +6127,14 @@ export default function App() {
     [],
   );
 
+  const refreshRunningCommandActivityFromOutput = useCallback((_id: string, _data: string) => {
+    // Intentionally a no-op: output no longer extends the running-command
+    // timeout.  The timeout set when the command starts (3s / 10s) will
+    // fire on its own; OSC 133 lifecycle events clear it sooner when
+    // available.  Resetting on every output chunk caused fast commands
+    // (e.g. `ls`) to appear "active" for too long.
+  }, []);
+
   function openPathPicker(target: "project" | "session" | "ssh-remote", initial: string | null) {
     setPathPickerTarget(target);
     pathPickerInitialPathRef.current = initial;
@@ -5632,35 +6178,43 @@ export default function App() {
     const trimmed = cwd.trim();
     if (!trimmed) return;
 
-    // Our shell integrations emit CurrentDir right before drawing the prompt. Treat it as a
-    // definitive "command finished / prompt returned" signal to clear any lingering activity.
-    commandLifecycleSessionsRef.current.add(id);
-    clearAgentIdleTimer(id);
-    agentWorkingMapRef.current.set(id, false);
-    scheduleAgentWorkingSync();
+    const hasExplicitCommandLifecycle = commandLifecycleSessionsRef.current.has(id);
+    if (!hasExplicitCommandLifecycle) {
+      // Fallback for terminals that only expose cwd updates: treat this as prompt-ready.
+      clearAgentIdleTimer(id);
+      clearCommandActivityTimer(id);
+      agentWorkingMapRef.current.set(id, false);
+      scheduleAgentWorkingSync();
+    }
 
     updateSessionById(id, (s) => {
       const nextCwd = s.cwd !== trimmed ? trimmed : s.cwd;
-      if (nextCwd === s.cwd && !s.effectId) return s;
-      return { ...s, cwd: nextCwd, effectId: null, processTag: null };
+      if (hasExplicitCommandLifecycle) {
+        return nextCwd === s.cwd ? s : { ...s, cwd: nextCwd };
+      }
+      if (nextCwd === s.cwd && !s.effectId && !(s.runningCommand ?? "").trim() && !s.processTag) return s;
+      return { ...s, cwd: nextCwd, effectId: null, processTag: null, runningCommand: null };
     });
-  }, [clearAgentIdleTimer, scheduleAgentWorkingSync, updateSessionById]);
+  }, [clearAgentIdleTimer, clearCommandActivityTimer, scheduleAgentWorkingSync, updateSessionById]);
 
-  const onCommandChange = useCallback((id: string, commandLine: string, source: "osc" | "input" = "input") => {
+  const onCommandChange = useCallback((id: string, commandLine: string, source: "osc" | "osc133" | "input" = "input") => {
     const trimmed = commandLine.trim();
 
-    if (source === "osc") {
-      commandLifecycleSessionsRef.current.add(id);
+    if (source === "osc" || source === "osc133") {
+      if (source === "osc133") {
+        commandLifecycleSessionsRef.current.add(id);
+      }
 
-      // Shell integration sends an empty Command= right before the prompt is shown again.
+      // Shell integration sends an empty command when the prompt is shown again.
       // Treat this as "no foreground command running" (back at prompt).
       if (!trimmed) {
         clearAgentIdleTimer(id);
+        clearCommandActivityTimer(id);
         agentWorkingMapRef.current.set(id, false);
         scheduleAgentWorkingSync();
         updateSessionById(id, (s) => {
-          if (!s.effectId) return s;
-          return { ...s, effectId: null, processTag: null };
+          if (!s.effectId && !(s.runningCommand ?? "").trim()) return s;
+          return { ...s, effectId: null, processTag: null, runningCommand: null };
         });
         return;
       }
@@ -5668,13 +6222,17 @@ export default function App() {
       const effect = detectProcessEffect({ command: trimmed, name: null });
       const nextEffectId = effect?.id ?? null;
       clearAgentIdleTimer(id);
+      clearCommandActivityTimer(id);
       agentWorkingMapRef.current.set(id, false);
       scheduleAgentWorkingSync();
       updateSessionById(id, (s) => {
         const nextRestoreCommand = effect && !s.persistent ? trimmed : null;
+        const nextProcessTag = commandTagFromCommandLine(trimmed);
         if (
           s.effectId === nextEffectId &&
-          (s.restoreCommand ?? null) === nextRestoreCommand
+          (s.restoreCommand ?? null) === nextRestoreCommand &&
+          (s.runningCommand ?? null) === trimmed &&
+          (s.processTag ?? null) === nextProcessTag
         ) {
           return s;
         }
@@ -5682,42 +6240,59 @@ export default function App() {
           ...s,
           effectId: nextEffectId,
           restoreCommand: nextRestoreCommand,
-          processTag: null,
+          processTag: nextProcessTag,
+          runningCommand: trimmed,
         };
       });
+      scheduleRunningCommandActivityTimeout(id);
       return;
     }
 
-    // If this session already supports OSC lifecycle events, ignore input-based command
-    // detection to avoid double-firing and idle-timer races.
-    if (commandLifecycleSessionsRef.current.has(id)) return;
     if (!trimmed) return;
+
+    // If the session already has an agent effect, the user is sending a prompt
+    // to the agent, not starting a new shell command.  Preserve the existing
+    // effectId / restoreCommand / runningCommand so agent-activity tracking
+    // keeps working.
+    const existing = sessionByIdRef.current.get(id);
+    if (existing?.effectId && getProcessEffectById(existing.effectId)) {
+      return;
+    }
 
     const effect = detectProcessEffect({ command: trimmed, name: null });
     const nextEffectId = effect?.id ?? null;
     clearAgentIdleTimer(id);
+    clearCommandActivityTimer(id);
     agentWorkingMapRef.current.set(id, false);
     scheduleAgentWorkingSync();
     updateSessionById(id, (s) => {
       const nextRestoreCommand = effect && !s.persistent ? trimmed : null;
-      if (s.effectId === nextEffectId && (s.restoreCommand ?? null) === nextRestoreCommand)
+      const nextProcessTag = commandTagFromCommandLine(trimmed);
+      if (
+        s.effectId === nextEffectId &&
+        (s.restoreCommand ?? null) === nextRestoreCommand &&
+        (s.runningCommand ?? null) === trimmed &&
+        (s.processTag ?? null) === nextProcessTag
+      )
         return s;
       return {
         ...s,
         effectId: nextEffectId,
         restoreCommand: nextRestoreCommand,
-        processTag: null,
+        processTag: nextProcessTag,
+        runningCommand: trimmed,
       };
     });
-  }, [clearAgentIdleTimer, scheduleAgentWorkingSync, updateSessionById]);
+    scheduleRunningCommandActivityTimeout(id);
+  }, [clearAgentIdleTimer, clearCommandActivityTimer, scheduleAgentWorkingSync, scheduleRunningCommandActivityTimeout, updateSessionById]);
 
   function pickActiveSessionIdFromList(projectId: string, sessions: Session[]): string | null {
+    const orderedProjectSessions = sortProjectSessionsForSidebar(sessions, projectId);
     const last = lastActiveByProject.current.get(projectId);
     if (last) {
-      const lastSession = sessions.find(
+      const lastSession = orderedProjectSessions.find(
         (s) =>
           s.id === last &&
-          s.projectId === projectId &&
           !s.closing &&
           s.connectionState !== "reconnecting" &&
           s.connectionState !== "disconnected",
@@ -5725,9 +6300,8 @@ export default function App() {
       if (lastSession) return lastSession.id;
     }
     // Prefer live (non-exited, non-closing) sessions
-    const firstLive = sessions.find(
+    const firstLive = orderedProjectSessions.find(
       (s) =>
-        s.projectId === projectId &&
         !s.exited &&
         !s.closing &&
         s.connectionState !== "reconnecting" &&
@@ -5735,10 +6309,10 @@ export default function App() {
     );
     if (firstLive) return firstLive.id;
     // Fall back to non-closing (includes exited)
-    const firstOpen = sessions.find((s) => s.projectId === projectId && !s.closing);
+    const firstOpen = orderedProjectSessions.find((s) => !s.closing);
     if (firstOpen) return firstOpen.id;
     // Last resort: any session in this project
-    const firstAny = sessions.find((s) => s.projectId === projectId);
+    const firstAny = orderedProjectSessions[0] ?? null;
     return firstAny ? firstAny.id : null;
   }
 
@@ -6010,6 +6584,7 @@ export default function App() {
 		        if (closingSessions.current.has(id)) return;
               markSessionAliveFromOutput(id);
 			        markAgentWorkingFromOutput(id, text);
+              refreshRunningCommandActivityFromOutput(id, text);
               const queue = outputQueueRef.current.get(id) ?? [];
               if (queue.length === 0) {
                 queue.push(text);
@@ -6034,6 +6609,7 @@ export default function App() {
         const { id, exit_code } = event.payload;
 
         clearAgentIdleTimer(id);
+        clearCommandActivityTimer(id);
         agentWorkingMapRef.current.set(id, false);
         lastResizeAtRef.current.delete(id);
 
@@ -6066,6 +6642,7 @@ export default function App() {
               ...s,
               exited: true,
               exitCode: exit_code ?? null,
+              runningCommand: null,
               recordingActive: false,
               connectionState: isSshSession(s) ? "disconnected" : s.connectionState ?? "connected",
               manualReconnectAvailable: Boolean(isSshSession(s)),
@@ -6400,7 +6977,17 @@ export default function App() {
       };
 
       const persisted = dedupePersistedSessions(
-        state.sessions.filter((s) => projectById.has(s.projectId)),
+        state.sessions
+          .filter((s) => projectById.has(s.projectId))
+          .map((s) => ({
+            ...s,
+            pinned: Boolean((s as { pinned?: boolean }).pinned),
+            sidebarOrder:
+              typeof (s as { sidebarOrder?: unknown }).sidebarOrder === "number" &&
+              Number.isFinite((s as { sidebarOrder?: number }).sidebarOrder)
+                ? ((s as { sidebarOrder?: number }).sidebarOrder ?? null)
+                : s.createdAt,
+          })),
       );
 
       const syncLastActiveByProject = (items: Session[]) => {
@@ -6444,6 +7031,11 @@ export default function App() {
             persistent: s.persistent ?? false,
             persistId: s.persistId,
             createdAt: s.createdAt,
+            pinned: Boolean(s.pinned),
+            sidebarOrder:
+              typeof s.sidebarOrder === "number" && Number.isFinite(s.sidebarOrder)
+                ? s.sidebarOrder
+                : s.createdAt,
           });
           const created = applyPendingExit(createdRaw);
           if (s.symbol) created.symbol = s.symbol;
@@ -6469,6 +7061,7 @@ export default function App() {
                   data: "\r",
                   source: "system",
                 });
+                if (singleLine) onCommandChange(created.id, singleLine, "input");
               } catch {
                 // Best-effort restore: if this fails, the tab still opens as a shell.
               }
@@ -6667,6 +7260,10 @@ export default function App() {
 	        window.clearTimeout(timeout);
 	      }
 	      agentIdleTimersRef.current.clear();
+        for (const timeout of commandActivityTimersRef.current.values()) {
+          window.clearTimeout(timeout);
+        }
+        commandActivityTimersRef.current.clear();
 	      for (const id of sessionIdsRef.current) {
         const s = sessionsRef.current.find((x) => x.id === id) ?? null;
         if (s?.persistent && !s.exited) void detachSession(id).catch(() => {});
@@ -6744,6 +7341,7 @@ export default function App() {
           await invoke("write_to_session", { id: s.id, data: data.command, source: "system" });
           await sleep(30);
           await invoke("write_to_session", { id: s.id, data: "\r", source: "system" });
+          onCommandChange(s.id, data.command, "input");
         } catch (err) {
           reportError("Failed to start SSH inside persistent session", err);
         }
@@ -6986,9 +7584,9 @@ export default function App() {
 
       const commandLine = (preset.command ?? "").trim();
       if (commandLine) {
-        void invoke("write_to_session", { id: next.id, data: `${commandLine}\r`, source: "ui" }).catch((err) =>
-          reportError(`Failed to start ${preset.title}`, err),
-        );
+        void invoke("write_to_session", { id: next.id, data: `${commandLine}\r`, source: "ui" })
+          .then(() => onCommandChange(next.id, commandLine, "input"))
+          .catch((err) => reportError(`Failed to start ${preset.title}`, err));
       }
     } catch (err) {
       reportError(`Failed to start ${preset.title}`, err);
@@ -7253,6 +7851,164 @@ export default function App() {
       manual: true,
     });
   }, []);
+
+  const handleToggleSessionPin = useCallback((sessionId: string) => {
+    setSessions((prev) => {
+      const target = prev.find((session) => session.id === sessionId);
+      if (!target) return prev;
+
+      const projectId = target.projectId;
+      const sorted = sortProjectSessionsForSidebar(prev, projectId);
+      const source = sorted.find((session) => session.id === sessionId);
+      if (!source) return prev;
+
+      const nextPinned = !Boolean(source.pinned);
+      const remaining = sorted.filter((session) => session.id !== sessionId);
+      const insertIndex = nextPinned
+        ? 0
+        : (() => {
+            const firstUnpinned = remaining.findIndex((session) => !Boolean(session.pinned));
+            return firstUnpinned >= 0 ? firstUnpinned : remaining.length;
+          })();
+
+      const reordered = [
+        ...remaining.slice(0, insertIndex),
+        { ...source, pinned: nextPinned },
+        ...remaining.slice(insertIndex),
+      ];
+
+      return mergeProjectSessionLayout(
+        prev,
+        projectId,
+        normalizeProjectSessionLayout(reordered),
+      );
+    });
+  }, []);
+
+  const handleReorderSession = useCallback((sourceSessionId: string, targetSessionId: string, position: "before" | "after" = "before") => {
+    if (!sourceSessionId || !targetSessionId || sourceSessionId === targetSessionId) return;
+
+    setSessions((prev) => {
+      const source = prev.find((session) => session.id === sourceSessionId);
+      const target = prev.find((session) => session.id === targetSessionId);
+      if (!source || !target || source.projectId !== target.projectId) return prev;
+
+      const projectId = source.projectId;
+      const sorted = sortProjectSessionsForSidebar(prev, projectId);
+      const sourceIndex = sorted.findIndex((session) => session.id === sourceSessionId);
+      const targetIndex = sorted.findIndex((session) => session.id === targetSessionId);
+      if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return prev;
+
+      const moving = { ...sorted[sourceIndex], pinned: Boolean(sorted[targetIndex].pinned) };
+      const remaining = sorted.filter((session) => session.id !== sourceSessionId);
+      const targetIdx = remaining.findIndex((session) => session.id === targetSessionId);
+      if (targetIdx < 0) return prev;
+      const insertIndex = position === "after" ? targetIdx + 1 : targetIdx;
+
+      const reordered = [...remaining];
+      reordered.splice(insertIndex, 0, moving);
+
+      return mergeProjectSessionLayout(
+        prev,
+        projectId,
+        normalizeProjectSessionLayout(reordered),
+      );
+    });
+  }, []);
+
+  const dismissAutoRenameActivity = useCallback(() => {
+    setAutoRenameActivity(null);
+  }, []);
+
+  const handleAutoRenameSessions = useCallback(async () => {
+    if (autoRenamingSessions) return;
+    const projectId = activeProjectIdRef.current;
+    if (!projectId) return;
+
+    const projectSessions = sessionsRef.current.filter(
+      (session) => session.projectId === projectId && !session.closing,
+    );
+    if (projectSessions.length === 0) return;
+
+    const projectTitle = projectByIdRef.current.get(projectId)?.title ?? null;
+    const agentSettings = loadAgentSettings();
+    const provider = agentSettings.provider === "codex" ? "codex" : "claude-code";
+    const providerLabel = agentProviderLabel(provider);
+    const prompt = buildSessionAutoRenamePrompt(projectId, projectTitle);
+    const launchSettings: AgentLaunchSettings = {
+      provider,
+      model: agentSettings.model,
+      effort: agentSettings.effort,
+      allowedTools: agentSettings.allowedTools,
+    };
+
+    if (!activityCenterOpen) {
+      setAppSettingsOpen(false);
+      setActivityCenterAutoOpenSource("auto-rename");
+      setActivityCenterOpen(true);
+    }
+
+    setAutoRenameActivity({
+      projectId,
+      providerLabel,
+      status: "running",
+      summary: `Renaming ${projectSessions.length} session${projectSessions.length === 1 ? "" : "s"} with ${providerLabel}`,
+      entries: [
+        {
+          id: makeId(),
+          text: `${providerLabel} is inspecting the active project sessions`,
+          tone: "info",
+        },
+      ],
+    });
+    setAutoRenamingSessions(true);
+
+    try {
+      await runBackgroundAgentPrompt(prompt, launchSettings, {
+        onOutputLine: (line) => {
+          const update = parseStreamLine(line);
+          if (!update) return;
+          const nextEntries = summarizeAutoRenameUpdate(update, sessionsRef.current);
+          if (nextEntries.length === 0) return;
+          setAutoRenameActivity((prev) => {
+            if (!prev || prev.projectId !== projectId) return prev;
+            return {
+              ...prev,
+              entries: [
+                ...prev.entries,
+                ...nextEntries.map((entry) => ({ id: makeId(), ...entry })),
+              ].slice(-AUTO_RENAME_LOG_ENTRY_LIMIT),
+            };
+          });
+        },
+      });
+      setAutoRenameActivity((prev) =>
+        prev?.projectId === projectId ? null : prev,
+      );
+    } catch (err) {
+      const message = formatError(err);
+      setAutoRenameActivity((prev) => {
+        if (!prev || prev.projectId !== projectId) return prev;
+        return {
+          ...prev,
+          status: "error",
+          summary: `${providerLabel} could not finish the rename run`,
+          entries: [
+            ...prev.entries.slice(-(AUTO_RENAME_LOG_ENTRY_LIMIT - 1)),
+            { id: makeId(), text: message, tone: "error" },
+          ],
+        };
+      });
+      reportError(`Failed to rename sessions with ${providerLabel}`, err);
+    } finally {
+      setAutoRenamingSessions(false);
+    }
+  }, [
+    activityCenterOpen,
+    autoRenamingSessions,
+    reportError,
+    runBackgroundAgentPrompt,
+  ]);
 
   const handleRenameSession = useCallback((sessionId: string, newName: string) => {
     const trimmed = newName.trim();
@@ -7577,6 +8333,152 @@ export default function App() {
     return next;
   }, [workingAgentCountByProject]);
 
+  const handleToggleActivityCenter = useCallback(() => {
+    setAppSettingsOpen(false);
+    setActivityCenterAutoOpenSource(null);
+    setActivityCenterOpen((prev) => !prev);
+  }, []);
+
+  const handleToggleAppSettings = useCallback(() => {
+    setActivityCenterOpen(false);
+    setActivityCenterAutoOpenSource(null);
+    setAppSettingsOpen((prev) => !prev);
+  }, []);
+
+  const activityItems = useMemo<ActivityCenterItem[]>(() => {
+    const items: ActivityCenterItem[] = [];
+    const projectTitleById = new Map(
+      projects.map((project) => [project.id, project.title?.trim?.() || project.title || "—"] as const),
+    );
+
+    const sessionActivityItems = sessions
+      .flatMap((session): ActivityCenterItem[] => {
+        const activity = getSessionActivityState(session, agentWorkingIds);
+        if (!activity.isActive) return [];
+
+        const details: string[] = [];
+        const projectTitle = projectTitleById.get(session.projectId) ?? "—";
+        if (projectTitle) details.push(`Project: ${projectTitle}`);
+        if (session.disconnectReason?.trim()) details.push(session.disconnectReason.trim());
+        if (session.cwd?.trim()) details.push(shortenPathSmart(session.cwd.trim(), 68));
+        if (activity.command) details.push(truncateInlineText(activity.command, 96));
+
+        const summaryParts: string[] = [];
+        if (activity.isAgentWorking && activity.effect) {
+          summaryParts.push(`${activity.effect.label} active`);
+        }
+        if (activity.isRecording) summaryParts.push("Recording");
+        if (activity.isReconnecting) {
+          const attempt = session.reconnectAttempt
+            ? ` (${Math.min(session.reconnectAttempt, SSH_RECONNECT_MAX_ATTEMPTS)}/${SSH_RECONNECT_MAX_ATTEMPTS})`
+            : "";
+          summaryParts.push(`SSH reconnecting${attempt}`);
+        }
+        if (activity.isDisconnected) summaryParts.push("SSH disconnected");
+
+        return [
+          {
+            id: `session-activity-${session.id}`,
+            title: session.name,
+            summary: summaryParts.join(" • "),
+            tone: activity.isDisconnected ? "warning" : "info",
+            running: activity.isActive,
+            details,
+            actionLabel: activity.isDisconnected ? "Reconnect" : undefined,
+            onAction: activity.isDisconnected ? () => handleReconnectSession(session.id) : undefined,
+          },
+        ];
+      })
+      .sort((a, b) => {
+        if (a.running !== b.running) return a.running ? -1 : 1;
+        if (a.tone !== b.tone) return a.tone === "warning" ? -1 : 1;
+        return a.title.localeCompare(b.title);
+      });
+
+    items.push(...sessionActivityItems);
+
+    if (sessionRestoreProgress) {
+      const completed = Math.max(0, sessionRestoreProgress.total - sessionRestoreProgress.remaining);
+      items.push({
+        id: "restore-sessions",
+        title: "Restoring sessions",
+        summary: `${completed}/${sessionRestoreProgress.total} restored`,
+        tone: "info",
+        running: true,
+        details: [`${sessionRestoreProgress.remaining} remaining`],
+      });
+    }
+
+    if (autoRenameActivity) {
+      items.push({
+        id: "auto-rename",
+        title: `Auto-rename (${autoRenameActivity.providerLabel})`,
+        summary: autoRenameActivity.summary,
+        tone: autoRenameActivity.status === "error" ? "error" : "info",
+        running: autoRenameActivity.status === "running",
+        details: autoRenameActivity.entries.map((entry) => entry.text),
+        onDismiss: autoRenameActivity.status === "error" ? dismissAutoRenameActivity : undefined,
+      });
+    }
+
+    if (persistenceDisabledReason) {
+      const isKeychainIssue =
+        secureStorageMode === "keychain" &&
+        /keychain|keyring/i.test(persistenceDisabledReason);
+      items.push({
+        id: "persistence-disabled",
+        title: "Secure persistence paused",
+        summary: persistenceDisabledReason,
+        tone: "warning",
+        actionLabel: isKeychainIssue ? (secureStorageRetrying ? "Retrying…" : "Retry") : undefined,
+        onAction: isKeychainIssue ? () => void retrySecureStorage() : undefined,
+        actionDisabled: secureStorageRetrying,
+        onDismiss: () => setPersistenceDisabledReason(null),
+      });
+    }
+
+    if (error) {
+      items.push({
+        id: "app-error",
+        title: "Error",
+        summary: error,
+        tone: "error",
+        onDismiss: () => setError(null),
+      });
+    }
+
+    if (notice) {
+      items.push({
+        id: "app-notice",
+        title: "Notice",
+        summary: notice,
+        tone: "info",
+        onDismiss: dismissNotice,
+      });
+    }
+
+    return items;
+  }, [
+    autoRenameActivity,
+    dismissAutoRenameActivity,
+    dismissNotice,
+    error,
+    agentWorkingIds,
+    handleReconnectSession,
+    notice,
+    persistenceDisabledReason,
+    projects,
+    retrySecureStorage,
+    secureStorageMode,
+    secureStorageRetrying,
+    sessionRestoreProgress,
+    sessions,
+  ]);
+  const hasRunningActivityItems = useMemo(
+    () => activityItems.some((item) => item.running),
+    [activityItems],
+  );
+
   const sidebarJsx = useMemo(() => (
     <aside
       className="sidebar"
@@ -7640,12 +8542,18 @@ export default function App() {
         onRemoveSplitView={handleRemoveSplitView}
         onSelectSession={setActiveId}
         onCloseSession={handleCloseSession}
+        onToggleSessionPin={handleToggleSessionPin}
+        onReorderSession={handleReorderSession}
         onReconnectSession={handleReconnectSession}
         onRenameSession={handleRenameSession}
         onSetSessionSymbol={handleSetSessionSymbol}
         onSetSessionColor={handleSetSessionColor}
         onQuickStart={handleQuickStartFromSidebar}
         onOpenNewSession={handleOpenNewSession}
+        onAutoRenameSessions={handleAutoRenameSessions}
+        autoRenameRunning={
+          autoRenamingSessions || autoRenameActivity?.status === "running"
+        }
         onOpenPersistentSessions={handleOpenPersistentSessions}
         onOpenSshManager={handleOpenSshManager}
         onOpenAgentShortcuts={handleOpenAgentShortcuts}
@@ -7655,13 +8563,14 @@ export default function App() {
     projects, activeProjectId, activeProject, environments,
     stableSessionCountByProject, stableWorkingAgentCountByProject,
     prompts, agentShortcuts, stableProjectSessions, stableProjectSplitViews, agentWorkingIds,
-    activeId, splitPane, activeSplitViewId, projectsListMaxHeight,
+    activeId, splitPane, activeSplitViewId, projectsListMaxHeight, autoRenamingSessions, autoRenameActivity,
     selectProject, moveProject, openNewProject, openRenameProject,
     openProjectSettings, handleDeleteProject, handleRenameProjectInline, handleSetProjectSymbol, handleSetProjectColor,
     handleSendPromptToActive, openPromptEditor, handleOpenPromptsPanel,
-    handleCloseSession, handleReconnectSession, handleRenameSession, handleSetSessionSymbol, handleSetSessionColor,
+    handleCloseSession, handleToggleSessionPin, handleReorderSession, handleReconnectSession,
+    handleRenameSession, handleSetSessionSymbol, handleSetSessionColor,
     handleSplitSession, handleUnsplit, handleActivateSplitView, handleRemoveSplitView, handleQuickStartFromSidebar,
-    handleOpenNewSession, handleOpenPersistentSessions,
+    handleOpenNewSession, handleAutoRenameSessions, handleOpenPersistentSessions,
     handleOpenSshManager, handleOpenAgentShortcuts,
     resetProjectsListMaxHeight, handleProjectsDividerKeyDown,
     handleProjectsDividerPointerDown,
@@ -7682,100 +8591,17 @@ export default function App() {
         ) : null}
       </div>
       <div className="topbarRight">
-        {persistenceDisabledReason && (
-          <div className="errorBanner" role="alert">
-            <div className="errorText" title={persistenceDisabledReason}>
-              {persistenceDisabledReason}
-            </div>
-            {secureStorageMode === "keychain" &&
-            /keychain|keyring/i.test(persistenceDisabledReason) ? (
-              <button
-                type="button"
-                className="errorClose"
-                onClick={() => void retrySecureStorage()}
-                disabled={secureStorageRetrying}
-                title="Retry Keychain access"
-              >
-                {secureStorageRetrying ? "Retrying…" : "Retry"}
-              </button>
-            ) : (
-              <button
-                className="errorClose"
-                onClick={() => setPersistenceDisabledReason(null)}
-                title="Dismiss"
-              >
-                ×
-              </button>
-            )}
-          </div>
-        )}
-
-        {error && (
-          <div className="errorBanner" role="alert">
-            <div className="errorText" title={error}>
-              {error}
-            </div>
-            <button className="errorClose" onClick={() => setError(null)} title="Dismiss">
-              ×
-            </button>
-          </div>
-        )}
-
-        {notice && (
-          <div className="noticeBanner" role="status" aria-live="polite">
-            <div className="noticeText" title={notice}>
-              {notice}
-            </div>
-            <button className="errorClose" onClick={dismissNotice} title="Dismiss">
-              ×
-            </button>
-          </div>
-        )}
-
-        {sessionRestoreProgress && (
-          <div
-            className="restoreHint"
-            role="status"
-            aria-live="polite"
-            title={`Restoring saved sessions (${sessionRestoreProgress.total - sessionRestoreProgress.remaining}/${sessionRestoreProgress.total})`}
-          >
-            <span className="restoreHintDot" />
-            <span>{`Restoring ${sessionRestoreProgress.remaining}…`}</span>
-          </div>
-        )}
-
-        {activeIsSsh && active?.connectionState === "reconnecting" && (
-          <div
-            className="restoreHint"
-            role="status"
-            aria-live="polite"
-            title={active.disconnectReason ?? "Reconnecting SSH session"}
-          >
-            <span className="restoreHintDot" />
-            <span>
-              {`Reconnecting${active.reconnectAttempt ? ` (${Math.min(active.reconnectAttempt, SSH_RECONNECT_MAX_ATTEMPTS)}/${SSH_RECONNECT_MAX_ATTEMPTS})` : "…"}`}
-            </span>
-          </div>
-        )}
-
-        {activeIsSsh && active?.connectionState === "disconnected" && (
-          <div className="restoreHint restoreHintError" role="status" aria-live="polite">
-            <span className="restoreHintDot" />
-            <span title={active.disconnectReason ?? undefined}>Disconnected</span>
-            <button
-              type="button"
-              className="btnSmall"
-              onClick={() => handleReconnectSession(active.id)}
-            >
-              Reconnect
-            </button>
-          </div>
-        )}
+        <ActivityCenter
+          menuRef={activityCenterMenuRef}
+          open={activityCenterOpen}
+          items={activityItems}
+          onToggle={handleToggleActivityCenter}
+        />
         <div className="topbarSettingsMenu sidebarActionMenu" ref={appSettingsMenuRef}>
           <button
             type="button"
             className={`iconBtn ${appSettingsOpen ? "iconBtnActive" : ""}`}
-            onClick={() => setAppSettingsOpen((prev) => !prev)}
+            onClick={handleToggleAppSettings}
             title="Application settings"
             aria-label="Application settings"
             aria-haspopup="menu"
@@ -7815,7 +8641,7 @@ export default function App() {
           ) : null}
         </div>
 
-        {!error && !notice && (
+        {!hasRunningActivityItems && (
           <div className="shortcutHint">
             <kbd>{"\u2318"}K</kbd> Quick Access
           </div>
@@ -7925,18 +8751,6 @@ export default function App() {
               <Icon name="folder" />
             </button>
 
-            {/* Record Button */}
-            <button
-              className={`iconBtn ${active.recordingActive ? "iconBtnRecording" : ""}`}
-              onClick={() =>
-                active.recordingActive ? void stopRecording(active.id) : openRecordPrompt(active.id)
-              }
-              disabled={Boolean(active.exited || active.closing || active.connectionState === "reconnecting" || active.connectionState === "disconnected")}
-              title={active.recordingActive ? "Stop recording (active)" : "Start recording"}
-            >
-              <Icon name={active.recordingActive ? "stop" : "record"} />
-            </button>
-
             {/* Panels Button */}
             <button
               className={`iconBtn ${slidePanelOpen ? "iconBtnActive" : ""}`}
@@ -7962,29 +8776,16 @@ export default function App() {
               <Icon name="wand" size={19} />
             </button>
 
-            {/* Replay Button */}
-            <button
-              className="iconBtn"
-              onClick={() => void openReplayForActive()}
-              disabled={!active.lastRecordingId}
-              title={active.lastRecordingId ? "Replay last recording" : "No recording yet"}
-            >
-              <Icon name="play" />
-            </button>
           </>
         )}
       </div>
     </div>
   ), [
     active, activeProject, activeIsSsh, activeSshTarget, activeWorkspaceView,
-    error, notice, persistenceDisabledReason, sessionRestoreProgress,
-    secureStorageMode, secureStorageRetrying, slidePanelOpen, agentPanelOpen,
-    appSettingsOpen,
+    activityCenterOpen, activityItems, slidePanelOpen, agentPanelOpen, appSettingsOpen,
     uiTheme,
-    retrySecureStorage, dismissNotice, reportError,
-    handleReconnectSession,
-    updateActiveWorkspaceView, stopRecording, openRecordPrompt,
-    refreshRecordings, openReplayForActive,
+    handleToggleActivityCenter, handleToggleAppSettings, reportError,
+    updateActiveWorkspaceView, refreshRecordings,
   ]);
 
   const workspaceRowJsx = useMemo(() => (
@@ -9452,8 +10253,27 @@ export default function App() {
                   )}
                 </div>
 
-                {/* Refresh Button */}
+                {/* Recording Actions */}
                 <div className="panelFooter">
+                  {active && (
+                    <button
+                      className={`panelFooterBtn ${active.recordingActive ? "panelFooterBtnDanger" : ""}`}
+                      onClick={() =>
+                        active.recordingActive ? void stopRecording(active.id) : openRecordPrompt(active.id)
+                      }
+                      disabled={Boolean(active.exited || active.closing || active.connectionState === "reconnecting" || active.connectionState === "disconnected")}
+                    >
+                      {active.recordingActive ? "Stop Recording" : "Record Session"}
+                    </button>
+                  )}
+                  {active?.lastRecordingId && (
+                    <button
+                      className="panelFooterBtn"
+                      onClick={() => void openReplayForActive()}
+                    >
+                      Replay Last
+                    </button>
+                  )}
                   <button className="panelFooterBtn" onClick={() => void refreshRecordings()}>
                     Refresh
                   </button>

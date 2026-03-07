@@ -335,68 +335,11 @@ export const ProjectsSection = React.memo(function ProjectsSection({
             >
               <button
                 type="button"
-                className="projectItemMain"
-                onClick={() => onSelectProject(p.id)}
-                onDoubleClick={() => onOpenProjectSettings(p.id)}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  setContextMenu({ projectId: p.id, x: e.clientX, y: e.clientY });
-                  setSymbolPicker(null);
-                  setColorPicker(null);
-                }}
-                title={
-                  [
-                    p.title,
-                    p.sshTarget ? `SSH: ${p.sshTarget}` : null,
-                    p.sshRemotePath ? `Remote: ${p.sshRemotePath}` : null,
-                    workingCount ? `Agents working: ${workingCount}` : null,
-                    !p.sshTarget && p.basePath ? `Base: ${p.basePath}` : null,
-                    envName ? `Env: ${envName}` : null,
-                  ]
-                    .filter(Boolean)
-                    .join("\n")
-                }
-              >
-                {p.symbol && <span className="sessionSymbol">{p.symbol}</span>}
-                {renamingId === p.id ? (
-                  <input
-                    className="sessionNameInput"
-                    value={renameValue}
-                    onChange={(e) => setRenameValue(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") handleRenameSubmit();
-                      if (e.key === "Escape") handleRenameCancel();
-                      e.stopPropagation();
-                    }}
-                    onBlur={handleRenameSubmit}
-                    onClick={(e) => e.stopPropagation()}
-                    autoFocus
-                  />
-                ) : (
-                  <>
-                    <span className="projectTitle">{p.title}</span>
-                    {p.sshTarget && <span className="projectSshBadge" title={`SSH: ${p.sshTarget}`}>SSH</span>}
-                  </>
-                )}
-                <span className="projectBadges">
-                  {workingCount > 0 && (
-                    <span
-                      className="projectAgentsBadge"
-                      title={`${workingCount} agent${workingCount === 1 ? "" : "s"} working`}
-                    >
-                      <span className="projectAgentsDot" aria-hidden="true" />
-                      {workingCount}
-                    </span>
-                  )}
-                  <span className="projectCount">{count}</span>
-                </span>
-              </button>
-              <button
-                type="button"
                 className="projectDragHandle"
                 aria-label={`Reorder ${p.title}`}
                 title="Drag to reorder"
                 disabled={projects.length <= 1}
+                onClick={(e) => e.stopPropagation()}
                 onPointerDown={(e) => {
                   if (projects.length <= 1) return;
                   if (e.button !== 0) return;
@@ -528,7 +471,65 @@ export const ProjectsSection = React.memo(function ProjectsSection({
                   document.addEventListener("pointercancel", onUp);
                 }}
               >
-                <Icon name="grip" />
+                <Icon name="grip" size={10} />
+              </button>
+              <button
+                type="button"
+                className="projectItemMain"
+                onClick={() => onSelectProject(p.id)}
+                onDoubleClick={() => onOpenProjectSettings(p.id)}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setContextMenu({ projectId: p.id, x: e.clientX, y: e.clientY });
+                  setSymbolPicker(null);
+                  setColorPicker(null);
+                }}
+                title={
+                  [
+                    p.title,
+                    p.sshTarget ? `SSH: ${p.sshTarget}` : null,
+                    p.sshRemotePath ? `Remote: ${p.sshRemotePath}` : null,
+                    workingCount ? `Agents working: ${workingCount}` : null,
+                    !p.sshTarget && p.basePath ? `Base: ${p.basePath}` : null,
+                    envName ? `Env: ${envName}` : null,
+                  ]
+                    .filter(Boolean)
+                    .join("\n")
+                }
+              >
+                {p.symbol && <span className="sessionSymbol">{p.symbol}</span>}
+                {renamingId === p.id ? (
+                  <input
+                    className="sessionNameInput"
+                    value={renameValue}
+                    onChange={(e) => setRenameValue(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleRenameSubmit();
+                      if (e.key === "Escape") handleRenameCancel();
+                      e.stopPropagation();
+                    }}
+                    onBlur={handleRenameSubmit}
+                    onClick={(e) => e.stopPropagation()}
+                    autoFocus
+                  />
+                ) : (
+                  <>
+                    <span className="projectTitle">{p.title}</span>
+                    {p.sshTarget && <span className="projectSshBadge" title={`SSH: ${p.sshTarget}`}>SSH</span>}
+                  </>
+                )}
+                <span className="projectBadges">
+                  {workingCount > 0 && (
+                    <span
+                      className="projectAgentsBadge"
+                      title={`${workingCount} agent${workingCount === 1 ? "" : "s"} working`}
+                    >
+                      <span className="projectAgentsDot" aria-hidden="true" />
+                      {workingCount}
+                    </span>
+                  )}
+                  <span className="projectCount">{count}</span>
+                </span>
               </button>
             </div>
           );

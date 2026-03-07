@@ -35,11 +35,13 @@ type Session = {
   name: string;
   command: string;
   cwd: string | null;
+  pinned?: boolean;
   launchCommand: string | null;
   restoreCommand?: string | null;
   persistent?: boolean;
   effectId?: string | null;
   processTag?: string | null;
+  runningCommand?: string | null;
   recordingActive?: boolean;
   exited?: boolean;
   closing?: boolean;
@@ -68,10 +70,14 @@ type SessionItemProps = {
   splitTag?: string | null;
   isAgentWorking: boolean;
   isRenaming: boolean;
+  isPinned: boolean;
+  isDragging: boolean;
+  dropPosition: "before" | "after" | null;
   renameValue: string;
   onSelectSession: (sessionId: string) => void;
   onCloseSession: (sessionId: string) => void;
   onReconnectSession: (sessionId: string) => void;
+  onDragHandlePointerDown: (e: React.PointerEvent<HTMLButtonElement>, sessionId: string) => void;
   onContextMenu: (sessionId: string, x: number, y: number) => void;
   onRenameValueChange: (value: string) => void;
   onRenameSubmit: () => void;
@@ -85,10 +91,14 @@ const SessionItem = React.memo(function SessionItem({
   splitTag,
   isAgentWorking,
   isRenaming,
+  isPinned,
+  isDragging,
+  dropPosition,
   renameValue,
   onSelectSession,
   onCloseSession,
   onReconnectSession,
+  onDragHandlePointerDown,
   onContextMenu,
   onRenameValueChange,
   onRenameSubmit,
@@ -108,6 +118,7 @@ const SessionItem = React.memo(function SessionItem({
     detectProcessEffect({ command: launchOrRestore, name: s.name });
   const chipLabel = effect?.label ?? s.processTag ?? null;
   const hasAgentIcon = Boolean(effect?.iconSrc);
+  const hasRunningCommand = Boolean((s.runningCommand ?? "").trim());
   const isWorking = Boolean(effect && isAgentWorking && !isExited && !isClosing);
   const isRecording = Boolean(s.recordingActive && !isExited && !isClosing);
   const isSsh = isSshCommand(launchOrRestore);
@@ -136,7 +147,12 @@ const SessionItem = React.memo(function SessionItem({
         isPersistent ? "sessionItemPersistent" : ""
       } ${isDefaultType ? "sessionItemDefault" : ""} ${
         s.color ? "sessionItemColored" : ""
+      } ${isPinned ? "sessionItemPinned" : ""} ${
+        isDragging ? "sessionItemDragging" : ""
+      } ${dropPosition === "before" ? "sessionItemDropBefore" : ""} ${
+        dropPosition === "after" ? "sessionItemDropAfter" : ""
       }`}
+      data-session-id={s.id}
       style={s.color ? { "--tab-color": s.color } as React.CSSProperties : undefined}
       onClick={() => onSelectSession(s.id)}
       onContextMenu={(e) => {
@@ -144,6 +160,16 @@ const SessionItem = React.memo(function SessionItem({
         onContextMenu(s.id, e.clientX, e.clientY);
       }}
     >
+      <button
+        type="button"
+        className="sessionDragHandle"
+        onPointerDown={(e) => onDragHandlePointerDown(e, s.id)}
+        onClick={(event) => event.stopPropagation()}
+        title="Drag to reorder"
+        aria-label="Drag to reorder"
+      >
+        <Icon name="grip" size={10} />
+      </button>
       <div className="sessionMeta">
         <div className="sessionName">
           {splitTag ? (
@@ -250,12 +276,16 @@ type SessionsSectionProps = {
   onRemoveSplitView: (viewId: string) => void;
   onSelectSession: (sessionId: string) => void;
   onCloseSession: (sessionId: string) => void;
+  onToggleSessionPin: (sessionId: string) => void;
+  onReorderSession: (sourceSessionId: string, targetSessionId: string, position: "before" | "after") => void;
   onReconnectSession: (sessionId: string) => void;
   onRenameSession: (sessionId: string, newName: string) => void;
   onSetSessionSymbol: (sessionId: string, symbol: string | null) => void;
   onSetSessionColor: (sessionId: string, color: string | null) => void;
   onQuickStart: (effect: ProcessEffect) => void;
   onOpenNewSession: () => void;
+  onAutoRenameSessions: () => void;
+  autoRenameRunning: boolean;
   onOpenAgentShortcuts: () => void;
   onOpenPersistentSessions: () => void;
   onOpenSshManager: () => void;
@@ -275,12 +305,16 @@ export const SessionsSection = React.memo(function SessionsSection({
   onRemoveSplitView,
   onSelectSession,
   onCloseSession,
+  onToggleSessionPin,
+  onReorderSession,
   onReconnectSession,
   onRenameSession,
   onSetSessionSymbol,
   onSetSessionColor,
   onQuickStart,
   onOpenNewSession,
+  onAutoRenameSessions,
+  autoRenameRunning,
   onOpenAgentShortcuts,
   onOpenPersistentSessions,
   onOpenSshManager,
@@ -289,6 +323,15 @@ export const SessionsSection = React.memo(function SessionsSection({
   const settingsMenuRef = React.useRef<HTMLDivElement | null>(null);
   const [createOpen, setCreateOpen] = React.useState(false);
   const [settingsOpen, setSettingsOpen] = React.useState(false);
+  const [draggingSessionId, setDraggingSessionId] = React.useState<string | null>(null);
+  const [dropTarget, setDropTarget] = React.useState<{
+    sessionId: string;
+    position: "before" | "after";
+  } | null>(null);
+
+  const sessionListRef = React.useRef<HTMLDivElement | null>(null);
+  const previousItemRectsRef = React.useRef<Map<string, DOMRect>>(new Map());
+  const activeAnimationsRef = React.useRef<Map<string, Animation>>(new Map());
 
   // Context menu state
   const contextMenuRef = React.useRef<HTMLDivElement | null>(null);
@@ -407,6 +450,196 @@ export const SessionsSection = React.memo(function SessionsSection({
     onCloseSession(contextMenu.sessionId);
     setContextMenu(null);
   }, [contextMenu, onCloseSession]);
+
+  const handleTogglePinFromContextMenu = React.useCallback(() => {
+    if (!contextMenu) return;
+    onToggleSessionPin(contextMenu.sessionId);
+    setContextMenu(null);
+  }, [contextMenu, onToggleSessionPin]);
+
+  const handleDragEnd = React.useCallback(() => {
+    setDraggingSessionId(null);
+    setDropTarget(null);
+  }, []);
+
+  React.useLayoutEffect(() => {
+    const list = sessionListRef.current;
+    if (!list) return;
+
+    const items = Array.from(list.querySelectorAll<HTMLElement>(".sessionItem"));
+    const nextRects = new Map<string, DOMRect>();
+    for (const item of items) {
+      const id = item.dataset.sessionId;
+      if (!id) continue;
+      nextRects.set(id, item.getBoundingClientRect());
+    }
+
+    const prevRects = previousItemRectsRef.current;
+    if (prevRects.size > 0) {
+      for (const item of items) {
+        const id = item.dataset.sessionId;
+        if (!id) continue;
+        const prev = prevRects.get(id);
+        const next = nextRects.get(id);
+        if (!prev || !next) continue;
+        if (id === draggingSessionId) continue;
+
+        const dx = prev.left - next.left;
+        const dy = prev.top - next.top;
+        if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) continue;
+
+        activeAnimationsRef.current.get(id)?.cancel();
+        const animation = item.animate(
+          [{ transform: `translate(${dx}px, ${dy}px)` }, { transform: "translate(0, 0)" }],
+          { duration: 160, easing: "cubic-bezier(0.2, 0, 0, 1)" },
+        );
+        activeAnimationsRef.current.set(id, animation);
+        void animation.finished
+          .then(() => {
+            if (activeAnimationsRef.current.get(id) === animation) {
+              activeAnimationsRef.current.delete(id);
+            }
+          })
+          .catch(() => {});
+      }
+    }
+
+    previousItemRectsRef.current = nextRects;
+  }, [sessions, draggingSessionId]);
+
+  const handleDragHandlePointerDown = React.useCallback(
+    (e: React.PointerEvent<HTMLButtonElement>, sessionId: string) => {
+      if (sessions.length <= 1) return;
+      if (e.button !== 0) return;
+
+      const pointerId = e.pointerId;
+      const handle = e.currentTarget;
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const deadZonePx = 6;
+
+      let dragging = false;
+      let lastTargetId: string | null = null;
+      let lastPosition: "before" | "after" | null = null;
+      let latestPointer: { x: number; y: number } | null = null;
+      let raf: number | null = null;
+
+      const prevCursor = document.body.style.cursor;
+      const prevUserSelect = document.body.style.userSelect;
+
+      const getDropPosition = (clientY: number, rect: DOMRect, targetId: string) => {
+        const mid = rect.top + rect.height / 2;
+        const delta = clientY - mid;
+        if (delta > deadZonePx) return "after";
+        if (delta < -deadZonePx) return "before";
+        if (lastTargetId === targetId && lastPosition) return lastPosition;
+        return delta >= 0 ? "after" : "before";
+      };
+
+      const stop = () => {
+        if (raf !== null) {
+          window.cancelAnimationFrame(raf);
+          raf = null;
+        }
+        document.removeEventListener("pointermove", onMove);
+        document.removeEventListener("pointerup", onUp);
+        document.removeEventListener("pointercancel", onUp);
+        try {
+          handle.releasePointerCapture(pointerId);
+        } catch {
+          // ignore
+        }
+        document.body.style.cursor = prevCursor;
+        document.body.style.userSelect = prevUserSelect;
+        handleDragEnd();
+      };
+
+      const processPointer = () => {
+        raf = null;
+        if (!latestPointer) return;
+        const { x, y } = latestPointer;
+
+        if (!dragging) {
+          const dx = x - startX;
+          const dy = y - startY;
+          const distance = Math.hypot(dx, dy);
+          if (distance < 6) return;
+          dragging = true;
+          setDraggingSessionId(sessionId);
+          setDropTarget(null);
+          document.body.style.cursor = "grabbing";
+          document.body.style.userSelect = "none";
+        }
+
+        const list = sessionListRef.current;
+        if (!list) return;
+
+        const listRect = list.getBoundingClientRect();
+        const edgeZone = 22;
+        if (y < listRect.top + edgeZone) {
+          const ratio = (listRect.top + edgeZone - y) / edgeZone;
+          list.scrollBy({ top: -Math.ceil(10 * ratio), behavior: "auto" });
+        } else if (y > listRect.bottom - edgeZone) {
+          const ratio = (y - (listRect.bottom - edgeZone)) / edgeZone;
+          list.scrollBy({ top: Math.ceil(10 * ratio), behavior: "auto" });
+        }
+
+        const element = document.elementFromPoint(x, y) as HTMLElement | null;
+        const item = element?.closest<HTMLElement>(".sessionItem") ?? null;
+        if (!item || !list.contains(item)) {
+          setDropTarget(null);
+          return;
+        }
+
+        const targetId = item.dataset.sessionId ?? null;
+        if (!targetId || targetId === sessionId) {
+          setDropTarget(null);
+          return;
+        }
+
+        const rect = item.getBoundingClientRect();
+        const position = getDropPosition(y, rect, targetId);
+        setDropTarget((prev) => {
+          if (prev?.sessionId === targetId && prev.position === position) return prev;
+          return { sessionId: targetId, position };
+        });
+
+        if (lastTargetId === targetId && lastPosition === position) return;
+        lastTargetId = targetId;
+        lastPosition = position;
+        onReorderSession(sessionId, targetId, position);
+      };
+
+      const scheduleProcess = () => {
+        if (raf !== null) return;
+        raf = window.requestAnimationFrame(processPointer);
+      };
+
+      const onMove = (ev: PointerEvent) => {
+        if (ev.pointerId !== pointerId) return;
+        latestPointer = { x: ev.clientX, y: ev.clientY };
+        scheduleProcess();
+      };
+
+      const onUp = (ev: PointerEvent) => {
+        if (ev.pointerId !== pointerId) return;
+        stop();
+      };
+
+      e.preventDefault();
+      e.stopPropagation();
+
+      try {
+        handle.setPointerCapture(pointerId);
+      } catch {
+        // ignore
+      }
+      document.addEventListener("pointermove", onMove);
+      document.addEventListener("pointerup", onUp);
+      document.addEventListener("pointercancel", onUp);
+    },
+    [sessions.length, onReorderSession, handleDragEnd],
+  );
 
   // Dismiss handlers for menus, context menu, symbol picker, color picker
   React.useEffect(() => {
@@ -582,6 +815,28 @@ export const SessionsSection = React.memo(function SessionsSection({
               </div>
             )}
           </div>
+
+          <button
+            type="button"
+            className={`btnSmall btnIcon ${autoRenameRunning ? "btnIconActive" : ""}`}
+            onClick={onAutoRenameSessions}
+            title={
+              autoRenameRunning
+                ? "Renaming sessions with the configured agent"
+                : "Rename all sessions with the configured agent"
+            }
+            aria-label={
+              autoRenameRunning
+                ? "Renaming sessions with the configured agent"
+                : "Rename all sessions with the configured agent"
+            }
+            disabled={autoRenameRunning || sessions.length === 0}
+          >
+            <Icon
+              name={autoRenameRunning ? "refresh" : "wand"}
+              className={autoRenameRunning ? "sessionAutoRenameIconSpin" : undefined}
+            />
+          </button>
         </div>
       </div>
 
@@ -608,7 +863,7 @@ export const SessionsSection = React.memo(function SessionsSection({
         </div>
       )}
 
-      <div className="sessionList">
+      <div className="sessionList" ref={sessionListRef}>
         {sessions.length === 0 ? (
           <div className="empty">No sessions in this project.</div>
         ) : (
@@ -620,10 +875,14 @@ export const SessionsSection = React.memo(function SessionsSection({
               isSecondary={false}
               isAgentWorking={agentWorkingIds.has(s.id)}
               isRenaming={renamingId === s.id}
+              isPinned={Boolean(s.pinned)}
+              isDragging={draggingSessionId === s.id}
+              dropPosition={draggingSessionId && draggingSessionId !== s.id && dropTarget?.sessionId === s.id ? dropTarget.position : null}
               renameValue={renamingId === s.id ? renameValue : ""}
               onSelectSession={handleSelectStandaloneSession}
               onCloseSession={onCloseSession}
               onReconnectSession={onReconnectSession}
+              onDragHandlePointerDown={handleDragHandlePointerDown}
               onContextMenu={handleContextMenu}
               onRenameValueChange={setRenameValue}
               onRenameSubmit={handleRenameSubmit}
@@ -814,6 +1073,14 @@ export const SessionsSection = React.memo(function SessionsSection({
             onClick={handleRenameStart}
           >
             Rename
+          </button>
+          <button
+            type="button"
+            className="sessionContextMenuItem"
+            role="menuitem"
+            onClick={handleTogglePinFromContextMenu}
+          >
+            {contextSession.pinned ? "Unpin" : "Pin"}
           </button>
           <button
             type="button"
