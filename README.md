@@ -43,7 +43,7 @@
 
 ## Demo
 
-[![Agents UI demo](docs/agents-ui-demo-video.gif)](docs/agents-ui-demo-video.mp4)
+![Agents UI demo](docs/agents-ui-demo.png)
 
 ## Highlights
 
