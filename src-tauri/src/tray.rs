@@ -249,7 +249,7 @@ impl StatusTrayState {
 
         if let Some(working_item) = &self.working_item {
             working_item
-                .set_text(format!("Agents working: {working_count}"))
+                .set_text(format!("Active terminals: {working_count}"))
                 .map_err(|e| e.to_string())?;
         }
 
@@ -273,7 +273,7 @@ impl StatusTrayState {
             format!("Agents UI — {sessions_open} sessions open")
         } else {
             format!(
-                "Agents UI — {working_count} working • {sessions_open} sessions open"
+                "Agents UI — {working_count} active • {sessions_open} sessions open"
             )
         };
         let _ = tray.set_tooltip(Some(tooltip));
@@ -329,7 +329,7 @@ pub fn build_status_tray(app: &AppHandle) -> Result<StatusTrayState, String> {
         .enabled(false)
         .build(app)
         .map_err(|e| e.to_string())?;
-    let working_item = MenuItemBuilder::with_id("tray-working", "Agents working: 0")
+    let working_item = MenuItemBuilder::with_id("tray-working", "Active terminals: 0")
         .enabled(false)
         .build(app)
         .map_err(|e| e.to_string())?;

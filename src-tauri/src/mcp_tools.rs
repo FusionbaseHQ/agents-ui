@@ -153,6 +153,14 @@ pub fn tool_list() -> Vec<Value> {
             },
             "required": ["sessionId"]
         })),
+        tool_def("rename_session", "Rename a terminal session. Use this after inspecting the session output so the name reflects the work currently happening in that terminal.", json!({
+            "type": "object",
+            "properties": {
+                "sessionId": { "type": "string", "description": "Session ID" },
+                "name": { "type": "string", "description": "New semantic session name" }
+            },
+            "required": ["sessionId", "name"]
+        })),
         tool_def("write_to_session", "Write raw data (keystrokes/text) directly to a session's terminal PTY. IMPORTANT: To execute a command, you MUST append \\r at the end (e.g. \"ls\\r\"). Without \\r the text is typed but not submitted. Prefer send_command for running commands.", json!({
             "type": "object",
             "properties": {
@@ -438,6 +446,7 @@ fn tool_to_method(name: &str) -> Option<&'static str> {
         "get_session" => Some("sessions.get"),
         "create_session" => Some("sessions.create"),
         "close_session" => Some("sessions.close"),
+        "rename_session" => Some("sessions.rename"),
         "write_to_session" => Some("sessions.write"),
         "send_command" => None, // handled as special case in call_tool
         "activate_session" => Some("sessions.activate"),
@@ -488,6 +497,7 @@ fn map_params(name: &str, args: &Value) -> Value {
             p
         }
         "close_session" => json!({ "id": args.get("sessionId") }),
+        "rename_session" => json!({ "id": args.get("sessionId"), "name": args.get("name") }),
         "write_to_session" => json!({ "id": args.get("sessionId"), "data": args.get("data") }),
         "send_command" => json!({}), // handled as special case in call_tool
         "activate_session" => json!({ "id": args.get("sessionId") }),

@@ -39,7 +39,7 @@ type TerminalPaneProps = {
   onSplitRatioChange: (ratio: number) => void;
   onCloseSplitPane: (closedSessionId: string) => void;
   onCwdChange: (id: string, cwd: string) => void;
-  onCommandChange: (id: string, commandLine: string, source?: "osc" | "input") => void;
+  onCommandChange: (id: string, commandLine: string, source?: "osc" | "osc133" | "input") => void;
   onSessionResize: (id: string, size: { cols: number; rows: number }) => void;
   onSessionTransportError: (id: string, operation: "write" | "resize", errorMessage: string) => void;
   registry: React.MutableRefObject<TerminalRegistry>;

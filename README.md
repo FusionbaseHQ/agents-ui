@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="src-tauri/icons/icon.png" alt="Agents UI Logo" width="128" height="128">
+  <img src="src-tauri/icons/agents-ui-logo.svg" alt="Agents UI Logo" width="128" height="128">
 </p>
 
 <h1 align="center">Agents UI</h1>
