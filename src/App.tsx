@@ -168,7 +168,7 @@ const STORAGE_SSH_HISTORY_KEY = "agents-ui-ssh-history-v1";
 const STORAGE_SPLIT_VIEWS_KEY = "agents-ui-split-views-v1";
 const STORAGE_AGENT_PANEL_WIDTH_KEY = "agents-ui-agent-panel-width-v1";
 const STORAGE_UI_THEME_KEY = "agents-ui-ui-theme-v1";
-const DEFAULT_UI_THEME: UiTheme = "dawn";
+const DEFAULT_UI_THEME: UiTheme = "midnight";
 const MAX_SSH_HISTORY = 10;
 
 const MAX_PENDING_SESSIONS = 32;
