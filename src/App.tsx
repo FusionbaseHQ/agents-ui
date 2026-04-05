@@ -1,6 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { homeDir } from "@tauri-apps/api/path";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { initBridge, registerHandlers, destroyBridge, notifyStateChange } from "./apiBridge";
 import React, { useEffect, useMemo, useRef, useState, useCallback, useLayoutEffect } from "react";
 import { type PendingDataBuffer, type TerminalRegistry } from "./SessionTerminal";
@@ -1377,7 +1378,7 @@ async function createSession(input: {
   pinned?: boolean;
   sidebarOrder?: number | null;
 }): Promise<Session> {
-  const persistent = Boolean(input.persistent);
+  const persistent = input.persistent ?? !input.launchCommand;
   const persistId = input.persistId ?? makeId();
   const createdAt = input.createdAt ?? Date.now();
 
@@ -1386,7 +1387,8 @@ async function createSession(input: {
   const launchCommand = ensureSshKeepAliveOptions(launchCommandRaw);
   const trimmedRestoreCommand = (input.restoreCommand ?? "").trim();
   const restoreCommandRaw = trimmedRestoreCommand ? trimmedRestoreCommand : null;
-  const restoreCommand = ensureSshKeepAliveOptions(restoreCommandRaw);
+  const restoreCommand = ensureSshKeepAliveOptions(restoreCommandRaw)
+    ?? (persistent ? null : launchCommand);
   const explicitSshTarget = input.sshTarget?.trim() || null;
   const commandForDetection = launchCommand ?? restoreCommand;
   const isSshSession = Boolean(explicitSshTarget) || isSshCommandLine(commandForDetection);
@@ -2073,6 +2075,30 @@ export default function App() {
   const lastResizeAtRef = useRef<Map<string, number>>(new Map());
   const attachingPersistentIdsRef = useRef<Set<string>>(new Set());
 
+  // Wrapper that keeps refs in sync immediately inside the setState updater,
+  // eliminating the stale-ref window between state update and effect execution.
+  const setSessionsSync = useCallback((updater: React.SetStateAction<Session[]>) => {
+    setSessions((prev) => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      sessionsRef.current = next;
+      sessionIdsRef.current = next.map(s => s.id);
+      sessionByIdRef.current = new Map(next.map(s => [s.id, s]));
+      return next;
+    });
+  }, []);
+
+  const flushPendingSave = useCallback(() => {
+    if (saveTimerRef.current !== null) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    const state = pendingSaveRef.current;
+    if (state) {
+      void invoke("save_persisted_state", { state }).catch(() => {});
+      pendingSaveRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     invoke<AppInfo>("get_app_info")
@@ -2149,7 +2175,7 @@ export default function App() {
       : COMMAND_ACTIVITY_IDLE_MS;
     const timeout = window.setTimeout(() => {
       commandActivityTimersRef.current.delete(id);
-      setSessions((prev) => {
+      setSessionsSync((prev) => {
         const index = prev.findIndex((session) => session.id === id);
         if (index < 0) return prev;
         const current = prev[index];
@@ -2430,7 +2456,7 @@ export default function App() {
       return;
     }
 
-    setSessions((prev) => {
+    setSessionsSync((prev) => {
       const index = prev.findIndex((s) => s.id === id);
       if (index < 0) return prev;
       const session = prev[index];
@@ -2506,7 +2532,7 @@ export default function App() {
           return { ...prev, fileExplorerRootDir: root, codeEditorRootDir: root };
         });
         if (active) {
-          setSessions((prev) =>
+          setSessionsSync((prev) =>
             prev.map((s) =>
               s.id === active.id
                 ? { ...s, sshTarget: s.sshTarget ?? target, sshRootDir: root }
@@ -2808,7 +2834,7 @@ export default function App() {
       const previousAttempt = manual ? 0 : Math.max(0, base.reconnectAttempt ?? 0);
       const nextAttempt = previousAttempt + 1;
       if (nextAttempt > SSH_RECONNECT_MAX_ATTEMPTS) {
-        setSessions((prev) =>
+        setSessionsSync((prev) =>
           prev.map((s) =>
             s.id === id
               ? {
@@ -2830,7 +2856,7 @@ export default function App() {
       const delayMs = immediate ? 0 : reconnectDelayMsForAttempt(nextAttempt);
       const nextReconnectAt = Date.now() + delayMs;
 
-      setSessions((prev) =>
+      setSessionsSync((prev) =>
         prev.map((s) =>
           s.id === id
             ? {
@@ -2919,7 +2945,7 @@ export default function App() {
           clearSessionRuntimeBuffers(id);
           commandLifecycleSessionsRef.current.delete(id);
 
-          setSessions((prev) => {
+          setSessionsSync((prev) => {
             const index = prev.findIndex((s) => s.id === id);
             if (index < 0) return prev;
             const previous = prev[index];
@@ -2962,7 +2988,7 @@ export default function App() {
           const latest = sessionByIdRef.current.get(id) ?? null;
           if (!latest || latest.closing) return;
           if ((latest.reconnectAttempt ?? nextAttempt) >= SSH_RECONNECT_MAX_ATTEMPTS) {
-            setSessions((prev) =>
+            setSessionsSync((prev) =>
               prev.map((s) =>
                 s.id === id
                   ? {
@@ -3020,18 +3046,20 @@ export default function App() {
           const backendIds = new Set(backend.map((s) => s.id));
           const missingSsh: string[] = [];
           const missingOther: string[] = [];
+          const missingPersistent: string[] = [];
 
           for (const session of sessionsRef.current) {
             if (session.exited || session.closing) continue;
             if ((session.connectionState ?? "connected") === "reconnecting") continue;
             if (backendIds.has(session.id)) continue;
-            if (isSshSession(session)) missingSsh.push(session.id);
+            if (session.persistent) missingPersistent.push(session.id);
+            else if (isSshSession(session)) missingSsh.push(session.id);
             else missingOther.push(session.id);
           }
 
           if (missingOther.length > 0) {
             const missingSet = new Set(missingOther);
-            setSessions((prev) =>
+            setSessionsSync((prev) =>
               prev.map((s) =>
                 missingSet.has(s.id)
                   ? {
@@ -3047,6 +3075,32 @@ export default function App() {
               ),
             );
             for (const id of missingOther) {
+              clearSessionRuntimeBuffers(id);
+            }
+          }
+
+          // Re-attach persistent sessions that lost their backend PTY
+          for (const id of missingPersistent) {
+            const s = sessionByIdRef.current.get(id);
+            if (!s) continue;
+            try {
+              const created = await createSession({
+                projectId: s.projectId,
+                name: s.name,
+                persistent: true,
+                persistId: s.persistId,
+                cwd: s.cwd,
+                envVars: envVarsForProjectId(s.projectId, projectsRef.current, environmentsRef.current),
+                createdAt: s.createdAt,
+                pinned: s.pinned,
+                sidebarOrder: s.sidebarOrder,
+              });
+              setSessionsSync(prev => prev.map(x => x.id === id ? { ...created, connectionState: "connected" as const } : x));
+              setActiveId(prev => prev === id ? created.id : prev);
+            } catch {
+              setSessionsSync(prev => prev.map(x =>
+                x.id === id ? { ...x, exited: true, connectionState: "disconnected" as const, disconnectReason: `Session lost after sleep (${reason}).` } : x
+              ));
               clearSessionRuntimeBuffers(id);
             }
           }
@@ -3112,8 +3166,11 @@ export default function App() {
     // Tauri emits "system-resumed" when macOS wakes from sleep — more reliable than timestamp gaps
     let unlistenResumed: (() => void) | null = null;
     listen("system-resumed", () => {
-      console.warn("[agents-ui] System resumed from sleep (Tauri event). Recovering canvases.");
+      console.warn("[agents-ui] System resumed from sleep (Tauri event). Recovering canvases and checking sessions.");
       window.setTimeout(recoverAllCanvases, 500);
+      window.setTimeout(() => {
+        runSessionHealthCheckRef.current("sleep-resume", true);
+      }, 2000);
     }).then((fn) => { unlistenResumed = fn; });
 
     return () => {
@@ -3125,7 +3182,7 @@ export default function App() {
   }, [hydrated]);
 
   const addSessionWithProjectSafeActivation = useCallback((session: Session) => {
-    setSessions((prev) => {
+    setSessionsSync((prev) => {
       if (prev.some((s) => s.id === session.id)) {
         if (import.meta.env.DEV) {
           console.warn(`[addSession] Duplicate session id=${session.id} name="${session.name}" — skipped`);
@@ -3148,7 +3205,8 @@ export default function App() {
       );
     }
     lastActiveByProject.current.set(session.projectId, session.id);
-  }, [scheduleRunningCommandActivityTimeout]);
+    flushPendingSave();
+  }, [scheduleRunningCommandActivityTimeout, flushPendingSave]);
 
   const handleOpenTerminalAtPath = useCallback(
     async (path: string, provider: "local" | "ssh", sshTarget: string | null) => {
@@ -3238,6 +3296,7 @@ export default function App() {
 
   useEffect(() => {
     // Dedup guard: if the sessions array has duplicates by id, fix it.
+    // Ref sync is handled by setSessionsSync — this only handles the rare dedup case.
     const seenIds = new Set<string>();
     let hasDupes = false;
     for (const s of sessions) {
@@ -3255,14 +3314,9 @@ export default function App() {
         seen.add(s.id);
         deduped.push(s);
       }
-      setSessions(deduped);
-      return; // effect will re-run with deduped sessions
+      setSessionsSync(deduped);
     }
-
-    sessionIdsRef.current = sessions.map((s) => s.id);
-    sessionsRef.current = sessions;
-    sessionByIdRef.current = new Map(sessions.map((session) => [session.id, session]));
-  }, [sessions]);
+  }, [sessions, setSessionsSync]);
 
   useEffect(() => {
     const activeRunningCommands = new Set<string>();
@@ -3384,7 +3438,7 @@ export default function App() {
         effectId: s.effectId ?? null,
         bootstrapCommand,
       });
-      setSessions((prev) =>
+      setSessionsSync((prev) =>
         prev.map((x) =>
           x.id === sessionId
             ? { ...x, recordingActive: true, lastRecordingId: safeId }
@@ -3402,7 +3456,7 @@ export default function App() {
       try {
         await invoke("stop_session_recording", { id: s.id });
       } finally {
-        setSessions((prev) =>
+        setSessionsSync((prev) =>
           prev.map((x) => (x.id === sessionId ? { ...x, recordingActive: false } : x)),
         );
       }
@@ -3449,8 +3503,9 @@ export default function App() {
       "sessions.rename": (p) => {
         const id = p.id as string;
         const name = p.name as string;
-        setSessions((prev) => prev.map((s) => s.id === id ? { ...s, name } : s));
+        setSessionsSync((prev) => prev.map((s) => s.id === id ? { ...s, name } : s));
         invoke("rename_session", { id, name }).catch(() => {});
+        flushPendingSave();
         const s = sessionsRef.current.find((s) => s.id === id);
         notifyStateChange("sessions.renamed", { sessionId: id, name });
         return s ? { ...s, name } : null;
@@ -3458,14 +3513,14 @@ export default function App() {
       "sessions.set_symbol": (p) => {
         const id = p.id as string;
         const symbol = (p.symbol as string) || null;
-        setSessions((prev) => prev.map((s) => s.id === id ? { ...s, symbol } : s));
+        setSessionsSync((prev) => prev.map((s) => s.id === id ? { ...s, symbol } : s));
         notifyStateChange("sessions.updated", { sessionId: id, symbol });
         return null;
       },
       "sessions.set_color": (p) => {
         const id = p.id as string;
         const color = (p.color as string) || null;
-        setSessions((prev) => prev.map((s) => s.id === id ? { ...s, color } : s));
+        setSessionsSync((prev) => prev.map((s) => s.id === id ? { ...s, color } : s));
         notifyStateChange("sessions.updated", { sessionId: id, color });
         return null;
       },
@@ -3597,7 +3652,7 @@ export default function App() {
         for (const sid of idsToClose) {
           await closeSession(sid).catch(() => {});
         }
-        setSessions((prev) => prev.filter((s) => s.projectId !== id));
+        setSessionsSync((prev) => prev.filter((s) => s.projectId !== id));
         setProjects((prev) => {
           const next = prev.filter((pr) => pr.id !== id);
           if (next.length === 0) {
@@ -4125,7 +4180,7 @@ export default function App() {
   useEffect(() => {
     if (!hydrated) return;
     const validProjectIds = new Set(projects.map((p) => p.id));
-    setSessions((prev) => {
+    setSessionsSync((prev) => {
       // Step 1: Remove sessions with invalid projectId.
       let next = prev.filter((s) => validProjectIds.has(s.projectId));
 
@@ -5579,7 +5634,7 @@ export default function App() {
         effectId: s.effectId ?? null,
         bootstrapCommand,
       });
-      setSessions((prev) =>
+      setSessionsSync((prev) =>
         prev.map((x) =>
           x.id === sessionId
             ? { ...x, recordingActive: true, lastRecordingId: safeId }
@@ -5602,7 +5657,7 @@ export default function App() {
     } catch (err) {
       reportError("Failed to stop recording", err);
     } finally {
-      setSessions((prev) =>
+      setSessionsSync((prev) =>
         prev.map((x) => (x.id === sessionId ? { ...x, recordingActive: false } : x)),
       );
     }
@@ -5674,7 +5729,7 @@ export default function App() {
     try {
       await invoke("delete_recording", { recordingId });
       setRecordings((prev) => prev.filter((r) => r.recordingId !== recordingId));
-      setSessions((prev) =>
+      setSessionsSync((prev) =>
         prev.map((s) =>
           s.lastRecordingId === recordingId ? { ...s, lastRecordingId: null } : s,
         ),
@@ -6110,7 +6165,7 @@ export default function App() {
         envVars: envVarsForProjectId(projectId, projects, environments),
       });
       const created = applyPendingExit(createdRaw);
-      setSessions((prev) => {
+      setSessionsSync((prev) => {
         if (prev.some((s) => s.id === created.id)) return prev;
         return [...prev, created];
       });
@@ -6191,7 +6246,7 @@ export default function App() {
 
   const updateSessionById = useCallback(
     (id: string, updater: (session: Session) => Session) => {
-      setSessions((prev) => {
+      setSessionsSync((prev) => {
         const index = prev.findIndex((s) => s.id === id);
         if (index < 0) return prev;
         const current = prev[index];
@@ -6610,7 +6665,7 @@ export default function App() {
           envVars: envVarsForProjectId(fallback.id, [fallback], environments),
         });
         const s = applyPendingExit(createdRaw);
-        setSessions([s]);
+        setSessionsSync([s]);
         setActiveId(s.id);
       } catch (err) {
         reportError("Failed to create session", err);
@@ -6711,7 +6766,7 @@ export default function App() {
           return;
         }
 
-        setSessions((prev) => {
+        setSessionsSync((prev) => {
           let found = false;
           const next = prev.map((s) => {
             if (s.id !== id) return s;
@@ -6818,6 +6873,33 @@ export default function App() {
         setPendingTrayAction(event.payload);
       });
       unlisteners.push(unlistenTray);
+
+      // Intercept window close to flush pending state before shutdown
+      const unlistenClose = await getCurrentWindow().onCloseRequested(async (event) => {
+        event.preventDefault();
+        // Flush pending save immediately
+        if (saveTimerRef.current !== null) {
+          window.clearTimeout(saveTimerRef.current);
+          saveTimerRef.current = null;
+        }
+        const state = pendingSaveRef.current;
+        if (state) {
+          await invoke("save_persisted_state", { state }).catch(() => {});
+          pendingSaveRef.current = null;
+        }
+        // Detach persistent sessions (keep alive), close others
+        const promises: Promise<void>[] = [];
+        for (const s of sessionsRef.current) {
+          if (s.persistent && !s.exited) {
+            promises.push(detachSession(s.id).catch(() => {}));
+          } else if (!s.exited) {
+            promises.push(closeSession(s.id).catch(() => {}));
+          }
+        }
+        await Promise.allSettled(promises);
+        await getCurrentWindow().destroy();
+      });
+      unlisteners.push(unlistenClose);
 
       // Check if we were cancelled during async setup
       if (cancelled) {
@@ -7204,7 +7286,7 @@ export default function App() {
         } catch (err) {
           if (!cancelled) reportError("Failed to create session", err);
           setSessionRestoreProgress(null);
-          setSessions([]);
+          setSessionsSync([]);
           setActiveId(null);
           setHydrated(true);
           return;
@@ -7215,7 +7297,7 @@ export default function App() {
         }
         syncLastActiveByProject([first]);
         setSessionRestoreProgress(null);
-        setSessions([first]);
+        setSessionsSync([first]);
         setActiveId(first.id);
         setHydrated(true);
         if (totalToRestore > 0) {
@@ -7232,7 +7314,7 @@ export default function App() {
       // Never pass a mutable working array reference into React state.
       // If we later mutate that same array during the restore loop, React can
       // miss updates because the state reference is unchanged.
-      setSessions([...restored]);
+      setSessionsSync([...restored]);
       setActiveId(initialActive ? initialActive.id : null);
       const attemptedCount = Math.max(1, firstRestoreIndex + 1);
       const remainingAfterInitial = Math.max(0, totalToRestore - attemptedCount);
@@ -7262,7 +7344,7 @@ export default function App() {
         if (created) {
           restored = [...restored, created].sort((a, b) => a.createdAt - b.createdAt);
           syncLastActiveByProject(restored);
-          setSessions((prev) => {
+          setSessionsSync((prev) => {
             if (prev.some((s) => s.id === created.id)) return prev; // dedup guard
             return [...prev, created].sort((a, b) => a.createdAt - b.createdAt);
           });
@@ -7318,6 +7400,11 @@ export default function App() {
 	        window.clearTimeout(saveTimerRef.current);
 	        saveTimerRef.current = null;
 	      }
+	      // Flush pending state instead of discarding it
+	      const pendingState = pendingSaveRef.current;
+	      if (pendingState) {
+	        void invoke("save_persisted_state", { state: pendingState }).catch(() => {});
+	      }
 	      pendingSaveRef.current = null;
 	      if (workspaceViewSaveTimerRef.current !== null) {
 	        window.clearTimeout(workspaceViewSaveTimerRef.current);
@@ -7354,10 +7441,7 @@ export default function App() {
     const name = data.name.trim() || undefined;
     try {
       const launchCommand = data.command.trim() || null;
-      if (data.persistent && launchCommand) {
-        setError("Persistent terminals require an empty command (run commands inside the terminal).");
-        return;
-      }
+      const usePersistent = data.persistent && !launchCommand;
       const desiredCwd =
         data.cwd.trim() || activeProject?.basePath || homeDirRef.current || "";
       const validatedCwd = await invoke<string | null>("validate_directory", {
@@ -7372,7 +7456,7 @@ export default function App() {
         projectId: activeProjectId,
         name,
         launchCommand,
-        persistent: data.persistent,
+        persistent: usePersistent,
         cwd: validatedCwd,
         envVars: envVarsForProjectId(activeProjectId, projects, environments),
       });
@@ -7484,7 +7568,7 @@ export default function App() {
         if (view && (view.aId === id || view.bId === id)) return null;
         return prev;
       });
-	    setSessions((prev) => {
+	    setSessionsSync((prev) => {
 	      const removed = prev.find((s) => s.id === id);
 	      const next = prev.filter((s) => s.id !== id);
 	      if (next.length === prev.length) return prev; // not found — no-op
@@ -7504,6 +7588,7 @@ export default function App() {
 
     // Step 1: Remove from UI state immediately. No "closing" intermediate state.
     removeSessionFromState(id);
+    flushPendingSave();
 
     // Step 2: Fire-and-forget backend + persistent session cleanup.
     void (async () => {
@@ -7590,7 +7675,7 @@ export default function App() {
       await Promise.all(toClose.map((id) => closeSession(id).catch(() => {})));
       await invoke("kill_persistent_session", { persistId });
 
-      setSessions((prev) => {
+      setSessionsSync((prev) => {
         const next = prev.filter((s) => s.persistId !== persistId);
         setActiveId((prevActive) => {
           if (!prevActive) return prevActive;
@@ -7931,7 +8016,7 @@ export default function App() {
   }, []);
 
   const handleToggleSessionPin = useCallback((sessionId: string) => {
-    setSessions((prev) => {
+    setSessionsSync((prev) => {
       const target = prev.find((session) => session.id === sessionId);
       if (!target) return prev;
 
@@ -7966,7 +8051,7 @@ export default function App() {
   const handleReorderSession = useCallback((sourceSessionId: string, targetSessionId: string, position: "before" | "after" = "before") => {
     if (!sourceSessionId || !targetSessionId || sourceSessionId === targetSessionId) return;
 
-    setSessions((prev) => {
+    setSessionsSync((prev) => {
       const source = prev.find((session) => session.id === sourceSessionId);
       const target = prev.find((session) => session.id === targetSessionId);
       if (!source || !target || source.projectId !== target.projectId) return prev;
@@ -8095,7 +8180,7 @@ export default function App() {
   const handleRenameSession = useCallback((sessionId: string, newName: string) => {
     const trimmed = newName.trim();
     if (!trimmed) return;
-    setSessions((prev) => {
+    setSessionsSync((prev) => {
       const idx = prev.findIndex((s) => s.id === sessionId);
       if (idx < 0 || prev[idx].name === trimmed) return prev;
       const next = prev.slice();
@@ -8106,7 +8191,7 @@ export default function App() {
   }, []);
 
   const handleSetSessionSymbol = useCallback((sessionId: string, symbol: string | null) => {
-    setSessions((prev) => {
+    setSessionsSync((prev) => {
       const idx = prev.findIndex((s) => s.id === sessionId);
       if (idx < 0) return prev;
       const current = prev[idx].symbol ?? null;
@@ -8118,7 +8203,7 @@ export default function App() {
   }, []);
 
   const handleSetSessionColor = useCallback((sessionId: string, color: string | null) => {
-    setSessions((prev) => {
+    setSessionsSync((prev) => {
       const idx = prev.findIndex((s) => s.id === sessionId);
       if (idx < 0) return prev;
       const current = prev[idx].color ?? null;
