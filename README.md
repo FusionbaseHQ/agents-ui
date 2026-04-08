@@ -21,7 +21,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-AGPL%203.0-blue.svg" alt="License">
   <img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-0.6.0-green.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.6.5-green.svg" alt="Version">
   <img src="https://img.shields.io/badge/tauri-v2-orange.svg" alt="Tauri">
 </p>
 
@@ -36,8 +36,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/FusionbaseHQ/agents-ui/releases/tag/v0.6.0">
-    <img src="https://img.shields.io/badge/Download-v0.6.0%20(macOS)-brightgreen" alt="Download v0.6.0 for macOS">
+  <a href="https://github.com/FusionbaseHQ/agents-ui/releases/tag/v0.6.5">
+    <img src="https://img.shields.io/badge/Download-v0.6.5%20(macOS)-brightgreen" alt="Download v0.6.5 for macOS">
   </a>
 </p>
 
@@ -80,6 +80,7 @@
 - Activity indicators show when agents are working
 - Automatic agent detection with branded icons
 - Built-in MCP server for programmatic control by AI agents (sessions, projects, files, themes)
+- [Python SDK](https://github.com/FusionbaseHQ/agents-ui-python-sdk) for steering the application programmatically
 
 ### Projects & Workspace
 - Project-based organization (sessions, base paths, and environment sets)
