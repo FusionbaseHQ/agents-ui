@@ -1911,6 +1911,9 @@ body::after {
 }
 
 .activeTitle {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   font-size: 11px;
   color: var(--muted);
   text-transform: uppercase;
@@ -1921,6 +1924,48 @@ body::after {
   text-overflow: ellipsis;
   min-width: 0;
   flex-shrink: 1;
+}
+
+.activeTitleText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.systemHealthStats {
+  display: inline-flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(var(--ink-rgb), 0.62);
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.systemHealthItem {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.systemHealthItem + .systemHealthItem {
+  padding-left: 2px;
+}
+
+.systemHealthLabel {
+  color: rgba(var(--ink-rgb), 0.48);
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.systemHealthValue {
+  color: rgba(var(--ink-rgb), 0.72);
+  font-variant-numeric: tabular-nums;
 }
 
 .errorBanner {

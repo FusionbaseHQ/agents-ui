@@ -20,6 +20,7 @@ mod secure;
 mod ssh;
 mod ssh_fs;
 mod startup;
+mod system_stats;
 mod tray;
 
 use app_info::get_app_info;
@@ -44,6 +45,7 @@ use ssh_fs::{
 };
 use fs_watcher::{start_fs_watcher, stop_fs_watcher, watch_directory, unwatch_directory, FsWatcherState};
 use startup::get_startup_flags;
+use system_stats::{ssh_system_health_stats, system_health_stats};
 use agent::{start_agent_prompt, stop_agent, get_agent_terminal_command, build_agent_task_command, write_agent_mcp_config, register_mcp_with_agents, read_agent_session_output, orchestrate_ensure_dir, orchestrate_read_file, AgentState};
 use api_bridge::{api_respond, api_notify_state_change, ApiPendingRequests, ApiEventBus};
 use mcp_tools::OutputBuffers;
@@ -168,6 +170,8 @@ fn main() {
             ssh_download_file,
             ssh_upload_file,
             ssh_download_to_temp,
+            system_health_stats,
+            ssh_system_health_stats,
             load_recording,
             list_recordings,
             delete_recording,

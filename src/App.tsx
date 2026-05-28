@@ -142,6 +142,21 @@ type TrayMenuEventPayload = {
   projectId?: string | null;
   persistId?: string | null;
 };
+type SystemHealthStats = {
+  cpuPercent?: number | null;
+  memoryUsedBytes?: number | null;
+  memoryFreeBytes?: number | null;
+  memoryTotalBytes?: number | null;
+  diskUsedBytes?: number | null;
+  diskFreeBytes?: number | null;
+  diskTotalBytes?: number | null;
+};
+type SystemHealthDisplayItem = {
+  key: string;
+  label: string;
+  value: string;
+  title: string;
+};
 type RecentSessionKey = { projectId: string; persistId: string };
 type TrayRecentSession = { label: string; projectId: string; persistId: string };
 type OutputQueueBySession = Map<string, string[]>;
@@ -185,6 +200,7 @@ const DISPLAY_WAKE_RENDER_GAP_MS = 8_000;
 const DISPLAY_WAKE_TIMER_INTERVAL_MS = 2_000;
 const DISPLAY_WAKE_RECOVERY_MIN_GAP_MS = 4_000;
 const DISPLAY_WAKE_RECOVERY_DELAYS_MS = [0, 250, 1_000, 3_000] as const;
+const SYSTEM_HEALTH_REFRESH_MS = 5_000;
 const COMMAND_ACTIVITY_IDLE_MS = 3_000;
 
 const DEFAULT_AGENT_SHORTCUT_IDS = ["codex", "claude", "gemini"];
@@ -709,6 +725,75 @@ function isSshSession(session: {
     Boolean((session.sshTarget ?? "").trim()) ||
     isSshCommandLine(session.launchCommand ?? session.restoreCommand ?? null)
   );
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function hasSystemHealthStats(stats: SystemHealthStats | null | undefined): stats is SystemHealthStats {
+  if (!stats) return false;
+  return (
+    isFiniteNumber(stats.cpuPercent) ||
+    isFiniteNumber(stats.memoryUsedBytes) ||
+    isFiniteNumber(stats.memoryFreeBytes) ||
+    isFiniteNumber(stats.diskUsedBytes) ||
+    isFiniteNumber(stats.diskFreeBytes)
+  );
+}
+
+function formatHealthBytes(bytes: number | null | undefined): string | null {
+  if (!isFiniteNumber(bytes) || bytes < 0) return null;
+  const units = ["B", "KB", "MB", "GB", "TB"] as const;
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const decimals = unitIndex === 0 || value >= 10 ? 0 : 1;
+  return `${value.toFixed(decimals)} ${units[unitIndex]}`;
+}
+
+function buildSystemHealthDisplay(stats: SystemHealthStats | null): SystemHealthDisplayItem[] {
+  if (!hasSystemHealthStats(stats)) return [];
+
+  const items: SystemHealthDisplayItem[] = [];
+  if (isFiniteNumber(stats.cpuPercent)) {
+    const rounded = Math.round(stats.cpuPercent);
+    items.push({
+      key: "cpu",
+      label: "CPU",
+      value: `${rounded}%`,
+      title: `CPU usage: ${stats.cpuPercent.toFixed(1)}%`,
+    });
+  }
+
+  const memoryUsed = formatHealthBytes(stats.memoryUsedBytes);
+  const memoryFree = formatHealthBytes(stats.memoryFreeBytes);
+  if (memoryUsed && memoryFree) {
+    const memoryTotal = formatHealthBytes(stats.memoryTotalBytes);
+    items.push({
+      key: "memory",
+      label: "MEM",
+      value: `${memoryUsed} used / ${memoryFree} free`,
+      title: `Memory: ${memoryUsed} used, ${memoryFree} free${memoryTotal ? `, ${memoryTotal} total` : ""}`,
+    });
+  }
+
+  const diskUsed = formatHealthBytes(stats.diskUsedBytes);
+  const diskFree = formatHealthBytes(stats.diskFreeBytes);
+  if (diskUsed && diskFree) {
+    const diskTotal = formatHealthBytes(stats.diskTotalBytes);
+    items.push({
+      key: "disk",
+      label: "DISK",
+      value: `${diskUsed} used / ${diskFree} free`,
+      title: `Disk: ${diskUsed} used, ${diskFree} free${diskTotal ? `, ${diskTotal} total` : ""}`,
+    });
+  }
+
+  return items;
 }
 
 type SessionActivityState = {
@@ -2502,6 +2587,57 @@ export default function App() {
     if (stored) return stored;
     return sshTargetFromCommandLine(active.launchCommand ?? active.restoreCommand ?? null);
   }, [active]);
+
+  const [systemHealthStats, setSystemHealthStats] = useState<SystemHealthStats | null>(null);
+  const systemHealthItems = useMemo(
+    () => buildSystemHealthDisplay(systemHealthStats),
+    [systemHealthStats],
+  );
+  const activeHealthSessionId = active?.id ?? null;
+  const activeHealthConnectionState = active?.connectionState ?? "connected";
+
+  useEffect(() => {
+    if (!hydrated || !activeHealthSessionId) {
+      setSystemHealthStats(null);
+      return;
+    }
+
+    const target = activeSshTarget?.trim() ?? "";
+    if (activeIsSsh && (!target || activeHealthConnectionState !== "connected")) {
+      setSystemHealthStats(null);
+      return;
+    }
+
+    let cancelled = false;
+    let inFlight = false;
+
+    const refresh = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        const next = activeIsSsh
+          ? await invoke<SystemHealthStats | null>("ssh_system_health_stats", { target })
+          : await invoke<SystemHealthStats | null>("system_health_stats");
+        if (!cancelled) {
+          setSystemHealthStats(hasSystemHealthStats(next) ? next : null);
+        }
+      } catch {
+        if (!cancelled) setSystemHealthStats(null);
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    void refresh();
+    const interval = window.setInterval(() => {
+      void refresh();
+    }, SYSTEM_HEALTH_REFRESH_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [activeHealthConnectionState, activeHealthSessionId, activeIsSsh, activeSshTarget, hydrated]);
 
   const sshRootResolveInFlightRef = useRef<Set<string>>(new Set());
   useEffect(() => {
@@ -8906,15 +9042,24 @@ export default function App() {
   const topbarJsx = useMemo(() => (
     <div className="topbar">
       <div className="activeTitle">
-        <span>{activeProject ? `Project: ${activeProject.title}` : "Project: —"}</span>
-        <span>{active ? ` • ${active.name}` : " • No session"}</span>
+        <span className="activeTitleText">
+          <span>{activeProject ? `Project: ${activeProject.title}` : "Project: —"}</span>
+          <span>{active ? ` • ${active.name}` : " • No session"}</span>
+        </span>
         {activeIsSsh ? (
-          <>
-            {" "}
-            <span className="chip chip-ssh" title="SSH">
-              <span className="chipLabel">ssh</span>
-            </span>
-          </>
+          <span className="chip chip-ssh" title="SSH">
+            <span className="chipLabel">ssh</span>
+          </span>
+        ) : null}
+        {systemHealthItems.length > 0 ? (
+          <span className="systemHealthStats" aria-label="System health">
+            {systemHealthItems.map((item) => (
+              <span key={item.key} className="systemHealthItem" title={item.title}>
+                <span className="systemHealthLabel">{item.label}</span>
+                <span className="systemHealthValue">{item.value}</span>
+              </span>
+            ))}
+          </span>
         ) : null}
       </div>
       <div className="topbarRight">
@@ -9108,7 +9253,7 @@ export default function App() {
       </div>
     </div>
   ), [
-    active, activeProject, activeIsSsh, activeSshTarget, activeWorkspaceView,
+    active, activeProject, activeIsSsh, activeSshTarget, activeWorkspaceView, systemHealthItems,
     activityCenterOpen, activityItems, slidePanelOpen, agentPanelOpen, appSettingsOpen,
     uiTheme,
     handleToggleActivityCenter, handleToggleAppSettings, reportError,

@@ -299,6 +299,11 @@ fn run_ssh(target: &str, remote_args: &[String], stdin: Option<&[u8]>) -> Result
     }
 }
 
+pub(crate) fn run_ssh_script(target: &str, script: &str) -> Result<Output, String> {
+    let args = vec!["sh".to_string()];
+    run_ssh(target, &args, Some(script.as_bytes()))
+}
+
 fn run_sftp_batch(target: &str, batch: &str) -> Result<Output, String> {
     let mut cmd = Command::new(program_path("sftp")?);
     cmd.args(ssh_common_args()?);
