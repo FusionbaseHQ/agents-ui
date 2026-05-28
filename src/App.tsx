@@ -181,6 +181,10 @@ const SSH_RECONNECT_MAX_ATTEMPTS = 6;
 const SESSION_HEALTHCHECK_VISIBLE_INTERVAL_MS = 30_000;
 const SESSION_HEALTHCHECK_MIN_GAP_MS = 5_000;
 const SLEEP_DETECTION_GAP_MS = 15_000;
+const DISPLAY_WAKE_RENDER_GAP_MS = 8_000;
+const DISPLAY_WAKE_TIMER_INTERVAL_MS = 2_000;
+const DISPLAY_WAKE_RECOVERY_MIN_GAP_MS = 4_000;
+const DISPLAY_WAKE_RECOVERY_DELAYS_MS = [0, 250, 1_000, 3_000] as const;
 const COMMAND_ACTIVITY_IDLE_MS = 3_000;
 
 const DEFAULT_AGENT_SHORTCUT_IDS = ["codex", "claude", "gemini"];
@@ -3132,17 +3136,73 @@ export default function App() {
     if (!hydrated) return;
 
     let lastActiveAt = Date.now();
+    let lastTimerTickAt = Date.now();
+    let lastFrameAt = performance.now();
+    let lastRecoveryRequestedAt = 0;
+    let recoveryBatch = 0;
+    let frameId: number | null = null;
+    let disposed = false;
+    const recoveryTimers: number[] = [];
+    const windowUnlisteners: Array<() => void> = [];
 
-    const recoverAllCanvases = () => {
+    const clearRecoveryTimers = () => {
+      for (const timer of recoveryTimers.splice(0)) {
+        window.clearTimeout(timer);
+      }
+    };
+
+    const forceWebviewRepaint = () => {
+      const root = document.getElementById("root");
+      if (!root) return;
+      root.classList.remove("agentsUiWakeRepaint");
+      void root.offsetHeight;
+      root.classList.add("agentsUiWakeRepaint");
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
+          root.classList.remove("agentsUiWakeRepaint");
+        });
+      });
+    };
+
+    const recoverAllCanvases = (source: string, force = false) => {
+      forceWebviewRepaint();
       for (const [id, entry] of registry.current.entries()) {
-        try { entry.recoverCanvas(); } catch { console.warn("[agents-ui] Failed to recover canvas for session", id); }
+        try { entry.recoverCanvas({ force, source }); } catch { console.warn("[agents-ui] Failed to recover canvas for session", id); }
+      }
+    };
+
+    const scheduleCanvasRecovery = (
+      source: string,
+      options: { force?: boolean; healthCheck?: boolean; bypassThrottle?: boolean } = {},
+    ) => {
+      const now = Date.now();
+      if (!options.bypassThrottle && now - lastRecoveryRequestedAt < DISPLAY_WAKE_RECOVERY_MIN_GAP_MS) return;
+      lastRecoveryRequestedAt = now;
+      recoveryBatch += 1;
+      const batch = recoveryBatch;
+      clearRecoveryTimers();
+
+      console.warn(`[agents-ui] Recovering terminal canvases after ${source}.`);
+      for (const delay of DISPLAY_WAKE_RECOVERY_DELAYS_MS) {
+        const timer = window.setTimeout(() => {
+          const index = recoveryTimers.indexOf(timer);
+          if (index >= 0) recoveryTimers.splice(index, 1);
+          if (disposed || batch !== recoveryBatch) return;
+          recoverAllCanvases(source, options.force ?? true);
+        }, delay);
+        recoveryTimers.push(timer);
+      }
+      if (options.healthCheck) {
+        window.setTimeout(() => {
+          if (!disposed) runSessionHealthCheckRef.current(source, true);
+        }, 2_000);
       }
     };
 
     const maybeTriggerCanvasRecovery = (elapsed: number, source: string) => {
       if (elapsed > SLEEP_DETECTION_GAP_MS) {
-        console.warn(`[agents-ui] Detected possible wake from sleep via ${source} (gap=${elapsed}ms). Recovering canvases.`);
-        window.setTimeout(recoverAllCanvases, 500);
+        console.warn(`[agents-ui] Detected possible wake from sleep via ${source} (gap=${elapsed}ms).`);
+        scheduleCanvasRecovery(source, { force: true });
       }
     };
 
@@ -3162,29 +3222,119 @@ export default function App() {
       runSessionHealthCheckRef.current("focus", true);
       maybeTriggerCanvasRecovery(elapsed, "focus");
     };
+    const onPageShow = (event: PageTransitionEvent) => {
+      const elapsed = Date.now() - lastActiveAt;
+      lastActiveAt = Date.now();
+      runSessionHealthCheckRef.current("pageshow", true);
+      if (event.persisted) {
+        scheduleCanvasRecovery("pageshow-cache-restore", { force: true, healthCheck: true, bypassThrottle: true });
+        return;
+      }
+      maybeTriggerCanvasRecovery(elapsed, "pageshow");
+    };
+    const onDocumentResume = () => {
+      lastActiveAt = Date.now();
+      scheduleCanvasRecovery("document-resume", { force: true, healthCheck: true, bypassThrottle: true });
+    };
+    const onWindowResize = () => {
+      const elapsed = Date.now() - lastActiveAt;
+      if (elapsed > SLEEP_DETECTION_GAP_MS) {
+        lastActiveAt = Date.now();
+        scheduleCanvasRecovery("window-resize-after-idle", { force: true });
+      }
+    };
+    const onFrame = (timestamp: number) => {
+      const elapsed = timestamp - lastFrameAt;
+      lastFrameAt = timestamp;
+      if (document.visibilityState === "visible" && elapsed > DISPLAY_WAKE_RENDER_GAP_MS) {
+        scheduleCanvasRecovery(`render-frame-gap-${Math.round(elapsed)}ms`, { force: true, healthCheck: true });
+      }
+      frameId = window.requestAnimationFrame(onFrame);
+    };
     const interval = window.setInterval(() => {
       if (document.visibilityState !== "visible") return;
       runSessionHealthCheckRef.current("interval");
     }, SESSION_HEALTHCHECK_VISIBLE_INTERVAL_MS);
+    const displayWatchdogInterval = window.setInterval(() => {
+      const now = Date.now();
+      const elapsed = now - lastTimerTickAt;
+      lastTimerTickAt = now;
+      if (document.visibilityState === "visible" && elapsed > DISPLAY_WAKE_RENDER_GAP_MS) {
+        scheduleCanvasRecovery(`timer-gap-${elapsed}ms`, { force: true, healthCheck: true });
+      }
+    }, DISPLAY_WAKE_TIMER_INTERVAL_MS);
 
     document.addEventListener("visibilitychange", onVisibility);
+    document.addEventListener("resume", onDocumentResume);
     window.addEventListener("focus", onFocus);
+    window.addEventListener("pageshow", onPageShow);
+    window.addEventListener("resize", onWindowResize);
+    frameId = window.requestAnimationFrame(onFrame);
     runSessionHealthCheckRef.current("startup", true);
 
     // Tauri emits "system-resumed" when macOS wakes from sleep — more reliable than timestamp gaps
     let unlistenResumed: (() => void) | null = null;
     listen("system-resumed", () => {
-      console.warn("[agents-ui] System resumed from sleep (Tauri event). Recovering canvases and checking sessions.");
-      window.setTimeout(recoverAllCanvases, 500);
-      window.setTimeout(() => {
-        runSessionHealthCheckRef.current("sleep-resume", true);
-      }, 2000);
-    }).then((fn) => { unlistenResumed = fn; });
+      console.warn("[agents-ui] System resumed from sleep (Tauri event).");
+      lastActiveAt = Date.now();
+      lastTimerTickAt = Date.now();
+      scheduleCanvasRecovery("sleep-resume", { force: true, healthCheck: true, bypassThrottle: true });
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlistenResumed = fn;
+    }).catch((err) => {
+      console.warn("[agents-ui] Failed to register system resume listener", err);
+    });
+
+    const appWindow = getCurrentWindow();
+    appWindow.onFocusChanged(({ payload: focused }) => {
+      if (!focused) {
+        lastActiveAt = Date.now();
+        return;
+      }
+      const elapsed = Date.now() - lastActiveAt;
+      lastActiveAt = Date.now();
+      runSessionHealthCheckRef.current("tauri-focus", true);
+      maybeTriggerCanvasRecovery(elapsed, "tauri-focus");
+    }).then((fn) => {
+      if (disposed) fn();
+      else windowUnlisteners.push(fn);
+    }).catch((err) => {
+      console.warn("[agents-ui] Failed to register window focus listener", err);
+    });
+    appWindow.onScaleChanged(() => {
+      scheduleCanvasRecovery("window-scale-change", { force: true, bypassThrottle: true });
+    }).then((fn) => {
+      if (disposed) fn();
+      else windowUnlisteners.push(fn);
+    }).catch((err) => {
+      console.warn("[agents-ui] Failed to register window scale listener", err);
+    });
+    appWindow.onResized(() => {
+      onWindowResize();
+    }).then((fn) => {
+      if (disposed) fn();
+      else windowUnlisteners.push(fn);
+    }).catch((err) => {
+      console.warn("[agents-ui] Failed to register window resize listener", err);
+    });
 
     return () => {
+      disposed = true;
       window.clearInterval(interval);
+      window.clearInterval(displayWatchdogInterval);
+      clearRecoveryTimers();
+      if (frameId !== null) {
+        window.cancelAnimationFrame(frameId);
+      }
       document.removeEventListener("visibilitychange", onVisibility);
+      document.removeEventListener("resume", onDocumentResume);
       window.removeEventListener("focus", onFocus);
+      window.removeEventListener("pageshow", onPageShow);
+      window.removeEventListener("resize", onWindowResize);
+      for (const unlisten of windowUnlisteners.splice(0)) {
+        unlisten();
+      }
       unlistenResumed?.();
     };
   }, [hydrated]);
@@ -5111,6 +5261,7 @@ export default function App() {
     const handleError = (event: ErrorEvent) => {
       const cause = event.error ?? event.message;
       if (isKnownXtermRendererResizeRace(cause)) {
+        event.preventDefault();
         logKnownXtermRaceSuppression();
         return;
       }
@@ -5118,6 +5269,7 @@ export default function App() {
     };
     const handleRejection = (event: PromiseRejectionEvent) => {
       if (isKnownXtermRendererResizeRace(event.reason)) {
+        event.preventDefault();
         logKnownXtermRaceSuppression();
         return;
       }

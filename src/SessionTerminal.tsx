@@ -7,7 +7,8 @@ import { SearchAddon } from "@xterm/addon-search";
 import { SessionShellIntegration, type CommandBlock } from "./shellIntegration";
 import { notifyStateChange } from "./apiBridge";
 
-export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon; search: SearchAddon; shellInt?: SessionShellIntegration; recoverCanvas: () => void }>;
+export type CanvasRecoveryOptions = { force?: boolean; source?: string };
+export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon; search: SearchAddon; shellInt?: SessionShellIntegration; recoverCanvas: (options?: CanvasRecoveryOptions) => void }>;
 export type PendingDataBuffer = Map<string, string[]>;
 
 type RenderDimension = { width: number; height: number };
@@ -316,8 +317,9 @@ function SessionTerminal(props: SessionTerminalProps) {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const canvasAddonRef = useRef<CanvasAddon | null>(null);
-  const recoverCanvasRef = useRef<() => void>(() => {});
+  const recoverCanvasRef = useRef<(options?: CanvasRecoveryOptions) => void>(() => {});
   const lastCanvasRecoveryRef = useRef(0);
+  const canvasRecoveryTimersRef = useRef<number[]>([]);
   const resizeRafRef = useRef<number | null>(null);
   const resizeTimeoutRef = useRef<number | null>(null);
   const resizeRetryCountRef = useRef(0);
@@ -376,30 +378,6 @@ function SessionTerminal(props: SessionTerminalProps) {
     patchXtermRenderServiceDimensions(term);
     patchXtermPausedResizeTask(term);
 
-    // Recovery function for canvas context loss (e.g. after macOS sleep/GPU reset).
-    // Disposes the stale CanvasAddon and loads a fresh one with valid 2D contexts.
-    const recoverCanvas = () => {
-      const now = Date.now();
-      if (now - lastCanvasRecoveryRef.current < 5_000) return;
-      lastCanvasRecoveryRef.current = now;
-
-      const t = termRef.current;
-      if (!t || !t.element) return;
-      try { canvasAddonRef.current?.dispose(); } catch { /* best-effort */ }
-      try {
-        const fresh = new CanvasAddon();
-        canvasAddonRef.current = fresh;
-        t.loadAddon(fresh);
-        patchXtermRenderServiceDimensions(t);
-        patchXtermPausedResizeTask(t);
-        t.refresh(0, Math.max(0, t.rows - 1));
-      } catch {
-        // CanvasAddon failed — terminal falls back to DOM renderer which still works
-        canvasAddonRef.current = null;
-      }
-    };
-    recoverCanvasRef.current = recoverCanvas;
-
     const reportTransportError = (operation: "write" | "resize", err: unknown) => {
       onTransportErrorRef.current?.(props.id, operation, formatInvokeError(err));
     };
@@ -411,6 +389,80 @@ function SessionTerminal(props: SessionTerminalProps) {
       invoke("resize_session", { id: props.id, cols, rows }).catch((err) => {
         reportTransportError("resize", err);
       });
+
+    const repaintTerminal = () => {
+      const t = termRef.current;
+      const fitAddon = fitRef.current;
+      if (!t || !t.element) return;
+
+      if (fitAddon && container.getBoundingClientRect().width > 0 && container.getBoundingClientRect().height > 0) {
+        try {
+          fitAddon.fit();
+          const { cols, rows } = t;
+          const last = lastSizeRef.current;
+          if (!last || last.cols !== cols || last.rows !== rows) {
+            lastSizeRef.current = { cols, rows };
+            onResizeRef.current?.(props.id, { cols, rows });
+            void resizeSession(cols, rows);
+          }
+        } catch {
+          // best-effort repaint
+        }
+      }
+
+      try {
+        t.refresh(0, Math.max(0, t.rows - 1));
+      } catch {
+        // best-effort repaint
+      }
+    };
+
+    const scheduleTerminalRepaint = (delayMs: number) => {
+      const timer = window.setTimeout(() => {
+        canvasRecoveryTimersRef.current = canvasRecoveryTimersRef.current.filter((id) => id !== timer);
+        repaintTerminal();
+      }, delayMs);
+      canvasRecoveryTimersRef.current.push(timer);
+    };
+
+    // Recovery function for canvas context loss (e.g. after macOS sleep/GPU reset).
+    // Disposes the stale CanvasAddon and loads a fresh one with valid 2D contexts.
+    const recoverCanvas = (options?: CanvasRecoveryOptions) => {
+      const now = Date.now();
+      if (!options?.force && now - lastCanvasRecoveryRef.current < 5_000) return;
+      lastCanvasRecoveryRef.current = now;
+
+      const t = termRef.current;
+      if (!t || !t.element) return;
+      try { canvasAddonRef.current?.dispose(); } catch { /* best-effort */ }
+      try {
+        const fresh = new CanvasAddon();
+        canvasAddonRef.current = fresh;
+        t.loadAddon(fresh);
+        patchXtermRenderServiceDimensions(t);
+        patchXtermPausedResizeTask(t);
+        repaintTerminal();
+        scheduleTerminalRepaint(250);
+        scheduleTerminalRepaint(1_000);
+      } catch {
+        // CanvasAddon failed — terminal falls back to DOM renderer which still works
+        canvasAddonRef.current = null;
+        repaintTerminal();
+      }
+    };
+    recoverCanvasRef.current = recoverCanvas;
+
+    const handleCanvasContextLost = (event: Event) => {
+      event.preventDefault();
+      window.setTimeout(() => recoverCanvas({ force: true, source: event.type }), 250);
+    };
+    const handleCanvasContextRestored = () => {
+      recoverCanvas({ force: true, source: "contextrestored" });
+    };
+    container.addEventListener("contextlost", handleCanvasContextLost, true);
+    container.addEventListener("contextrestored", handleCanvasContextRestored, true);
+    container.addEventListener("webglcontextlost", handleCanvasContextLost, true);
+    container.addEventListener("webglcontextrestored", handleCanvasContextRestored, true);
 
     const skipEscapeSequence = (data: string, start: number): number => {
       const next = data[start];
@@ -968,11 +1020,19 @@ function SessionTerminal(props: SessionTerminalProps) {
 	      };
 	    }
 
-	    return () => {
-	      resizeObserver.disconnect();
-	      if (resizeRafRef.current !== null) {
-	        window.cancelAnimationFrame(resizeRafRef.current);
-	      }
+		    return () => {
+		      container.removeEventListener("contextlost", handleCanvasContextLost, true);
+		      container.removeEventListener("contextrestored", handleCanvasContextRestored, true);
+		      container.removeEventListener("webglcontextlost", handleCanvasContextLost, true);
+		      container.removeEventListener("webglcontextrestored", handleCanvasContextRestored, true);
+		      for (const timer of canvasRecoveryTimersRef.current) {
+		        window.clearTimeout(timer);
+		      }
+		      canvasRecoveryTimersRef.current = [];
+		      resizeObserver.disconnect();
+		      if (resizeRafRef.current !== null) {
+		        window.cancelAnimationFrame(resizeRafRef.current);
+		      }
 	      if (resizeTimeoutRef.current !== null) {
 	        window.clearTimeout(resizeTimeoutRef.current);
 	      }
