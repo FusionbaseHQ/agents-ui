@@ -6,6 +6,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
+const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
+
 /// Get the user's default login shell, same logic as pty.rs.
 fn default_user_shell() -> String {
     if let Ok(shell) = std::env::var("SHELL") {
@@ -160,11 +162,14 @@ fn build_codex_cmd(
 
     let mut parts: Vec<String> = vec!["codex".into(), "exec".into()];
 
-    // -m is a subcommand flag for `codex exec`, must come before the prompt
-    if let Some(ref model) = settings.model {
-        parts.push("-m".into());
-        parts.push(shell_escape(model));
-    }
+    // -m is a subcommand flag for `codex exec`, must come before the prompt.
+    let model = settings
+        .model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or(DEFAULT_CODEX_MODEL);
+    parts.push("-m".into());
+    parts.push(shell_escape(model));
 
     // Resume uses: codex exec resume <sessionId> <prompt>
     if let Some(sid) = session_id {
@@ -372,9 +377,16 @@ pub async fn get_agent_terminal_command(
     }
 
     let mut parts = vec![binary.to_string()];
+    let has_explicit_model = extra_args
+        .as_ref()
+        .is_some_and(|args| args.iter().any(|arg| arg == "--model" || arg == "-m"));
 
     if binary == "codex" {
         // Codex uses its own global MCP registry (registered at MCP server startup)
+        if !has_explicit_model {
+            parts.push("--model".into());
+            parts.push(DEFAULT_CODEX_MODEL.into());
+        }
     } else {
         parts.push("--mcp-config".into());
         parts.push(mcp_config_path.to_string_lossy().to_string());
@@ -687,10 +699,13 @@ fn build_codex_task_cmd(
 
     let mut parts: Vec<String> = vec!["codex".into(), "exec".into()];
 
-    if let Some(ref model) = settings.model {
-        parts.push("-m".into());
-        parts.push(shell_escape(model));
-    }
+    let model = settings
+        .model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or(DEFAULT_CODEX_MODEL);
+    parts.push("-m".into());
+    parts.push(shell_escape(model));
 
     parts.push(shell_escape(prompt));
     parts.push("--full-auto".into());

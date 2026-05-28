@@ -23,7 +23,7 @@ Rules:
 - Each task should be independently executable by a coding agent in a terminal
 - Use "dependencies" to specify task IDs that must complete first (e.g. ["1", "2"])
 - "assignee" must be "claude-code" or "codex"
-- "model" is optional. For claude-code: "opus", "sonnet", "haiku". For codex: "gpt-5.3-codex", "gpt-5.3-codex-spark"
+- "model" is optional. For claude-code: "opus", "sonnet", "haiku". For codex: "gpt-5.5", "gpt-5.3-codex", "gpt-5.3-codex-spark"
 - Keep tasks focused — each should take a single agent session
 - Minimize dependencies to maximize parallelism
 - 2-8 tasks is typical for most goals
@@ -214,8 +214,9 @@ export async function dispatchTask(
 
 function buildExtraArgs(settings: AgentLaunchSettings): string[] {
   const args: string[] = [];
-  if (settings.model) {
-    args.push("--model", settings.model);
+  const model = settings.provider === "codex" ? settings.model || "gpt-5.5" : settings.model;
+  if (model) {
+    args.push("--model", model);
   }
   if (settings.effort) {
     args.push("--effort", settings.effort);

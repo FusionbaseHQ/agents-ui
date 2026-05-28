@@ -43,16 +43,16 @@ type McpRegistrationResult = {
 
 const CLAUDE_MODELS = [
   { value: "", label: "Default" },
-  { value: "opus", label: "Opus 4.6" },
-  { value: "sonnet", label: "Sonnet 4.6" },
+  { value: "opus", label: "Opus 4.7" },
+  { value: "sonnet", label: "Sonnet 4.7" },
   { value: "haiku", label: "Haiku 4.5" },
 ];
 
+const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const CODEX_MODELS = [
-  { value: "", label: "Default" },
+  { value: DEFAULT_CODEX_MODEL, label: "GPT-5.5" },
   { value: "gpt-5.3-codex", label: "GPT-5.3 Codex" },
   { value: "gpt-5.3-codex-spark", label: "GPT-5.3 Spark" },
-  { value: "gpt-5.2-codex", label: "GPT-5.2 Codex" },
 ];
 
 const ALL_MODELS = [...CLAUDE_MODELS, ...CODEX_MODELS];
@@ -62,9 +62,15 @@ function modelsForProvider(provider: string): { value: string; label: string }[]
 }
 
 function modelDisplayLabel(model: string | undefined, provider: string): string {
+  if (provider === "codex" && !model) return "GPT-5.5";
   if (!model) return "Default";
   const opt = ALL_MODELS.find((o) => o.value === model);
   return opt ? opt.label : model;
+}
+
+function effectiveModelForProvider(provider: AgentProvider, model: string | undefined): string | undefined {
+  if (provider === "codex") return model || DEFAULT_CODEX_MODEL;
+  return model;
 }
 
 const EFFORT_OPTIONS: { value: ReasoningEffort | ""; label: string; short: string }[] = [
@@ -291,12 +297,13 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
   }, []);
 
   const createConversation = useCallback((): AgentConversation => {
+    const provider = settings.provider === "terminal" ? "claude-code" : settings.provider;
     const conv: AgentConversation = {
       id: `conv-${Date.now()}`,
       sessionId: null,
       messages: [],
-      provider: settings.provider === "terminal" ? "claude-code" : settings.provider,
-      model: settings.model,
+      provider,
+      model: effectiveModelForProvider(provider, settings.model),
       createdAt: Date.now(),
     };
     setConversations((prev) => [conv, ...prev]);
@@ -337,7 +344,12 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
     setConversations((prev) => {
       const idx = prev.findIndex((c) => c.id === conv!.id);
       if (idx < 0) return prev;
-      const updated = { ...prev[idx], messages: [...prev[idx].messages, userMsg], model: settings.model };
+      const provider = prev[idx].provider === "codex" ? "codex" : "claude-code";
+      const updated = {
+        ...prev[idx],
+        messages: [...prev[idx].messages, userMsg],
+        model: effectiveModelForProvider(provider, settings.model),
+      };
       const result = [...prev];
       result[idx] = updated;
       return result;
@@ -353,7 +365,7 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
     try {
       const launchSettings: AgentLaunchSettings = {
         provider: conv.provider === "codex" ? "codex" : "claude-code",
-        model: settings.model,
+        model: effectiveModelForProvider(conv.provider, settings.model),
         effort: settings.effort,
         allowedTools: settings.allowedTools,
       };
@@ -396,7 +408,8 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
     if (settings.provider === newProvider) return;
     // If current conversation has messages, create a new one for the new provider
     const needsNewConv = activeConv && activeConv.messages.length > 0;
-    setSettings((s) => ({ ...s, provider: newProvider, model: undefined }));
+    const nextModel = effectiveModelForProvider(newProvider, undefined);
+    setSettings((s) => ({ ...s, provider: newProvider, model: nextModel }));
     if (needsNewConv) {
       const providerLabel = newProvider === "codex" ? "Codex" : "Claude Code";
       setProviderSwitchNotice(`Switched to ${providerLabel}. Previous chat moved to history.`);
@@ -406,7 +419,7 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
         sessionId: null,
         messages: [],
         provider: newProvider,
-        model: undefined, // reset model when switching provider
+        model: nextModel,
         createdAt: Date.now(),
       };
       setConversations((prev) => [conv, ...prev]);
@@ -417,7 +430,7 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
         const idx = prev.findIndex((c) => c.id === activeConv.id);
         if (idx < 0) return prev;
         const result = [...prev];
-        result[idx] = { ...prev[idx], provider: newProvider };
+        result[idx] = { ...prev[idx], provider: newProvider, model: nextModel };
         return result;
       });
     }
@@ -435,14 +448,16 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
 
   const switchToTerminal = useCallback(async () => {
     try {
+      const model = effectiveModelForProvider(settings.provider, settings.model);
       const command: string = await invoke("get_agent_terminal_command", {
         provider: settings.provider === "codex" ? "codex" : "claude-code",
+        extraArgs: model ? ["--model", model] : undefined,
       });
       onCreateTerminalSession?.(command);
     } catch (err) {
       console.error("Failed to get agent terminal command:", err);
     }
-  }, [settings.provider, onCreateTerminalSession]);
+  }, [settings.provider, settings.model, onCreateTerminalSession]);
 
   // Settings panel
   if (showSettings) {
@@ -509,8 +524,8 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
                 }}
               >
                 <option value="">Default</option>
-                <option value="opus">Opus 4.6</option>
-                <option value="sonnet">Sonnet 4.6</option>
+                <option value="opus">Opus 4.7</option>
+                <option value="sonnet">Sonnet 4.7</option>
                 <option value="haiku">Haiku 4.5</option>
                 <option value="custom">Custom...</option>
               </select>
@@ -540,7 +555,7 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
               <select
                 className="agentSettingsSelect"
                 value={
-                  settings.model === undefined || settings.model === "" ? ""
+                  settings.model === undefined || settings.model === "" ? DEFAULT_CODEX_MODEL
                   : CODEX_MODELS.some((o) => o.value === settings.model) ? settings.model
                   : "custom"
                 }
@@ -553,10 +568,9 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
                   }
                 }}
               >
-                <option value="">Default</option>
+                <option value={DEFAULT_CODEX_MODEL}>GPT-5.5</option>
                 <option value="gpt-5.3-codex">GPT-5.3 Codex</option>
                 <option value="gpt-5.3-codex-spark">GPT-5.3 Spark</option>
-                <option value="gpt-5.2-codex">GPT-5.2 Codex</option>
                 <option value="custom">Custom...</option>
               </select>
             </label>
@@ -570,7 +584,7 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
               <input
                 className="agentSettingsInput"
                 type="text"
-                placeholder="e.g. gpt-5.1-codex-max"
+                placeholder="e.g. gpt-5.5"
                 value={settings.model}
                 onChange={(e) =>
                   setSettings((s) => ({ ...s, model: e.target.value || undefined }))
@@ -884,7 +898,7 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
                   <button
                     key={opt.value}
                     type="button"
-                    className={`agentModelDropdownItem ${(settings.model ?? "") === opt.value ? "agentModelDropdownItemActive" : ""}`}
+                    className={`agentModelDropdownItem ${(effectiveModelForProvider(settings.provider, settings.model) ?? "") === opt.value ? "agentModelDropdownItemActive" : ""}`}
                     onClick={() => {
                       setSettings((s) => ({ ...s, model: opt.value || undefined }));
                       setShowModelDropdown(false);

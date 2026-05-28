@@ -34,9 +34,9 @@ const MODEL_LABELS: Record<string, string> = {
   opus: "Opus",
   sonnet: "Sonnet",
   haiku: "Haiku",
+  "gpt-5.5": "GPT-5.5",
   "gpt-5.3-codex": "GPT-5.3",
   "gpt-5.3-codex-spark": "Spark",
-  "gpt-5.2-codex": "GPT-5.2",
 };
 
 function providerModelLabel(conv: AgentConversation): string {
