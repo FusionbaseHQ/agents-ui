@@ -2901,6 +2901,11 @@ body::after {
   inset: 0;
 }
 
+.codeEditorMonacoHidden {
+  visibility: hidden;
+  pointer-events: none;
+}
+
 .codeEditorOverlay {
   position: absolute;
   inset: 0;
@@ -3016,6 +3021,153 @@ body::after {
   justify-content: center;
   color: var(--muted);
   font-size: 12px;
+}
+
+.fileViewerCenter {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 18px;
+  text-align: center;
+  color: var(--text);
+}
+
+.fileViewerTitle {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.fileViewerMuted {
+  max-width: min(460px, 90%);
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fileViewerError {
+  min-width: 0;
+  max-width: 240px;
+  color: rgba(var(--danger-rgb), 0.95);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fileViewerToolbar {
+  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-bottom: 1px solid rgba(var(--ink-rgb), 0.06);
+  color: var(--muted);
+  font-size: 12px;
+  background: rgba(var(--ink-rgb), 0.02);
+  min-width: 0;
+}
+
+.fileViewerInput {
+  width: 92px;
+  min-width: 0;
+  height: 24px;
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--paper);
+  color: var(--text);
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.fileViewerSearchInput {
+  width: 140px;
+}
+
+.imageViewer,
+.byteViewer,
+.largeTextViewer {
+  position: absolute;
+  inset: 0;
+  min-width: 0;
+  min-height: 0;
+  background: var(--panel);
+}
+
+.imageViewer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  padding: 14px;
+}
+
+.imageViewer img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  image-rendering: auto;
+}
+
+.byteViewer,
+.largeTextViewer {
+  display: flex;
+  flex-direction: column;
+}
+
+.byteViewerList,
+.largeTextList {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: rgba(var(--ink-rgb), 0.92);
+  background: rgba(var(--shadow-rgb), 0.1);
+}
+
+.byteViewerRow,
+.largeTextRow {
+  display: flex;
+  align-items: center;
+  min-width: max-content;
+  white-space: pre;
+}
+
+.byteViewerOffset,
+.largeTextLineNo {
+  flex: 0 0 auto;
+  width: 86px;
+  padding: 0 10px;
+  color: var(--muted);
+  user-select: none;
+  text-align: right;
+}
+
+.byteViewerHex {
+  display: inline-grid;
+  grid-template-columns: repeat(16, 2ch);
+  column-gap: 8px;
+  padding-right: 18px;
+}
+
+.byteViewerAscii {
+  display: inline-grid;
+  grid-template-columns: repeat(16, 1ch);
+  column-gap: 2px;
+  color: rgba(var(--ink-rgb), 0.8);
+}
+
+.byteViewerMissing {
+  color: rgba(var(--ink-rgb), 0.26);
+}
+
+.largeTextLine {
+  min-width: 0;
+  padding-right: 20px;
 }
 
 .agentShortcutEditorName {

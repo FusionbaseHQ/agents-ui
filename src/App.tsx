@@ -1233,10 +1233,18 @@ function coerceCodeEditorPersistedState(value: unknown): CodeEditorPersistedStat
 
   const tabs = rawTabs
     .filter((t): t is { path: unknown } => Boolean(t) && typeof t === "object" && "path" in (t as object))
-    .map((t) => (typeof t.path === "string" ? t.path.trim() : ""))
-    .filter((p) => Boolean(p))
+    .map((t) => {
+      const rec = t as Record<string, unknown>;
+      const path = typeof rec.path === "string" ? rec.path.trim() : "";
+      const viewerKind: CodeEditorPersistedState["tabs"][number]["viewerKind"] =
+        rec.viewerKind === "largeText" || rec.viewerKind === "image" || rec.viewerKind === "bytes" || rec.viewerKind === "text"
+          ? rec.viewerKind
+          : null;
+      return { path, viewerKind };
+    })
+    .filter((it) => Boolean(it.path))
     .slice(0, 40)
-    .map((path) => ({ path, dirty: false, content: null }));
+    .map(({ path, viewerKind }) => ({ path, dirty: false, content: null, viewerKind }));
 
   if (tabs.length === 0) return null;
 
@@ -2572,7 +2580,7 @@ export default function App() {
   }, [updateActiveWorkspaceView]);
 
   const handleSelectWorkspaceFile = useCallback(
-    (path: string) => {
+    (path: string, mode: CodeEditorOpenFileRequest["mode"] = "auto") => {
       updateActiveWorkspaceView((prev) => {
         const project = projectByIdRef.current.get(activeProjectId) ?? null;
         const root = (
@@ -2590,7 +2598,7 @@ export default function App() {
           codeEditorActiveFilePath: path,
           codeEditorRootDir: prev.codeEditorRootDir ?? root,
           fileExplorerRootDir: prev.fileExplorerRootDir ?? root,
-          openFileRequest: { path, nonce: Date.now() },
+          openFileRequest: { path, mode, nonce: Date.now() },
         };
       });
     },

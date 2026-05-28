@@ -223,7 +223,7 @@ type FileRowProps = {
   isDropTarget: boolean;
   isPreparing: boolean;
   onToggleDir: (path: string) => void;
-  onSelectFile: (path: string) => void;
+  onSelectFile: (path: string, mode?: "auto" | "text" | "image" | "bytes") => void;
   onContextMenu: (x: number, y: number, entry: FsEntry) => void;
   onMouseDown: (e: React.MouseEvent, entry: FsEntry) => void;
   onMouseMove: (e: React.MouseEvent) => void;
@@ -328,7 +328,7 @@ export function FileExplorerPanel({
   rootDir: string;
   persistedState?: FileExplorerPersistedState | null;
   activeFilePath: string | null;
-  onSelectFile: (path: string) => void;
+  onSelectFile: (path: string, mode?: "auto" | "text" | "image" | "bytes") => void;
   onOpenTerminalAtPath?: (path: string, provider: "local" | "ssh", sshTarget: string | null) => void;
   onPersistState?: (state: FileExplorerPersistedState) => void;
   onClose: () => void;
@@ -1777,6 +1777,43 @@ export function FileExplorerPanel({
           >
             Open terminal here
           </button>
+          {!contextMenu.entry.isDir ? (
+            <>
+              <button
+                type="button"
+                className="sidebarActionMenuItem"
+                role="menuitem"
+                onClick={() => {
+                  onSelectFile(contextMenu.entry.path, "auto");
+                  setContextMenu(null);
+                }}
+              >
+                Open
+              </button>
+              <button
+                type="button"
+                className="sidebarActionMenuItem"
+                role="menuitem"
+                onClick={() => {
+                  onSelectFile(contextMenu.entry.path, "text");
+                  setContextMenu(null);
+                }}
+              >
+                Open as text
+              </button>
+              <button
+                type="button"
+                className="sidebarActionMenuItem"
+                role="menuitem"
+                onClick={() => {
+                  onSelectFile(contextMenu.entry.path, "bytes");
+                  setContextMenu(null);
+                }}
+              >
+                Open bytes
+              </button>
+            </>
+          ) : null}
           <div className="fileContextMenuSep" role="separator" />
           <button
             type="button"

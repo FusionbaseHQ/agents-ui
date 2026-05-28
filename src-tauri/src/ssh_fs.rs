@@ -2,7 +2,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use crate::files::FsEntry;
+use crate::files::{
+    base64_encode, probe_from_sample, FileProbe, FileRangeRead, FsEntry, MAX_RANGE_READ_BYTES,
+    PROBE_BYTES,
+};
 
 const MAX_TEXT_FILE_BYTES: usize = 2 * 1024 * 1024;
 const BINARY_CHECK_BYTES: usize = 8 * 1024;
@@ -210,6 +213,30 @@ fn output_to_error(prefix: &str, output: &Output) -> String {
         return format!("{prefix}: {stdout}");
     }
     format!("{prefix}: command failed")
+}
+
+fn parse_remote_file_meta(stderr: &[u8], marker: &str) -> Result<(u64, Option<u64>), String> {
+    let text = String::from_utf8_lossy(stderr);
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix(marker) else {
+            continue;
+        };
+        let mut size: Option<u64> = None;
+        let mut mtime_s: Option<u64> = None;
+        for part in rest.split_whitespace() {
+            if let Some(value) = part.strip_prefix("size=") {
+                size = value.parse::<u64>().ok();
+            } else if let Some(value) = part.strip_prefix("mtime=") {
+                if !value.is_empty() {
+                    mtime_s = value.parse::<u64>().ok();
+                }
+            }
+        }
+        let size = size.ok_or_else(|| "ssh metadata missing size".to_string())?;
+        return Ok((size, mtime_s.and_then(|v| v.checked_mul(1000))));
+    }
+    Err("ssh metadata missing".to_string())
 }
 
 fn shell_escape_posix(value: &str) -> String {
@@ -518,6 +545,139 @@ fn ssh_read_text_file_sync(target: String, root: String, path: String) -> Result
         return Err("binary files are not supported".to_string());
     }
     String::from_utf8(bytes).map_err(|_| "file is not valid UTF-8".to_string())
+}
+
+#[tauri::command]
+pub async fn ssh_probe_file(
+    target: String,
+    root: String,
+    path: String,
+) -> Result<FileProbe, String> {
+    tauri::async_runtime::spawn_blocking(move || ssh_probe_file_sync(target, root, path))
+        .await
+        .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+fn ssh_probe_file_sync(target: String, root: String, path: String) -> Result<FileProbe, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("missing ssh target".to_string());
+    }
+    let (root, path) = ensure_within_root(&root, &path)?;
+    ensure_not_root(&root, &path, "read")?;
+
+    let probe_bytes = PROBE_BYTES.to_string();
+    let script = r#"set -e
+file="$1"
+count="$2"
+[ -f "$file" ] || { echo "not a file" >&2; exit 1; }
+size="$(wc -c < "$file" | tr -d '[:space:]')"
+mtime=""
+if stat -c %Y "$file" >/dev/null 2>&1; then
+  mtime="$(stat -c %Y "$file" 2>/dev/null || true)"
+elif stat -f %m "$file" >/dev/null 2>&1; then
+  mtime="$(stat -f %m "$file" 2>/dev/null || true)"
+fi
+printf 'AGENTS_UI_PROBE size=%s mtime=%s\n' "$size" "$mtime" >&2
+if command -v head >/dev/null 2>&1; then
+  head -c "$count" "$file"
+else
+  dd if="$file" bs=1 count="$count" 2>/dev/null
+fi"#;
+
+    let command = build_sh_c_command(&script, Some("--"), &[path.clone(), probe_bytes]);
+    let args = vec![command];
+    let output = run_ssh(target, &args, None)?;
+    if !output.status.success() {
+        return Err(output_to_error("ssh failed", &output));
+    }
+    let (size, mtime_ms) = parse_remote_file_meta(&output.stderr, "AGENTS_UI_PROBE ")?;
+    Ok(probe_from_sample(
+        size,
+        mtime_ms,
+        &output.stdout,
+        Some(Path::new(&path)),
+    ))
+}
+
+#[tauri::command]
+pub async fn ssh_read_file_range(
+    target: String,
+    root: String,
+    path: String,
+    offset: u64,
+    length: u64,
+) -> Result<FileRangeRead, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ssh_read_file_range_sync(target, root, path, offset, length)
+    })
+    .await
+    .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+fn ssh_read_file_range_sync(
+    target: String,
+    root: String,
+    path: String,
+    offset: u64,
+    length: u64,
+) -> Result<FileRangeRead, String> {
+    if length > MAX_RANGE_READ_BYTES as u64 {
+        return Err(format!(
+            "range too large ({length} bytes, max {MAX_RANGE_READ_BYTES} bytes)"
+        ));
+    }
+
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("missing ssh target".to_string());
+    }
+    let (root, path) = ensure_within_root(&root, &path)?;
+    ensure_not_root(&root, &path, "read")?;
+
+    let script = r#"set -e
+file="$1"
+offset="$2"
+count="$3"
+[ -f "$file" ] || { echo "not a file" >&2; exit 1; }
+size="$(wc -c < "$file" | tr -d '[:space:]')"
+mtime=""
+if stat -c %Y "$file" >/dev/null 2>&1; then
+  mtime="$(stat -c %Y "$file" 2>/dev/null || true)"
+elif stat -f %m "$file" >/dev/null 2>&1; then
+  mtime="$(stat -f %m "$file" 2>/dev/null || true)"
+fi
+printf 'AGENTS_UI_RANGE size=%s mtime=%s\n' "$size" "$mtime" >&2
+if [ "$offset" -ge "$size" ]; then
+  exit 0
+fi
+start=$((offset + 1))
+if command -v tail >/dev/null 2>&1 && command -v head >/dev/null 2>&1; then
+  tail -c +"$start" "$file" | head -c "$count"
+else
+  dd if="$file" bs=1 skip="$offset" count="$count" 2>/dev/null
+fi"#;
+
+    let command = build_sh_c_command(
+        &script,
+        Some("--"),
+        &[path, offset.to_string(), length.to_string()],
+    );
+    let args = vec![command];
+    let output = run_ssh(target, &args, None)?;
+    if !output.status.success() {
+        return Err(output_to_error("ssh failed", &output));
+    }
+    let (size, mtime_ms) = parse_remote_file_meta(&output.stderr, "AGENTS_UI_RANGE ")?;
+    let clamped_offset = offset.min(size);
+    Ok(FileRangeRead {
+        offset: clamped_offset,
+        length: output.stdout.len(),
+        size,
+        mtime_ms,
+        eof: clamped_offset + output.stdout.len() as u64 >= size,
+        data_base64: base64_encode(&output.stdout),
+    })
 }
 
 #[tauri::command]

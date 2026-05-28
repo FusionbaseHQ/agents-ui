@@ -1,12 +1,15 @@
 use serde::Serialize;
 use std::{
-    fs,
-    io,
+    fs::{self, File},
+    io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 
 const MAX_TEXT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const BINARY_CHECK_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_RANGE_READ_BYTES: usize = 1024 * 1024;
+pub(crate) const PROBE_BYTES: usize = 64 * 1024;
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -15,6 +18,148 @@ pub struct FsEntry {
     pub path: String,
     pub is_dir: bool,
     pub size: u64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FileProbe {
+    pub size: u64,
+    pub mtime_ms: Option<u64>,
+    pub kind: String,
+    pub image_type: Option<String>,
+    pub mime: Option<String>,
+    pub has_nul: bool,
+    pub valid_utf8: bool,
+    pub is_large_text: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FileRangeRead {
+    pub offset: u64,
+    pub length: usize,
+    pub size: u64,
+    pub mtime_ms: Option<u64>,
+    pub eof: bool,
+    pub data_base64: String,
+}
+
+fn mtime_ms(meta: &fs::Metadata) -> Option<u64> {
+    meta.modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+}
+
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut i = 0usize;
+    while i + 3 <= bytes.len() {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | bytes[i + 2] as u32;
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        out.push(TABLE[(n & 0x3f) as usize] as char);
+        i += 3;
+    }
+    match bytes.len() - i {
+        1 => {
+            let n = (bytes[i] as u32) << 16;
+            out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+            out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+            out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+            out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+            out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
+}
+
+fn raster_image_type(sample: &[u8], path: Option<&Path>) -> Option<(&'static str, &'static str)> {
+    if sample.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
+        return Some(("png", "image/png"));
+    }
+    if sample.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some(("jpeg", "image/jpeg"));
+    }
+    if sample.starts_with(b"GIF87a") || sample.starts_with(b"GIF89a") {
+        return Some(("gif", "image/gif"));
+    }
+    if sample.len() >= 12 && sample.starts_with(b"RIFF") && &sample[8..12] == b"WEBP" {
+        return Some(("webp", "image/webp"));
+    }
+    if sample.starts_with(b"BM") {
+        return Some(("bmp", "image/bmp"));
+    }
+    if sample.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        return Some(("ico", "image/x-icon"));
+    }
+
+    let ext = path
+        .and_then(|p| p.extension())
+        .and_then(|v| v.to_str())
+        .map(|v| v.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("png") => Some(("png", "image/png")),
+        Some("jpg") | Some("jpeg") => Some(("jpeg", "image/jpeg")),
+        Some("gif") => Some(("gif", "image/gif")),
+        Some("webp") => Some(("webp", "image/webp")),
+        Some("bmp") => Some(("bmp", "image/bmp")),
+        Some("ico") => Some(("ico", "image/x-icon")),
+        _ => None,
+    }
+}
+
+fn sample_is_valid_utf8(sample: &[u8]) -> bool {
+    match std::str::from_utf8(sample) {
+        Ok(_) => true,
+        Err(err) => {
+            err.error_len().is_none() && sample.len().saturating_sub(err.valid_up_to()) <= 4
+        }
+    }
+}
+
+pub(crate) fn probe_from_sample(
+    size: u64,
+    mtime_ms: Option<u64>,
+    sample: &[u8],
+    path: Option<&Path>,
+) -> FileProbe {
+    let image = raster_image_type(sample, path);
+    let has_nul = sample[..sample.len().min(BINARY_CHECK_BYTES)]
+        .iter()
+        .any(|b| *b == 0);
+    let valid_utf8 = sample_is_valid_utf8(sample);
+    let kind = if image.is_some() {
+        "image"
+    } else if size == 0 || (!has_nul && valid_utf8) {
+        "text"
+    } else {
+        "binary"
+    };
+    let (image_type, mime) = match image {
+        Some((kind, mime)) => (Some(kind.to_string()), Some(mime.to_string())),
+        None => (None, None),
+    };
+    FileProbe {
+        size,
+        mtime_ms,
+        kind: kind.to_string(),
+        image_type,
+        mime,
+        has_nul,
+        valid_utf8,
+        is_large_text: kind == "text" && size > MAX_TEXT_FILE_BYTES,
+    }
 }
 
 fn canonicalize_existing(path: &Path) -> Result<PathBuf, String> {
@@ -63,7 +208,10 @@ pub fn list_fs_entries(root: String, path: String) -> Result<Vec<FsEntry>, Strin
         let mut size = 0u64;
         let is_dir = match item.file_type() {
             Ok(t) if t.is_dir() => true,
-            Ok(t) if t.is_file() => false,
+            Ok(t) if t.is_file() => {
+                size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                false
+            }
             Ok(_) | Err(_) => {
                 // Follow symlinks (matches previous behavior) and fall back when file_type is unavailable.
                 let meta = match fs::metadata(&path) {
@@ -129,6 +277,75 @@ pub fn read_text_file(root: String, path: String) -> Result<String, String> {
     }
 
     String::from_utf8(bytes).map_err(|_| "file is not valid UTF-8".to_string())
+}
+
+#[tauri::command]
+pub fn probe_file(root: String, path: String) -> Result<FileProbe, String> {
+    let root = Path::new(root.trim());
+    let path = Path::new(path.trim());
+    let file = ensure_within_root(root, path)?;
+    if !file.is_file() {
+        return Err("not a file".to_string());
+    }
+
+    let meta = fs::metadata(&file).map_err(|e| format!("metadata failed: {e}"))?;
+    let size = meta.len();
+    let mut f = File::open(&file).map_err(|e| format!("open failed: {e}"))?;
+    let mut sample = vec![0u8; PROBE_BYTES.min(size as usize)];
+    if !sample.is_empty() {
+        f.read_exact(&mut sample)
+            .map_err(|e| format!("read failed: {e}"))?;
+    }
+    Ok(probe_from_sample(
+        size,
+        mtime_ms(&meta),
+        &sample,
+        Some(&file),
+    ))
+}
+
+#[tauri::command]
+pub fn read_file_range(
+    root: String,
+    path: String,
+    offset: u64,
+    length: u64,
+) -> Result<FileRangeRead, String> {
+    if length > MAX_RANGE_READ_BYTES as u64 {
+        return Err(format!(
+            "range too large ({length} bytes, max {MAX_RANGE_READ_BYTES} bytes)"
+        ));
+    }
+
+    let root = Path::new(root.trim());
+    let path = Path::new(path.trim());
+    let file = ensure_within_root(root, path)?;
+    if !file.is_file() {
+        return Err("not a file".to_string());
+    }
+
+    let meta = fs::metadata(&file).map_err(|e| format!("metadata failed: {e}"))?;
+    let size = meta.len();
+    let read_len = length as usize;
+    let clamped_offset = offset.min(size);
+    let available = size.saturating_sub(clamped_offset).min(read_len as u64) as usize;
+    let mut bytes = vec![0u8; available];
+    if available > 0 {
+        let mut f = File::open(&file).map_err(|e| format!("open failed: {e}"))?;
+        f.seek(SeekFrom::Start(clamped_offset))
+            .map_err(|e| format!("seek failed: {e}"))?;
+        f.read_exact(&mut bytes)
+            .map_err(|e| format!("read failed: {e}"))?;
+    }
+
+    Ok(FileRangeRead {
+        offset: clamped_offset,
+        length: bytes.len(),
+        size,
+        mtime_ms: mtime_ms(&meta),
+        eof: clamped_offset + bytes.len() as u64 >= size,
+        data_base64: base64_encode(&bytes),
+    })
 }
 
 #[tauri::command]

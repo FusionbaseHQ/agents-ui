@@ -9,7 +9,7 @@ import { ConfirmActionModal } from "./modals/ConfirmActionModal";
 
 type MonacoType = typeof import("monaco-editor");
 
-export type CodeEditorOpenFileRequest = { path: string; nonce: number };
+export type CodeEditorOpenFileRequest = { path: string; nonce: number; mode?: CodeEditorOpenMode };
 
 loader.config({ monaco: bundledMonaco });
 
@@ -17,10 +17,42 @@ export type CodeEditorPanelHandle = {
   openFind: () => boolean;
 };
 
+export type CodeEditorOpenMode = "auto" | "text" | "image" | "bytes";
+type ViewerKind = "text" | "largeText" | "image" | "bytes";
+
+type FileProbe = {
+  size: number;
+  mtimeMs?: number | null;
+  kind: "text" | "image" | "binary" | string;
+  imageType?: string | null;
+  mime?: string | null;
+  hasNul: boolean;
+  validUtf8: boolean;
+  isLargeText: boolean;
+};
+
+type FileRangeRead = {
+  offset: number;
+  length: number;
+  size: number;
+  mtimeMs?: number | null;
+  eof: boolean;
+  dataBase64: string;
+};
+
+type ReadRangeFn = (path: string, offset: number, length: number) => Promise<FileRangeRead>;
+
+const EDITABLE_TEXT_MAX_BYTES = 2 * 1024 * 1024;
+const IMAGE_PREVIEW_MAX_BYTES = 64 * 1024 * 1024;
+const RANGE_CHUNK_BYTES = 256 * 1024;
+const MAX_RANGE_BYTES = 1024 * 1024;
+const MAX_VIEWER_CACHE_BYTES = 8 * 1024 * 1024;
+
 export type CodeEditorPersistedTab = {
   path: string;
   dirty: boolean;
   content: string | null;
+  viewerKind?: ViewerKind | null;
 };
 
 export type CodeEditorPersistedState = {
@@ -35,9 +67,14 @@ export type CodeEditorFsEvent =
 type Tab = {
   path: string;
   title: string;
+  viewerKind: ViewerKind | null;
+  requestedMode: CodeEditorOpenMode;
   dirty: boolean;
   loading: boolean;
   error: string | null;
+  size: number | null;
+  mime: string | null;
+  imageType: string | null;
 };
 
 type PendingCloseAction =
@@ -59,6 +96,66 @@ function dirname(path: string): string {
   const idx = cleaned.lastIndexOf("/");
   if (idx <= 0) return "/";
   return cleaned.slice(0, idx);
+}
+
+function emptyTab(path: string, requestedMode: CodeEditorOpenMode = "auto"): Tab {
+  return {
+    path,
+    title: basename(path),
+    viewerKind: null,
+    requestedMode,
+    dirty: false,
+    loading: true,
+    error: null,
+    size: null,
+    mime: null,
+    imageType: null,
+  };
+}
+
+function chooseViewerKind(probe: FileProbe, mode: CodeEditorOpenMode): ViewerKind {
+  if (mode === "bytes") return "bytes";
+  if (mode === "image") return probe.kind === "image" ? "image" : "bytes";
+  if (probe.kind === "image" && mode !== "text") return "image";
+  if (probe.kind === "text" && probe.validUtf8 && !probe.hasNul) {
+    return probe.size <= EDITABLE_TEXT_MAX_BYTES && mode !== "auto" ? "text" : probe.size <= EDITABLE_TEXT_MAX_BYTES ? "text" : "largeText";
+  }
+  return "bytes";
+}
+
+function decodeBase64Bytes(value: string): Uint8Array {
+  const binary = atob(value);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+function formatBytes(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "";
+  if (value < 1024) return `${value} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let n = value / 1024;
+  let idx = 0;
+  while (n >= 1024 && idx < units.length - 1) {
+    n /= 1024;
+    idx += 1;
+  }
+  return `${n >= 10 ? n.toFixed(1) : n.toFixed(2)} ${units[idx]}`;
+}
+
+function byteToAscii(byte: number): string {
+  return byte >= 32 && byte < 127 ? String.fromCharCode(byte) : ".";
 }
 
 function inferLanguageId(path: string): string {
@@ -183,6 +280,41 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     [provider, rootDir, sshTargetValue],
   );
 
+  const probeFile = React.useCallback(
+    async (path: string): Promise<FileProbe> => {
+      if (provider === "ssh") {
+        if (!sshTargetValue) throw new Error("Missing SSH target.");
+        return await invoke<FileProbe>("ssh_probe_file", { target: sshTargetValue, root: rootDir, path });
+      }
+      return await invoke<FileProbe>("probe_file", { root: rootDir, path });
+    },
+    [provider, rootDir, sshTargetValue],
+  );
+
+  const readFileRange = React.useCallback<ReadRangeFn>(
+    async (path: string, offset: number, length: number): Promise<FileRangeRead> => {
+      const safeOffset = Math.max(0, Math.floor(offset));
+      const safeLength = Math.max(0, Math.min(MAX_RANGE_BYTES, Math.floor(length)));
+      if (provider === "ssh") {
+        if (!sshTargetValue) throw new Error("Missing SSH target.");
+        return await invoke<FileRangeRead>("ssh_read_file_range", {
+          target: sshTargetValue,
+          root: rootDir,
+          path,
+          offset: safeOffset,
+          length: safeLength,
+        });
+      }
+      return await invoke<FileRangeRead>("read_file_range", {
+        root: rootDir,
+        path,
+        offset: safeOffset,
+        length: safeLength,
+      });
+    },
+    [provider, rootDir, sshTargetValue],
+  );
+
   const writeTextFile = React.useCallback(
     async (path: string, content: string): Promise<void> => {
       if (provider === "ssh") {
@@ -213,6 +345,9 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   const editorRef = React.useRef<import("monaco-editor").editor.IStandaloneCodeEditor | null>(null);
 
   const openFind = React.useCallback((): boolean => {
+    const active = activePathRef.current;
+    const tab = active ? tabsRef.current.find((it) => it.path === active) : null;
+    if (tab?.viewerKind !== "text") return false;
     const editor = editorRef.current;
     if (!editor) return false;
     try {
@@ -265,8 +400,8 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     const currentTabs = tabsRef.current;
     const outTabs: CodeEditorPersistedTab[] = currentTabs.map((tab) => {
       const dirty = dirtyPathsRef.current.has(tab.path) || tab.dirty;
-      const content = dirty ? readModelValue(tab.path) ?? "" : null;
-      return { path: tab.path, dirty, content };
+      const content = dirty && tab.viewerKind === "text" ? readModelValue(tab.path) ?? "" : null;
+      return { path: tab.path, dirty: tab.viewerKind === "text" ? dirty : false, content, viewerKind: tab.viewerKind };
     });
     return { tabs: outTabs, activePath: activePathRef.current };
   }, [readModelValue]);
@@ -355,34 +490,62 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   }, [modelUriForPath]);
 
   const openFile = React.useCallback(
-    async (path: string) => {
+    async (path: string, mode: CodeEditorOpenMode = "auto") => {
       const normalized = path.trim();
       if (!normalized) return;
 
-      if (openPathsRef.current.has(normalized)) {
-        setActivePath(normalized);
-        activePathRef.current = normalized;
-        const monaco = monacoRef.current;
-        const hasModel =
-          modelsRef.current.has(normalized) ||
-          (monaco ? Boolean(monaco.editor.getModel(modelUriForPath(monaco, normalized))) : false);
-        if (hasModel) {
-          setEditorModel(normalized);
-          return;
-        }
-        if (loadNonceByPathRef.current.has(normalized)) {
-          return;
-        }
-        updateTab(normalized, (tab) => ({ ...tab, loading: true, error: null }));
+      const reload = async () => {
+        updateTab(normalized, (tab) => ({
+          ...tab,
+          requestedMode: mode,
+          loading: true,
+          error: null,
+          viewerKind: tab.viewerKind,
+        }));
+
         const loadNonce = nextLoadNonceRef.current++;
         loadNonceByPathRef.current.set(normalized, loadNonce);
         try {
-          const content = await readTextFile(normalized);
+          const probe = await probeFile(normalized);
           if (!openPathsRef.current.has(normalized)) return;
           if (loadNonceByPathRef.current.get(normalized) !== loadNonce) return;
-          ensureModel(normalized, content);
-          updateTab(normalized, (tab) => ({ ...tab, loading: false, error: null }));
-          if (activePathRef.current === normalized) setEditorModel(normalized);
+
+          const viewerKind = chooseViewerKind(probe, mode);
+          if (viewerKind !== "text") {
+            const editor = editorRef.current;
+            if (editor && editor.getModel() === modelsRef.current.get(normalized)) {
+              editor.setModel(null);
+            }
+            const model = modelsRef.current.get(normalized);
+            if (model && !dirtyPathsRef.current.has(normalized)) {
+              modelsRef.current.delete(normalized);
+              model.dispose();
+            }
+            pendingContentRef.current.delete(normalized);
+          }
+
+          if (viewerKind === "text") {
+            const content = await readTextFile(normalized);
+            if (!openPathsRef.current.has(normalized)) return;
+            if (loadNonceByPathRef.current.get(normalized) !== loadNonce) return;
+            ensureModel(normalized, content);
+          }
+
+          updateTab(normalized, (tab) => ({
+            ...tab,
+            viewerKind,
+            requestedMode: mode,
+            loading: false,
+            error: mode === "image" && viewerKind !== "image" ? "Not a supported raster image." : null,
+            size: probe.size,
+            mime: probe.mime ?? null,
+            imageType: probe.imageType ?? null,
+          }));
+
+          if (activePathRef.current === normalized) {
+            if (viewerKind === "text") setEditorModel(normalized);
+            else setEditorModel(null);
+          }
         } catch (err) {
           if (!openPathsRef.current.has(normalized)) return;
           if (loadNonceByPathRef.current.get(normalized) !== loadNonce) return;
@@ -393,42 +556,39 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
             loadNonceByPathRef.current.delete(normalized);
           }
         }
+      };
+
+      if (openPathsRef.current.has(normalized)) {
+        setActivePath(normalized);
+        activePathRef.current = normalized;
+
+        const existing = tabsRef.current.find((tab) => tab.path === normalized) ?? null;
+        const requestedModeMatches = mode === "auto" || existing?.requestedMode === mode;
+        if (existing?.viewerKind && requestedModeMatches) {
+          if (existing.viewerKind === "text") setEditorModel(normalized);
+          else setEditorModel(null);
+          return;
+        }
+        if (dirtyPathsRef.current.has(normalized)) {
+          setEditorModel(normalized);
+          return;
+        }
+        if (loadNonceByPathRef.current.has(normalized)) {
+          return;
+        }
+        await reload();
         return;
       }
 
       openPathsRef.current.add(normalized);
-      setTabs((prev) => {
-        const next = [
-          ...prev,
-          { path: normalized, title: basename(normalized), dirty: false, loading: true, error: null },
-        ];
-        tabsRef.current = next;
-        return next;
-      });
+      const nextTabs = [...tabsRef.current, emptyTab(normalized, mode)];
+      tabsRef.current = nextTabs;
+      setTabs(nextTabs);
       setActivePath(normalized);
       activePathRef.current = normalized;
-
-      const loadNonce = nextLoadNonceRef.current++;
-      loadNonceByPathRef.current.set(normalized, loadNonce);
-      try {
-        const content = await readTextFile(normalized);
-        if (!openPathsRef.current.has(normalized)) return;
-        if (loadNonceByPathRef.current.get(normalized) !== loadNonce) return;
-        ensureModel(normalized, content);
-        updateTab(normalized, (tab) => ({ ...tab, loading: false, error: null }));
-        if (activePathRef.current === normalized) setEditorModel(normalized);
-      } catch (err) {
-        if (!openPathsRef.current.has(normalized)) return;
-        if (loadNonceByPathRef.current.get(normalized) !== loadNonce) return;
-        const message = err instanceof Error ? err.message : String(err);
-        updateTab(normalized, (tab) => ({ ...tab, loading: false, error: message }));
-      } finally {
-        if (loadNonceByPathRef.current.get(normalized) === loadNonce) {
-          loadNonceByPathRef.current.delete(normalized);
-        }
-      }
+      await reload();
     },
-    [ensureModel, modelUriForPath, readTextFile, setEditorModel, updateTab],
+    [ensureModel, probeFile, readTextFile, setEditorModel, updateTab],
   );
 
   React.useEffect(() => {
@@ -440,13 +600,18 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     const nextTabs: Tab[] = persistedState.tabs.map((it) => ({
       path: it.path,
       title: basename(it.path),
-      dirty: it.dirty,
+      viewerKind: it.dirty && it.content != null ? "text" : null,
+      requestedMode: it.viewerKind === "bytes" ? "bytes" : it.viewerKind === "image" ? "image" : "auto",
+      dirty: it.dirty && it.content != null,
       loading: it.content == null,
       error: null,
+      size: null,
+      mime: null,
+      imageType: null,
     }));
     setTabs(nextTabs);
     openPathsRef.current = new Set(persistedState.tabs.map((t) => t.path));
-    dirtyPathsRef.current = new Set(persistedState.tabs.filter((t) => t.dirty).map((t) => t.path));
+    dirtyPathsRef.current = new Set(persistedState.tabs.filter((t) => t.dirty && t.content != null).map((t) => t.path));
 
     for (const tab of persistedState.tabs) {
       if (!tab.dirty) continue;
@@ -468,7 +633,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
 
   React.useEffect(() => {
     if (!openFileRequest) return;
-    const key = `${openFileRequest.nonce}:${openFileRequest.path}`;
+    const key = `${openFileRequest.nonce}:${openFileRequest.path}:${openFileRequest.mode ?? "auto"}`;
     if (lastOpenRequestRef.current === key) return;
     if (scheduledOpenRequestRef.current === key) return;
     scheduledOpenRequestRef.current = key;
@@ -480,7 +645,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       lastOpenRequestRef.current = key;
       if (scheduledOpenRequestRef.current === key) scheduledOpenRequestRef.current = null;
       onConsumeOpenFileRequestRef.current?.();
-      void openFile(openFileRequest.path);
+      void openFile(openFileRequest.path, openFileRequest.mode ?? "auto");
     };
 
     // Defer to the microtask queue so StrictMode test mounts don't eat the request,
@@ -588,6 +753,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       }
       dirtyPathsRef.current.delete(path);
       openPathsRef.current.delete(path);
+      pendingContentRef.current.delete(path);
 
       const prevTabs = tabsRef.current;
       const next = prevTabs.filter((t) => t.path !== path);
@@ -625,6 +791,8 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   const saveActive = React.useCallback(async () => {
     const path = activePathRef.current;
     if (!path) return;
+    const tab = tabsRef.current.find((t) => t.path === path);
+    if (tab?.viewerKind !== "text") return;
     if (!dirtyPathsRef.current.has(path)) return;
 
     const monaco = monacoRef.current;
@@ -728,6 +896,14 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
         pendingContentRef.current = nextPending;
       }
 
+      if (loadNonceByPathRef.current.size > 0) {
+        const nextLoads = new Map<string, number>();
+        for (const [p, nonce] of loadNonceByPathRef.current.entries()) {
+          nextLoads.set(transformPath(p), nonce);
+        }
+        loadNonceByPathRef.current = nextLoads;
+      }
+
       const monaco = monacoRef.current;
       if (monaco) {
         const editor = editorRef.current;
@@ -778,6 +954,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
 
       openPathsRef.current = new Set(Array.from(openPathsRef.current).filter((p) => !shouldClose(p)));
       dirtyPathsRef.current = new Set(Array.from(dirtyPathsRef.current).filter((p) => !shouldClose(p)));
+      loadNonceByPathRef.current = new Map(Array.from(loadNonceByPathRef.current).filter(([p]) => !shouldClose(p)));
 
       if (pendingContentRef.current.size > 0) {
         const nextPending = new Map<string, string>();
@@ -974,7 +1151,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
             type="button"
             className="btnSmall"
             onClick={() => void saveActive()}
-            disabled={!activeTab || !activeTab.dirty || activeTab.loading || Boolean(activeTab.error)}
+            disabled={!activeTab || activeTab.viewerKind !== "text" || !activeTab.dirty || activeTab.loading || Boolean(activeTab.error)}
             title="Save (Ctrl/Cmd+S)"
           >
             {saveStatus === "saving" ? "Saving…" : saveStatus === "saved" ? "Saved" : "Save"}
@@ -995,18 +1172,18 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
         {!activeTab ? <div className="empty">No file selected.</div> : null}
 
         {tabs.length ? (
-          <div className="codeEditorMonaco">
-          <Editor
-            theme={editorTheme}
-            onMount={onMount}
-            keepCurrentModel
-            defaultLanguage="plaintext"
-            defaultPath="inmemory://model/initial"
-            options={{
-              automaticLayout: true,
-              minimap: { enabled: false },
-              scrollBeyondLastLine: false,
-              renderWhitespace: "none",
+          <div className={`codeEditorMonaco ${activeTab?.viewerKind === "text" || !activeTab?.viewerKind ? "" : "codeEditorMonacoHidden"}`}>
+            <Editor
+              theme={editorTheme}
+              onMount={onMount}
+              keepCurrentModel
+              defaultLanguage="plaintext"
+              defaultPath="inmemory://model/initial"
+              options={{
+                automaticLayout: true,
+                minimap: { enabled: false },
+                scrollBeyondLastLine: false,
+                renderWhitespace: "none",
                 wordWrap: "off",
                 tabSize: 2,
                 fontSize: 12,
@@ -1014,12 +1191,43 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
                 smoothScrolling: true,
               }}
             />
-            {activeTab?.loading ? <div className="codeEditorOverlay">Loading…</div> : null}
-            {activeTab?.error ? (
-              <div className="codeEditorOverlay" title={activeTab.error}>
-                {activeTab.error.length > 220 ? `${activeTab.error.slice(0, 220)}…` : activeTab.error}
-              </div>
-            ) : null}
+          </div>
+        ) : null}
+
+        {activeTab && !activeTab.loading && !activeTab.error && activeTab.viewerKind === "image" ? (
+          <ImageViewer
+            key={`image:${activeTab.path}:${activeTab.size ?? 0}`}
+            path={activeTab.path}
+            size={activeTab.size ?? 0}
+            mime={activeTab.mime ?? "application/octet-stream"}
+            readRange={readFileRange}
+            onOpenBytes={() => void openFile(activeTab.path, "bytes")}
+          />
+        ) : null}
+
+        {activeTab && !activeTab.loading && !activeTab.error && activeTab.viewerKind === "bytes" ? (
+          <ByteViewer
+            key={`bytes:${activeTab.path}:${activeTab.size ?? 0}`}
+            path={activeTab.path}
+            size={activeTab.size ?? 0}
+            readRange={readFileRange}
+          />
+        ) : null}
+
+        {activeTab && !activeTab.loading && !activeTab.error && activeTab.viewerKind === "largeText" ? (
+          <LargeTextViewer
+            key={`large-text:${activeTab.path}:${activeTab.size ?? 0}`}
+            path={activeTab.path}
+            size={activeTab.size ?? 0}
+            readRange={readFileRange}
+            onOpenBytes={() => void openFile(activeTab.path, "bytes")}
+          />
+        ) : null}
+
+        {activeTab?.loading ? <div className="codeEditorOverlay">Loading…</div> : null}
+        {activeTab?.error ? (
+          <div className="codeEditorOverlay" title={activeTab.error}>
+            {activeTab.error.length > 220 ? `${activeTab.error.slice(0, 220)}…` : activeTab.error}
           </div>
         ) : null}
 
@@ -1074,5 +1282,546 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     </section>
   );
 });
+
+function ImageViewer({
+  path,
+  size,
+  mime,
+  readRange,
+  onOpenBytes,
+}: {
+  path: string;
+  size: number;
+  mime: string;
+  readRange: ReadRangeFn;
+  onOpenBytes: () => void;
+}) {
+  const [url, setUrl] = React.useState<string | null>(null);
+  const [loaded, setLoaded] = React.useState(0);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    setUrl(null);
+    setLoaded(0);
+    setError(null);
+
+    if (size > IMAGE_PREVIEW_MAX_BYTES) return;
+
+    const run = async () => {
+      try {
+        const parts: Uint8Array[] = [];
+        for (let offset = 0; offset < size; offset += RANGE_CHUNK_BYTES) {
+          if (cancelled) return;
+          const length = Math.min(RANGE_CHUNK_BYTES, size - offset);
+          const chunk = await readRange(path, offset, length);
+          if (cancelled) return;
+          parts.push(decodeBase64Bytes(chunk.dataBase64));
+          setLoaded(Math.min(size, offset + chunk.length));
+          if (chunk.length === 0 || chunk.eof) break;
+        }
+        if (cancelled) return;
+        const blobParts = parts.map((part) =>
+          part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength) as ArrayBuffer,
+        );
+        objectUrl = URL.createObjectURL(new Blob(blobParts, { type: mime || "application/octet-stream" }));
+        setUrl(objectUrl);
+      } catch (err) {
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    };
+
+    void run();
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [mime, path, readRange, size]);
+
+  if (size > IMAGE_PREVIEW_MAX_BYTES) {
+    return (
+      <div className="fileViewerCenter">
+        <div className="fileViewerTitle">Image preview skipped</div>
+        <div className="fileViewerMuted">{formatBytes(size)} exceeds the preview limit.</div>
+        <button type="button" className="btnSmall" onClick={onOpenBytes}>
+          Open bytes
+        </button>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="fileViewerCenter">
+        <div className="fileViewerTitle">Image failed to load</div>
+        <div className="fileViewerMuted" title={error}>{error}</div>
+        <button type="button" className="btnSmall" onClick={onOpenBytes}>
+          Open bytes
+        </button>
+      </div>
+    );
+  }
+
+  if (!url) {
+    return (
+      <div className="fileViewerCenter">
+        <div className="fileViewerTitle">Loading image</div>
+        <div className="fileViewerMuted">
+          {formatBytes(loaded)} / {formatBytes(size)}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="imageViewer">
+      <img src={url} alt={basename(path)} onError={() => setError("The image decoder rejected this file.")} />
+    </div>
+  );
+}
+
+function ByteViewer({ path, size, readRange }: { path: string; size: number; readRange: ReadRangeFn }) {
+  const listRef = React.useRef<HTMLDivElement | null>(null);
+  const cacheRef = React.useRef<Map<number, { bytes: Uint8Array; lastUsed: number }>>(new Map());
+  const pendingRef = React.useRef<Set<number>>(new Set());
+  const cacheBytesRef = React.useRef(0);
+  const [version, setVersion] = React.useState(0);
+  const [scrollTop, setScrollTop] = React.useState(0);
+  const [listHeight, setListHeight] = React.useState(0);
+  const [error, setError] = React.useState<string | null>(null);
+  const [jumpValue, setJumpValue] = React.useState("");
+  const rowHeight = 22;
+  const bytesPerRow = 16;
+  const totalRows = Math.max(1, Math.ceil(size / bytesPerRow));
+  const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - 24);
+  const endIndex = Math.min(totalRows, Math.ceil((scrollTop + listHeight) / rowHeight) + 24);
+
+  React.useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const sync = () => {
+      setScrollTop(el.scrollTop);
+      setListHeight(el.clientHeight);
+    };
+    sync();
+    el.addEventListener("scroll", sync, { passive: true });
+    const ro = new ResizeObserver(sync);
+    ro.observe(el);
+    return () => {
+      el.removeEventListener("scroll", sync);
+      ro.disconnect();
+    };
+  }, []);
+
+  const touchChunk = React.useCallback((start: number): Uint8Array | null => {
+    const item = cacheRef.current.get(start);
+    if (!item) return null;
+    item.lastUsed = Date.now();
+    return item.bytes;
+  }, []);
+
+  const readChunk = React.useCallback(
+    async (start: number) => {
+      if (start >= size) return;
+      if (cacheRef.current.has(start) || pendingRef.current.has(start)) return;
+      pendingRef.current.add(start);
+      setVersion((v) => v + 1);
+      try {
+        const length = Math.min(RANGE_CHUNK_BYTES, size - start);
+        const result = await readRange(path, start, length);
+        const bytes = decodeBase64Bytes(result.dataBase64);
+        cacheRef.current.set(result.offset, { bytes, lastUsed: Date.now() });
+        cacheBytesRef.current += bytes.length;
+        while (cacheBytesRef.current > MAX_VIEWER_CACHE_BYTES && cacheRef.current.size > 1) {
+          let oldestKey: number | null = null;
+          let oldestAt = Number.POSITIVE_INFINITY;
+          for (const [key, value] of cacheRef.current.entries()) {
+            if (value.lastUsed < oldestAt) {
+              oldestAt = value.lastUsed;
+              oldestKey = key;
+            }
+          }
+          if (oldestKey == null) break;
+          const removed = cacheRef.current.get(oldestKey);
+          cacheRef.current.delete(oldestKey);
+          cacheBytesRef.current -= removed?.bytes.length ?? 0;
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        pendingRef.current.delete(start);
+        setVersion((v) => v + 1);
+      }
+    },
+    [path, readRange, size],
+  );
+
+  React.useEffect(() => {
+    const firstByte = startIndex * bytesPerRow;
+    const lastByte = Math.min(size, endIndex * bytesPerRow);
+    const firstChunk = Math.floor(firstByte / RANGE_CHUNK_BYTES) * RANGE_CHUNK_BYTES;
+    for (let start = firstChunk; start < lastByte; start += RANGE_CHUNK_BYTES) {
+      void readChunk(start);
+    }
+  }, [endIndex, readChunk, size, startIndex, version]);
+
+  const byteAt = React.useCallback(
+    (offset: number): number | null => {
+      if (offset >= size) return null;
+      const chunkStart = Math.floor(offset / RANGE_CHUNK_BYTES) * RANGE_CHUNK_BYTES;
+      const chunk = touchChunk(chunkStart);
+      if (!chunk) return null;
+      const idx = offset - chunkStart;
+      return idx >= 0 && idx < chunk.length ? chunk[idx] : null;
+    },
+    [size, touchChunk],
+  );
+
+  const jumpToOffset = React.useCallback(() => {
+    const trimmed = jumpValue.trim().replace(/^0x/i, "");
+    const parsed = trimmed ? Number.parseInt(trimmed, 16) : 0;
+    if (!Number.isFinite(parsed)) return;
+    const row = Math.max(0, Math.min(totalRows - 1, Math.floor(parsed / bytesPerRow)));
+    if (listRef.current) listRef.current.scrollTop = row * rowHeight;
+  }, [jumpValue, totalRows]);
+
+  const rows: React.ReactNode[] = [];
+  for (let row = startIndex; row < endIndex; row++) {
+    const offset = row * bytesPerRow;
+    const hex: React.ReactNode[] = [];
+    const ascii: React.ReactNode[] = [];
+    for (let i = 0; i < bytesPerRow; i++) {
+      const value = byteAt(offset + i);
+      hex.push(
+        <span key={`h:${i}`} className={value == null ? "byteViewerMissing" : ""}>
+          {value == null ? ".." : value.toString(16).padStart(2, "0")}
+        </span>,
+      );
+      ascii.push(
+        <span key={`a:${i}`} className={value == null ? "byteViewerMissing" : ""}>
+          {value == null ? "." : byteToAscii(value)}
+        </span>,
+      );
+    }
+    rows.push(
+      <div className="byteViewerRow" style={{ height: rowHeight }} key={offset}>
+        <span className="byteViewerOffset">{offset.toString(16).padStart(8, "0")}</span>
+        <span className="byteViewerHex">{hex}</span>
+        <span className="byteViewerAscii">{ascii}</span>
+      </div>,
+    );
+  }
+
+  return (
+    <div className="byteViewer">
+      <div className="fileViewerToolbar">
+        <span>{formatBytes(size)}</span>
+        <input
+          className="fileViewerInput"
+          value={jumpValue}
+          onChange={(e) => setJumpValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") jumpToOffset();
+          }}
+          placeholder="offset hex"
+        />
+        <button type="button" className="btnSmall" onClick={jumpToOffset}>
+          Go
+        </button>
+        {error ? <span className="fileViewerError" title={error}>{error}</span> : null}
+      </div>
+      <div className="byteViewerList" ref={listRef}>
+        <div style={{ paddingTop: startIndex * rowHeight, paddingBottom: Math.max(0, (totalRows - endIndex) * rowHeight) }}>
+          {rows}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type LineCheckpoint = { line: number; offset: number };
+
+function countNewlines(bytes: Uint8Array, end = bytes.length): number {
+  let count = 0;
+  const limit = Math.min(end, bytes.length);
+  for (let i = 0; i < limit; i++) {
+    if (bytes[i] === 10) count += 1;
+  }
+  return count;
+}
+
+function indexOfBytes(haystack: Uint8Array, needle: Uint8Array, startAt: number): number {
+  if (needle.length === 0) return -1;
+  outer: for (let i = Math.max(0, startAt); i <= haystack.length - needle.length; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+function LargeTextViewer({
+  path,
+  size,
+  readRange,
+  onOpenBytes,
+}: {
+  path: string;
+  size: number;
+  readRange: ReadRangeFn;
+  onOpenBytes: () => void;
+}) {
+  const listRef = React.useRef<HTMLDivElement | null>(null);
+  const checkpointsRef = React.useRef<LineCheckpoint[]>([{ line: 0, offset: 0 }]);
+  const [indexState, setIndexState] = React.useState({ offset: 0, lines: 0, done: size === 0, totalLines: size === 0 ? 1 : 0 });
+  const [scrollTop, setScrollTop] = React.useState(0);
+  const [listHeight, setListHeight] = React.useState(0);
+  const [lineInput, setLineInput] = React.useState("");
+  const [query, setQuery] = React.useState("");
+  const [searchStatus, setSearchStatus] = React.useState<string | null>(null);
+  const [searchBusy, setSearchBusy] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  const [windowLines, setWindowLines] = React.useState<{ baseLine: number; lines: string[]; partial: boolean } | null>(null);
+  const rowHeight = 20;
+  const indexedRatio = size > 0 ? indexState.offset / size : 1;
+  const estimatedRows = indexState.done
+    ? Math.max(1, indexState.totalLines)
+    : Math.max(indexState.lines + 2048, Math.ceil(size / Math.max(48, indexState.offset / Math.max(1, indexState.lines || 1))));
+  const totalRows = Math.max(1, estimatedRows);
+  const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - 16);
+  const endIndex = Math.min(totalRows, Math.ceil((scrollTop + listHeight) / rowHeight) + 16);
+
+  React.useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const sync = () => {
+      setScrollTop(el.scrollTop);
+      setListHeight(el.clientHeight);
+    };
+    sync();
+    el.addEventListener("scroll", sync, { passive: true });
+    const ro = new ResizeObserver(sync);
+    ro.observe(el);
+    return () => {
+      el.removeEventListener("scroll", sync);
+      ro.disconnect();
+    };
+  }, []);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const checkpoints: LineCheckpoint[] = [{ line: 0, offset: 0 }];
+    checkpointsRef.current = checkpoints;
+
+    const run = async () => {
+      let offset = 0;
+      let line = 0;
+      let lastByte: number | null = null;
+      let lastPublish = 0;
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      try {
+        while (offset < size && !cancelled) {
+          const result = await readRange(path, offset, Math.min(RANGE_CHUNK_BYTES, size - offset));
+          if (cancelled) return;
+          const bytes = decodeBase64Bytes(result.dataBase64);
+          // Validate UTF-8 as a stream so multibyte characters split across ranges are accepted.
+          decoder.decode(bytes, { stream: !(result.eof || offset + bytes.length >= size) });
+          for (let i = 0; i < bytes.length; i++) {
+            if (bytes[i] === 10) {
+              line += 1;
+              if (line % 1024 === 0) checkpoints.push({ line, offset: result.offset + i + 1 });
+            }
+          }
+          if (bytes.length > 0) lastByte = bytes[bytes.length - 1];
+          offset = result.offset + bytes.length;
+          const now = Date.now();
+          if (now - lastPublish > 120 || result.eof) {
+            lastPublish = now;
+            checkpointsRef.current = checkpoints.slice();
+            setIndexState({
+              offset,
+              lines: line,
+              done: result.eof || offset >= size,
+              totalLines: result.eof || offset >= size ? Math.max(1, line + (lastByte === 10 ? 0 : 1)) : 0,
+            });
+          }
+          if (bytes.length === 0 || result.eof) break;
+        }
+        decoder.decode();
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      }
+    };
+
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [path, readRange, size]);
+
+  const findCheckpoint = React.useCallback((line: number): LineCheckpoint => {
+    const checkpoints = checkpointsRef.current;
+    let lo = 0;
+    let hi = checkpoints.length - 1;
+    while (lo <= hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      if (checkpoints[mid].line <= line) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    return checkpoints[Math.max(0, hi)] ?? { line: 0, offset: 0 };
+  }, []);
+
+  React.useEffect(() => {
+    if (error) return;
+    if (!indexState.done && startIndex > indexState.lines) {
+      setWindowLines(null);
+      return;
+    }
+    let cancelled = false;
+    const load = async () => {
+      const checkpoint = findCheckpoint(startIndex);
+      try {
+        const result = await readRange(path, checkpoint.offset, Math.min(MAX_RANGE_BYTES, size - checkpoint.offset));
+        if (cancelled) return;
+        const bytes = decodeBase64Bytes(result.dataBase64);
+        const decoded = new TextDecoder("utf-8").decode(bytes);
+        const rawLines = decoded.split("\n").map((line) => (line.endsWith("\r") ? line.slice(0, -1) : line));
+        const skip = Math.max(0, startIndex - checkpoint.line);
+        setWindowLines({
+          baseLine: checkpoint.line + skip,
+          lines: rawLines.slice(skip, skip + Math.max(32, endIndex - startIndex + 32)),
+          partial: !result.eof && checkpoint.offset + bytes.length < size,
+        });
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [endIndex, error, findCheckpoint, indexState.done, indexState.lines, path, readRange, size, startIndex]);
+
+  const scrollToLine = React.useCallback((line: number) => {
+    const target = Math.max(0, Math.min(totalRows - 1, line));
+    if (listRef.current) listRef.current.scrollTop = target * rowHeight;
+  }, [totalRows]);
+
+  const submitLineJump = React.useCallback(() => {
+    const parsed = Number.parseInt(lineInput.trim(), 10);
+    if (!Number.isFinite(parsed)) return;
+    scrollToLine(Math.max(0, parsed - 1));
+  }, [lineInput, scrollToLine]);
+
+  const runSearch = React.useCallback(async () => {
+    const trimmed = query;
+    if (!trimmed) return;
+    const needle = new TextEncoder().encode(trimmed);
+    if (needle.length === 0) return;
+    setSearchBusy(true);
+    setSearchStatus(null);
+    try {
+      let offset = 0;
+      let line = 0;
+      let overlap = new Uint8Array(0);
+      while (offset < size) {
+        const result = await readRange(path, offset, Math.min(RANGE_CHUNK_BYTES, size - offset));
+        const bytes = decodeBase64Bytes(result.dataBase64);
+        const combined = overlap.length ? concatBytes([overlap, bytes]) : bytes;
+        const searchStart = Math.max(0, overlap.length - needle.length + 1);
+        const found = indexOfBytes(combined, needle, searchStart);
+        if (found >= 0) {
+          const lineAtCombinedStart = line - countNewlines(overlap);
+          const matchedLine = lineAtCombinedStart + countNewlines(combined, found);
+          scrollToLine(matchedLine);
+          setSearchStatus(`Line ${matchedLine + 1}`);
+          return;
+        }
+        line += countNewlines(bytes);
+        overlap = needle.length > 1 ? bytes.slice(Math.max(0, bytes.length - needle.length + 1)) : new Uint8Array(0);
+        offset = result.offset + bytes.length;
+        if (bytes.length === 0 || result.eof) break;
+      }
+      setSearchStatus("No match");
+    } catch (err) {
+      setSearchStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSearchBusy(false);
+    }
+  }, [path, query, readRange, scrollToLine, size]);
+
+  const rows: React.ReactNode[] = [];
+  for (let row = startIndex; row < endIndex; row++) {
+    const text =
+      windowLines && row >= windowLines.baseLine && row < windowLines.baseLine + windowLines.lines.length
+        ? windowLines.lines[row - windowLines.baseLine]
+        : !indexState.done && row > indexState.lines
+          ? "Indexing..."
+          : "";
+    rows.push(
+      <div className="largeTextRow" style={{ height: rowHeight }} key={row}>
+        <span className="largeTextLineNo">{row + 1}</span>
+        <span className="largeTextLine">{text}</span>
+      </div>,
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="fileViewerCenter">
+        <div className="fileViewerTitle">Text viewer stopped</div>
+        <div className="fileViewerMuted" title={error}>{error}</div>
+        <button type="button" className="btnSmall" onClick={onOpenBytes}>
+          Open bytes
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="largeTextViewer">
+      <div className="fileViewerToolbar">
+        <span>{formatBytes(size)}</span>
+        <span>{indexState.done ? `${indexState.totalLines} lines` : `Indexed ${Math.round(indexedRatio * 100)}%`}</span>
+        <input
+          className="fileViewerInput"
+          value={lineInput}
+          onChange={(e) => setLineInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") submitLineJump();
+          }}
+          placeholder="line"
+        />
+        <button type="button" className="btnSmall" onClick={submitLineJump}>
+          Go
+        </button>
+        <button type="button" className="btnSmall" onClick={() => scrollToLine(totalRows - 1)}>
+          Tail
+        </button>
+        <input
+          className="fileViewerInput fileViewerSearchInput"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void runSearch();
+          }}
+          placeholder="find literal"
+        />
+        <button type="button" className="btnSmall" onClick={() => void runSearch()} disabled={searchBusy || !query}>
+          {searchBusy ? "Finding..." : "Find"}
+        </button>
+        {searchStatus ? <span className="fileViewerMuted">{searchStatus}</span> : null}
+      </div>
+      <div className="largeTextList" ref={listRef}>
+        <div style={{ paddingTop: startIndex * rowHeight, paddingBottom: Math.max(0, (totalRows - endIndex) * rowHeight) }}>
+          {rows}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 export default CodeEditorPanel;
