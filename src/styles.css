@@ -1742,8 +1742,7 @@ body::after {
 }
 
 .agentBadge.chip-codex,
-.agentBadge.chip-claude,
-.agentBadge.chip-gemini {
+.agentBadge.chip-claude {
   border: none;
   background: transparent;
   padding: 0;
@@ -1779,10 +1778,6 @@ body::after {
   background: var(--accent-2);
 }
 
-.chip-gemini .chipActivity {
-  background: var(--accent-3);
-}
-
 @keyframes chipPulse {
   0% {
     transform: scale(0.80);
@@ -1807,12 +1802,6 @@ body::after {
 .chip-claude {
   border-color: rgba(var(--accent-2-rgb), 0.45);
   background: rgba(var(--accent-2-rgb), 0.12);
-  color: rgba(var(--ink-rgb), 0.88);
-}
-
-.chip-gemini {
-  border-color: rgba(var(--accent-3-rgb), 0.45);
-  background: rgba(var(--accent-3-rgb), 0.12);
   color: rgba(var(--ink-rgb), 0.88);
 }
 

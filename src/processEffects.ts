@@ -1,6 +1,5 @@
 const claudeIcon = "/agent-icons/claude-code-icon.png";
 const codexIcon = "/agent-icons/openai-codex-icon.png";
-const geminiIcon = "/agent-icons/gemini-logo.png";
 
 export type ProcessEffect = {
   id: string;
@@ -13,7 +12,6 @@ export type ProcessEffect = {
 export const PROCESS_EFFECTS: ProcessEffect[] = [
   { id: "codex", label: "codex", matchCommands: ["codex"], idleAfterMs: 2000, iconSrc: codexIcon },
   { id: "claude", label: "claude", matchCommands: ["claude"], idleAfterMs: 2000, iconSrc: claudeIcon },
-  { id: "gemini", label: "gemini", matchCommands: ["gemini"], idleAfterMs: 2000, iconSrc: geminiIcon },
 ];
 
 function normalizeCommandToken(token: string): string {

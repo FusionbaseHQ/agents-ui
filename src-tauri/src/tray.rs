@@ -112,18 +112,6 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
                 },
             );
         }
-        "tray-start-gemini" => {
-            show_main_window(app);
-            let _ = app.emit(
-                EVENT_TRAY_MENU,
-                TrayMenuEventPayload {
-                    id: "start-agent".to_string(),
-                    effect_id: Some("gemini".to_string()),
-                    project_id: None,
-                    persist_id: None,
-                },
-            );
-        }
         id if id.starts_with("tray-recent-") => {
             let index = id
                 .strip_prefix("tray-recent-")
@@ -309,10 +297,6 @@ pub fn build_status_tray(app: &AppHandle) -> Result<StatusTrayState, String> {
     let start_claude_item = MenuItemBuilder::with_id("tray-start-claude", "Start claude")
         .build(app)
         .map_err(|e| e.to_string())?;
-    let start_gemini_item = MenuItemBuilder::with_id("tray-start-gemini", "Start gemini")
-        .build(app)
-        .map_err(|e| e.to_string())?;
-
     let project_item = MenuItemBuilder::with_id("tray-project", "Project: —")
         .enabled(false)
         .build(app)
@@ -351,7 +335,6 @@ pub fn build_status_tray(app: &AppHandle) -> Result<StatusTrayState, String> {
         .separator()
         .item(&start_codex_item)
         .item(&start_claude_item)
-        .item(&start_gemini_item)
         .separator()
         .item(&project_item)
         .item(&session_item)

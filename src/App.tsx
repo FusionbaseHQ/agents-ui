@@ -203,7 +203,7 @@ const DISPLAY_WAKE_RECOVERY_DELAYS_MS = [0, 250, 1_000, 3_000] as const;
 const SYSTEM_HEALTH_REFRESH_MS = 5_000;
 const COMMAND_ACTIVITY_IDLE_MS = 3_000;
 
-const DEFAULT_AGENT_SHORTCUT_IDS = ["codex", "claude", "gemini"];
+const DEFAULT_AGENT_SHORTCUT_IDS = ["codex", "claude"];
 const DEFAULT_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT = 290;
 const MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT = 0;
 const MAX_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT = 1200;
@@ -451,7 +451,6 @@ function formatCommandTokenLabel(token: string): string {
     claude: "Claude",
     codex: "Codex",
     deno: "Deno",
-    gemini: "Gemini",
     git: "Git",
     go: "Go",
     node: "Node",
@@ -1475,7 +1474,7 @@ async function createSession(input: {
   pinned?: boolean;
   sidebarOrder?: number | null;
 }): Promise<Session> {
-  const persistent = input.persistent ?? !input.launchCommand;
+  const persistent = input.persistent ?? false;
   const persistId = input.persistId ?? makeId();
   const createdAt = input.createdAt ?? Date.now();
 
