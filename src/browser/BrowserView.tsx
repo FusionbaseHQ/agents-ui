@@ -29,6 +29,17 @@ export default function BrowserView({
   const editingRef = React.useRef(false);
   const onUrlChangeRef = React.useRef(onUrlChange);
   onUrlChangeRef.current = onUrlChange;
+  const [debugMsg, setDebugMsg] = React.useState("");
+
+  // TEMP: surface backend positioning diagnostics in a fixed banner the native
+  // webview cannot cover. Remove once the overlay alignment is sorted.
+  React.useEffect(() => {
+    let un: (() => void) | undefined;
+    void listen<string>("browser://debug", (e) => setDebugMsg(String(e.payload))).then((f) => {
+      un = f;
+    });
+    return () => un?.();
+  }, []);
 
   React.useEffect(() => {
     const el = viewportRef.current;
@@ -89,6 +100,25 @@ export default function BrowserView({
 
   return (
     <div className="browserView">
+      {debugMsg ? (
+        <div
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            zIndex: 99999,
+            background: "#b00020",
+            color: "#fff",
+            font: "11px ui-monospace, Menlo, monospace",
+            padding: "2px 6px",
+            pointerEvents: "none",
+            whiteSpace: "pre-wrap",
+          }}
+        >
+          {debugMsg}
+        </div>
+      ) : null}
       <div className="fileViewerToolbar browserBar">
         <button
           type="button"

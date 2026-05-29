@@ -6,7 +6,7 @@
 use serde::Serialize;
 use tauri::{
     webview::{PageLoadEvent, WebviewBuilder},
-    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewUrl,
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, WebviewUrl,
 };
 
 // Parked far off-screen instead of destroyed, so switching tabs keeps page state.
@@ -33,24 +33,34 @@ fn normalize_url(input: &str) -> Result<tauri::Url, String> {
     tauri::Url::parse(&candidate).map_err(|e| format!("invalid url: {e}"))
 }
 
-// The frontend measures the target rect with getBoundingClientRect (origin =
-// top-left of the web content area). A child webview, however, is positioned in
-// its parent NSView's coordinate space, which on macOS spans the full window
-// frame (including the title bar). So we add the title-bar inset — the gap
-// between the window's outer (frame) and inner (content) origin — to align the
-// child with the DOM. On a borderless window this is (0, 0), a no-op.
-fn content_offset(app: &AppHandle) -> (f64, f64) {
-    let Some(window) = app.get_window("main") else {
-        return (0.0, 0.0);
-    };
-    let scale = window.scale_factor().unwrap_or(1.0).max(1.0);
-    match (window.inner_position(), window.outer_position()) {
-        (Ok(inner), Ok(outer)) => (
-            (inner.x - outer.x) as f64 / scale,
-            (inner.y - outer.y) as f64 / scale,
-        ),
-        _ => (0.0, 0.0),
-    }
+// Translate a DOM rect (from getBoundingClientRect, origin = top-left of the web
+// content) into the coordinate space the child webview is positioned in.
+//
+// The trick: the main app webview and the child browser webview are sibling
+// views in the SAME coordinate space, and both are positioned via Tauri's
+// Webview::position()/set_position(). DOM (0,0) is exactly the main webview's
+// top-left. So the child's target is simply main_webview.position() + (x, y).
+// This is self-calibrating — it needs no knowledge of title-bar height or which
+// view space Tauri uses, because we read and write through the same API.
+//
+// Returns the physical position to place the child at.
+fn child_physical_position(app: &AppHandle, dom_x: f64, dom_y: f64) -> PhysicalPosition<f64> {
+    let scale = app
+        .get_window("main")
+        .and_then(|w| w.scale_factor().ok())
+        .unwrap_or(1.0)
+        .max(1.0);
+    let origin = app
+        .get_webview("main")
+        .and_then(|w| w.position().ok())
+        .map(|p| (p.x as f64, p.y as f64))
+        .unwrap_or((0.0, 0.0));
+    PhysicalPosition::new(origin.0 + dom_x * scale, origin.1 + dom_y * scale)
+}
+
+fn emit_debug(app: &AppHandle, msg: String) {
+    eprintln!("[browser] {msg}");
+    let _ = app.emit_to("main", "browser://debug", msg);
 }
 
 fn emit_nav(app: &AppHandle, label: &str, url: &str, loading: bool) {
@@ -77,11 +87,21 @@ pub fn browser_open(
 ) -> Result<(), String> {
     let w = width.max(1.0);
     let h = height.max(1.0);
-    let (dx, dy) = content_offset(&app);
+    let pos = child_physical_position(&app, x, y);
     // Already created: just reveal + reposition (keeps the current page).
     if let Some(webview) = app.get_webview(&label) {
-        let _ = webview.set_position(LogicalPosition::new(x + dx, y + dy));
+        let _ = webview.set_position(pos);
         let _ = webview.set_size(LogicalSize::new(w, h));
+        emit_debug(
+            &app,
+            format!(
+                "reposition dom=({x:.0},{y:.0},{w:.0},{h:.0}) set_phys=({:.0},{:.0}) main_pos={:?} readback={:?}",
+                pos.x,
+                pos.y,
+                app.get_webview("main").and_then(|m| m.position().ok()),
+                webview.position().ok(),
+            ),
+        );
         return Ok(());
     }
     let window = app
@@ -105,8 +125,24 @@ pub fn browser_open(
         });
 
     window
-        .add_child(builder, LogicalPosition::new(x + dx, y + dy), LogicalSize::new(w, h))
+        .add_child(builder, pos, LogicalSize::new(w, h))
         .map_err(|e| format!("failed to create browser webview: {e}"))?;
+    // The main webview may not be positioned yet at first paint; reposition once
+    // more now that the child exists, using the main webview's actual origin.
+    if let Some(webview) = app.get_webview(&label) {
+        let pos2 = child_physical_position(&app, x, y);
+        let _ = webview.set_position(pos2);
+        emit_debug(
+            &app,
+            format!(
+                "created dom=({x:.0},{y:.0},{w:.0},{h:.0}) set_phys=({:.0},{:.0}) main_pos={:?} readback={:?}",
+                pos2.x,
+                pos2.y,
+                app.get_webview("main").and_then(|m| m.position().ok()),
+                webview.position().ok(),
+            ),
+        );
+    }
     Ok(())
 }
 
@@ -122,8 +158,7 @@ pub fn browser_set_bounds(
     let Some(webview) = app.get_webview(&label) else {
         return Ok(());
     };
-    let (dx, dy) = content_offset(&app);
-    let _ = webview.set_position(LogicalPosition::new(x + dx, y + dy));
+    let _ = webview.set_position(child_physical_position(&app, x, y));
     let _ = webview.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
     Ok(())
 }
