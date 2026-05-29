@@ -116,7 +116,21 @@ function emptyTab(path: string, requestedMode: CodeEditorOpenMode = "auto"): Tab
   };
 }
 
-function chooseViewerKind(probe: FileProbe, mode: CodeEditorOpenMode): ViewerKind {
+// Structured text formats only auto-open in their rich viewer when small enough
+// to load whole; bigger files fall through to the editor / streamed text viewer.
+const STRUCTURED_AUTO_MAX_BYTES = 8 * 1024 * 1024;
+
+function autoStructuredKind(path: string): ViewerKind | null {
+  const name = basename(path).toLowerCase();
+  const dot = name.lastIndexOf(".");
+  const ext = dot >= 0 ? name.slice(dot + 1) : "";
+  if (ext === "md" || ext === "markdown" || ext === "mdown" || ext === "mkd" || ext === "mdx") return "markdown";
+  if (ext === "json") return "json";
+  if (ext === "csv" || ext === "tsv") return "csv";
+  return null;
+}
+
+function chooseViewerKind(probe: FileProbe, mode: CodeEditorOpenMode, path: string): ViewerKind {
   if (mode === "bytes") return "bytes";
   if (mode === "markdown") return "markdown";
   if (mode === "json") return "json";
@@ -125,7 +139,13 @@ function chooseViewerKind(probe: FileProbe, mode: CodeEditorOpenMode): ViewerKin
   if (mode === "image") return probe.kind === "image" ? "image" : "bytes";
   if (probe.kind === "image" && mode !== "text") return "image";
   if (probe.kind === "text" && probe.validUtf8 && !probe.hasNul) {
-    return probe.size <= EDITABLE_TEXT_MAX_BYTES && mode !== "auto" ? "text" : probe.size <= EDITABLE_TEXT_MAX_BYTES ? "text" : "largeText";
+    // Auto-route .md/.json/.csv to their rich viewers (overridable to raw text
+    // via "View as"); other text, or oversized structured files, stay editable.
+    if (mode === "auto" && probe.size <= STRUCTURED_AUTO_MAX_BYTES) {
+      const structured = autoStructuredKind(path);
+      if (structured) return structured;
+    }
+    return probe.size <= EDITABLE_TEXT_MAX_BYTES ? "text" : "largeText";
   }
   return "bytes";
 }
@@ -602,7 +622,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
           if (loadNonceByPathRef.current.get(normalized) !== loadNonce) return;
           loadedMtimeRef.current.set(normalized, probe.mtimeMs ?? 0);
 
-          const viewerKind = chooseViewerKind(probe, mode);
+          const viewerKind = chooseViewerKind(probe, mode, normalized);
           if (viewerKind !== "text") {
             const editor = editorRef.current;
             if (editor && editor.getModel() === modelsRef.current.get(normalized)) {
