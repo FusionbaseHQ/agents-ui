@@ -33,6 +33,26 @@ fn normalize_url(input: &str) -> Result<tauri::Url, String> {
     tauri::Url::parse(&candidate).map_err(|e| format!("invalid url: {e}"))
 }
 
+// The frontend measures the target rect with getBoundingClientRect (origin =
+// top-left of the web content area). A child webview, however, is positioned in
+// its parent NSView's coordinate space, which on macOS spans the full window
+// frame (including the title bar). So we add the title-bar inset — the gap
+// between the window's outer (frame) and inner (content) origin — to align the
+// child with the DOM. On a borderless window this is (0, 0), a no-op.
+fn content_offset(app: &AppHandle) -> (f64, f64) {
+    let Some(window) = app.get_window("main") else {
+        return (0.0, 0.0);
+    };
+    let scale = window.scale_factor().unwrap_or(1.0).max(1.0);
+    match (window.inner_position(), window.outer_position()) {
+        (Ok(inner), Ok(outer)) => (
+            (inner.x - outer.x) as f64 / scale,
+            (inner.y - outer.y) as f64 / scale,
+        ),
+        _ => (0.0, 0.0),
+    }
+}
+
 fn emit_nav(app: &AppHandle, label: &str, url: &str, loading: bool) {
     let _ = app.emit_to(
         "main",
@@ -57,9 +77,10 @@ pub fn browser_open(
 ) -> Result<(), String> {
     let w = width.max(1.0);
     let h = height.max(1.0);
+    let (dx, dy) = content_offset(&app);
     // Already created: just reveal + reposition (keeps the current page).
     if let Some(webview) = app.get_webview(&label) {
-        let _ = webview.set_position(LogicalPosition::new(x, y));
+        let _ = webview.set_position(LogicalPosition::new(x + dx, y + dy));
         let _ = webview.set_size(LogicalSize::new(w, h));
         return Ok(());
     }
@@ -84,7 +105,7 @@ pub fn browser_open(
         });
 
     window
-        .add_child(builder, LogicalPosition::new(x, y), LogicalSize::new(w, h))
+        .add_child(builder, LogicalPosition::new(x + dx, y + dy), LogicalSize::new(w, h))
         .map_err(|e| format!("failed to create browser webview: {e}"))?;
     Ok(())
 }
@@ -101,7 +122,8 @@ pub fn browser_set_bounds(
     let Some(webview) = app.get_webview(&label) else {
         return Ok(());
     };
-    let _ = webview.set_position(LogicalPosition::new(x, y));
+    let (dx, dy) = content_offset(&app);
+    let _ = webview.set_position(LogicalPosition::new(x + dx, y + dy));
     let _ = webview.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
     Ok(())
 }
