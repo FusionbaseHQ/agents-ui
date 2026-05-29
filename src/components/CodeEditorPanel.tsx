@@ -1377,6 +1377,34 @@ function ImageViewer({
   const [url, setUrl] = React.useState<string | null>(null);
   const [loaded, setLoaded] = React.useState(0);
   const [error, setError] = React.useState<string | null>(null);
+  const [natural, setNatural] = React.useState<{ w: number; h: number } | null>(null);
+  const [scale, setScale] = React.useState(1);
+  const [fit, setFit] = React.useState(true);
+  const [checker, setChecker] = React.useState(true);
+  const scrollRef = React.useRef<HTMLDivElement | null>(null);
+
+  const zoomBy = React.useCallback((factor: number) => {
+    setFit(false);
+    setScale((prev) => Math.min(32, Math.max(0.05, prev * factor)));
+  }, []);
+
+  // Fit-to-window: recompute scale from the container and the image's natural
+  // size while Fit is engaged (and on resize).
+  React.useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !natural || !fit) return;
+    const apply = () => {
+      const availW = el.clientWidth - 28;
+      const availH = el.clientHeight - 28;
+      if (availW <= 0 || availH <= 0) return;
+      const next = Math.min(availW / natural.w, availH / natural.h, 1);
+      if (next > 0) setScale(next);
+    };
+    apply();
+    const ro = new ResizeObserver(apply);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [natural, fit]);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -1384,6 +1412,7 @@ function ImageViewer({
     setUrl(null);
     setLoaded(0);
     setError(null);
+    setNatural(null);
 
     if (size > IMAGE_PREVIEW_MAX_BYTES) return;
 
@@ -1453,9 +1482,71 @@ function ImageViewer({
     );
   }
 
+  const dims = natural ? `${natural.w}×${natural.h}` : "";
   return (
     <div className="imageViewer">
-      <img src={url} alt={basename(path)} onError={() => setError("The image decoder rejected this file.")} />
+      <div className="fileViewerToolbar">
+        <span>{dims ? `${dims} · ` : ""}{formatBytes(size)}</span>
+        <span className="pdfViewerSpacer" />
+        <button type="button" className="btnSmall" onClick={() => zoomBy(1 / 1.25)} title="Zoom out" aria-label="Zoom out">
+          −
+        </button>
+        <span className="pdfViewerZoom">{Math.round(scale * 100)}%</span>
+        <button type="button" className="btnSmall" onClick={() => zoomBy(1.25)} title="Zoom in" aria-label="Zoom in">
+          +
+        </button>
+        <button
+          type="button"
+          className={`btnSmall ${fit ? "pdfViewerFitActive" : ""}`}
+          onClick={() => setFit((prev) => !prev)}
+          title="Fit to window"
+        >
+          Fit
+        </button>
+        <button
+          type="button"
+          className="btnSmall"
+          onClick={() => {
+            setFit(false);
+            setScale(1);
+          }}
+          title="Actual size"
+        >
+          1:1
+        </button>
+        <button
+          type="button"
+          className={`btnSmall ${checker ? "pdfViewerFitActive" : ""}`}
+          onClick={() => setChecker((prev) => !prev)}
+          title="Transparency checkerboard"
+          aria-label="Toggle transparency checkerboard"
+        >
+          ▦
+        </button>
+        <button type="button" className="btnSmall" onClick={onOpenBytes}>
+          Open bytes
+        </button>
+      </div>
+      <div
+        className="imageViewerScroll"
+        ref={scrollRef}
+        onWheel={(e) => {
+          if (e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+            zoomBy(e.deltaY < 0 ? 1.1 : 1 / 1.1);
+          }
+        }}
+      >
+        <img
+          className={`imageViewerImg ${checker ? "imageViewerChecker" : ""}`}
+          src={url}
+          alt={basename(path)}
+          draggable={false}
+          style={natural ? { width: Math.round(natural.w * scale), height: Math.round(natural.h * scale) } : undefined}
+          onLoad={(e) => setNatural({ w: e.currentTarget.naturalWidth || 1, h: e.currentTarget.naturalHeight || 1 })}
+          onError={() => setError("The image decoder rejected this file.")}
+        />
+      </div>
     </div>
   );
 }

@@ -3141,17 +3141,31 @@ body::after {
 
 .imageViewer {
   display: flex;
+  flex-direction: column;
+}
+
+.imageViewerScroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
   align-items: center;
   justify-content: center;
-  overflow: auto;
   padding: 14px;
 }
 
-.imageViewer img {
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
+.imageViewerImg {
+  display: block;
+  flex: 0 0 auto;
   image-rendering: auto;
+}
+
+/* Checkerboard behind transparent areas (PNG/WebP/SVG with alpha). */
+.imageViewerChecker {
+  background-image:
+    conic-gradient(rgba(var(--ink-rgb), 0.16) 25%, transparent 0 50%, rgba(var(--ink-rgb), 0.16) 0 75%, transparent 0),
+    linear-gradient(#ffffff, #ffffff);
+  background-size: 18px 18px, 100% 100%;
 }
 
 .byteViewer,

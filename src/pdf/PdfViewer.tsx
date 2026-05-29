@@ -168,6 +168,8 @@ export default function PdfViewer({
   scaleRef.current = scale;
   const numPagesRef = React.useRef(numPages);
   numPagesRef.current = numPages;
+  const currentPageRef = React.useRef(currentPage);
+  currentPageRef.current = currentPage;
   const defaultSizeRef = React.useRef(defaultSize);
   defaultSizeRef.current = defaultSize;
 
@@ -525,6 +527,47 @@ export default function PdfViewer({
     setScale((prev) => clampScale(prev * factor));
   }, []);
 
+  const onListKeyDown = React.useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (e.target instanceof HTMLInputElement) return; // let the page/zoom inputs type
+      const total = numPagesRef.current;
+      if (e.ctrlKey || e.metaKey) {
+        if (e.key === "=" || e.key === "+") {
+          e.preventDefault();
+          zoomBy(ZOOM_STEP);
+        } else if (e.key === "-") {
+          e.preventDefault();
+          zoomBy(1 / ZOOM_STEP);
+        } else if (e.key === "0") {
+          e.preventDefault();
+          setFitWidth(true);
+        }
+        return;
+      }
+      switch (e.key) {
+        case "PageDown":
+          e.preventDefault();
+          scrollToPage(Math.min(total, currentPageRef.current + 1));
+          break;
+        case "PageUp":
+          e.preventDefault();
+          scrollToPage(Math.max(1, currentPageRef.current - 1));
+          break;
+        case "Home":
+          e.preventDefault();
+          scrollToPage(1);
+          break;
+        case "End":
+          e.preventDefault();
+          scrollToPage(total);
+          break;
+        default:
+          break; // arrows / space fall through to native scrolling
+      }
+    },
+    [scrollToPage, zoomBy],
+  );
+
   const submitPassword = React.useCallback(() => {
     const resolve = passwordResolverRef.current;
     if (!resolve) return;
@@ -626,7 +669,14 @@ export default function PdfViewer({
           Open bytes
         </button>
       </div>
-      <div className="pdfViewerList" ref={listRef}>
+      <div
+        className="pdfViewerList"
+        ref={listRef}
+        tabIndex={0}
+        role="document"
+        aria-label={`PDF, ${numPages} pages`}
+        onKeyDown={onListKeyDown}
+      >
         <div className="pdfViewerPages">
           {Array.from({ length: numPages }, (_, i) => {
             const n = i + 1;
