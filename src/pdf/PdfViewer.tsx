@@ -1,5 +1,6 @@
 import React from "react";
 import { getPdfWorker, pdfDocumentOptions, pdfjsLib } from "./pdfEnv";
+import { concatBytes, decodeBase64Bytes } from "../fileViewer/bytes";
 import type { PDFDocumentProxy, RenderTask } from "pdfjs-dist";
 
 // Mirrors the FileRangeRead/ReadRangeFn shape from CodeEditorPanel so this lazy
@@ -34,25 +35,6 @@ const FALLBACK_PAGE = { w: 612, h: 792 }; // US Letter @72dpi, used until page 1
 function clampScale(value: number): number {
   if (!Number.isFinite(value) || value <= 0) return 1;
   return Math.min(MAX_SCALE, Math.max(MIN_SCALE, value));
-}
-
-function decodeBase64Bytes(value: string): Uint8Array {
-  const binary = atob(value);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
-  return out;
-}
-
-function concatBytes(parts: Uint8Array[]): Uint8Array {
-  let total = 0;
-  for (const part of parts) total += part.length;
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const part of parts) {
-    out.set(part, offset);
-    offset += part.length;
-  }
-  return out;
 }
 
 // Feeds PDF.js the bytes it asks for, on demand, by translating its range
@@ -310,6 +292,8 @@ export default function PdfViewer({
 
   const scheduleRender = React.useCallback(
     (n: number) => {
+      // A page flung out of view before its turn shouldn't be queued at all.
+      if (!visibleRef.current.has(n)) return;
       const existing = renderedRef.current.get(n);
       if (existing && existing.scale === scaleRef.current) {
         existing.touched = ++lruClockRef.current;

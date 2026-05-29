@@ -103,6 +103,21 @@ fn raster_image_type(sample: &[u8], path: Option<&Path>) -> Option<(&'static str
     if sample.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
         return Some(("ico", "image/x-icon"));
     }
+    // TIFF: little-endian "II*\0" or big-endian "MM\0*". WebKit renders these in <img>.
+    if sample.starts_with(&[0x49, 0x49, 0x2a, 0x00]) || sample.starts_with(&[0x4d, 0x4d, 0x00, 0x2a]) {
+        return Some(("tiff", "image/tiff"));
+    }
+    // ISOBMFF-based formats: bytes 4..8 == "ftyp", brand at 8..12. WebKit renders
+    // AVIF (Safari 16.4+) and HEIC/HEIF (Safari 17+ / macOS) in <img>.
+    if sample.len() >= 12 && &sample[4..8] == b"ftyp" {
+        match &sample[8..12] {
+            b"avif" | b"avis" => return Some(("avif", "image/avif")),
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"mif1" | b"msf1" => {
+                return Some(("heic", "image/heic"));
+            }
+            _ => {}
+        }
+    }
 
     let ext = path
         .and_then(|p| p.extension())
@@ -115,6 +130,9 @@ fn raster_image_type(sample: &[u8], path: Option<&Path>) -> Option<(&'static str
         Some("webp") => Some(("webp", "image/webp")),
         Some("bmp") => Some(("bmp", "image/bmp")),
         Some("ico") => Some(("ico", "image/x-icon")),
+        Some("tif") | Some("tiff") => Some(("tiff", "image/tiff")),
+        Some("avif") => Some(("avif", "image/avif")),
+        Some("heic") | Some("heif") => Some(("heic", "image/heic")),
         _ => None,
     }
 }
@@ -309,9 +327,10 @@ pub fn probe_file(root: String, path: String) -> Result<FileProbe, String> {
         return Err("not a file".to_string());
     }
 
-    let meta = fs::metadata(&file).map_err(|e| format!("metadata failed: {e}"))?;
-    let size = meta.len();
+    // Single open + fstat on the handle, rather than a separate path stat + open.
     let mut f = File::open(&file).map_err(|e| format!("open failed: {e}"))?;
+    let meta = f.metadata().map_err(|e| format!("metadata failed: {e}"))?;
+    let size = meta.len();
     let mut sample = vec![0u8; PROBE_BYTES.min(size as usize)];
     if !sample.is_empty() {
         f.read_exact(&mut sample)
@@ -573,5 +592,15 @@ mod tests {
     fn plain_text_and_binary_unchanged() {
         assert_eq!(kind_of(b"hello, world\n"), "text");
         assert_eq!(kind_of(&[0x00, 0x01, 0x02, 0xff, 0xfe]), "binary");
+    }
+
+    #[test]
+    fn detects_tiff_and_isobmff_images() {
+        assert_eq!(kind_of(&[0x49, 0x49, 0x2a, 0x00, 0x08, 0x00]), "image"); // TIFF LE
+        assert_eq!(kind_of(&[0x4d, 0x4d, 0x00, 0x2a, 0x00, 0x08]), "image"); // TIFF BE
+        let avif = b"\x00\x00\x00\x20ftypavif\x00\x00\x00\x00";
+        assert_eq!(kind_of(avif), "image");
+        let heic = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00";
+        assert_eq!(kind_of(heic), "image");
     }
 }

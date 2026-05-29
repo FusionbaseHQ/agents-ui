@@ -6,6 +6,8 @@ import React from "react";
 import { shortenPathSmart } from "../pathDisplay";
 import { Icon } from "./Icon";
 import { ConfirmActionModal } from "./modals/ConfirmActionModal";
+import { concatBytes, decodeBase64Bytes } from "../fileViewer/bytes";
+import { useChunkCache } from "../fileViewer/useChunkCache";
 
 type MonacoType = typeof import("monaco-editor");
 
@@ -128,24 +130,6 @@ function chooseViewerKind(probe: FileProbe, mode: CodeEditorOpenMode): ViewerKin
   return "bytes";
 }
 
-function decodeBase64Bytes(value: string): Uint8Array {
-  const binary = atob(value);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
-  return out;
-}
-
-function concatBytes(parts: Uint8Array[]): Uint8Array {
-  const total = parts.reduce((sum, part) => sum + part.length, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const part of parts) {
-    out.set(part, offset);
-    offset += part.length;
-  }
-  return out;
-}
-
 function formatBytes(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "";
   if (value < 1024) return `${value} B`;
@@ -163,10 +147,43 @@ function byteToAscii(byte: number): string {
   return byte >= 32 && byte < 127 ? String.fromCharCode(byte) : ".";
 }
 
+// Lazily-built indexes from Monaco's full language registry so any language
+// Monaco ships (Dockerfile, GraphQL, Vue, C#, Swift, Terraform, Makefile, …) is
+// recognized, not just the curated list below.
+let monacoLangByExt: Map<string, string> | null = null;
+let monacoLangByFilename: Map<string, string> | null = null;
+function buildMonacoLangIndex(): void {
+  monacoLangByExt = new Map();
+  monacoLangByFilename = new Map();
+  for (const lang of bundledMonaco.languages.getLanguages()) {
+    for (const ext of lang.extensions ?? []) {
+      const key = ext.replace(/^\./, "").toLowerCase();
+      if (key && !monacoLangByExt.has(key)) monacoLangByExt.set(key, lang.id);
+    }
+    for (const filename of lang.filenames ?? []) {
+      monacoLangByFilename.set(filename.toLowerCase(), lang.id);
+    }
+  }
+}
+
 function inferLanguageId(path: string): string {
   const name = basename(path);
+  const lowerName = name.toLowerCase();
   const dot = name.lastIndexOf(".");
   const ext = dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
+  // Curated preferred mappings first (e.g. tsx -> typescript, not the registry's
+  // "typescriptreact" if that ever ships), then fall back to Monaco's registry.
+  const preferred = preferredLanguageId(ext);
+  if (preferred) return preferred;
+  if (!monacoLangByExt || !monacoLangByFilename) buildMonacoLangIndex();
+  return (
+    monacoLangByFilename!.get(lowerName) ??
+    (ext ? monacoLangByExt!.get(ext) : undefined) ??
+    "plaintext"
+  );
+}
+
+function preferredLanguageId(ext: string): string | null {
   switch (ext) {
     case "ts":
     case "tsx":
@@ -214,7 +231,7 @@ function inferLanguageId(path: string): string {
     case "toml":
       return "toml";
     default:
-      return "plaintext";
+      return null;
   }
 }
 
@@ -231,6 +248,63 @@ type CodeEditorPanelProps = {
   onActiveFilePathChange: (path: string | null) => void;
   onCloseEditor: () => void;
 };
+
+// Memoized so switching the active tab (or editing one) only re-renders the
+// affected tabs, not the whole strip. Relies on stable onOpen/onClose/registerRef.
+const EditorTab = React.memo(function EditorTab({
+  tab,
+  isActive,
+  suffix,
+  onOpen,
+  onClose,
+  registerRef,
+}: {
+  tab: Tab;
+  isActive: boolean;
+  suffix: string;
+  onOpen: (path: string) => void;
+  onClose: (path: string) => void;
+  registerRef: (path: string, el: HTMLButtonElement | null) => void;
+}) {
+  return (
+    <div
+      className={`codeEditorTab ${isActive ? "codeEditorTabActive" : ""}`}
+      role="tab"
+      aria-selected={isActive}
+    >
+      <button
+        type="button"
+        className="codeEditorTabMain"
+        onClick={() => onOpen(tab.path)}
+        onAuxClick={(e) => {
+          if (e.button !== 1) return;
+          e.preventDefault();
+          onClose(tab.path);
+        }}
+        ref={(el) => registerRef(tab.path, el)}
+        title={tab.path}
+      >
+        <span className="codeEditorTabTitle">
+          {tab.title}
+          {suffix ? <span className="codeEditorTabTitleSuffix">{suffix}</span> : null}
+        </span>
+        {tab.dirty ? <span className="codeEditorTabDirty" aria-label="Unsaved changes" /> : null}
+      </button>
+      <button
+        type="button"
+        className="codeEditorTabClose"
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose(tab.path);
+        }}
+        title="Close"
+        aria-label={`Close ${tab.title}`}
+      >
+        <Icon name="close" size={12} />
+      </button>
+    </div>
+  );
+});
 
 export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEditorPanelProps>(function CodeEditorPanel(
   {
@@ -842,6 +916,11 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
         if (!path) return;
         requestCloseTab(path);
       });
+      // Format Document (Shift+Alt+F, as in VS Code). A no-op for languages
+      // without a registered formatter (only TS/JS/JSON/CSS/HTML ship one).
+      editor.addCommand(monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF, () => {
+        void editor.getAction("editor.action.formatDocument")?.run();
+      });
       for (const [path, content] of pendingContentRef.current.entries()) {
         ensureModel(path, content);
       }
@@ -1006,6 +1085,12 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     return counts;
   }, [tabs]);
 
+  const openTab = React.useCallback((path: string) => void openFile(path), [openFile]);
+  const registerTabButton = React.useCallback((path: string, el: HTMLButtonElement | null) => {
+    if (!el) tabButtonRefs.current.delete(path);
+    else tabButtonRefs.current.set(path, el);
+  }, []);
+
   React.useLayoutEffect(() => {
     if (!activePath) return;
     const el = tabButtonRefs.current.get(activePath);
@@ -1048,46 +1133,15 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
               const parentName = parent === "/" ? "/" : parent.split("/").filter(Boolean).slice(-1)[0] ?? "";
               const suffix = isDuplicate && parentName ? ` · ${parentName}` : "";
               return (
-                <div
+                <EditorTab
                   key={tab.path}
-                  className={`codeEditorTab ${tab.path === activePath ? "codeEditorTabActive" : ""}`}
-                  role="tab"
-                  aria-selected={tab.path === activePath}
-                >
-                  <button
-                    type="button"
-                    className="codeEditorTabMain"
-                    onClick={() => void openFile(tab.path)}
-                    onAuxClick={(e) => {
-                      if (e.button !== 1) return;
-                      e.preventDefault();
-                      requestCloseTab(tab.path);
-                    }}
-                    ref={(el) => {
-                      if (!el) tabButtonRefs.current.delete(tab.path);
-                      else tabButtonRefs.current.set(tab.path, el);
-                    }}
-                    title={tab.path}
-                  >
-                    <span className="codeEditorTabTitle">
-                      {tab.title}
-                      {suffix ? <span className="codeEditorTabTitleSuffix">{suffix}</span> : null}
-                    </span>
-                    {tab.dirty ? <span className="codeEditorTabDirty" aria-label="Unsaved changes" /> : null}
-                  </button>
-                  <button
-                    type="button"
-                    className="codeEditorTabClose"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      requestCloseTab(tab.path);
-                    }}
-                    title="Close"
-                    aria-label={`Close ${tab.title}`}
-                  >
-                    <Icon name="close" size={12} />
-                  </button>
-                </div>
+                  tab={tab}
+                  isActive={tab.path === activePath}
+                  suffix={suffix}
+                  onOpen={openTab}
+                  onClose={requestCloseTab}
+                  registerRef={registerTabButton}
+                />
               );
             })}
           </div>
@@ -1194,6 +1248,13 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
                 fontSize: 12,
                 fontLigatures: true,
                 smoothScrolling: true,
+                folding: true,
+                foldingStrategy: "auto",
+                showFoldingControls: "mouseover",
+                bracketPairColorization: { enabled: true },
+                guides: { bracketPairs: "active", indentation: true },
+                stickyScroll: { enabled: true },
+                "semanticHighlighting.enabled": true,
               }}
             />
           </div>
@@ -1592,6 +1653,7 @@ function LargeTextViewer({
   onOpenBytes: () => void;
 }) {
   const listRef = React.useRef<HTMLDivElement | null>(null);
+  const readChunk = useChunkCache();
   const checkpointsRef = React.useRef<LineCheckpoint[]>([{ line: 0, offset: 0 }]);
   const [indexState, setIndexState] = React.useState({ offset: 0, lines: 0, done: size === 0, totalLines: size === 0 ? 1 : 0 });
   const [scrollTop, setScrollTop] = React.useState(0);
@@ -1701,9 +1763,9 @@ function LargeTextViewer({
     const load = async () => {
       const checkpoint = findCheckpoint(startIndex);
       try {
-        const result = await readRange(path, checkpoint.offset, Math.min(MAX_RANGE_BYTES, size - checkpoint.offset));
+        const result = await readChunk(readRange, path, checkpoint.offset, Math.min(MAX_RANGE_BYTES, size - checkpoint.offset));
         if (cancelled) return;
-        const bytes = decodeBase64Bytes(result.dataBase64);
+        const bytes = result.bytes;
         const decoded = new TextDecoder("utf-8").decode(bytes);
         const rawLines = decoded.split("\n").map((line) => (line.endsWith("\r") ? line.slice(0, -1) : line));
         const skip = Math.max(0, startIndex - checkpoint.line);
@@ -1720,7 +1782,7 @@ function LargeTextViewer({
     return () => {
       cancelled = true;
     };
-  }, [endIndex, error, findCheckpoint, indexState.done, indexState.lines, path, readRange, size, startIndex]);
+  }, [endIndex, error, findCheckpoint, indexState.done, indexState.lines, path, readChunk, readRange, size, startIndex]);
 
   const scrollToLine = React.useCallback((line: number) => {
     const target = Math.max(0, Math.min(totalRows - 1, line));
