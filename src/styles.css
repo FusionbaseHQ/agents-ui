@@ -3149,12 +3149,85 @@ body::after {
 .imageViewer,
 .byteViewer,
 .largeTextViewer,
-.pdfViewer {
+.pdfViewer,
+.markdownViewer {
   position: absolute;
   inset: 0;
   min-width: 0;
   min-height: 0;
   background: var(--panel);
+}
+
+.markdownViewer {
+  display: flex;
+  flex-direction: column;
+}
+
+.markdownViewerBody {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 20px 28px;
+  max-width: 920px;
+  margin: 0 auto;
+  width: 100%;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.6;
+  word-wrap: break-word;
+}
+
+.markdownViewerBody h1,
+.markdownViewerBody h2,
+.markdownViewerBody h3 {
+  border-bottom: 1px solid rgba(var(--ink-rgb), 0.08);
+  padding-bottom: 0.2em;
+  margin-top: 1.2em;
+}
+
+.markdownViewerBody code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+  background: rgba(var(--ink-rgb), 0.07);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+
+.markdownViewerBody pre {
+  background: rgba(var(--shadow-rgb), 0.18);
+  padding: 12px 14px;
+  border-radius: var(--radius-control);
+  overflow: auto;
+}
+
+.markdownViewerBody pre code {
+  background: none;
+  padding: 0;
+}
+
+.markdownViewerBody a {
+  color: rgba(var(--accent-rgb), 1);
+}
+
+.markdownViewerBody blockquote {
+  margin: 0.6em 0;
+  padding-left: 12px;
+  border-left: 3px solid rgba(var(--ink-rgb), 0.18);
+  color: var(--muted);
+}
+
+.markdownViewerBody table {
+  border-collapse: collapse;
+}
+
+.markdownViewerBody th,
+.markdownViewerBody td {
+  border: 1px solid rgba(var(--ink-rgb), 0.14);
+  padding: 4px 10px;
+}
+
+.markdownViewerBody img {
+  max-width: 100%;
 }
 
 .imageViewer {

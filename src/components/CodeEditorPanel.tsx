@@ -19,12 +19,13 @@ export type CodeEditorPanelHandle = {
   openFind: () => boolean;
 };
 
-export type CodeEditorOpenMode = "auto" | "text" | "image" | "bytes";
-type ViewerKind = "text" | "largeText" | "image" | "bytes" | "pdf";
+export type CodeEditorOpenMode = "auto" | "text" | "image" | "bytes" | "markdown";
+type ViewerKind = "text" | "largeText" | "image" | "bytes" | "pdf" | "markdown";
 
 // PDF.js is heavy and only needed when a PDF is actually opened, so load the
 // viewer (and the library) lazily — same approach as LazyCodeEditorPanel.
 const LazyPdfViewer = React.lazy(() => import("../pdf/PdfViewer"));
+const LazyMarkdownViewer = React.lazy(() => import("../fileViewer/MarkdownViewer"));
 
 type FileProbe = {
   size: number;
@@ -121,6 +122,7 @@ function emptyTab(path: string, requestedMode: CodeEditorOpenMode = "auto"): Tab
 
 function chooseViewerKind(probe: FileProbe, mode: CodeEditorOpenMode): ViewerKind {
   if (mode === "bytes") return "bytes";
+  if (mode === "markdown") return "markdown";
   if (probe.kind === "pdf" && mode !== "text") return "pdf";
   if (mode === "image") return probe.kind === "image" ? "image" : "bytes";
   if (probe.kind === "image" && mode !== "text") return "image";
@@ -1277,6 +1279,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
             >
               <option value="auto">Auto</option>
               <option value="text">Text</option>
+              <option value="markdown">Markdown</option>
               <option value="image">Image</option>
               <option value="bytes">Bytes</option>
             </select>
@@ -1351,6 +1354,18 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
           <React.Suspense fallback={<div className="codeEditorOverlay">Loading PDF…</div>}>
             <LazyPdfViewer
               key={`pdf:${activeTab.path}:${activeTab.size ?? 0}`}
+              path={activeTab.path}
+              size={activeTab.size ?? 0}
+              readRange={readFileRange}
+              onOpenBytes={() => void openFile(activeTab.path, "bytes")}
+            />
+          </React.Suspense>
+        ) : null}
+
+        {activeTab && !activeTab.loading && !activeTab.error && activeTab.viewerKind === "markdown" ? (
+          <React.Suspense fallback={<div className="codeEditorOverlay">Loading…</div>}>
+            <LazyMarkdownViewer
+              key={`markdown:${activeTab.path}:${activeTab.size ?? 0}`}
               path={activeTab.path}
               size={activeTab.size ?? 0}
               readRange={readFileRange}
