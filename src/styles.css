@@ -2865,6 +2865,66 @@ body::after {
   background: rgba(var(--danger-rgb), 0.25);
 }
 
+.codeEditorTabLock {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin-right: 4px;
+  font-size: 10px;
+  opacity: 0.7;
+  user-select: none;
+}
+
+/* Tab context menu */
+.codeEditorTabMenuBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+}
+
+.codeEditorTabMenu {
+  position: fixed;
+  min-width: 178px;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  box-shadow: 0 6px 24px rgba(var(--shadow-rgb), 0.4);
+  display: flex;
+  flex-direction: column;
+}
+
+.codeEditorTabMenuItem {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+.codeEditorTabMenuItem:hover:not(:disabled) {
+  background: rgba(var(--accent-rgb), 0.14);
+}
+
+.codeEditorTabMenuItem:disabled {
+  color: var(--muted);
+  opacity: 0.5;
+  cursor: default;
+}
+
+.codeEditorTabMenuSep {
+  height: 1px;
+  margin: 4px 6px;
+  background: rgba(var(--ink-rgb), 0.1);
+}
+
 .codeEditorTabsMenuRow {
   display: flex;
   align-items: center;

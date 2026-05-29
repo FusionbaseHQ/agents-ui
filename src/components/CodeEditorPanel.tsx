@@ -56,6 +56,7 @@ export type CodeEditorPersistedTab = {
   dirty: boolean;
   content: string | null;
   viewerKind?: ViewerKind | null;
+  locked?: boolean;
 };
 
 export type CodeEditorPersistedState = {
@@ -78,11 +79,14 @@ type Tab = {
   size: number | null;
   mime: string | null;
   imageType: string | null;
+  locked: boolean;
 };
 
 type PendingCloseAction =
   | { kind: "editor" }
   | { kind: "tab"; path: string };
+
+type TabMenuState = { x: number; y: number; path: string };
 
 function basename(path: string): string {
   const trimmed = path.trim();
@@ -113,6 +117,7 @@ function emptyTab(path: string, requestedMode: CodeEditorOpenMode = "auto"): Tab
     size: null,
     mime: null,
     imageType: null,
+    locked: false,
   };
 }
 
@@ -279,6 +284,7 @@ const EditorTab = React.memo(function EditorTab({
   onOpen,
   onClose,
   registerRef,
+  onContextMenu,
 }: {
   tab: Tab;
   isActive: boolean;
@@ -286,19 +292,24 @@ const EditorTab = React.memo(function EditorTab({
   onOpen: (path: string) => void;
   onClose: (path: string) => void;
   registerRef: (path: string, el: HTMLButtonElement | null) => void;
+  onContextMenu: (path: string, x: number, y: number) => void;
 }) {
   return (
     <div
-      className={`codeEditorTab ${isActive ? "codeEditorTabActive" : ""}`}
+      className={`codeEditorTab ${isActive ? "codeEditorTabActive" : ""} ${tab.locked ? "codeEditorTabLocked" : ""}`}
       role="tab"
       aria-selected={isActive}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onContextMenu(tab.path, e.clientX, e.clientY);
+      }}
     >
       <button
         type="button"
         className="codeEditorTabMain"
         onClick={() => onOpen(tab.path)}
         onAuxClick={(e) => {
-          if (e.button !== 1) return;
+          if (e.button !== 1 || tab.locked) return;
           e.preventDefault();
           onClose(tab.path);
         }}
@@ -311,18 +322,24 @@ const EditorTab = React.memo(function EditorTab({
         </span>
         {tab.dirty ? <span className="codeEditorTabDirty" aria-label="Unsaved changes" /> : null}
       </button>
-      <button
-        type="button"
-        className="codeEditorTabClose"
-        onClick={(e) => {
-          e.stopPropagation();
-          onClose(tab.path);
-        }}
-        title="Close"
-        aria-label={`Close ${tab.title}`}
-      >
-        <Icon name="close" size={12} />
-      </button>
+      {tab.locked ? (
+        <span className="codeEditorTabLock" title="Locked — right-click to unlock" aria-label="Locked tab">
+          🔒
+        </span>
+      ) : (
+        <button
+          type="button"
+          className="codeEditorTabClose"
+          onClick={(e) => {
+            e.stopPropagation();
+            onClose(tab.path);
+          }}
+          title="Close"
+          aria-label={`Close ${tab.title}`}
+        >
+          <Icon name="close" size={12} />
+        </button>
+      )}
     </div>
   );
 });
@@ -348,6 +365,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   const [saveStatus, setSaveStatus] = React.useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveError, setSaveError] = React.useState<string | null>(null);
   const [pendingClose, setPendingClose] = React.useState<PendingCloseAction | null>(null);
+  const [tabMenu, setTabMenu] = React.useState<TabMenuState | null>(null);
   const [saveConflictPath, setSaveConflictPath] = React.useState<string | null>(null);
   const [crossFindOpen, setCrossFindOpen] = React.useState(false);
   const [crossFind, setCrossFind] = React.useState("");
@@ -513,7 +531,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     const outTabs: CodeEditorPersistedTab[] = currentTabs.map((tab) => {
       const dirty = dirtyPathsRef.current.has(tab.path) || tab.dirty;
       const content = dirty && tab.viewerKind === "text" ? readModelValue(tab.path) ?? "" : null;
-      return { path: tab.path, dirty: tab.viewerKind === "text" ? dirty : false, content, viewerKind: tab.viewerKind };
+      return { path: tab.path, dirty: tab.viewerKind === "text" ? dirty : false, content, viewerKind: tab.viewerKind, locked: tab.locked };
     });
     return { tabs: outTabs, activePath: activePathRef.current };
   }, [readModelValue]);
@@ -721,6 +739,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       size: null,
       mime: null,
       imageType: null,
+      locked: Boolean(it.locked),
     }));
     setTabs(nextTabs);
     openPathsRef.current = new Set(persistedState.tabs.map((t) => t.path));
@@ -879,6 +898,44 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
         return;
       }
       if (activePathRef.current === path) {
+        const nextActive = next[next.length - 1].path;
+        setActivePath(nextActive);
+        activePathRef.current = nextActive;
+        setEditorModel(nextActive);
+      }
+    },
+    [onCloseEditor, setEditorModel],
+  );
+
+  // Batch close (for the tab context menu). Skips locked tabs and tabs with
+  // unsaved changes so nothing is silently discarded; those stay open.
+  const closeTabs = React.useCallback(
+    (targets: string[]) => {
+      const lockedSet = new Set(tabsRef.current.filter((t) => t.locked).map((t) => t.path));
+      const toClose = new Set(targets.filter((p) => !lockedSet.has(p) && !dirtyPathsRef.current.has(p)));
+      if (toClose.size === 0) return;
+      const editor = editorRef.current;
+      for (const p of toClose) {
+        const model = modelsRef.current.get(p);
+        if (model) {
+          if (editor && editor.getModel() === model) editor.setModel(null);
+          modelsRef.current.delete(p);
+          model.dispose();
+        }
+        dirtyPathsRef.current.delete(p);
+        openPathsRef.current.delete(p);
+        pendingContentRef.current.delete(p);
+      }
+      const next = tabsRef.current.filter((t) => !toClose.has(t.path));
+      tabsRef.current = next;
+      setTabs(next);
+      if (next.length === 0) {
+        setActivePath(null);
+        activePathRef.current = null;
+        onCloseEditor();
+        return;
+      }
+      if (activePathRef.current && toClose.has(activePathRef.current)) {
         const nextActive = next[next.length - 1].path;
         setActivePath(nextActive);
         activePathRef.current = nextActive;
@@ -1161,6 +1218,24 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     if (!el) tabButtonRefs.current.delete(path);
     else tabButtonRefs.current.set(path, el);
   }, []);
+  const openTabMenu = React.useCallback((path: string, x: number, y: number) => {
+    setTabMenu({ path, x, y });
+  }, []);
+  const toggleTabLock = React.useCallback(
+    (path: string) => {
+      updateTab(path, (tab) => ({ ...tab, locked: !tab.locked }));
+    },
+    [updateTab],
+  );
+
+  React.useEffect(() => {
+    if (!tabMenu) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setTabMenu(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [tabMenu]);
 
   // Find (and optionally replace) across all open text models. Edits go through
   // pushEditOperations, so each model's onDidChangeContent marks its tab dirty.
@@ -1245,6 +1320,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
                   onOpen={openTab}
                   onClose={requestCloseTab}
                   registerRef={registerTabButton}
+                  onContextMenu={openTabMenu}
                 />
               );
             })}
@@ -1582,6 +1658,51 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
           if (model) void performWrite(path, model);
         }}
       />
+      {tabMenu ? (
+        <div
+          className="codeEditorTabMenuBackdrop"
+          onClick={() => setTabMenu(null)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setTabMenu(null);
+          }}
+        >
+          <div
+            className="codeEditorTabMenu"
+            role="menu"
+            style={{ left: Math.min(tabMenu.x, window.innerWidth - 190), top: Math.min(tabMenu.y, window.innerHeight - 240) }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {(() => {
+              const path = tabMenu.path;
+              const all = tabsRef.current.map((t) => t.path);
+              const idx = all.indexOf(path);
+              const locked = tabs.find((t) => t.path === path)?.locked ?? false;
+              const run = (fn: () => void) => {
+                fn();
+                setTabMenu(null);
+              };
+              const Item = ({ label, onClick, disabled }: { label: string; onClick: () => void; disabled?: boolean }) => (
+                <button type="button" className="codeEditorTabMenuItem" role="menuitem" disabled={disabled} onClick={() => run(onClick)}>
+                  {label}
+                </button>
+              );
+              return (
+                <>
+                  <Item label="Close" onClick={() => requestCloseTab(path)} />
+                  <Item label="Close Others" onClick={() => closeTabs(all.filter((p) => p !== path))} disabled={all.length <= 1} />
+                  <Item label="Close to the Right" onClick={() => closeTabs(all.slice(idx + 1))} disabled={idx < 0 || idx >= all.length - 1} />
+                  <Item label="Close to the Left" onClick={() => closeTabs(all.slice(0, idx))} disabled={idx <= 0} />
+                  <Item label="Close All" onClick={() => closeTabs(all)} disabled={all.length === 0} />
+                  <div className="codeEditorTabMenuSep" />
+                  <Item label={locked ? "Unlock" : "Lock"} onClick={() => toggleTabLock(path)} />
+                  <Item label="Copy Path" onClick={() => void navigator.clipboard?.writeText(path)} />
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      ) : null}
     </section>
   );
 });
