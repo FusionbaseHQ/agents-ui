@@ -3398,7 +3398,18 @@ body::after {
 }
 
 .byteViewerMissing {
-  color: rgba(var(--ink-rgb), 0.26);
+  color: rgba(var(--ink-rgb), 0.42);
+}
+
+.byteViewerInspect {
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+  background: rgba(var(--ink-rgb), 0.03);
+  border-bottom: 1px solid rgba(var(--ink-rgb), 0.06);
+  white-space: nowrap;
+  overflow-x: auto;
 }
 
 .largeTextLine {

@@ -1688,6 +1688,7 @@ function ByteViewer({ path, size, readRange }: { path: string; size: number; rea
   const [findStatus, setFindStatus] = React.useState<string | null>(null);
   const [findBusy, setFindBusy] = React.useState(false);
   const findNextOffsetRef = React.useRef(0);
+  const [inspectOffset, setInspectOffset] = React.useState<number | null>(null);
   const rowHeight = 22;
   const bytesPerRow = 16;
   const totalRows = Math.max(1, Math.ceil(size / bytesPerRow));
@@ -1780,6 +1781,7 @@ function ByteViewer({ path, size, readRange }: { path: string; size: number; rea
     if (!Number.isFinite(parsed)) return;
     const row = Math.max(0, Math.min(totalRows - 1, Math.floor(parsed / bytesPerRow)));
     if (listRef.current) listRef.current.scrollTop = row * rowHeight;
+    setInspectOffset(parsed);
   }, [jumpValue, totalRows]);
 
   const findFrom = React.useCallback(
@@ -1849,6 +1851,30 @@ function ByteViewer({ path, size, readRange }: { path: string; size: number; rea
     );
   }
 
+  // Data inspector: interpret the up-to-8 bytes at the inspect offset (little-endian).
+  let inspect: string | null = null;
+  if (inspectOffset != null && inspectOffset >= 0 && inspectOffset < size) {
+    const buf = new Uint8Array(8);
+    let have = 0;
+    for (let i = 0; i < 8 && inspectOffset + i < size; i++) {
+      const value = byteAt(inspectOffset + i);
+      if (value == null) break;
+      buf[i] = value;
+      have += 1;
+    }
+    if (have === 0) {
+      inspect = "loading…";
+    } else {
+      const dv = new DataView(buf.buffer);
+      const parts = [`u8 ${buf[0]}`, `i8 ${dv.getInt8(0)}`];
+      if (have >= 2) parts.push(`u16 ${dv.getUint16(0, true)}`, `i16 ${dv.getInt16(0, true)}`);
+      if (have >= 4)
+        parts.push(`u32 ${dv.getUint32(0, true)}`, `i32 ${dv.getInt32(0, true)}`, `f32 ${dv.getFloat32(0, true).toPrecision(6)}`);
+      if (have >= 8) parts.push(`u64 ${dv.getBigUint64(0, true)}`, `f64 ${dv.getFloat64(0, true).toPrecision(8)}`);
+      inspect = parts.join("  ");
+    }
+  }
+
   return (
     <div className="byteViewer">
       <div className="fileViewerToolbar">
@@ -1897,6 +1923,11 @@ function ByteViewer({ path, size, readRange }: { path: string; size: number; rea
         {findStatus ? <span className="fileViewerMuted">{findStatus}</span> : null}
         {error ? <span className="fileViewerError" title={error}>{error}</span> : null}
       </div>
+      {inspect ? (
+        <div className="byteViewerInspect">
+          @0x{(inspectOffset ?? 0).toString(16)} LE&nbsp;&nbsp;{inspect}
+        </div>
+      ) : null}
       <div className="byteViewerList" ref={listRef}>
         <div style={{ paddingTop: startIndex * rowHeight, paddingBottom: Math.max(0, (totalRows - endIndex) * rowHeight) }}>
           {rows}
