@@ -959,6 +959,10 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       editor.addCommand(monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF, () => {
         void editor.getAction("editor.action.formatDocument")?.run();
       });
+      // Go to Symbol / quick outline (Ctrl/Cmd+Shift+O).
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyO, () => {
+        void editor.getAction("editor.action.quickOutline")?.run();
+      });
       for (const [path, content] of pendingContentRef.current.entries()) {
         ensureModel(path, content);
       }
@@ -1260,8 +1264,23 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       </div>
 
       {activeTab ? (
-        <div className="codeEditorPathBar" title={activeTab.path}>
-          {activeTab.path}
+        <div className="codeEditorPathBar">
+          <span className="codeEditorPathBarText" title={activeTab.path}>
+            {activeTab.path}
+          </span>
+          {!activeTab.loading && !activeTab.error ? (
+            <select
+              className="codeEditorViewAs"
+              title="View as"
+              value={activeTab.requestedMode}
+              onChange={(e) => void openFile(activeTab.path, e.target.value as CodeEditorOpenMode)}
+            >
+              <option value="auto">Auto</option>
+              <option value="text">Text</option>
+              <option value="image">Image</option>
+              <option value="bytes">Bytes</option>
+            </select>
+          ) : null}
         </div>
       ) : null}
 

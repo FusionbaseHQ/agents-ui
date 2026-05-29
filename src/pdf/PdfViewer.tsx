@@ -172,6 +172,7 @@ export default function PdfViewer({
   const [defaultSize, setDefaultSize] = React.useState<PageSize | null>(null);
   const [scale, setScale] = React.useState(1);
   const [fitWidth, setFitWidth] = React.useState(true);
+  const [rotation, setRotation] = React.useState(0); // user rotation in degrees (0/90/180/270)
   const [currentPage, setCurrentPage] = React.useState(1);
   const [pageInput, setPageInput] = React.useState("");
   const [passwordInput, setPasswordInput] = React.useState("");
@@ -186,6 +187,8 @@ export default function PdfViewer({
   numPagesRef.current = numPages;
   const currentPageRef = React.useRef(currentPage);
   currentPageRef.current = currentPage;
+  const rotationRef = React.useRef(rotation);
+  rotationRef.current = rotation;
   const defaultSizeRef = React.useRef(defaultSize);
   defaultSizeRef.current = defaultSize;
 
@@ -233,7 +236,7 @@ export default function PdfViewer({
           !shown || Math.abs(shown.w - unscaled.width) > 0.5 || Math.abs(shown.h - unscaled.height) > 0.5;
         pageSizeRef.current.set(n, { w: unscaled.width, h: unscaled.height });
         if (sizeChanged) setLayoutVersion((v) => v + 1);
-        const viewport = page.getViewport({ scale: targetScale });
+        const viewport = page.getViewport({ scale: targetScale, rotation: (page.rotate + rotationRef.current) % 360 });
         const dpr = Math.min(window.devicePixelRatio || 1, MAX_CANVAS_DPR);
         const canvas = document.createElement("canvas");
         canvas.className = "pdfPageCanvas";
@@ -495,26 +498,27 @@ export default function PdfViewer({
     const apply = () => {
       const avail = el.clientWidth - LIST_PADDING * 2;
       if (avail <= 0) return;
-      const next = clampScale(avail / defaultSize.w);
+      const baseWidth = rotation % 180 !== 0 ? defaultSize.h : defaultSize.w;
+      const next = clampScale(avail / baseWidth);
       setScale((prev) => (Math.abs(prev - next) > 0.001 ? next : prev));
     };
     apply();
     const ro = new ResizeObserver(apply);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [defaultSize, fitWidth, status]);
+  }, [defaultSize, fitWidth, status, rotation]);
 
-  // Zoom changed: the cached canvases are now the wrong resolution. Drop them
-  // (bumping the render sequence cancels in-flight work) and repaint what's
-  // visible at the new scale. Slot heights re-flow from `scale` in render.
+  // Zoom or rotation changed: the cached canvases are now the wrong resolution
+  // /orientation. Drop them (bumping the render sequence cancels in-flight work)
+  // and repaint what's visible. Slot heights re-flow from scale/rotation in render.
   React.useEffect(() => {
     renderSeqRef.current += 1;
     for (const page of renderedRef.current.values()) disposeRendered(page);
     renderedRef.current.clear();
     renderingRef.current.clear();
-    renderQueueRef.current.length = 0; // drop pages queued at the old scale
+    renderQueueRef.current.length = 0; // drop pages queued at the old scale/rotation
     for (const n of visibleRef.current) scheduleRender(n);
-  }, [scale, scheduleRender]);
+  }, [scale, rotation, scheduleRender]);
 
   const scrollToPage = React.useCallback((n: number) => {
     const list = listRef.current;
@@ -674,6 +678,15 @@ export default function PdfViewer({
         >
           Fit
         </button>
+        <button
+          type="button"
+          className="btnSmall"
+          onClick={() => setRotation((r) => (r + 90) % 360)}
+          title="Rotate 90°"
+          aria-label="Rotate 90 degrees"
+        >
+          ⟳
+        </button>
         <button type="button" className="btnSmall" onClick={onOpenBytes}>
           Open bytes
         </button>
@@ -690,12 +703,13 @@ export default function PdfViewer({
           {Array.from({ length: numPages }, (_, i) => {
             const n = i + 1;
             const sz = pageSizeRef.current.get(n) ?? defaultSize;
+            const swap = rotation % 180 !== 0;
             return (
               <PageSlot
                 key={n}
                 pageNumber={n}
-                width={Math.round(sz.w * scale)}
-                height={Math.round(sz.h * scale)}
+                width={Math.round((swap ? sz.h : sz.w) * scale)}
+                height={Math.round((swap ? sz.w : sz.h) * scale)}
                 register={registerSlot}
                 unregister={unregisterSlot}
               />

@@ -2917,16 +2917,34 @@ body::after {
 }
 
 .codeEditorPathBar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 3px 10px;
   font-size: 10px;
   color: var(--muted);
   font-family: ui-monospace, monospace;
-  text-align: center;
+  background: rgba(var(--shadow-rgb), 0.15);
+  border-bottom: 1px solid rgba(var(--ink-rgb), 0.04);
+}
+
+.codeEditorPathBarText {
+  flex: 1;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  background: rgba(var(--shadow-rgb), 0.15);
-  border-bottom: 1px solid rgba(var(--ink-rgb), 0.04);
+}
+
+.codeEditorViewAs {
+  flex: 0 0 auto;
+  height: 18px;
+  padding: 0 4px;
+  font: 10px ui-monospace, monospace;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
 }
 
 .codeEditorBody {
