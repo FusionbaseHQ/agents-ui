@@ -18,7 +18,11 @@ export type CodeEditorPanelHandle = {
 };
 
 export type CodeEditorOpenMode = "auto" | "text" | "image" | "bytes";
-type ViewerKind = "text" | "largeText" | "image" | "bytes";
+type ViewerKind = "text" | "largeText" | "image" | "bytes" | "pdf";
+
+// PDF.js is heavy and only needed when a PDF is actually opened, so load the
+// viewer (and the library) lazily — same approach as LazyCodeEditorPanel.
+const LazyPdfViewer = React.lazy(() => import("../pdf/PdfViewer"));
 
 type FileProbe = {
   size: number;
@@ -115,6 +119,7 @@ function emptyTab(path: string, requestedMode: CodeEditorOpenMode = "auto"): Tab
 
 function chooseViewerKind(probe: FileProbe, mode: CodeEditorOpenMode): ViewerKind {
   if (mode === "bytes") return "bytes";
+  if (probe.kind === "pdf" && mode !== "text") return "pdf";
   if (mode === "image") return probe.kind === "image" ? "image" : "bytes";
   if (probe.kind === "image" && mode !== "text") return "image";
   if (probe.kind === "text" && probe.validUtf8 && !probe.hasNul) {
@@ -1222,6 +1227,18 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
             readRange={readFileRange}
             onOpenBytes={() => void openFile(activeTab.path, "bytes")}
           />
+        ) : null}
+
+        {activeTab && !activeTab.loading && !activeTab.error && activeTab.viewerKind === "pdf" ? (
+          <React.Suspense fallback={<div className="codeEditorOverlay">Loading PDF…</div>}>
+            <LazyPdfViewer
+              key={`pdf:${activeTab.path}:${activeTab.size ?? 0}`}
+              path={activeTab.path}
+              size={activeTab.size ?? 0}
+              readRange={readFileRange}
+              onOpenBytes={() => void openFile(activeTab.path, "bytes")}
+            />
+          </React.Suspense>
         ) : null}
 
         {activeTab?.loading ? <div className="codeEditorOverlay">Loading…</div> : null}

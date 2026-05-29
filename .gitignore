@@ -2,6 +2,9 @@
 node_modules/
 dist/
 
+# PDF.js assets copied out of node_modules at build time (see vite.config.ts)
+public/pdfjs/
+
 # Logs
 *.log
 npm-debug.log*

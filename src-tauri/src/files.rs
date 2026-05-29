@@ -119,6 +119,18 @@ fn raster_image_type(sample: &[u8], path: Option<&Path>) -> Option<(&'static str
     }
 }
 
+fn looks_like_pdf(sample: &[u8]) -> bool {
+    // Real PDFs begin with "%PDF-<version>". Tolerate a few leading bytes (BOM /
+    // junk) by scanning only the very start, and require a version digit right
+    // after the signature, so a text file that merely mentions "%PDF-" isn't
+    // misclassified as a PDF and routed to the (failing) PDF viewer.
+    const SIG: &[u8] = b"%PDF-";
+    let scan = &sample[..sample.len().min(16)];
+    scan.windows(SIG.len()).enumerate().any(|(i, window)| {
+        window == SIG && scan.get(i + SIG.len()).is_some_and(u8::is_ascii_digit)
+    })
+}
+
 fn sample_is_valid_utf8(sample: &[u8]) -> bool {
     match std::str::from_utf8(sample) {
         Ok(_) => true,
@@ -135,20 +147,29 @@ pub(crate) fn probe_from_sample(
     path: Option<&Path>,
 ) -> FileProbe {
     let image = raster_image_type(sample, path);
+    let is_pdf = looks_like_pdf(sample);
     let has_nul = sample[..sample.len().min(BINARY_CHECK_BYTES)]
         .iter()
         .any(|b| *b == 0);
     let valid_utf8 = sample_is_valid_utf8(sample);
-    let kind = if image.is_some() {
+    // Detect PDFs before the text/binary fallthrough: small PDFs can look like
+    // valid UTF-8 text near the header, so the magic-byte check must win.
+    let kind = if is_pdf {
+        "pdf"
+    } else if image.is_some() {
         "image"
     } else if size == 0 || (!has_nul && valid_utf8) {
         "text"
     } else {
         "binary"
     };
-    let (image_type, mime) = match image {
-        Some((kind, mime)) => (Some(kind.to_string()), Some(mime.to_string())),
-        None => (None, None),
+    let (image_type, mime) = if is_pdf {
+        (None, Some("application/pdf".to_string()))
+    } else {
+        match image {
+            Some((kind, mime)) => (Some(kind.to_string()), Some(mime.to_string())),
+            None => (None, None),
+        }
     };
     FileProbe {
         size,
@@ -513,4 +534,44 @@ pub fn copy_fs_entry(root: String, source_path: String, dest_path: String) -> Re
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kind_of(sample: &[u8]) -> String {
+        probe_from_sample(sample.len() as u64, None, sample, None).kind
+    }
+
+    #[test]
+    fn detects_pdf_header() {
+        let probe = probe_from_sample(2048, None, b"%PDF-1.7\n1 0 obj\n", None);
+        assert_eq!(probe.kind, "pdf");
+        assert_eq!(probe.mime.as_deref(), Some("application/pdf"));
+    }
+
+    #[test]
+    fn detects_pdf_with_leading_bom() {
+        // A few leading junk/BOM bytes before the signature are tolerated.
+        assert_eq!(kind_of(b"\xef\xbb\xbf%PDF-2.0\n"), "pdf");
+    }
+
+    #[test]
+    fn text_mentioning_pdf_signature_is_not_a_pdf() {
+        // The signature appears well past the start, so this stays text rather
+        // than being misrouted to the PDF viewer.
+        assert_eq!(kind_of(b"This document describes the %PDF-1.5 file header.\n"), "text");
+    }
+
+    #[test]
+    fn pdf_signature_without_version_digit_is_not_a_pdf() {
+        assert_eq!(kind_of(b"%PDF-marker but not a real pdf\n"), "text");
+    }
+
+    #[test]
+    fn plain_text_and_binary_unchanged() {
+        assert_eq!(kind_of(b"hello, world\n"), "text");
+        assert_eq!(kind_of(&[0x00, 0x01, 0x02, 0xff, 0xfe]), "binary");
+    }
 }
