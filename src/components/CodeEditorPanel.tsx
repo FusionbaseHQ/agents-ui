@@ -124,8 +124,9 @@ function autoStructuredKind(path: string): ViewerKind | null {
   const name = basename(path).toLowerCase();
   const dot = name.lastIndexOf(".");
   const ext = dot >= 0 ? name.slice(dot + 1) : "";
+  // Only render-oriented formats auto-open in their rich viewer. JSON and code
+  // files stay in the editor by default (JSON tree is available via "View as").
   if (ext === "md" || ext === "markdown" || ext === "mdown" || ext === "mkd" || ext === "mdx") return "markdown";
-  if (ext === "json") return "json";
   if (ext === "csv" || ext === "tsv") return "csv";
   return null;
 }
