@@ -1,11 +1,10 @@
 import React from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { concatBytes } from "./bytes";
+import { readAllText } from "./readText";
 import type { ReadRangeFn } from "./useChunkCache";
 
 const MAX_MARKDOWN_BYTES = 8 * 1024 * 1024;
-const CHUNK = 256 * 1024;
 
 // Rendered Markdown preview. react-markdown does not render raw HTML by default
 // (no rehype-raw), so this is safe under the app CSP. Opened on demand via the
@@ -34,16 +33,9 @@ export default function MarkdownViewer({
     }
     void (async () => {
       try {
-        const parts: Uint8Array[] = [];
-        for (let offset = 0; offset < size; offset += CHUNK) {
-          const reqLen = Math.min(CHUNK, size - offset);
-          const chunk = await readRange(path, offset, reqLen);
-          if (cancelled) return;
-          parts.push(chunk);
-          if (chunk.length === 0 || chunk.length < reqLen) break;
-        }
+        const value = await readAllText(readRange, path, size, () => cancelled);
         if (cancelled) return;
-        setText(new TextDecoder("utf-8").decode(concatBytes(parts)));
+        setText(value);
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
       }

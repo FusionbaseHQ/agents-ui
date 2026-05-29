@@ -19,13 +19,14 @@ export type CodeEditorPanelHandle = {
   openFind: () => boolean;
 };
 
-export type CodeEditorOpenMode = "auto" | "text" | "image" | "bytes" | "markdown";
-type ViewerKind = "text" | "largeText" | "image" | "bytes" | "pdf" | "markdown";
+export type CodeEditorOpenMode = "auto" | "text" | "image" | "bytes" | "markdown" | "json" | "csv";
+type ViewerKind = "text" | "largeText" | "image" | "bytes" | "pdf" | "markdown" | "json" | "csv";
 
-// PDF.js is heavy and only needed when a PDF is actually opened, so load the
-// viewer (and the library) lazily — same approach as LazyCodeEditorPanel.
+// Heavier / rarely-needed viewers load lazily — same approach as LazyCodeEditorPanel.
 const LazyPdfViewer = React.lazy(() => import("../pdf/PdfViewer"));
 const LazyMarkdownViewer = React.lazy(() => import("../fileViewer/MarkdownViewer"));
+const LazyJsonTreeViewer = React.lazy(() => import("../fileViewer/JsonTreeViewer"));
+const LazyCsvTableViewer = React.lazy(() => import("../fileViewer/CsvTableViewer"));
 
 type FileProbe = {
   size: number;
@@ -118,6 +119,8 @@ function emptyTab(path: string, requestedMode: CodeEditorOpenMode = "auto"): Tab
 function chooseViewerKind(probe: FileProbe, mode: CodeEditorOpenMode): ViewerKind {
   if (mode === "bytes") return "bytes";
   if (mode === "markdown") return "markdown";
+  if (mode === "json") return "json";
+  if (mode === "csv") return "csv";
   if (probe.kind === "pdf" && mode !== "text") return "pdf";
   if (mode === "image") return probe.kind === "image" ? "image" : "bytes";
   if (probe.kind === "image" && mode !== "text") return "image";
@@ -1278,6 +1281,8 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
               <option value="auto">Auto</option>
               <option value="text">Text</option>
               <option value="markdown">Markdown</option>
+              <option value="json">JSON tree</option>
+              <option value="csv">CSV table</option>
               <option value="image">Image</option>
               <option value="bytes">Bytes</option>
             </select>
@@ -1364,6 +1369,30 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
           <React.Suspense fallback={<div className="codeEditorOverlay">Loading…</div>}>
             <LazyMarkdownViewer
               key={`markdown:${activeTab.path}:${activeTab.size ?? 0}`}
+              path={activeTab.path}
+              size={activeTab.size ?? 0}
+              readRange={readFileRange}
+              onOpenBytes={() => void openFile(activeTab.path, "bytes")}
+            />
+          </React.Suspense>
+        ) : null}
+
+        {activeTab && !activeTab.loading && !activeTab.error && activeTab.viewerKind === "json" ? (
+          <React.Suspense fallback={<div className="codeEditorOverlay">Loading…</div>}>
+            <LazyJsonTreeViewer
+              key={`json:${activeTab.path}:${activeTab.size ?? 0}`}
+              path={activeTab.path}
+              size={activeTab.size ?? 0}
+              readRange={readFileRange}
+              onOpenBytes={() => void openFile(activeTab.path, "bytes")}
+            />
+          </React.Suspense>
+        ) : null}
+
+        {activeTab && !activeTab.loading && !activeTab.error && activeTab.viewerKind === "csv" ? (
+          <React.Suspense fallback={<div className="codeEditorOverlay">Loading…</div>}>
+            <LazyCsvTableViewer
+              key={`csv:${activeTab.path}:${activeTab.size ?? 0}`}
               path={activeTab.path}
               size={activeTab.size ?? 0}
               readRange={readFileRange}

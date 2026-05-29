@@ -3150,12 +3150,102 @@ body::after {
 .byteViewer,
 .largeTextViewer,
 .pdfViewer,
-.markdownViewer {
+.markdownViewer,
+.jsonTreeViewer,
+.csvTableViewer {
   position: absolute;
   inset: 0;
   min-width: 0;
   min-height: 0;
   background: var(--panel);
+}
+
+.jsonTreeViewer,
+.csvTableViewer {
+  display: flex;
+  flex-direction: column;
+}
+
+.jsonTreeBody {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px 12px;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text);
+}
+
+.jsonRow {
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+  white-space: pre;
+}
+
+.jsonToggle {
+  display: inline-block;
+  width: 12px;
+  color: var(--muted);
+  flex: 0 0 auto;
+}
+
+.jsonKey {
+  color: rgba(var(--accent-rgb), 0.95);
+}
+
+.jsonString {
+  color: rgba(var(--ink-rgb), 0.85);
+}
+
+.jsonNumber {
+  color: #2aa198;
+}
+
+.jsonBool {
+  color: #b58900;
+}
+
+.jsonNull,
+.jsonMuted {
+  color: var(--muted);
+}
+
+.csvTableBody {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: rgba(var(--shadow-rgb), 0.1);
+}
+
+.csvTable {
+  border-collapse: collapse;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text);
+}
+
+.csvTable th,
+.csvTable td {
+  border: 1px solid rgba(var(--ink-rgb), 0.12);
+  padding: 3px 8px;
+  text-align: left;
+  white-space: pre;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.csvTable thead th {
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+  font-weight: 650;
+}
+
+.csvRowNum {
+  color: var(--muted);
+  user-select: none;
+  text-align: right;
+  background: rgba(var(--ink-rgb), 0.03);
 }
 
 .markdownViewer {
