@@ -25,8 +25,11 @@ import { FileExplorerPanel, type FileExplorerPersistedState } from "./components
 import type {
   CodeEditorFsEvent,
   CodeEditorOpenFileRequest,
+  CodeEditorOpenWorkspaceTabRequest,
   CodeEditorPanelHandle,
   CodeEditorPersistedState,
+  CodeEditorWorkspaceSnapshot,
+  CodeEditorWorkspaceTab,
 } from "./components/CodeEditorPanel";
 import { AgentShortcutsModal } from "./components/AgentShortcutsModal";
 import { AgentPanel } from "./agent/AgentPanel";
@@ -110,6 +113,7 @@ type WorkspaceView = {
   codeEditorOpen: boolean;
   codeEditorRootDir: string | null;
   openFileRequest: CodeEditorOpenFileRequest | null;
+  openWorkspaceTabRequest: CodeEditorOpenWorkspaceTabRequest | null;
   codeEditorActiveFilePath: string | null;
   codeEditorPersistedState: CodeEditorPersistedState | null;
   codeEditorFsEvent: CodeEditorFsEvent | null;
@@ -1932,6 +1936,7 @@ export default function App() {
         codeEditorOpen: false,
         codeEditorRootDir: null,
         openFileRequest: null,
+        openWorkspaceTabRequest: null,
         codeEditorActiveFilePath: null,
         codeEditorPersistedState: null,
         codeEditorFsEvent: null,
@@ -1962,6 +1967,13 @@ export default function App() {
   const activeWorkspaceView = useMemo(() => {
     return workspaceViewByKey[activeWorkspaceKey] ?? createInitialWorkspaceView(activeProjectId);
   }, [activeProjectId, activeWorkspaceKey, createInitialWorkspaceView, workspaceViewByKey]);
+
+  const activeWorkspaceKeyRef = useRef(activeWorkspaceKey);
+  const activeWorkspaceViewRef = useRef(activeWorkspaceView);
+  useEffect(() => {
+    activeWorkspaceKeyRef.current = activeWorkspaceKey;
+    activeWorkspaceViewRef.current = activeWorkspaceView;
+  }, [activeWorkspaceKey, activeWorkspaceView]);
 
   const updateWorkspaceViewForKey = useCallback(
     (key: string, projectId: string, updater: (prev: WorkspaceView) => WorkspaceView) => {
@@ -2715,6 +2727,7 @@ export default function App() {
       ...prev,
       codeEditorOpen: false,
       openFileRequest: null,
+      openWorkspaceTabRequest: null,
     }));
   }, [updateActiveWorkspaceView]);
 
@@ -3756,6 +3769,110 @@ export default function App() {
       return { sessionId };
     }
 
+    function activeWorkspaceProvider(): "local" | "ssh" {
+      const activeSession = sessionsRef.current.find((s) => s.id === activeIdRef.current) ?? null;
+      const project = projectByIdRef.current.get(activeProjectIdRef.current) ?? null;
+      if (activeSession) return isSshSession(activeSession) ? "ssh" : "local";
+      return (project?.sshTarget ?? "").trim() ? "ssh" : "local";
+    }
+
+    function activeWorkspaceRoot(): string {
+      const view = activeWorkspaceViewRef.current;
+      const project = projectByIdRef.current.get(activeProjectIdRef.current) ?? null;
+      const activeSession = sessionsRef.current.find((s) => s.id === activeIdRef.current) ?? null;
+      const provider = activeWorkspaceProvider();
+      const root = (
+        view.codeEditorRootDir ??
+        view.fileExplorerRootDir ??
+        (provider === "ssh"
+          ? activeSession?.sshRootDir ?? project?.sshRemotePath ?? ""
+          : project?.basePath ?? activeSession?.cwd ?? "")
+      ).trim();
+      if (root) return root;
+      if (provider === "local") return "/";
+      throw new Error("workspace root is not resolved yet");
+    }
+
+    function activeWorkspaceRootOrEmpty(): string {
+      try {
+        return activeWorkspaceRoot();
+      } catch {
+        return "";
+      }
+    }
+
+    function fallbackWorkspaceSnapshot(): CodeEditorWorkspaceSnapshot {
+      const view = activeWorkspaceViewRef.current;
+      const activeTabId = view.codeEditorActiveFilePath ?? view.codeEditorPersistedState?.activePath ?? null;
+      const tabs: CodeEditorWorkspaceTab[] = (view.codeEditorPersistedState?.tabs ?? []).map((tab) => ({
+        id: tab.path,
+        kind: "file",
+        title: tab.path.split("/").filter(Boolean).slice(-1)[0] ?? tab.path,
+        active: tab.path === activeTabId,
+        path: tab.path,
+        url: null,
+        label: null,
+        viewerKind: tab.viewerKind ?? null,
+        requestedMode: "auto",
+        dirty: Boolean(tab.dirty),
+        loading: false,
+        error: null,
+        locked: Boolean(tab.locked),
+        size: null,
+        mime: null,
+        imageType: null,
+      }));
+      return {
+        provider: activeWorkspaceProvider(),
+        rootDir: activeWorkspaceRootOrEmpty(),
+        activeTabId,
+        activeFilePath: activeTabId,
+        tabs,
+      };
+    }
+
+    function requireWorkspaceEditor(): CodeEditorPanelHandle {
+      const handle = codeEditorPanelRef.current;
+      if (!handle) throw new Error("workspace editor is not open");
+      return handle;
+    }
+
+    function parseEditorMode(value: unknown): CodeEditorOpenFileRequest["mode"] | undefined {
+      return value === "auto" ||
+        value === "text" ||
+        value === "image" ||
+        value === "bytes" ||
+        value === "markdown" ||
+        value === "json" ||
+        value === "csv"
+        ? value
+        : undefined;
+    }
+
+    function normalizeBrowserApiUrl(value: string): string {
+      const trimmed = value.trim();
+      if (!trimmed) throw new Error("url is required");
+      const candidate = trimmed.includes("://") || trimmed.startsWith("about:") ? trimmed : `https://${trimmed}`;
+      new URL(candidate);
+      return candidate;
+    }
+
+    function queueWorkspaceTabRequest(request: CodeEditorOpenWorkspaceTabRequest) {
+      const root = activeWorkspaceRoot();
+      const workspaceKey = activeWorkspaceKeyRef.current;
+      const projectId = activeProjectIdRef.current;
+      updateWorkspaceViewForKey(workspaceKey, projectId, (prev) => ({
+        ...prev,
+        codeEditorOpen: true,
+        codeEditorRootDir: prev.codeEditorRootDir ?? root,
+        fileExplorerRootDir: prev.fileExplorerRootDir ?? root,
+        codeEditorActiveFilePath:
+          request.kind === "file" && request.path ? request.path : prev.codeEditorActiveFilePath,
+        openWorkspaceTabRequest: request,
+      }));
+      return { queued: true, request, workspace: fallbackWorkspaceSnapshot() };
+    }
+
     registerHandlers({
       // ── sessions ──
       "sessions.list": (p) => {
@@ -4240,12 +4357,110 @@ export default function App() {
         notifyStateChange("split_views.closed", { splitViewId: id });
         return null;
       },
+      // ── workspace file viewer / browser ──
+      "workspace.tabs.list": () => {
+        return codeEditorPanelRef.current?.workspaceSnapshot() ?? fallbackWorkspaceSnapshot();
+      },
+      "workspace.tabs.open": async (p) => {
+        const kind = p.kind === "browser" || p.kind === "file"
+          ? p.kind
+          : typeof p.url === "string"
+            ? "browser"
+            : "file";
+        const request: CodeEditorOpenWorkspaceTabRequest = {
+          nonce: Date.now(),
+          kind,
+          path: typeof p.path === "string" ? p.path : null,
+          url: typeof p.url === "string" ? p.url : null,
+          title: typeof p.title === "string" ? p.title : null,
+        };
+        if (kind === "file" && !request.path?.trim()) throw new Error("path is required");
+        if (kind === "browser" && request.url?.trim()) request.url = normalizeBrowserApiUrl(request.url);
+        const mode = parseEditorMode(p.mode);
+        if (mode) request.mode = mode;
+        const handle = codeEditorPanelRef.current;
+        if (!handle) {
+          const queued = queueWorkspaceTabRequest(request);
+          notifyStateChange("workspace.tabs.open_queued", queued);
+          return queued;
+        }
+        const tab = await handle.openWorkspaceTab(request);
+        notifyStateChange("workspace.tabs.opened", { tab });
+        return { queued: false, tab };
+      },
+      "workspace.tabs.focus": (p) => {
+        const tab = requireWorkspaceEditor().focusWorkspaceTab({
+          tabId: typeof p.tabId === "string" ? p.tabId : null,
+          path: typeof p.path === "string" ? p.path : null,
+        });
+        notifyStateChange("workspace.tabs.focused", { tabId: tab.id });
+        return tab;
+      },
+      "workspace.tabs.close": (p) => {
+        const tab = requireWorkspaceEditor().closeWorkspaceTab({
+          tabId: typeof p.tabId === "string" ? p.tabId : null,
+          path: typeof p.path === "string" ? p.path : null,
+          force: p.force === true,
+        });
+        notifyStateChange("workspace.tabs.closed", { tabId: tab.id });
+        return tab;
+      },
+      "browser.navigate": async (p) => {
+        const url = normalizeBrowserApiUrl(typeof p.url === "string" ? p.url : "");
+        const tabId = typeof p.tabId === "string" ? p.tabId : null;
+        const handle = codeEditorPanelRef.current;
+        if (!handle) {
+          if (tabId) throw new Error("workspace editor is not open");
+          const queued = queueWorkspaceTabRequest({
+            nonce: Date.now(),
+            kind: "browser",
+            url,
+            title: typeof p.title === "string" ? p.title : null,
+          });
+          notifyStateChange("browser.navigate_queued", queued);
+          return queued;
+        }
+        const tab = await handle.browserNavigate({
+          tabId,
+          url,
+          activate: p.activate !== false,
+        });
+        notifyStateChange("browser.navigated", { tabId: tab.id, url: tab.url });
+        return tab;
+      },
+      "browser.action": async (p) => {
+        const action = p.action === "back" || p.action === "forward" || p.action === "reload" ? p.action : null;
+        if (!action) throw new Error("unknown browser action");
+        const tab = await requireWorkspaceEditor().browserAction({
+          tabId: typeof p.tabId === "string" ? p.tabId : null,
+          action,
+        });
+        notifyStateChange("browser.action", { tabId: tab.id, action });
+        return tab;
+      },
+      "browser.snapshot": (p) => {
+        const handle = codeEditorPanelRef.current;
+        if (!handle) {
+          if (typeof p.tabId === "string" && p.tabId.trim()) throw new Error("workspace editor is not open");
+          return { activeTabId: null, activeBrowserTabId: null, tabs: [] };
+        }
+        return handle.browserSnapshot({ tabId: typeof p.tabId === "string" ? p.tabId : null });
+      },
+      "file_viewer.snapshot": (p) => {
+        const input: { tabId?: string | null; path?: string | null; maxContentLength?: number } = {
+          tabId: typeof p.tabId === "string" ? p.tabId : null,
+          path: typeof p.path === "string" ? p.path : null,
+        };
+        if (typeof p.maxContentLength === "number") input.maxContentLength = p.maxContentLength;
+        return requireWorkspaceEditor().fileViewerSnapshot(input);
+      },
       // ── ui ──
       "ui.state": () => ({
         activeProjectId: activeProjectIdRef.current,
         activeSessionId: activeIdRef.current,
         activeSplitViewId: activeSplitViewIdRef.current,
         theme: uiThemeRef.current,
+        workspace: codeEditorPanelRef.current?.workspaceSnapshot() ?? fallbackWorkspaceSnapshot(),
       }),
       "ui.get_theme": () => ({ theme: uiThemeRef.current }),
       "ui.set_theme": (p) => {
@@ -7368,6 +7583,7 @@ export default function App() {
             codeEditorActiveFilePath,
             codeEditorPersistedState,
             openFileRequest: null,
+            openWorkspaceTabRequest: null,
             codeEditorFsEvent: null,
           };
         }
@@ -9323,6 +9539,7 @@ export default function App() {
                   ).trim()
                 }
                 openFileRequest={activeWorkspaceView.openFileRequest}
+                openWorkspaceTabRequest={activeWorkspaceView.openWorkspaceTabRequest}
                 persistedState={activeWorkspaceView.codeEditorPersistedState}
                 fsEvent={activeWorkspaceView.codeEditorFsEvent}
                 onPersistState={(state) =>
@@ -9335,6 +9552,12 @@ export default function App() {
                   updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
                     ...prev,
                     openFileRequest: null,
+                  }))
+                }
+                onConsumeOpenWorkspaceTabRequest={() =>
+                  updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => ({
+                    ...prev,
+                    openWorkspaceTabRequest: null,
                   }))
                 }
                 onActiveFilePathChange={(path) =>

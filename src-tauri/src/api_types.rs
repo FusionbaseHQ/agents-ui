@@ -320,6 +320,15 @@ pub fn method_catalog() -> Vec<MethodInfo> {
         MethodInfo { name: "ssh_files.rename".into(), description: "Rename remote file/directory".into(), category: "ssh_files".into(), bridge: false },
         MethodInfo { name: "ssh_files.delete".into(), description: "Delete remote file/directory".into(), category: "ssh_files".into(), bridge: false },
         MethodInfo { name: "ssh_files.download".into(), description: "Download file from SSH".into(), category: "ssh_files".into(), bridge: false },
+        // workspace file viewer / browser
+        MethodInfo { name: "workspace.tabs.list".into(), description: "List open file viewer and browser tabs".into(), category: "workspace".into(), bridge: true },
+        MethodInfo { name: "workspace.tabs.open".into(), description: "Open a file viewer or embedded browser tab".into(), category: "workspace".into(), bridge: true },
+        MethodInfo { name: "workspace.tabs.focus".into(), description: "Focus an open workspace tab".into(), category: "workspace".into(), bridge: true },
+        MethodInfo { name: "workspace.tabs.close".into(), description: "Close an open workspace tab".into(), category: "workspace".into(), bridge: true },
+        MethodInfo { name: "browser.navigate".into(), description: "Navigate an embedded browser tab".into(), category: "browser".into(), bridge: true },
+        MethodInfo { name: "browser.action".into(), description: "Run browser navigation action".into(), category: "browser".into(), bridge: true },
+        MethodInfo { name: "browser.snapshot".into(), description: "Get embedded browser tab state".into(), category: "browser".into(), bridge: true },
+        MethodInfo { name: "file_viewer.snapshot".into(), description: "Get active file viewer state and text content when available".into(), category: "file_viewer".into(), bridge: true },
         // split_views
         MethodInfo { name: "split_views.list".into(), description: "List split views".into(), category: "split_views".into(), bridge: true },
         MethodInfo { name: "split_views.create".into(), description: "Create a split view".into(), category: "split_views".into(), bridge: true },
@@ -360,6 +369,9 @@ pub fn is_bridge_method(method: &str) -> bool {
         "assets.delete" | "assets.apply" | "assets.update_settings" |
         "recordings.start" | "recordings.stop" |
         "ssh.connect" | "ssh.history" | "ssh.delete_history" |
+        "workspace.tabs.list" | "workspace.tabs.open" | "workspace.tabs.focus" | "workspace.tabs.close" |
+        "browser.navigate" | "browser.action" | "browser.snapshot" |
+        "file_viewer.snapshot" |
         "split_views.list" | "split_views.create" | "split_views.update" | "split_views.close" |
         "ui.state" | "ui.activate_session" | "ui.toggle_panel" | "ui.command_palette" |
         "ui.navigate_session" |
@@ -374,6 +386,7 @@ pub fn rate_category(method: &str) -> RateCategory {
         "sessions.write" => RateCategory::TerminalIO,
         m if m.ends_with(".list") || m.ends_with(".get") || m.ends_with(".search")
             || m == "app.info" || m == "app.state" || m == "ui.state"
+            || m == "browser.snapshot" || m == "file_viewer.snapshot"
             || m == "api.methods" || m == "api.describe"
             || m == "auth.authenticate"
             || m == "recordings.load" || m == "files.read" || m == "ssh_files.read"

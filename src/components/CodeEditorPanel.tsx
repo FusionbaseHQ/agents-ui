@@ -17,10 +17,70 @@ loader.config({ monaco: bundledMonaco });
 
 export type CodeEditorPanelHandle = {
   openFind: () => boolean;
+  workspaceSnapshot: () => CodeEditorWorkspaceSnapshot;
+  openWorkspaceTab: (input: CodeEditorOpenWorkspaceTabInput) => Promise<CodeEditorWorkspaceTab>;
+  focusWorkspaceTab: (input: { tabId?: string | null; path?: string | null }) => CodeEditorWorkspaceTab;
+  closeWorkspaceTab: (input: { tabId?: string | null; path?: string | null; force?: boolean }) => CodeEditorWorkspaceTab;
+  browserNavigate: (input: { tabId?: string | null; url: string; activate?: boolean }) => Promise<CodeEditorWorkspaceTab>;
+  browserAction: (input: { tabId?: string | null; action: "back" | "forward" | "reload" }) => Promise<CodeEditorWorkspaceTab>;
+  browserSnapshot: (input?: { tabId?: string | null }) => CodeEditorBrowserSnapshot;
+  fileViewerSnapshot: (input?: { tabId?: string | null; path?: string | null; maxContentLength?: number }) => CodeEditorFileViewerSnapshot;
 };
 
 export type CodeEditorOpenMode = "auto" | "text" | "image" | "bytes" | "markdown" | "json" | "csv";
 type ViewerKind = "text" | "largeText" | "image" | "bytes" | "pdf" | "markdown" | "json" | "csv" | "browser";
+
+export type CodeEditorOpenWorkspaceTabInput = {
+  kind?: "file" | "browser";
+  path?: string | null;
+  url?: string | null;
+  title?: string | null;
+  mode?: CodeEditorOpenMode;
+};
+
+export type CodeEditorOpenWorkspaceTabRequest = CodeEditorOpenWorkspaceTabInput & {
+  nonce: number;
+};
+
+export type CodeEditorWorkspaceTab = {
+  id: string;
+  kind: "file" | "browser";
+  title: string;
+  active: boolean;
+  path: string | null;
+  url: string | null;
+  label: string | null;
+  viewerKind: ViewerKind | null;
+  requestedMode: CodeEditorOpenMode;
+  dirty: boolean;
+  loading: boolean;
+  error: string | null;
+  locked: boolean;
+  size: number | null;
+  mime: string | null;
+  imageType: string | null;
+};
+
+export type CodeEditorWorkspaceSnapshot = {
+  provider: "local" | "ssh";
+  rootDir: string;
+  activeTabId: string | null;
+  activeFilePath: string | null;
+  tabs: CodeEditorWorkspaceTab[];
+};
+
+export type CodeEditorBrowserSnapshot = {
+  activeTabId: string | null;
+  activeBrowserTabId: string | null;
+  tabs: CodeEditorWorkspaceTab[];
+};
+
+export type CodeEditorFileViewerSnapshot = {
+  tab: CodeEditorWorkspaceTab;
+  contentAvailable: boolean;
+  content: string | null;
+  contentTruncated: boolean;
+};
 
 // Heavier / rarely-needed viewers load lazily — same approach as LazyCodeEditorPanel.
 const LazyPdfViewer = React.lazy(() => import("../pdf/PdfViewer"));
@@ -40,6 +100,15 @@ function urlHost(url: string): string {
   } catch {
     return "Browser";
   }
+}
+function normalizeBrowserUrl(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) throw new Error("url is required");
+  const candidate = trimmed.includes("://") || trimmed.startsWith("about:") ? trimmed : `https://${trimmed}`;
+  // Validate early so API-driven browser opens fail at the call site instead of
+  // later in the native child webview's layout loop.
+  new URL(candidate);
+  return candidate;
 }
 const isHtmlPath = (path: string) => /\.(x?html?|htm)$/i.test(path.trim());
 // file:// URL for a local absolute path (spaces etc. percent-encoded, slashes kept).
@@ -284,10 +353,12 @@ type CodeEditorPanelProps = {
   sshTarget?: string | null;
   rootDir: string;
   openFileRequest: CodeEditorOpenFileRequest | null;
+  openWorkspaceTabRequest?: CodeEditorOpenWorkspaceTabRequest | null;
   persistedState: CodeEditorPersistedState | null;
   fsEvent?: CodeEditorFsEvent | null;
   onPersistState: (state: CodeEditorPersistedState) => void;
   onConsumeOpenFileRequest?: () => void;
+  onConsumeOpenWorkspaceTabRequest?: () => void;
   onActiveFilePathChange: (path: string | null) => void;
   onCloseEditor: () => void;
 };
@@ -368,10 +439,12 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     sshTarget,
     rootDir,
     openFileRequest,
+    openWorkspaceTabRequest,
     persistedState,
     fsEvent,
     onPersistState,
     onConsumeOpenFileRequest,
+    onConsumeOpenWorkspaceTabRequest,
     onActiveFilePathChange,
     onCloseEditor,
   }: CodeEditorPanelProps,
@@ -482,6 +555,8 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   const restoredRef = React.useRef(false);
   const lastOpenRequestRef = React.useRef<string | null>(null);
   const scheduledOpenRequestRef = React.useRef<string | null>(null);
+  const lastWorkspaceTabRequestRef = React.useRef<string | null>(null);
+  const scheduledWorkspaceTabRequestRef = React.useRef<string | null>(null);
   const tabsRef = React.useRef<Tab[]>([]);
   React.useLayoutEffect(() => {
     tabsRef.current = tabs;
@@ -513,8 +588,6 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     }
   }, []);
 
-  React.useImperativeHandle(ref, () => ({ openFind }), [openFind]);
-
   const onPersistStateRef = React.useRef(onPersistState);
   React.useEffect(() => {
     onPersistStateRef.current = onPersistState;
@@ -524,6 +597,11 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   React.useEffect(() => {
     onConsumeOpenFileRequestRef.current = onConsumeOpenFileRequest;
   }, [onConsumeOpenFileRequest]);
+
+  const onConsumeOpenWorkspaceTabRequestRef = React.useRef(onConsumeOpenWorkspaceTabRequest);
+  React.useEffect(() => {
+    onConsumeOpenWorkspaceTabRequestRef.current = onConsumeOpenWorkspaceTabRequest;
+  }, [onConsumeOpenWorkspaceTabRequest]);
 
   const onActiveFilePathChangeRef = React.useRef(onActiveFilePathChange);
   React.useEffect(() => {
@@ -647,6 +725,112 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     modelsRef.current.set(path, model);
     editor.setModel(model);
   }, [modelUriForPath]);
+
+  const serializeWorkspaceTab = React.useCallback((tab: Tab): CodeEditorWorkspaceTab => {
+    const browserMeta = browserMetaRef.current.get(tab.path) ?? null;
+    const dirty = dirtyPathsRef.current.has(tab.path) || tab.dirty;
+    return {
+      id: tab.path,
+      kind: browserMeta ? "browser" : "file",
+      title: tab.title,
+      active: tab.path === activePathRef.current,
+      path: browserMeta ? null : tab.path,
+      url: browserMeta?.url ?? null,
+      label: browserMeta?.label ?? null,
+      viewerKind: tab.viewerKind,
+      requestedMode: tab.requestedMode,
+      dirty,
+      loading: tab.loading,
+      error: tab.error,
+      locked: tab.locked,
+      size: tab.size,
+      mime: tab.mime,
+      imageType: tab.imageType,
+    };
+  }, []);
+
+  const workspaceSnapshot = React.useCallback((): CodeEditorWorkspaceSnapshot => {
+    const active = activePathRef.current;
+    return {
+      provider,
+      rootDir,
+      activeTabId: active,
+      activeFilePath: active && !isBrowserPath(active) ? active : null,
+      tabs: tabsRef.current.map(serializeWorkspaceTab),
+    };
+  }, [provider, rootDir, serializeWorkspaceTab]);
+
+  const resolveExistingTabPath = React.useCallback((input?: { tabId?: string | null; path?: string | null }): string | null => {
+    const candidate = ((input?.tabId ?? input?.path ?? "") as string).trim();
+    if (!candidate) return activePathRef.current;
+    if (openPathsRef.current.has(candidate)) return candidate;
+    for (const [path, meta] of browserMetaRef.current.entries()) {
+      if (meta.label === candidate) return path;
+    }
+    return null;
+  }, []);
+
+  const resolveBrowserPath = React.useCallback((tabId?: string | null): string | null => {
+    const candidate = (tabId ?? "").trim();
+    if (candidate) {
+      if (browserMetaRef.current.has(candidate)) return candidate;
+      for (const [path, meta] of browserMetaRef.current.entries()) {
+        if (meta.label === candidate) return path;
+      }
+      return null;
+    }
+    const active = activePathRef.current;
+    if (active && browserMetaRef.current.has(active)) return active;
+    return tabsRef.current.find((tab) => browserMetaRef.current.has(tab.path))?.path ?? null;
+  }, []);
+
+  const browserSnapshot = React.useCallback(
+    (input?: { tabId?: string | null }): CodeEditorBrowserSnapshot => {
+      const target = input?.tabId ? resolveBrowserPath(input.tabId) : null;
+      if (input?.tabId && !target) throw new Error("browser tab not found");
+      const browserTabs = tabsRef.current.filter((tab) => browserMetaRef.current.has(tab.path));
+      const active = activePathRef.current;
+      const activeBrowser = active && browserMetaRef.current.has(active) ? active : null;
+      const tabs = target
+        ? browserTabs.filter((tab) => tab.path === target)
+        : browserTabs;
+      return {
+        activeTabId: active,
+        activeBrowserTabId: activeBrowser,
+        tabs: tabs.map(serializeWorkspaceTab),
+      };
+    },
+    [resolveBrowserPath, serializeWorkspaceTab],
+  );
+
+  const fileViewerSnapshot = React.useCallback(
+    (input?: { tabId?: string | null; path?: string | null; maxContentLength?: number }): CodeEditorFileViewerSnapshot => {
+      const resolved = resolveExistingTabPath(input);
+      if (!resolved) throw new Error("file viewer tab not found");
+      if (browserMetaRef.current.has(resolved)) throw new Error("target tab is a browser tab");
+      const tab = tabsRef.current.find((it) => it.path === resolved);
+      if (!tab) throw new Error("file viewer tab not found");
+
+      const fullContent = tab.viewerKind === "text" ? readModelValue(resolved) : null;
+      const maxContentLength = Math.min(
+        200_000,
+        Math.max(0, Math.floor(input?.maxContentLength ?? 20_000)),
+      );
+      const content =
+        fullContent == null
+          ? null
+          : fullContent.length > maxContentLength
+            ? fullContent.slice(0, maxContentLength)
+            : fullContent;
+      return {
+        tab: serializeWorkspaceTab(tab),
+        contentAvailable: fullContent != null,
+        content,
+        contentTruncated: fullContent != null && fullContent.length > maxContentLength,
+      };
+    },
+    [readModelValue, resolveExistingTabPath, serializeWorkspaceTab],
+  );
 
   const openFile = React.useCallback(
     async (path: string, mode: CodeEditorOpenMode = "auto") => {
@@ -782,8 +966,29 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       setActivePath(path);
       activePathRef.current = path;
       setEditorModel(null);
+      return tab;
     },
     [setEditorModel],
+  );
+
+  const openWorkspaceTab = React.useCallback(
+    async (input: CodeEditorOpenWorkspaceTabInput): Promise<CodeEditorWorkspaceTab> => {
+      const kind = input.kind ?? (input.url ? "browser" : "file");
+      if (kind === "browser") {
+        const url = normalizeBrowserUrl(input.url ?? BROWSER_START_URL);
+        const title = (input.title ?? "").trim() || urlHost(url);
+        const tab = openBrowserTab(url, title);
+        return serializeWorkspaceTab(tab);
+      }
+
+      const path = (input.path ?? "").trim();
+      if (!path) throw new Error("path is required");
+      await openFile(path, input.mode ?? "auto");
+      const tab = tabsRef.current.find((it) => it.path === path);
+      if (!tab) throw new Error("file tab did not open");
+      return serializeWorkspaceTab(tab);
+    },
+    [openBrowserTab, openFile, serializeWorkspaceTab],
   );
 
   // "Open in browser" for an HTML file: render it in a browser tab. Local files
@@ -878,6 +1083,40 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       if (scheduledOpenRequestRef.current === key) scheduledOpenRequestRef.current = null;
     };
   }, [openFile, openFileRequest]);
+
+  React.useEffect(() => {
+    if (!openWorkspaceTabRequest) return;
+    const kind = openWorkspaceTabRequest.kind ?? (openWorkspaceTabRequest.url ? "browser" : "file");
+    const key = [
+      openWorkspaceTabRequest.nonce,
+      kind,
+      openWorkspaceTabRequest.path ?? "",
+      openWorkspaceTabRequest.url ?? "",
+      openWorkspaceTabRequest.mode ?? "auto",
+      openWorkspaceTabRequest.title ?? "",
+    ].join(":");
+    if (lastWorkspaceTabRequestRef.current === key) return;
+    if (scheduledWorkspaceTabRequestRef.current === key) return;
+    scheduledWorkspaceTabRequestRef.current = key;
+
+    let cancelled = false;
+    const run = () => {
+      if (cancelled) return;
+      if (lastWorkspaceTabRequestRef.current === key) return;
+      lastWorkspaceTabRequestRef.current = key;
+      if (scheduledWorkspaceTabRequestRef.current === key) scheduledWorkspaceTabRequestRef.current = null;
+      onConsumeOpenWorkspaceTabRequestRef.current?.();
+      void openWorkspaceTab(openWorkspaceTabRequest).catch(() => {});
+    };
+
+    if (typeof queueMicrotask === "function") queueMicrotask(run);
+    else void Promise.resolve().then(run);
+
+    return () => {
+      cancelled = true;
+      if (scheduledWorkspaceTabRequestRef.current === key) scheduledWorkspaceTabRequestRef.current = null;
+    };
+  }, [openWorkspaceTab, openWorkspaceTabRequest]);
 
   React.useEffect(() => {
     if (!tabsMenuOpen) return;
@@ -1324,6 +1563,109 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       updateTab(path, (tab) => ({ ...tab, locked: !tab.locked }));
     },
     [updateTab],
+  );
+
+  const focusWorkspaceTab = React.useCallback(
+    (input: { tabId?: string | null; path?: string | null }): CodeEditorWorkspaceTab => {
+      const resolved = resolveExistingTabPath(input);
+      if (!resolved) throw new Error("tab not found");
+      const tab = tabsRef.current.find((it) => it.path === resolved);
+      if (!tab) throw new Error("tab not found");
+      setActivePath(resolved);
+      activePathRef.current = resolved;
+      if (tab.viewerKind === "text") setEditorModel(resolved);
+      else setEditorModel(null);
+      return serializeWorkspaceTab(tab);
+    },
+    [resolveExistingTabPath, serializeWorkspaceTab, setEditorModel],
+  );
+
+  const closeWorkspaceTab = React.useCallback(
+    (input: { tabId?: string | null; path?: string | null; force?: boolean }): CodeEditorWorkspaceTab => {
+      const resolved = resolveExistingTabPath(input);
+      if (!resolved) throw new Error("tab not found");
+      const tab = tabsRef.current.find((it) => it.path === resolved);
+      if (!tab) throw new Error("tab not found");
+      const snapshot = serializeWorkspaceTab(tab);
+      if (tab.locked && !input.force) throw new Error("tab is locked; pass force=true to close it");
+      if ((dirtyPathsRef.current.has(resolved) || tab.dirty) && !input.force) {
+        throw new Error("tab has unsaved changes; pass force=true to close it");
+      }
+      closeTab(resolved);
+      return snapshot;
+    },
+    [closeTab, resolveExistingTabPath, serializeWorkspaceTab],
+  );
+
+  const browserNavigate = React.useCallback(
+    async (input: { tabId?: string | null; url: string; activate?: boolean }): Promise<CodeEditorWorkspaceTab> => {
+      const url = normalizeBrowserUrl(input.url);
+      const path = resolveBrowserPath(input.tabId);
+      if (!path) throw new Error("browser tab not found");
+      const meta = browserMetaRef.current.get(path);
+      if (!meta) throw new Error("browser tab not found");
+      meta.url = url;
+      const title = urlHost(url);
+      updateTab(path, (tab) => (tab.title === title ? tab : { ...tab, title }));
+      if (input.activate !== false) {
+        setActivePath(path);
+        activePathRef.current = path;
+        setEditorModel(null);
+      }
+      try {
+        await invoke("browser_navigate", { label: meta.label, url });
+      } catch (err) {
+        // A freshly opened browser tab may not have created its native webview yet.
+        // Updating the stored URL is enough for the first BrowserView mount.
+        const message = err instanceof Error ? err.message : String(err);
+        if (!message.includes("browser not found")) throw err;
+      }
+      const tab = tabsRef.current.find((it) => it.path === path);
+      if (!tab) throw new Error("browser tab not found");
+      return serializeWorkspaceTab({ ...tab, title });
+    },
+    [resolveBrowserPath, serializeWorkspaceTab, setEditorModel, updateTab],
+  );
+
+  const browserAction = React.useCallback(
+    async (input: { tabId?: string | null; action: "back" | "forward" | "reload" }): Promise<CodeEditorWorkspaceTab> => {
+      if (!["back", "forward", "reload"].includes(input.action)) throw new Error("unknown browser action");
+      const path = resolveBrowserPath(input.tabId);
+      if (!path) throw new Error("browser tab not found");
+      const meta = browserMetaRef.current.get(path);
+      if (!meta) throw new Error("browser tab not found");
+      await invoke("browser_action", { label: meta.label, action: input.action });
+      const tab = tabsRef.current.find((it) => it.path === path);
+      if (!tab) throw new Error("browser tab not found");
+      return serializeWorkspaceTab(tab);
+    },
+    [resolveBrowserPath, serializeWorkspaceTab],
+  );
+
+  React.useImperativeHandle(
+    ref,
+    () => ({
+      openFind,
+      workspaceSnapshot,
+      openWorkspaceTab,
+      focusWorkspaceTab,
+      closeWorkspaceTab,
+      browserNavigate,
+      browserAction,
+      browserSnapshot,
+      fileViewerSnapshot,
+    }),
+    [
+      browserAction,
+      browserNavigate,
+      browserSnapshot,
+      closeWorkspaceTab,
+      fileViewerSnapshot,
+      focusWorkspaceTab,
+      openFind,
+      openWorkspaceTab,
+      workspaceSnapshot,
+    ],
   );
 
   React.useEffect(() => {

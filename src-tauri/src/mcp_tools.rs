@@ -328,6 +328,68 @@ pub fn tool_list() -> Vec<Value> {
             },
             "required": ["host", "root", "path", "content"]
         })),
+        // Workspace viewer/browser
+        tool_def("list_workspace_tabs", "List open workspace file-viewer/editor tabs and embedded browser tabs. Returns tab IDs, active tab, file paths, browser URLs, viewer modes, dirty state, and loading/errors.", json!({
+            "type": "object",
+            "properties": {}
+        })),
+        tool_def("open_workspace_tab", "Open a workspace tab. Use kind=file with path to show a file in the file viewer/editor, or kind=browser with url to open an embedded browser tab.", json!({
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "enum": ["file", "browser"], "description": "Tab kind to open" },
+                "path": { "type": "string", "description": "File path for kind=file" },
+                "url": { "type": "string", "description": "URL for kind=browser" },
+                "title": { "type": "string", "description": "Optional browser tab title" },
+                "mode": { "type": "string", "enum": ["auto", "text", "image", "bytes", "markdown", "json", "csv"], "description": "File viewer mode for kind=file" }
+            },
+            "required": ["kind"]
+        })),
+        tool_def("focus_workspace_tab", "Focus an open file-viewer/editor or embedded browser tab by tabId. Browser tab IDs look like browser://1; browser labels like browser-1 are also accepted.", json!({
+            "type": "object",
+            "properties": {
+                "tabId": { "type": "string", "description": "Workspace tab ID or browser label" }
+            },
+            "required": ["tabId"]
+        })),
+        tool_def("close_workspace_tab", "Close an open workspace tab. Pass force=true to close locked tabs or discard unsaved editor changes.", json!({
+            "type": "object",
+            "properties": {
+                "tabId": { "type": "string", "description": "Workspace tab ID or browser label" },
+                "force": { "type": "boolean", "description": "Close locked or dirty tabs" }
+            },
+            "required": ["tabId"]
+        })),
+        tool_def("browser_navigate", "Navigate an embedded browser tab. If tabId is omitted, the active browser tab is used, or a new browser tab is opened when the workspace editor is not mounted.", json!({
+            "type": "object",
+            "properties": {
+                "tabId": { "type": "string", "description": "Optional browser tab ID or label" },
+                "url": { "type": "string", "description": "Destination URL" },
+                "activate": { "type": "boolean", "description": "Whether to focus the browser tab. Default: true" }
+            },
+            "required": ["url"]
+        })),
+        tool_def("browser_action", "Run a navigation action in an embedded browser tab.", json!({
+            "type": "object",
+            "properties": {
+                "tabId": { "type": "string", "description": "Optional browser tab ID or label" },
+                "action": { "type": "string", "enum": ["back", "forward", "reload"], "description": "Browser action" }
+            },
+            "required": ["action"]
+        })),
+        tool_def("browser_snapshot", "Get embedded browser tab state, including active browser tab, labels, and URLs. Pass tabId to inspect one browser tab.", json!({
+            "type": "object",
+            "properties": {
+                "tabId": { "type": "string", "description": "Optional browser tab ID or label" }
+            }
+        })),
+        tool_def("file_viewer_snapshot", "Get the active file viewer/editor tab metadata and, for text editor tabs, current unsaved text content. Pass maxContentLength to cap returned text.", json!({
+            "type": "object",
+            "properties": {
+                "tabId": { "type": "string", "description": "Optional file tab ID/path" },
+                "path": { "type": "string", "description": "Optional file path" },
+                "maxContentLength": { "type": "number", "description": "Maximum text characters to return for editable text tabs (default: 20000, max: 200000)" }
+            }
+        })),
         // Prompts
         tool_def("list_prompts", "List all saved command prompts/snippets. Prompts are reusable command templates that can be sent to terminal sessions.", json!({
             "type": "object",
@@ -465,6 +527,14 @@ fn tool_to_method(name: &str) -> Option<&'static str> {
         "ssh_files_list" => Some("ssh_files.list"),
         "ssh_files_read" => Some("ssh_files.read"),
         "ssh_files_write" => Some("ssh_files.write"),
+        "list_workspace_tabs" => Some("workspace.tabs.list"),
+        "open_workspace_tab" => Some("workspace.tabs.open"),
+        "focus_workspace_tab" => Some("workspace.tabs.focus"),
+        "close_workspace_tab" => Some("workspace.tabs.close"),
+        "browser_navigate" => Some("browser.navigate"),
+        "browser_action" => Some("browser.action"),
+        "browser_snapshot" => Some("browser.snapshot"),
+        "file_viewer_snapshot" => Some("file_viewer.snapshot"),
         "list_prompts" => Some("prompts.list"),
         "send_prompt" => Some("prompts.send"),
         "get_app_info" => Some("app.info"),
@@ -534,6 +604,44 @@ fn map_params(name: &str, args: &Value) -> Value {
         "ssh_files_list" => json!({ "host": args.get("host"), "root": args.get("root"), "path": args.get("path") }),
         "ssh_files_read" => json!({ "host": args.get("host"), "root": args.get("root"), "path": args.get("path") }),
         "ssh_files_write" => json!({ "host": args.get("host"), "root": args.get("root"), "path": args.get("path"), "content": args.get("content") }),
+        "list_workspace_tabs" => json!({}),
+        "open_workspace_tab" => {
+            let mut p = json!({ "kind": args.get("kind") });
+            if let Some(v) = args.get("path") { p["path"] = v.clone(); }
+            if let Some(v) = args.get("url") { p["url"] = v.clone(); }
+            if let Some(v) = args.get("title") { p["title"] = v.clone(); }
+            if let Some(v) = args.get("mode") { p["mode"] = v.clone(); }
+            p
+        },
+        "focus_workspace_tab" => json!({ "tabId": args.get("tabId") }),
+        "close_workspace_tab" => {
+            let mut p = json!({ "tabId": args.get("tabId") });
+            if let Some(v) = args.get("force") { p["force"] = v.clone(); }
+            p
+        },
+        "browser_navigate" => {
+            let mut p = json!({ "url": args.get("url") });
+            if let Some(v) = args.get("tabId") { p["tabId"] = v.clone(); }
+            if let Some(v) = args.get("activate") { p["activate"] = v.clone(); }
+            p
+        },
+        "browser_action" => {
+            let mut p = json!({ "action": args.get("action") });
+            if let Some(v) = args.get("tabId") { p["tabId"] = v.clone(); }
+            p
+        },
+        "browser_snapshot" => {
+            let mut p = json!({});
+            if let Some(v) = args.get("tabId") { p["tabId"] = v.clone(); }
+            p
+        },
+        "file_viewer_snapshot" => {
+            let mut p = json!({});
+            if let Some(v) = args.get("tabId") { p["tabId"] = v.clone(); }
+            if let Some(v) = args.get("path") { p["path"] = v.clone(); }
+            if let Some(v) = args.get("maxContentLength") { p["maxContentLength"] = v.clone(); }
+            p
+        },
         "list_prompts" => json!({}),
         "send_prompt" => {
             let mut p = json!({ "sessionId": args.get("sessionId") });
