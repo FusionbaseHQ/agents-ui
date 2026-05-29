@@ -2947,6 +2947,16 @@ body::after {
   border-radius: var(--radius-control);
 }
 
+.codeEditorCrossFind {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 5px 8px;
+  background: rgba(var(--ink-rgb), 0.03);
+  border-bottom: 1px solid rgba(var(--ink-rgb), 0.06);
+}
+
 .codeEditorBody {
   position: relative;
   z-index: 0;

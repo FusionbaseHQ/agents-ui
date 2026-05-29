@@ -328,6 +328,11 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   const [saveError, setSaveError] = React.useState<string | null>(null);
   const [pendingClose, setPendingClose] = React.useState<PendingCloseAction | null>(null);
   const [saveConflictPath, setSaveConflictPath] = React.useState<string | null>(null);
+  const [crossFindOpen, setCrossFindOpen] = React.useState(false);
+  const [crossFind, setCrossFind] = React.useState("");
+  const [crossReplace, setCrossReplace] = React.useState("");
+  const [crossCase, setCrossCase] = React.useState(false);
+  const [crossStatus, setCrossStatus] = React.useState<string | null>(null);
   // mtime (ms) of each open file as last loaded/saved by us, used to detect an
   // external edit before we overwrite it on save.
   const loadedMtimeRef = React.useRef<Map<string, number>>(new Map());
@@ -1136,6 +1141,39 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     else tabButtonRefs.current.set(path, el);
   }, []);
 
+  // Find (and optionally replace) across all open text models. Edits go through
+  // pushEditOperations, so each model's onDidChangeContent marks its tab dirty.
+  const runCrossFind = React.useCallback(
+    (doReplace: boolean) => {
+      if (!crossFind) {
+        setCrossStatus(null);
+        return;
+      }
+      let totalMatches = 0;
+      let fileCount = 0;
+      for (const [, model] of modelsRef.current) {
+        if (model.isDisposed()) continue;
+        const matches = model.findMatches(crossFind, false, false, crossCase, null, false);
+        if (!matches.length) continue;
+        fileCount += 1;
+        totalMatches += matches.length;
+        if (doReplace) {
+          model.pushEditOperations(
+            null,
+            matches.map((m) => ({ range: m.range, text: crossReplace })),
+            () => null,
+          );
+        }
+      }
+      setCrossStatus(
+        totalMatches === 0
+          ? "No matches"
+          : `${doReplace ? "Replaced" : "Found"} ${totalMatches} in ${fileCount} file${fileCount === 1 ? "" : "s"}`,
+      );
+    },
+    [crossCase, crossFind, crossReplace],
+  );
+
   React.useLayoutEffect(() => {
     if (!activePath) return;
     const el = tabButtonRefs.current.get(activePath);
@@ -1203,6 +1241,15 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
         </div>
 
         <div className="codeEditorActions">
+          <button
+            type="button"
+            className={`btnSmall btnIcon ${crossFindOpen ? "btnIconActive" : ""}`}
+            onClick={() => setCrossFindOpen((v) => !v)}
+            title="Find / replace across open files"
+            aria-label="Find across open files"
+          >
+            ⌕
+          </button>
           <div className="sidebarActionMenu">
             <button
               type="button"
@@ -1265,6 +1312,41 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
           </button>
         </div>
       </div>
+
+      {crossFindOpen ? (
+        <div className="codeEditorCrossFind">
+          <input
+            className="fileViewerInput fileViewerSearchInput"
+            value={crossFind}
+            onChange={(e) => setCrossFind(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") runCrossFind(false);
+            }}
+            placeholder="find in open files"
+          />
+          <button
+            type="button"
+            className={`btnSmall ${crossCase ? "pdfViewerFitActive" : ""}`}
+            onClick={() => setCrossCase((v) => !v)}
+            title="Case sensitive"
+          >
+            Aa
+          </button>
+          <button type="button" className="btnSmall" onClick={() => runCrossFind(false)} disabled={!crossFind}>
+            Count
+          </button>
+          <input
+            className="fileViewerInput fileViewerSearchInput"
+            value={crossReplace}
+            onChange={(e) => setCrossReplace(e.target.value)}
+            placeholder="replace with"
+          />
+          <button type="button" className="btnSmall" onClick={() => runCrossFind(true)} disabled={!crossFind}>
+            Replace all
+          </button>
+          {crossStatus ? <span className="fileViewerMuted">{crossStatus}</span> : null}
+        </div>
+      ) : null}
 
       {activeTab ? (
         <div className="codeEditorPathBar">
