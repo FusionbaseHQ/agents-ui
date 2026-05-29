@@ -12,6 +12,12 @@ use tauri::{
 // Parked far off-screen instead of destroyed, so switching tabs keeps page state.
 const OFFSCREEN: f64 = -32000.0;
 
+// Extend the webview past the bottom (and right) edge of its DOM viewport so it
+// always fully covers it — no uncovered strip can show through if the vertical
+// offset is a few pixels off. The overflow spills past the panel edge (where
+// there's nothing) and is clipped by the window.
+const OVERSCAN: f64 = 60.0;
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct BrowserNavEvent {
@@ -82,8 +88,8 @@ pub fn browser_open(
     width: f64,
     height: f64,
 ) -> Result<(), String> {
-    let w = width.max(1.0);
-    let h = height.max(1.0);
+    let w = width.max(1.0) + OVERSCAN;
+    let h = height.max(1.0) + OVERSCAN;
     let pos = child_physical_position(&app, x, y);
     // Already created: just reveal + reposition (keeps the current page).
     if let Some(webview) = app.get_webview(&label) {
@@ -135,7 +141,7 @@ pub fn browser_set_bounds(
         return Ok(());
     };
     let _ = webview.set_position(child_physical_position(&app, x, y));
-    let _ = webview.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
+    let _ = webview.set_size(LogicalSize::new(width.max(1.0) + OVERSCAN, height.max(1.0) + OVERSCAN));
     Ok(())
 }
 
