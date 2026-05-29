@@ -1,7 +1,7 @@
 import React from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { concatBytes, decodeBase64Bytes } from "./bytes";
+import { concatBytes } from "./bytes";
 import type { ReadRangeFn } from "./useChunkCache";
 
 const MAX_MARKDOWN_BYTES = 8 * 1024 * 1024;
@@ -36,10 +36,11 @@ export default function MarkdownViewer({
       try {
         const parts: Uint8Array[] = [];
         for (let offset = 0; offset < size; offset += CHUNK) {
-          const chunk = await readRange(path, offset, Math.min(CHUNK, size - offset));
+          const reqLen = Math.min(CHUNK, size - offset);
+          const chunk = await readRange(path, offset, reqLen);
           if (cancelled) return;
-          parts.push(decodeBase64Bytes(chunk.dataBase64));
-          if (chunk.eof || chunk.length === 0) break;
+          parts.push(chunk);
+          if (chunk.length === 0 || chunk.length < reqLen) break;
         }
         if (cancelled) return;
         setText(new TextDecoder("utf-8").decode(concatBytes(parts)));

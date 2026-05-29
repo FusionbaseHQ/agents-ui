@@ -1,19 +1,8 @@
 import React from "react";
 import { getPdfWorker, pdfDocumentOptions, pdfjsLib } from "./pdfEnv";
-import { concatBytes, decodeBase64Bytes } from "../fileViewer/bytes";
+import { concatBytes } from "../fileViewer/bytes";
+import type { ReadRangeFn } from "../fileViewer/useChunkCache";
 import type { PDFDocumentProxy, RenderTask } from "pdfjs-dist";
-
-// Mirrors the FileRangeRead/ReadRangeFn shape from CodeEditorPanel so this lazy
-// module stays self-contained (no import cycle with the big editor file).
-type FileRangeRead = {
-  offset: number;
-  length: number;
-  size: number;
-  mtimeMs?: number | null;
-  eof: boolean;
-  dataBase64: string;
-};
-type ReadRangeFn = (path: string, offset: number, length: number) => Promise<FileRangeRead>;
 
 const RANGE_CALL_MAX = 1024 * 1024; // backend caps a single range read at 1 MiB
 // Granularity of PDF.js range requests. Smaller chunks reduce the wasted
@@ -69,13 +58,12 @@ class TauriRangeTransport extends pdfjsLib.PDFDataRangeTransport {
       let offset = begin;
       while (offset < end && !this.aborted) {
         const length = Math.min(RANGE_CALL_MAX, end - offset);
-        const result = await this.readRange(this.path, offset, length);
+        const bytes = await this.readRange(this.path, offset, length);
         if (this.aborted) return;
-        const bytes = decodeBase64Bytes(result.dataBase64);
         if (bytes.length === 0) break;
         parts.push(bytes);
         offset += bytes.length;
-        if (result.eof) break;
+        if (bytes.length < length) break; // short read => end of file
       }
       if (this.aborted) return;
       this.onDataRange(begin, concatBytes(parts));

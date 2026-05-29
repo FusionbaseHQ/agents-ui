@@ -6,7 +6,7 @@ import React from "react";
 import { shortenPathSmart } from "../pathDisplay";
 import { Icon } from "./Icon";
 import { ConfirmActionModal } from "./modals/ConfirmActionModal";
-import { concatBytes, decodeBase64Bytes } from "../fileViewer/bytes";
+import { concatBytes } from "../fileViewer/bytes";
 import { useChunkCache } from "../fileViewer/useChunkCache";
 
 type MonacoType = typeof import("monaco-editor");
@@ -38,16 +38,11 @@ type FileProbe = {
   isLargeText: boolean;
 };
 
-type FileRangeRead = {
-  offset: number;
-  length: number;
-  size: number;
-  mtimeMs?: number | null;
-  eof: boolean;
-  dataBase64: string;
-};
-
-type ReadRangeFn = (path: string, offset: number, length: number) => Promise<FileRangeRead>;
+// Range reads return raw bytes (tauri::ipc::Response → ArrayBuffer). Callers
+// derive EOF from a short read (bytes.length < requested length) and the file
+// size they already hold; the backend clamps offset, so the requested offset is
+// the chunk's start.
+type ReadRangeFn = (path: string, offset: number, length: number) => Promise<Uint8Array>;
 
 const EDITABLE_TEXT_MAX_BYTES = 2 * 1024 * 1024;
 const IMAGE_PREVIEW_MAX_BYTES = 64 * 1024 * 1024;
@@ -377,25 +372,28 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   );
 
   const readFileRange = React.useCallback<ReadRangeFn>(
-    async (path: string, offset: number, length: number): Promise<FileRangeRead> => {
+    async (path: string, offset: number, length: number): Promise<Uint8Array> => {
       const safeOffset = Math.max(0, Math.floor(offset));
       const safeLength = Math.max(0, Math.min(MAX_RANGE_BYTES, Math.floor(length)));
-      if (provider === "ssh") {
-        if (!sshTargetValue) throw new Error("Missing SSH target.");
-        return await invoke<FileRangeRead>("ssh_read_file_range", {
-          target: sshTargetValue,
-          root: rootDir,
-          path,
-          offset: safeOffset,
-          length: safeLength,
-        });
-      }
-      return await invoke<FileRangeRead>("read_file_range", {
-        root: rootDir,
-        path,
-        offset: safeOffset,
-        length: safeLength,
-      });
+      const buffer =
+        provider === "ssh"
+          ? await (async () => {
+              if (!sshTargetValue) throw new Error("Missing SSH target.");
+              return invoke<ArrayBuffer>("ssh_read_file_range", {
+                target: sshTargetValue,
+                root: rootDir,
+                path,
+                offset: safeOffset,
+                length: safeLength,
+              });
+            })()
+          : await invoke<ArrayBuffer>("read_file_range", {
+              root: rootDir,
+              path,
+              offset: safeOffset,
+              length: safeLength,
+            });
+      return new Uint8Array(buffer);
     },
     [provider, rootDir, sshTargetValue],
   );
@@ -1519,9 +1517,9 @@ function ImageViewer({
           const length = Math.min(RANGE_CHUNK_BYTES, size - offset);
           const chunk = await readRange(path, offset, length);
           if (cancelled) return;
-          parts.push(decodeBase64Bytes(chunk.dataBase64));
+          parts.push(chunk);
           setLoaded(Math.min(size, offset + chunk.length));
-          if (chunk.length === 0 || chunk.eof) break;
+          if (chunk.length === 0 || chunk.length < length) break;
         }
         if (cancelled) return;
         const blobParts = parts.map((part) =>
@@ -1699,9 +1697,8 @@ function ByteViewer({ path, size, readRange }: { path: string; size: number; rea
       setVersion((v) => v + 1);
       try {
         const length = Math.min(RANGE_CHUNK_BYTES, size - start);
-        const result = await readRange(path, start, length);
-        const bytes = decodeBase64Bytes(result.dataBase64);
-        cacheRef.current.set(result.offset, { bytes, lastUsed: Date.now() });
+        const bytes = await readRange(path, start, length);
+        cacheRef.current.set(start, { bytes, lastUsed: Date.now() });
         cacheBytesRef.current += bytes.length;
         while (cacheBytesRef.current > MAX_VIEWER_CACHE_BYTES && cacheRef.current.size > 1) {
           let oldestKey: number | null = null;
@@ -1769,12 +1766,12 @@ function ByteViewer({ path, size, readRange }: { path: string; size: number; rea
         let offset = Math.max(0, fromOffset);
         let overlap = new Uint8Array(0);
         while (offset < size) {
-          const result = await readRange(path, offset, Math.min(RANGE_CHUNK_BYTES, size - offset));
-          const bytes = decodeBase64Bytes(result.dataBase64);
+          const reqLen = Math.min(RANGE_CHUNK_BYTES, size - offset);
+          const bytes = await readRange(path, offset, reqLen);
           const combined = overlap.length ? concatBytes([overlap, bytes]) : bytes;
           const found = indexOfBytes(combined, needle, 0);
           if (found >= 0) {
-            const absolute = result.offset - overlap.length + found;
+            const absolute = offset - overlap.length + found;
             const row = Math.max(0, Math.floor(absolute / bytesPerRow));
             if (listRef.current) listRef.current.scrollTop = row * rowHeight;
             findNextOffsetRef.current = absolute + 1;
@@ -1782,8 +1779,8 @@ function ByteViewer({ path, size, readRange }: { path: string; size: number; rea
             return;
           }
           overlap = needle.length > 1 ? bytes.slice(Math.max(0, bytes.length - needle.length + 1)) : new Uint8Array(0);
-          offset = result.offset + bytes.length;
-          if (bytes.length === 0 || result.eof) break;
+          offset = offset + bytes.length;
+          if (bytes.length === 0 || bytes.length < reqLen) break;
         }
         findNextOffsetRef.current = 0;
         setFindStatus("No match");
@@ -1997,31 +1994,32 @@ function LargeTextViewer({
       const decoder = new TextDecoder("utf-8", { fatal: true });
       try {
         while (offset < size && !cancelled) {
-          const result = await readRange(path, offset, Math.min(RANGE_CHUNK_BYTES, size - offset));
+          const reqLen = Math.min(RANGE_CHUNK_BYTES, size - offset);
+          const bytes = await readRange(path, offset, reqLen);
           if (cancelled) return;
-          const bytes = decodeBase64Bytes(result.dataBase64);
+          const eof = bytes.length < reqLen;
           // Validate UTF-8 as a stream so multibyte characters split across ranges are accepted.
-          decoder.decode(bytes, { stream: !(result.eof || offset + bytes.length >= size) });
+          decoder.decode(bytes, { stream: !(eof || offset + bytes.length >= size) });
           for (let i = 0; i < bytes.length; i++) {
             if (bytes[i] === 10) {
               line += 1;
-              if (line % 1024 === 0) checkpoints.push({ line, offset: result.offset + i + 1 });
+              if (line % 1024 === 0) checkpoints.push({ line, offset: offset + i + 1 });
             }
           }
           if (bytes.length > 0) lastByte = bytes[bytes.length - 1];
-          offset = result.offset + bytes.length;
+          offset = offset + bytes.length;
           const now = Date.now();
-          if (now - lastPublish > 120 || result.eof) {
+          if (now - lastPublish > 120 || eof) {
             lastPublish = now;
             checkpointsRef.current = checkpoints.slice();
             setIndexState({
               offset,
               lines: line,
-              done: result.eof || offset >= size,
-              totalLines: result.eof || offset >= size ? Math.max(1, line + (lastByte === 10 ? 0 : 1)) : 0,
+              done: eof || offset >= size,
+              totalLines: eof || offset >= size ? Math.max(1, line + (lastByte === 10 ? 0 : 1)) : 0,
             });
           }
-          if (bytes.length === 0 || result.eof) break;
+          if (bytes.length === 0 || eof) break;
         }
         decoder.decode();
       } catch (err) {
@@ -2101,8 +2099,8 @@ function LargeTextViewer({
         let line = start.line;
         let overlap = new Uint8Array(0);
         while (offset < size) {
-          const result = await readRange(path, offset, Math.min(RANGE_CHUNK_BYTES, size - offset));
-          const bytes = decodeBase64Bytes(result.dataBase64);
+          const reqLen = Math.min(RANGE_CHUNK_BYTES, size - offset);
+          const bytes = await readRange(path, offset, reqLen);
           const combined = overlap.length ? concatBytes([overlap, bytes]) : bytes;
           const baseLine = line - countNewlines(overlap);
           let from = 0;
@@ -2120,8 +2118,8 @@ function LargeTextViewer({
           }
           line += countNewlines(bytes);
           overlap = needle.length > 1 ? bytes.slice(Math.max(0, bytes.length - needle.length + 1)) : new Uint8Array(0);
-          offset = result.offset + bytes.length;
-          if (bytes.length === 0 || result.eof) break;
+          offset = offset + bytes.length;
+          if (bytes.length === 0 || bytes.length < reqLen) break;
         }
         lastMatchLineRef.current = -1;
         setSearchStatus("No match");

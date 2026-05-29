@@ -2,10 +2,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use crate::files::{
-    base64_encode, probe_from_sample, FileProbe, FileRangeRead, FsEntry, MAX_RANGE_READ_BYTES,
-    PROBE_BYTES,
-};
+use crate::files::{probe_from_sample, FileProbe, FsEntry, MAX_RANGE_READ_BYTES, PROBE_BYTES};
 
 const MAX_TEXT_FILE_BYTES: usize = 2 * 1024 * 1024;
 const BINARY_CHECK_BYTES: usize = 8 * 1024;
@@ -612,12 +609,13 @@ pub async fn ssh_read_file_range(
     path: String,
     offset: u64,
     length: u64,
-) -> Result<FileRangeRead, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
         ssh_read_file_range_sync(target, root, path, offset, length)
     })
     .await
-    .map_err(|e| format!("ssh task join failed: {e:?}"))?
+    .map_err(|e| format!("ssh task join failed: {e:?}"))??;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 fn ssh_read_file_range_sync(
@@ -626,7 +624,7 @@ fn ssh_read_file_range_sync(
     path: String,
     offset: u64,
     length: u64,
-) -> Result<FileRangeRead, String> {
+) -> Result<Vec<u8>, String> {
     if length > MAX_RANGE_READ_BYTES as u64 {
         return Err(format!(
             "range too large ({length} bytes, max {MAX_RANGE_READ_BYTES} bytes)"
@@ -673,16 +671,8 @@ fi"#;
     if !output.status.success() {
         return Err(output_to_error("ssh failed", &output));
     }
-    let (size, mtime_ms) = parse_remote_file_meta(&output.stderr, "AGENTS_UI_RANGE ")?;
-    let clamped_offset = offset.min(size);
-    Ok(FileRangeRead {
-        offset: clamped_offset,
-        length: output.stdout.len(),
-        size,
-        mtime_ms,
-        eof: clamped_offset + output.stdout.len() as u64 >= size,
-        data_base64: base64_encode(&output.stdout),
-    })
+    // Raw bytes; the frontend derives offset/eof from the request + known size.
+    Ok(output.stdout)
 }
 
 #[tauri::command]

@@ -33,17 +33,6 @@ pub struct FileProbe {
     pub is_large_text: bool,
 }
 
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct FileRangeRead {
-    pub offset: u64,
-    pub length: usize,
-    pub size: u64,
-    pub mtime_ms: Option<u64>,
-    pub eof: bool,
-    pub data_base64: String,
-}
-
 fn mtime_ms(meta: &fs::Metadata) -> Option<u64> {
     meta.modified()
         .ok()?
@@ -52,37 +41,6 @@ fn mtime_ms(meta: &fs::Metadata) -> Option<u64> {
         .and_then(|d| u64::try_from(d.as_millis()).ok())
 }
 
-pub(crate) fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut i = 0usize;
-    while i + 3 <= bytes.len() {
-        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | bytes[i + 2] as u32;
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
-        out.push(TABLE[(n & 0x3f) as usize] as char);
-        i += 3;
-    }
-    match bytes.len() - i {
-        1 => {
-            let n = (bytes[i] as u32) << 16;
-            out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-            out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-            out.push('=');
-            out.push('=');
-        }
-        2 => {
-            let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
-            out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-            out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-            out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
-            out.push('=');
-        }
-        _ => {}
-    }
-    out
-}
 
 fn raster_image_type(sample: &[u8], path: Option<&Path>) -> Option<(&'static str, &'static str)> {
     if sample.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
@@ -350,7 +308,7 @@ pub fn read_file_range(
     path: String,
     offset: u64,
     length: u64,
-) -> Result<FileRangeRead, String> {
+) -> Result<tauri::ipc::Response, String> {
     if length > MAX_RANGE_READ_BYTES as u64 {
         return Err(format!(
             "range too large ({length} bytes, max {MAX_RANGE_READ_BYTES} bytes)"
@@ -378,14 +336,9 @@ pub fn read_file_range(
             .map_err(|e| format!("read failed: {e}"))?;
     }
 
-    Ok(FileRangeRead {
-        offset: clamped_offset,
-        length: bytes.len(),
-        size,
-        mtime_ms: mtime_ms(&meta),
-        eof: clamped_offset + bytes.len() as u64 >= size,
-        data_base64: base64_encode(&bytes),
-    })
+    // Raw bytes over IPC (no base64). The frontend derives offset/eof from the
+    // requested range and the known file size — a short read means EOF.
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[tauri::command]

@@ -1,17 +1,10 @@
 import React from "react";
-import { decodeBase64Bytes } from "./bytes";
 
-export type FileRangeRead = {
-  offset: number;
-  length: number;
-  size: number;
-  mtimeMs?: number | null;
-  eof: boolean;
-  dataBase64: string;
-};
-export type ReadRangeFn = (path: string, offset: number, length: number) => Promise<FileRangeRead>;
+// Range reads return raw bytes; a short read (fewer bytes than requested) means
+// the file ended at/within this range.
+export type ReadRangeFn = (path: string, offset: number, length: number) => Promise<Uint8Array>;
 
-export type RangeChunk = { bytes: Uint8Array; eof: boolean; size: number };
+export type RangeChunk = { bytes: Uint8Array; eof: boolean };
 
 // Per-mount, offset-keyed LRU cache of decoded chunks with in-flight dedup.
 // Scoped to the component instance, so a file change (which remounts the viewer
@@ -36,8 +29,8 @@ export function useChunkCache(maxBytes = 8 * 1024 * 1024) {
       const pending = inflightRef.current.get(offset);
       if (pending) return pending;
       const p = (async () => {
-        const result = await readRange(path, offset, length);
-        const chunk: RangeChunk = { bytes: decodeBase64Bytes(result.dataBase64), eof: result.eof, size: result.size };
+        const bytes = await readRange(path, offset, length);
+        const chunk: RangeChunk = { bytes, eof: bytes.length < length };
         const prev = cacheRef.current.get(offset);
         if (prev) bytesRef.current -= prev.chunk.bytes.length;
         cacheRef.current.set(offset, { chunk, touched: ++clockRef.current });
