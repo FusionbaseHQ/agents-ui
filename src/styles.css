@@ -3039,16 +3039,25 @@ body::after {
   background: var(--panel);
 }
 
-.browserBar {
+/* Parent selector raises specificity above .fileViewerToolbar / .fileViewerInput
+   (defined later in this file with equal single-class specificity). */
+.browserView .browserBar {
   display: flex;
   align-items: center;
   gap: 6px;
   flex: 0 0 auto;
+  height: 40px;
+  padding: 0 8px;
+  /* Solid chrome so the bar reads as a browser toolbar, not a faint strip. */
+  background: var(--panel-2, rgba(var(--ink-rgb), 0.05));
+  border-bottom: 1px solid rgba(var(--ink-rgb), 0.12);
 }
 
-.browserUrl {
+.browserView .browserUrl {
   flex: 1 1 auto;
+  width: auto;
   min-width: 0;
+  height: 28px;
 }
 
 .browserViewport {

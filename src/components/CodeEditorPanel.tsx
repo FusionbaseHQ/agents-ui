@@ -41,6 +41,9 @@ function urlHost(url: string): string {
     return "Browser";
   }
 }
+const isHtmlPath = (path: string) => /\.(x?html?|htm)$/i.test(path.trim());
+// file:// URL for a local absolute path (spaces etc. percent-encoded, slashes kept).
+const fileUrlForPath = (path: string) => `file://${encodeURI(path)}`;
 
 type FileProbe = {
   size: number;
@@ -760,25 +763,52 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
 
   // Open a new embedded-browser tab. The page runs in a native child WKWebView
   // (created lazily by BrowserView on first layout) that has no app capabilities.
-  const openBrowserTab = React.useCallback(() => {
-    const seq = ++browserSeqRef.current;
-    const path = `${BROWSER_PREFIX}${seq}`;
-    const label = `browser-${seq}`;
-    browserMetaRef.current.set(path, { label, url: BROWSER_START_URL });
-    openPathsRef.current.add(path);
-    const tab: Tab = {
-      ...emptyTab(path),
-      title: "New tab",
-      viewerKind: "browser",
-      loading: false,
-    };
-    const next = [...tabsRef.current, tab];
-    tabsRef.current = next;
-    setTabs(next);
-    setActivePath(path);
-    activePathRef.current = path;
-    setEditorModel(null);
-  }, [setEditorModel]);
+  const openBrowserTab = React.useCallback(
+    (url: string = BROWSER_START_URL, title = "New tab") => {
+      const seq = ++browserSeqRef.current;
+      const path = `${BROWSER_PREFIX}${seq}`;
+      const label = `browser-${seq}`;
+      browserMetaRef.current.set(path, { label, url });
+      openPathsRef.current.add(path);
+      const tab: Tab = {
+        ...emptyTab(path),
+        title,
+        viewerKind: "browser",
+        loading: false,
+      };
+      const next = [...tabsRef.current, tab];
+      tabsRef.current = next;
+      setTabs(next);
+      setActivePath(path);
+      activePathRef.current = path;
+      setEditorModel(null);
+    },
+    [setEditorModel],
+  );
+
+  // "Open in browser" for an HTML file: render it in a browser tab. Local files
+  // load directly via file://; SSH files are first downloaded to a temp file.
+  const openHtmlInBrowser = React.useCallback(
+    async (path: string) => {
+      try {
+        let localPath = path;
+        if (provider === "ssh") {
+          if (!sshTargetValue) throw new Error("Missing SSH target.");
+          localPath = await invoke<string>("ssh_download_to_temp", {
+            target: sshTargetValue,
+            root: rootDir,
+            remotePath: path,
+          });
+        }
+        openBrowserTab(fileUrlForPath(localPath), basename(path));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setSaveError(message);
+        setSaveStatus("error");
+      }
+    },
+    [openBrowserTab, provider, rootDir, sshTargetValue],
+  );
 
   React.useEffect(() => {
     if (restoredRef.current) return;
@@ -1409,7 +1439,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
           <button
             type="button"
             className="btnSmall btnIcon"
-            onClick={openBrowserTab}
+            onClick={() => openBrowserTab()}
             title="New browser tab"
             aria-label="New browser tab"
           >
@@ -1532,7 +1562,14 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
               className="codeEditorViewAs"
               title="View as"
               value={activeTab.requestedMode}
-              onChange={(e) => void openFile(activeTab.path, e.target.value as CodeEditorOpenMode)}
+              onChange={(e) => {
+                const value = e.target.value;
+                if (value === "browser") {
+                  void openHtmlInBrowser(activeTab.path);
+                  return;
+                }
+                void openFile(activeTab.path, value as CodeEditorOpenMode);
+              }}
             >
               <option value="auto">Auto</option>
               <option value="text">Text</option>
@@ -1541,6 +1578,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
               <option value="csv">CSV table</option>
               <option value="image">Image</option>
               <option value="bytes">Bytes</option>
+              {isHtmlPath(activeTab.path) ? <option value="browser">Browser</option> : null}
             </select>
           ) : null}
         </div>
