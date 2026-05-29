@@ -21,6 +21,7 @@ export default function BrowserView({
   suppressed: boolean;
   onUrlChange: (url: string) => void;
 }) {
+  const viewRef = React.useRef<HTMLDivElement | null>(null);
   const viewportRef = React.useRef<HTMLDivElement | null>(null);
   const [urlInput, setUrlInput] = React.useState(initialUrl);
   const [loading, setLoading] = React.useState(false);
@@ -48,13 +49,23 @@ export default function BrowserView({
       } else {
         const r = el.getBoundingClientRect();
         if (r.width > 0 && r.height > 0) {
-          const key = `${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)},${Math.round(r.height)}`;
+          const viewRect = viewRef.current?.getBoundingClientRect() ?? null;
+          const yOffset = viewRect ? Math.max(0, Math.round(r.top - viewRect.top)) : 0;
+          const key = `${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)},${Math.round(r.height)},${yOffset}`;
           if (key !== lastKey) {
             lastKey = key;
             parked = false;
             // browser_open creates the webview the first time and just repositions
             // (keeping the current page) afterwards.
-            void invoke("browser_open", { label, url: initialUrl, x: r.left, y: r.top, width: r.width, height: r.height });
+            void invoke("browser_open", {
+              label,
+              url: initialUrl,
+              x: r.left,
+              y: r.top,
+              width: r.width,
+              height: r.height,
+              yOffset,
+            });
           }
         }
       }
@@ -88,7 +99,7 @@ export default function BrowserView({
   const action = (a: "back" | "forward" | "reload") => void invoke("browser_action", { label, action: a });
 
   return (
-    <div className="browserView">
+    <div className="browserView" ref={viewRef}>
       <div className="fileViewerToolbar browserBar">
         <button
           type="button"

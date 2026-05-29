@@ -6,17 +6,11 @@
 use serde::Serialize;
 use tauri::{
     webview::{PageLoadEvent, WebviewBuilder},
-    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, WebviewUrl,
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, Rect, WebviewUrl,
 };
 
 // Parked far off-screen instead of destroyed, so switching tabs keeps page state.
 const OFFSCREEN: f64 = -32000.0;
-
-// Extend the webview past the bottom (and right) edge of its DOM viewport so it
-// always fully covers it — no uncovered strip can show through if the vertical
-// offset is a few pixels off. The overflow spills past the panel edge (where
-// there's nothing) and is clipped by the window.
-const OVERSCAN: f64 = 60.0;
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -39,31 +33,28 @@ fn normalize_url(input: &str) -> Result<tauri::Url, String> {
     tauri::Url::parse(&candidate).map_err(|e| format!("invalid url: {e}"))
 }
 
-// Translate a DOM rect (getBoundingClientRect, origin = top-left of the web
-// content) into the position to give the child webview.
+// Translate a DOM rect (getBoundingClientRect, origin = top-left of the main
+// webview's CSS viewport) into the child webview's native bounds.
 //
-// A child webview is positioned relative to its parent NSView, which is the
-// window's *frame* view (top-left includes the title bar). The DOM, however, is
-// rendered in the content view, inset below the title bar. So we work in screen
-// space, which is unambiguous:
-//   DOM (x,y) in screen px  = inner_position (content top-left on screen) + (x,y)*scale
-//   child parent top-left   = outer_position (window frame top-left on screen)
-//   child position (parent-relative) = DOM_screen - parent_screen
-//                                    = (inner - outer) + (x,y)*scale
-// (inner - outer) is the title-bar inset; on a borderless window it is (0,0).
-fn child_physical_position(app: &AppHandle, dom_x: f64, dom_y: f64) -> PhysicalPosition<f64> {
-    let window = app.get_window("main");
-    let scale = window
-        .as_ref()
+// The main app webview and browser child webviews are native siblings. The DOM
+// rect is relative to the main webview, so anchor it to the main webview's real
+// native origin instead of assuming the main webview starts at the window origin.
+fn child_bounds(app: &AppHandle, dom_x: f64, dom_y: f64, width: f64, height: f64, y_offset: f64) -> Rect {
+    let scale = app
+        .get_window("main")
         .and_then(|w| w.scale_factor().ok())
         .unwrap_or(1.0)
         .max(1.0);
-    let (ox, oy) = window
-        .as_ref()
-        .and_then(|w| Some((w.inner_position().ok()?, w.outer_position().ok()?)))
-        .map(|(inner, outer)| ((inner.x - outer.x) as f64, (inner.y - outer.y) as f64))
+    let origin = app
+        .get_webview("main")
+        .and_then(|w| w.position().ok())
+        .map(|p| (p.x as f64, p.y as f64))
         .unwrap_or((0.0, 0.0));
-    PhysicalPosition::new(ox + dom_x * scale, oy + dom_y * scale)
+
+    Rect {
+        position: PhysicalPosition::new(origin.0 + dom_x * scale, origin.1 + (dom_y + y_offset.max(0.0)) * scale).into(),
+        size: LogicalSize::new(width.max(1.0), height.max(1.0)).into(),
+    }
 }
 
 fn emit_nav(app: &AppHandle, label: &str, url: &str, loading: bool) {
@@ -87,14 +78,12 @@ pub fn browser_open(
     y: f64,
     width: f64,
     height: f64,
+    y_offset: Option<f64>,
 ) -> Result<(), String> {
-    let w = width.max(1.0) + OVERSCAN;
-    let h = height.max(1.0) + OVERSCAN;
-    let pos = child_physical_position(&app, x, y);
+    let bounds = child_bounds(&app, x, y, width, height, y_offset.unwrap_or(0.0));
     // Already created: just reveal + reposition (keeps the current page).
     if let Some(webview) = app.get_webview(&label) {
-        let _ = webview.set_position(pos);
-        let _ = webview.set_size(LogicalSize::new(w, h));
+        let _ = webview.set_bounds(bounds);
         return Ok(());
     }
     let window = app
@@ -102,28 +91,25 @@ pub fn browser_open(
         .ok_or_else(|| "main window not found".to_string())?;
     let target = normalize_url(&url)?;
 
-    let nav_app = app.clone();
-    let nav_label = label.clone();
     let load_app = app.clone();
     let load_label = label.clone();
 
-    let builder = WebviewBuilder::new(&label, WebviewUrl::External(target))
-        .on_navigation(move |u| {
-            emit_nav(&nav_app, &nav_label, u.as_str(), true);
-            true
-        })
-        .on_page_load(move |_webview, payload| {
-            let loading = matches!(payload.event(), PageLoadEvent::Started);
-            emit_nav(&load_app, &load_label, payload.url().as_str(), loading);
-        });
+    let builder = WebviewBuilder::new(&label, WebviewUrl::External(target)).on_page_load(move |_webview, payload| {
+        let loading = matches!(payload.event(), PageLoadEvent::Started);
+        emit_nav(&load_app, &load_label, payload.url().as_str(), loading);
+    });
 
     window
-        .add_child(builder, pos, LogicalSize::new(w, h))
+        .add_child(
+            builder,
+            bounds.position,
+            LogicalSize::new(width.max(1.0), height.max(1.0)),
+        )
         .map_err(|e| format!("failed to create browser webview: {e}"))?;
     // The main webview may not be positioned yet at first paint; reposition once
-    // more now that the child exists, using the main webview's actual origin.
+    // more now that the child exists.
     if let Some(webview) = app.get_webview(&label) {
-        let _ = webview.set_position(child_physical_position(&app, x, y));
+        let _ = webview.set_bounds(bounds);
     }
     Ok(())
 }
@@ -136,12 +122,12 @@ pub fn browser_set_bounds(
     y: f64,
     width: f64,
     height: f64,
+    y_offset: Option<f64>,
 ) -> Result<(), String> {
     let Some(webview) = app.get_webview(&label) else {
         return Ok(());
     };
-    let _ = webview.set_position(child_physical_position(&app, x, y));
-    let _ = webview.set_size(LogicalSize::new(width.max(1.0) + OVERSCAN, height.max(1.0) + OVERSCAN));
+    let _ = webview.set_bounds(child_bounds(&app, x, y, width, height, y_offset.unwrap_or(0.0)));
     Ok(())
 }
 
