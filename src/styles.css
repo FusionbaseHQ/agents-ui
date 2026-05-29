@@ -3053,11 +3053,37 @@ body::after {
   border-bottom: 1px solid rgba(var(--ink-rgb), 0.12);
 }
 
+.browserView .browserNavBtn {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
 .browserView .browserUrl {
   flex: 1 1 auto;
   width: auto;
   min-width: 0;
   height: 28px;
+}
+
+.browserSpinner {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(var(--ink-rgb), 0.2);
+  border-top-color: rgba(var(--ink-rgb), 0.7);
+  border-radius: 50%;
+  animation: browserSpin 0.7s linear infinite;
+}
+
+@keyframes browserSpin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .browserViewport {

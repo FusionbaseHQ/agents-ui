@@ -1,6 +1,7 @@
 import React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { Icon } from "../components/Icon";
 
 type BrowserNavEvent = { label: string; url: string; loading: boolean };
 
@@ -89,21 +90,40 @@ export default function BrowserView({
   return (
     <div className="browserView">
       <div className="fileViewerToolbar browserBar">
-        <button type="button" className="btnSmall" onClick={() => action("back")} title="Back" aria-label="Back">
-          ‹
+        <button
+          type="button"
+          className="btnSmall btnIcon browserNavBtn"
+          onClick={() => action("back")}
+          title="Back"
+          aria-label="Back"
+        >
+          <Icon name="chevron-left" size={16} />
         </button>
-        <button type="button" className="btnSmall" onClick={() => action("forward")} title="Forward" aria-label="Forward">
-          ›
+        <button
+          type="button"
+          className="btnSmall btnIcon browserNavBtn"
+          onClick={() => action("forward")}
+          title="Forward"
+          aria-label="Forward"
+        >
+          <Icon name="chevron-right" size={16} />
         </button>
-        <button type="button" className="btnSmall" onClick={() => action("reload")} title="Reload" aria-label="Reload">
-          ⟳
+        <button
+          type="button"
+          className="btnSmall btnIcon browserNavBtn"
+          onClick={() => action("reload")}
+          title="Reload"
+          aria-label="Reload"
+        >
+          <Icon name="refresh" size={15} />
         </button>
         <input
           className="fileViewerInput browserUrl"
           value={urlInput}
           spellCheck={false}
-          onFocus={() => {
+          onFocus={(e) => {
             editingRef.current = true;
+            e.currentTarget.select();
           }}
           onBlur={() => {
             editingRef.current = false;
@@ -115,12 +135,9 @@ export default function BrowserView({
               navigate(urlInput);
             }
           }}
-          placeholder="Enter a URL"
+          placeholder="Search or enter a URL"
         />
-        <button type="button" className="btnSmall" onClick={() => navigate(urlInput)}>
-          Go
-        </button>
-        {loading ? <span className="fileViewerMuted">…</span> : null}
+        {loading ? <span className="browserSpinner" aria-label="Loading" /> : null}
       </div>
       <div className="browserViewport" ref={viewportRef} />
     </div>
