@@ -327,6 +327,10 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   const [saveStatus, setSaveStatus] = React.useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveError, setSaveError] = React.useState<string | null>(null);
   const [pendingClose, setPendingClose] = React.useState<PendingCloseAction | null>(null);
+  const [saveConflictPath, setSaveConflictPath] = React.useState<string | null>(null);
+  // mtime (ms) of each open file as last loaded/saved by us, used to detect an
+  // external edit before we overwrite it on save.
+  const loadedMtimeRef = React.useRef<Map<string, number>>(new Map());
   const saveTimerRef = React.useRef<number | null>(null);
   const sshTargetValue = React.useMemo(() => (sshTarget ?? "").trim() || null, [sshTarget]);
   const tabStripRef = React.useRef<HTMLDivElement | null>(null);
@@ -588,6 +592,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
           const probe = await probeFile(normalized);
           if (!openPathsRef.current.has(normalized)) return;
           if (loadNonceByPathRef.current.get(normalized) !== loadNonce) return;
+          loadedMtimeRef.current.set(normalized, probe.mtimeMs ?? 0);
 
           const viewerKind = chooseViewerKind(probe, mode);
           if (viewerKind !== "text") {
@@ -867,6 +872,43 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     [closeTab],
   );
 
+  const modelForPath = React.useCallback(
+    (path: string) => {
+      const monaco = monacoRef.current;
+      return monaco ? monaco.editor.getModel(modelUriForPath(monaco, path)) : modelsRef.current.get(path) ?? null;
+    },
+    [modelUriForPath],
+  );
+
+  const performWrite = React.useCallback(
+    async (path: string, model: import("monaco-editor").editor.ITextModel) => {
+      setSaveStatus("saving");
+      setSaveError(null);
+      try {
+        await writeTextFile(path, model.getValue());
+        dirtyPathsRef.current.delete(path);
+        updateTab(path, (tab) => ({ ...tab, dirty: false }));
+        // Re-read mtime so this write isn't later mistaken for an external edit.
+        try {
+          const probe = await probeFile(path);
+          loadedMtimeRef.current.set(path, probe.mtimeMs ?? loadedMtimeRef.current.get(path) ?? 0);
+        } catch {
+          /* mtime refresh is best-effort */
+        }
+        setSaveStatus("saved");
+        if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = window.setTimeout(() => setSaveStatus("idle"), 1200);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setSaveStatus("error");
+        setSaveError(message);
+        if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = window.setTimeout(() => setSaveStatus("idle"), 2500);
+      }
+    },
+    [probeFile, updateTab, writeTextFile],
+  );
+
   const saveActive = React.useCallback(async () => {
     const path = activePathRef.current;
     if (!path) return;
@@ -874,27 +916,23 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     if (tab?.viewerKind !== "text") return;
     if (!dirtyPathsRef.current.has(path)) return;
 
-    const monaco = monacoRef.current;
-    const model = monaco ? monaco.editor.getModel(modelUriForPath(monaco, path)) : modelsRef.current.get(path);
+    const model = modelForPath(path);
     if (!model) return;
 
-    setSaveStatus("saving");
-    setSaveError(null);
+    // Guard against silently clobbering an edit made on disk (e.g. by an agent)
+    // since we loaded the file.
     try {
-      await writeTextFile(path, model.getValue());
-      dirtyPathsRef.current.delete(path);
-      updateTab(path, (tab) => ({ ...tab, dirty: false }));
-      setSaveStatus("saved");
-      if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
-      saveTimerRef.current = window.setTimeout(() => setSaveStatus("idle"), 1200);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setSaveStatus("error");
-      setSaveError(message);
-      if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
-      saveTimerRef.current = window.setTimeout(() => setSaveStatus("idle"), 2500);
+      const probe = await probeFile(path);
+      const loaded = loadedMtimeRef.current.get(path) ?? 0;
+      if ((probe.mtimeMs ?? 0) > loaded) {
+        setSaveConflictPath(path);
+        return;
+      }
+    } catch {
+      /* if the freshness check fails, fall through to the write */
     }
-  }, [modelUriForPath, updateTab, writeTextFile]);
+    await performWrite(path, model);
+  }, [modelForPath, performWrite, probeFile]);
 
   const requestCloseEditor = React.useCallback(() => {
     if (dirtyPathsRef.current.size > 0) {
@@ -1355,6 +1393,29 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
             return;
           }
           onCloseEditor();
+        }}
+      />
+      <ConfirmActionModal
+        isOpen={saveConflictPath != null}
+        title="File changed on disk"
+        message={
+          <>
+            <div>This file was modified outside the editor since you opened it:</div>
+            <div style={{ fontFamily: "ui-monospace, monospace", marginTop: 6, wordBreak: "break-all" }}>
+              {saveConflictPath}
+            </div>
+            <div style={{ marginTop: 6 }}>Overwrite it with your version? (Close and reopen to keep the on-disk changes.)</div>
+          </>
+        }
+        confirmLabel="Overwrite"
+        confirmDanger
+        onClose={() => setSaveConflictPath(null)}
+        onConfirm={() => {
+          const path = saveConflictPath;
+          setSaveConflictPath(null);
+          if (!path) return;
+          const model = modelForPath(path);
+          if (model) void performWrite(path, model);
         }}
       />
     </section>
