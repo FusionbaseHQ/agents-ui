@@ -1561,6 +1561,11 @@ function ByteViewer({ path, size, readRange }: { path: string; size: number; rea
   const [listHeight, setListHeight] = React.useState(0);
   const [error, setError] = React.useState<string | null>(null);
   const [jumpValue, setJumpValue] = React.useState("");
+  const [findValue, setFindValue] = React.useState("");
+  const [findMode, setFindMode] = React.useState<"hex" | "text">("hex");
+  const [findStatus, setFindStatus] = React.useState<string | null>(null);
+  const [findBusy, setFindBusy] = React.useState(false);
+  const findNextOffsetRef = React.useRef(0);
   const rowHeight = 22;
   const bytesPerRow = 16;
   const totalRows = Math.max(1, Math.ceil(size / bytesPerRow));
@@ -1656,6 +1661,46 @@ function ByteViewer({ path, size, readRange }: { path: string; size: number; rea
     if (listRef.current) listRef.current.scrollTop = row * rowHeight;
   }, [jumpValue, totalRows]);
 
+  const findFrom = React.useCallback(
+    async (fromOffset: number) => {
+      const needle = parseByteNeedle(findValue, findMode);
+      if (!needle) {
+        setFindStatus(findMode === "hex" ? "Enter hex bytes" : "Enter text");
+        return;
+      }
+      setFindBusy(true);
+      setFindStatus(null);
+      try {
+        let offset = Math.max(0, fromOffset);
+        let overlap = new Uint8Array(0);
+        while (offset < size) {
+          const result = await readRange(path, offset, Math.min(RANGE_CHUNK_BYTES, size - offset));
+          const bytes = decodeBase64Bytes(result.dataBase64);
+          const combined = overlap.length ? concatBytes([overlap, bytes]) : bytes;
+          const found = indexOfBytes(combined, needle, 0);
+          if (found >= 0) {
+            const absolute = result.offset - overlap.length + found;
+            const row = Math.max(0, Math.floor(absolute / bytesPerRow));
+            if (listRef.current) listRef.current.scrollTop = row * rowHeight;
+            findNextOffsetRef.current = absolute + 1;
+            setFindStatus(`0x${absolute.toString(16)}`);
+            return;
+          }
+          overlap = needle.length > 1 ? bytes.slice(Math.max(0, bytes.length - needle.length + 1)) : new Uint8Array(0);
+          offset = result.offset + bytes.length;
+          if (bytes.length === 0 || result.eof) break;
+        }
+        findNextOffsetRef.current = 0;
+        setFindStatus("No match");
+      } catch (err) {
+        setFindStatus(err instanceof Error ? err.message : String(err));
+      } finally {
+        setFindBusy(false);
+      }
+    },
+    [findMode, findValue, path, readRange, size],
+  );
+
   const rows: React.ReactNode[] = [];
   for (let row = startIndex; row < endIndex; row++) {
     const offset = row * bytesPerRow;
@@ -1699,6 +1744,36 @@ function ByteViewer({ path, size, readRange }: { path: string; size: number; rea
         <button type="button" className="btnSmall" onClick={jumpToOffset}>
           Go
         </button>
+        <button
+          type="button"
+          className="btnSmall"
+          onClick={() => setFindMode((m) => (m === "hex" ? "text" : "hex"))}
+          title="Toggle search between hex bytes and text"
+        >
+          {findMode === "hex" ? "hex" : "txt"}
+        </button>
+        <input
+          className="fileViewerInput fileViewerSearchInput"
+          value={findValue}
+          onChange={(e) => setFindValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void findFrom(0);
+          }}
+          placeholder={findMode === "hex" ? "ff d8 ff" : "find text"}
+        />
+        <button type="button" className="btnSmall" onClick={() => void findFrom(0)} disabled={findBusy || !findValue}>
+          {findBusy ? "…" : "Find"}
+        </button>
+        <button
+          type="button"
+          className="btnSmall"
+          onClick={() => void findFrom(findNextOffsetRef.current)}
+          disabled={findBusy || !findValue}
+          title="Find next"
+        >
+          Next
+        </button>
+        {findStatus ? <span className="fileViewerMuted">{findStatus}</span> : null}
         {error ? <span className="fileViewerError" title={error}>{error}</span> : null}
       </div>
       <div className="byteViewerList" ref={listRef}>
@@ -1732,6 +1807,37 @@ function indexOfBytes(haystack: Uint8Array, needle: Uint8Array, startAt: number)
   return -1;
 }
 
+function foldAscii(byte: number): number {
+  return byte >= 65 && byte <= 90 ? byte + 32 : byte; // A-Z -> a-z
+}
+
+// Like indexOfBytes but optionally case-folds ASCII letters on both sides.
+function indexOfBytesFold(haystack: Uint8Array, needle: Uint8Array, startAt: number, fold: boolean): number {
+  if (!fold) return indexOfBytes(haystack, needle, startAt);
+  if (needle.length === 0) return -1;
+  outer: for (let i = Math.max(0, startAt); i <= haystack.length - needle.length; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (foldAscii(haystack[i + j]) !== foldAscii(needle[j])) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+// Parse a byte-search needle: "hex" mode accepts pairs like "ff d8 ff" / "FFD8";
+// "text" mode encodes the literal UTF-8 bytes.
+function parseByteNeedle(value: string, mode: "hex" | "text"): Uint8Array | null {
+  if (mode === "text") {
+    const bytes = new TextEncoder().encode(value);
+    return bytes.length ? bytes : null;
+  }
+  const cleaned = value.replace(/0x/gi, "").replace(/[\s,]/g, "");
+  if (cleaned.length === 0 || cleaned.length % 2 !== 0 || /[^0-9a-fA-F]/.test(cleaned)) return null;
+  const out = new Uint8Array(cleaned.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = Number.parseInt(cleaned.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
 function LargeTextViewer({
   path,
   size,
@@ -1751,8 +1857,10 @@ function LargeTextViewer({
   const [listHeight, setListHeight] = React.useState(0);
   const [lineInput, setLineInput] = React.useState("");
   const [query, setQuery] = React.useState("");
+  const [caseInsensitive, setCaseInsensitive] = React.useState(false);
   const [searchStatus, setSearchStatus] = React.useState<string | null>(null);
   const [searchBusy, setSearchBusy] = React.useState(false);
+  const lastMatchLineRef = React.useRef(-1);
   const [error, setError] = React.useState<string | null>(null);
   const [windowLines, setWindowLines] = React.useState<{ baseLine: number; lines: string[]; partial: boolean } | null>(null);
   const rowHeight = 20;
@@ -1886,42 +1994,50 @@ function LargeTextViewer({
     scrollToLine(Math.max(0, parsed - 1));
   }, [lineInput, scrollToLine]);
 
-  const runSearch = React.useCallback(async () => {
-    const trimmed = query;
-    if (!trimmed) return;
-    const needle = new TextEncoder().encode(trimmed);
-    if (needle.length === 0) return;
-    setSearchBusy(true);
-    setSearchStatus(null);
-    try {
-      let offset = 0;
-      let line = 0;
-      let overlap = new Uint8Array(0);
-      while (offset < size) {
-        const result = await readRange(path, offset, Math.min(RANGE_CHUNK_BYTES, size - offset));
-        const bytes = decodeBase64Bytes(result.dataBase64);
-        const combined = overlap.length ? concatBytes([overlap, bytes]) : bytes;
-        const searchStart = Math.max(0, overlap.length - needle.length + 1);
-        const found = indexOfBytes(combined, needle, searchStart);
-        if (found >= 0) {
-          const lineAtCombinedStart = line - countNewlines(overlap);
-          const matchedLine = lineAtCombinedStart + countNewlines(combined, found);
-          scrollToLine(matchedLine);
-          setSearchStatus(`Line ${matchedLine + 1}`);
-          return;
+  const findFromLine = React.useCallback(
+    async (minLine: number) => {
+      const needle = new TextEncoder().encode(query);
+      if (needle.length === 0) return;
+      setSearchBusy(true);
+      setSearchStatus(null);
+      try {
+        const start = findCheckpoint(Math.max(0, minLine));
+        let offset = start.offset;
+        let line = start.line;
+        let overlap = new Uint8Array(0);
+        while (offset < size) {
+          const result = await readRange(path, offset, Math.min(RANGE_CHUNK_BYTES, size - offset));
+          const bytes = decodeBase64Bytes(result.dataBase64);
+          const combined = overlap.length ? concatBytes([overlap, bytes]) : bytes;
+          const baseLine = line - countNewlines(overlap);
+          let from = 0;
+          for (;;) {
+            const found = indexOfBytesFold(combined, needle, from, caseInsensitive);
+            if (found < 0) break;
+            const matchedLine = baseLine + countNewlines(combined, found);
+            if (matchedLine >= minLine) {
+              scrollToLine(matchedLine);
+              lastMatchLineRef.current = matchedLine;
+              setSearchStatus(`Line ${matchedLine + 1}`);
+              return;
+            }
+            from = found + 1;
+          }
+          line += countNewlines(bytes);
+          overlap = needle.length > 1 ? bytes.slice(Math.max(0, bytes.length - needle.length + 1)) : new Uint8Array(0);
+          offset = result.offset + bytes.length;
+          if (bytes.length === 0 || result.eof) break;
         }
-        line += countNewlines(bytes);
-        overlap = needle.length > 1 ? bytes.slice(Math.max(0, bytes.length - needle.length + 1)) : new Uint8Array(0);
-        offset = result.offset + bytes.length;
-        if (bytes.length === 0 || result.eof) break;
+        lastMatchLineRef.current = -1;
+        setSearchStatus("No match");
+      } catch (err) {
+        setSearchStatus(err instanceof Error ? err.message : String(err));
+      } finally {
+        setSearchBusy(false);
       }
-      setSearchStatus("No match");
-    } catch (err) {
-      setSearchStatus(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSearchBusy(false);
-    }
-  }, [path, query, readRange, scrollToLine, size]);
+    },
+    [caseInsensitive, findCheckpoint, path, query, readRange, scrollToLine, size],
+  );
 
   const rows: React.ReactNode[] = [];
   for (let row = startIndex; row < endIndex; row++) {
@@ -1976,12 +2092,30 @@ function LargeTextViewer({
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") void runSearch();
+            if (e.key === "Enter") void findFromLine(0);
           }}
-          placeholder="find literal"
+          placeholder="find text"
         />
-        <button type="button" className="btnSmall" onClick={() => void runSearch()} disabled={searchBusy || !query}>
+        <button
+          type="button"
+          className={`btnSmall ${caseInsensitive ? "pdfViewerFitActive" : ""}`}
+          onClick={() => setCaseInsensitive((prev) => !prev)}
+          title="Case-insensitive"
+          aria-label="Toggle case-insensitive search"
+        >
+          Aa
+        </button>
+        <button type="button" className="btnSmall" onClick={() => void findFromLine(0)} disabled={searchBusy || !query}>
           {searchBusy ? "Finding..." : "Find"}
+        </button>
+        <button
+          type="button"
+          className="btnSmall"
+          onClick={() => void findFromLine(lastMatchLineRef.current + 1)}
+          disabled={searchBusy || !query}
+          title="Find next"
+        >
+          Next
         </button>
         {searchStatus ? <span className="fileViewerMuted">{searchStatus}</span> : null}
       </div>
