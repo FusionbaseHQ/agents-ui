@@ -33,29 +33,31 @@ fn normalize_url(input: &str) -> Result<tauri::Url, String> {
     tauri::Url::parse(&candidate).map_err(|e| format!("invalid url: {e}"))
 }
 
-// Translate a DOM rect (from getBoundingClientRect, origin = top-left of the web
-// content) into the coordinate space the child webview is positioned in.
+// Translate a DOM rect (getBoundingClientRect, origin = top-left of the web
+// content) into the position to give the child webview.
 //
-// The trick: the main app webview and the child browser webview are sibling
-// views in the SAME coordinate space, and both are positioned via Tauri's
-// Webview::position()/set_position(). DOM (0,0) is exactly the main webview's
-// top-left. So the child's target is simply main_webview.position() + (x, y).
-// This is self-calibrating — it needs no knowledge of title-bar height or which
-// view space Tauri uses, because we read and write through the same API.
-//
-// Returns the physical position to place the child at.
+// A child webview is positioned relative to its parent NSView, which is the
+// window's *frame* view (top-left includes the title bar). The DOM, however, is
+// rendered in the content view, inset below the title bar. So we work in screen
+// space, which is unambiguous:
+//   DOM (x,y) in screen px  = inner_position (content top-left on screen) + (x,y)*scale
+//   child parent top-left   = outer_position (window frame top-left on screen)
+//   child position (parent-relative) = DOM_screen - parent_screen
+//                                    = (inner - outer) + (x,y)*scale
+// (inner - outer) is the title-bar inset; on a borderless window it is (0,0).
 fn child_physical_position(app: &AppHandle, dom_x: f64, dom_y: f64) -> PhysicalPosition<f64> {
-    let scale = app
-        .get_window("main")
+    let window = app.get_window("main");
+    let scale = window
+        .as_ref()
         .and_then(|w| w.scale_factor().ok())
         .unwrap_or(1.0)
         .max(1.0);
-    let origin = app
-        .get_webview("main")
-        .and_then(|w| w.position().ok())
-        .map(|p| (p.x as f64, p.y as f64))
+    let (ox, oy) = window
+        .as_ref()
+        .and_then(|w| Some((w.inner_position().ok()?, w.outer_position().ok()?)))
+        .map(|(inner, outer)| ((inner.x - outer.x) as f64, (inner.y - outer.y) as f64))
         .unwrap_or((0.0, 0.0));
-    PhysicalPosition::new(origin.0 + dom_x * scale, origin.1 + dom_y * scale)
+    PhysicalPosition::new(ox + dom_x * scale, oy + dom_y * scale)
 }
 
 fn emit_nav(app: &AppHandle, label: &str, url: &str, loading: bool) {
