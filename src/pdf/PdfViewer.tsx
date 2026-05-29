@@ -73,6 +73,29 @@ class TauriRangeTransport extends pdfjsLib.PDFDataRangeTransport {
   }
 }
 
+type PdfOutlineItem = { title: string; dest: string | unknown[] | null; items: PdfOutlineItem[] };
+
+function PdfOutlineTree({ items, onGo, depth }: { items: PdfOutlineItem[]; onGo: (dest: PdfOutlineItem["dest"]) => void; depth: number }) {
+  return (
+    <ul className="pdfOutlineList">
+      {items.map((item, i) => (
+        <li key={i}>
+          <button
+            type="button"
+            className="pdfOutlineItem"
+            style={{ paddingLeft: 8 + depth * 12 }}
+            onClick={() => onGo(item.dest)}
+            title={item.title}
+          >
+            {item.title || "—"}
+          </button>
+          {item.items?.length ? <PdfOutlineTree items={item.items} onGo={onGo} depth={depth + 1} /> : null}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 type PageSize = { w: number; h: number };
 type RenderedPage = {
   canvas: HTMLCanvasElement;
@@ -162,6 +185,8 @@ export default function PdfViewer({
   const [fitWidth, setFitWidth] = React.useState(true);
   const [rotation, setRotation] = React.useState(0); // user rotation in degrees (0/90/180/270)
   const [currentPage, setCurrentPage] = React.useState(1);
+  const [outline, setOutline] = React.useState<PdfOutlineItem[] | null>(null);
+  const [showOutline, setShowOutline] = React.useState(false);
   const [pageInput, setPageInput] = React.useState("");
   const [passwordInput, setPasswordInput] = React.useState("");
   const [renderError, setRenderError] = React.useState<string | null>(null);
@@ -354,6 +379,8 @@ export default function PdfViewer({
     setRenderError(null);
     setNumPages(0);
     setDefaultSize(null);
+    setOutline(null);
+    setShowOutline(false);
     slotRefs.current.clear();
     renderedRef.current.clear();
     renderingRef.current.clear();
@@ -400,6 +427,12 @@ export default function PdfViewer({
           first.cleanup();
         } catch {
           if (!cancelled) setDefaultSize({ ...FALLBACK_PAGE });
+        }
+        try {
+          const tree = (await pdf.getOutline()) as PdfOutlineItem[] | null;
+          if (!cancelled && tree && tree.length) setOutline(tree);
+        } catch {
+          /* no outline */
         }
         if (!cancelled) setStatus("ready");
       })
@@ -517,6 +550,22 @@ export default function PdfViewer({
     list.scrollTop += slotRect.top - listRect.top - LIST_PADDING;
   }, []);
 
+  const goToDest = React.useCallback(
+    async (dest: PdfOutlineItem["dest"]) => {
+      const pdf = pdfRef.current;
+      if (!pdf || !dest) return;
+      try {
+        const explicit = typeof dest === "string" ? await pdf.getDestination(dest) : dest;
+        if (!Array.isArray(explicit) || explicit.length === 0) return;
+        const pageIndex = await pdf.getPageIndex(explicit[0] as Parameters<typeof pdf.getPageIndex>[0]);
+        scrollToPage(pageIndex + 1);
+      } catch {
+        /* unresolved destination */
+      }
+    },
+    [scrollToPage],
+  );
+
   const jumpToPage = React.useCallback(() => {
     const parsed = Number.parseInt(pageInput.trim(), 10);
     if (!Number.isFinite(parsed)) return;
@@ -630,6 +679,17 @@ export default function PdfViewer({
   return (
     <div className="pdfViewer">
       <div className="fileViewerToolbar">
+        {outline ? (
+          <button
+            type="button"
+            className={`btnSmall ${showOutline ? "pdfViewerFitActive" : ""}`}
+            onClick={() => setShowOutline((v) => !v)}
+            title="Outline"
+            aria-label="Toggle outline"
+          >
+            ☰
+          </button>
+        ) : null}
         <span>
           Page {currentPage} / {numPages}
         </span>
@@ -679,15 +739,21 @@ export default function PdfViewer({
           Open bytes
         </button>
       </div>
-      <div
-        className="pdfViewerList"
-        ref={listRef}
-        tabIndex={0}
-        role="document"
-        aria-label={`PDF, ${numPages} pages`}
-        onKeyDown={onListKeyDown}
-      >
-        <div className="pdfViewerPages">
+      <div className="pdfViewerMain">
+        {showOutline && outline ? (
+          <aside className="pdfOutline" aria-label="Document outline">
+            <PdfOutlineTree items={outline} onGo={(dest) => void goToDest(dest)} depth={0} />
+          </aside>
+        ) : null}
+        <div
+          className="pdfViewerList"
+          ref={listRef}
+          tabIndex={0}
+          role="document"
+          aria-label={`PDF, ${numPages} pages`}
+          onKeyDown={onListKeyDown}
+        >
+          <div className="pdfViewerPages">
           {Array.from({ length: numPages }, (_, i) => {
             const n = i + 1;
             const sz = pageSizeRef.current.get(n) ?? defaultSize;
@@ -703,6 +769,7 @@ export default function PdfViewer({
               />
             );
           })}
+          </div>
         </div>
       </div>
     </div>
