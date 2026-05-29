@@ -3265,6 +3265,7 @@ body::after {
 }
 
 .pdfPage {
+  position: relative;
   flex: 0 0 auto;
   /* PDFs assume a white substrate; keep pages white in every theme so content
      renders with the contrast the document was authored for. */
@@ -3275,6 +3276,34 @@ body::after {
 
 .pdfPageCanvas {
   display: block;
+}
+
+/* Invisible, selectable/searchable text aligned over the rendered canvas. */
+.pdfTextLayer {
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  opacity: 1;
+  line-height: 1;
+  text-align: initial;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  z-index: 2;
+}
+
+.pdfTextLayer span,
+.pdfTextLayer br {
+  position: absolute;
+  color: transparent;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+}
+
+.pdfTextLayer ::selection {
+  background: rgba(0, 100, 255, 0.3);
 }
 
 .agentShortcutEditorName {

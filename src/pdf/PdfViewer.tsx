@@ -86,7 +86,23 @@ class TauriRangeTransport extends pdfjsLib.PDFDataRangeTransport {
 }
 
 type PageSize = { w: number; h: number };
-type RenderedPage = { canvas: HTMLCanvasElement; task: RenderTask | null; scale: number; touched: number };
+type RenderedPage = {
+  canvas: HTMLCanvasElement;
+  textLayer: HTMLElement | null;
+  task: RenderTask | null;
+  scale: number;
+  touched: number;
+};
+
+function disposeRendered(entry: RenderedPage): void {
+  try {
+    entry.task?.cancel();
+  } catch {
+    /* already settled */
+  }
+  entry.canvas.remove();
+  entry.textLayer?.remove();
+}
 
 function isCancelled(err: unknown): boolean {
   return Boolean(err) && (err as { name?: string }).name === "RenderingCancelledException";
@@ -182,12 +198,7 @@ export default function PdfViewer({
     let over = rendered.size - MAX_RENDERED_PAGES;
     for (const [n, page] of candidates) {
       if (over <= 0) break;
-      try {
-        page.task?.cancel();
-      } catch {
-        /* already settled */
-      }
-      page.canvas.remove();
+      disposeRendered(page);
       rendered.delete(n);
       over -= 1;
     }
@@ -236,21 +247,37 @@ export default function PdfViewer({
           transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
         });
         const stale = renderedRef.current.get(n);
-        if (stale) {
-          try {
-            stale.task?.cancel();
-          } catch {
-            /* already settled */
-          }
-        }
+        if (stale) disposeRendered(stale);
         slot.replaceChildren(canvas);
-        renderedRef.current.set(n, { canvas, task, scale: targetScale, touched: ++lruClockRef.current });
+        const entry: RenderedPage = { canvas, textLayer: null, task, scale: targetScale, touched: ++lruClockRef.current };
+        renderedRef.current.set(n, entry);
         await task.promise;
+        // Selectable/searchable/screen-reader text overlay aligned to the canvas.
+        // Additive and best-effort: a failure here never blanks the page.
+        try {
+          const textLayerDiv = document.createElement("div");
+          textLayerDiv.className = "pdfTextLayer";
+          textLayerDiv.style.setProperty("--scale-factor", String(targetScale));
+          textLayerDiv.style.width = `${Math.floor(viewport.width)}px`;
+          textLayerDiv.style.height = `${Math.floor(viewport.height)}px`;
+          const textLayer = new pdfjsLib.TextLayer({
+            textContentSource: page.streamTextContent({ includeMarkedContent: true }),
+            container: textLayerDiv,
+            viewport,
+          });
+          await textLayer.render();
+          if (seq === renderSeqRef.current && renderedRef.current.get(n) === entry && canvas.isConnected) {
+            slot.appendChild(textLayerDiv);
+            entry.textLayer = textLayerDiv;
+          }
+        } catch {
+          /* text layer unavailable — canvas still renders */
+        }
         page.cleanup();
         if (seq !== renderSeqRef.current) {
           const current = renderedRef.current.get(n);
-          if (current && current.canvas === canvas) {
-            current.canvas.remove();
+          if (current === entry) {
+            disposeRendered(entry);
             renderedRef.current.delete(n);
           }
         }
@@ -321,12 +348,7 @@ export default function PdfViewer({
     // strands its canvas in the DOM (and renderedRef).
     const rendered = renderedRef.current.get(n);
     if (rendered) {
-      try {
-        rendered.task?.cancel();
-      } catch {
-        /* already settled */
-      }
-      rendered.canvas.remove();
+      disposeRendered(rendered);
       renderedRef.current.delete(n);
     }
   }, []);
@@ -398,13 +420,7 @@ export default function PdfViewer({
 
     return () => {
       cancelled = true;
-      for (const page of renderedRef.current.values()) {
-        try {
-          page.task?.cancel();
-        } catch {
-          /* already settled */
-        }
-      }
+      for (const page of renderedRef.current.values()) disposeRendered(page);
       renderedRef.current.clear();
       observerRef.current?.disconnect();
       observerRef.current = null;
@@ -493,14 +509,7 @@ export default function PdfViewer({
   // visible at the new scale. Slot heights re-flow from `scale` in render.
   React.useEffect(() => {
     renderSeqRef.current += 1;
-    for (const page of renderedRef.current.values()) {
-      try {
-        page.task?.cancel();
-      } catch {
-        /* already settled */
-      }
-      page.canvas.remove();
-    }
+    for (const page of renderedRef.current.values()) disposeRendered(page);
     renderedRef.current.clear();
     renderingRef.current.clear();
     renderQueueRef.current.length = 0; // drop pages queued at the old scale
