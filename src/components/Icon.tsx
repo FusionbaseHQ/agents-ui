@@ -28,6 +28,7 @@ export type IconName =
   | "upload"
   | "history"
   | "activity"
+  | "globe"
   | "pin";
 
 type IconProps = {
@@ -52,6 +53,14 @@ export const Icon = React.memo(function Icon({ name, size = 16, className }: Ico
   };
 
   switch (name) {
+    case "globe":
+      return (
+        <svg {...common}>
+          <circle cx="12" cy="12" r="9" />
+          <path d="M3 12h18" />
+          <path d="M12 3a14 14 0 0 1 0 18 14 14 0 0 1 0-18" />
+        </svg>
+      );
     case "plus":
       return (
         <svg {...common}>

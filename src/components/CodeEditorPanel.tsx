@@ -20,13 +20,27 @@ export type CodeEditorPanelHandle = {
 };
 
 export type CodeEditorOpenMode = "auto" | "text" | "image" | "bytes" | "markdown" | "json" | "csv";
-type ViewerKind = "text" | "largeText" | "image" | "bytes" | "pdf" | "markdown" | "json" | "csv";
+type ViewerKind = "text" | "largeText" | "image" | "bytes" | "pdf" | "markdown" | "json" | "csv" | "browser";
 
 // Heavier / rarely-needed viewers load lazily — same approach as LazyCodeEditorPanel.
 const LazyPdfViewer = React.lazy(() => import("../pdf/PdfViewer"));
 const LazyMarkdownViewer = React.lazy(() => import("../fileViewer/MarkdownViewer"));
 const LazyJsonTreeViewer = React.lazy(() => import("../fileViewer/JsonTreeViewer"));
 const LazyCsvTableViewer = React.lazy(() => import("../fileViewer/CsvTableViewer"));
+const LazyBrowserView = React.lazy(() => import("../browser/BrowserView"));
+
+// Browser tabs aren't backed by a file; they use a synthetic, never-a-real-path
+// key ("browser://<n>", never an absolute path) so the file-loading machinery skips them.
+const BROWSER_PREFIX = "browser://";
+const BROWSER_START_URL = "https://duckduckgo.com";
+const isBrowserPath = (path: string) => path.startsWith(BROWSER_PREFIX);
+function urlHost(url: string): string {
+  try {
+    return new URL(url.includes("://") ? url : `https://${url}`).host || "Browser";
+  } catch {
+    return "Browser";
+  }
+}
 
 type FileProbe = {
   size: number;
@@ -384,6 +398,11 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   const tabsMenuButtonRef = React.useRef<HTMLButtonElement | null>(null);
   const [canScrollLeft, setCanScrollLeft] = React.useState(false);
   const [canScrollRight, setCanScrollRight] = React.useState(false);
+  // Browser tabs: synthetic-path tab → its native child-webview label + last URL.
+  // Kept in a ref (not state) because BrowserView owns the live URL; we only need
+  // it here to address browser_close on tab close and to seed BrowserView.
+  const browserMetaRef = React.useRef<Map<string, { label: string; url: string }>>(new Map());
+  const browserSeqRef = React.useRef(0);
 
   const modelUriForPath = React.useCallback(
     (monaco: MonacoType, path: string) => {
@@ -511,7 +530,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   const activePathRef = React.useRef<string | null>(null);
   React.useLayoutEffect(() => {
     activePathRef.current = activePath;
-    onActiveFilePathChangeRef.current(activePath);
+    onActiveFilePathChangeRef.current(activePath && !isBrowserPath(activePath) ? activePath : null);
   }, [activePath]);
 
   const readModelValue = React.useCallback((path: string): string | null => {
@@ -527,13 +546,15 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   }, [modelUriForPath]);
 
   const serializeState = React.useCallback((): CodeEditorPersistedState => {
-    const currentTabs = tabsRef.current;
+    // Browser tabs are session-only (no URL persistence), so they're excluded.
+    const currentTabs = tabsRef.current.filter((tab) => !isBrowserPath(tab.path));
     const outTabs: CodeEditorPersistedTab[] = currentTabs.map((tab) => {
       const dirty = dirtyPathsRef.current.has(tab.path) || tab.dirty;
       const content = dirty && tab.viewerKind === "text" ? readModelValue(tab.path) ?? "" : null;
       return { path: tab.path, dirty: tab.viewerKind === "text" ? dirty : false, content, viewerKind: tab.viewerKind, locked: tab.locked };
     });
-    return { tabs: outTabs, activePath: activePathRef.current };
+    const active = activePathRef.current;
+    return { tabs: outTabs, activePath: active && !isBrowserPath(active) ? active : null };
   }, [readModelValue]);
 
   React.useEffect(() => {
@@ -544,6 +565,11 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       } catch {
         // Best-effort: preserve editor state when possible.
       }
+      // Tear down any embedded-browser webviews so they don't linger off-screen.
+      for (const meta of browserMetaRef.current.values()) {
+        void invoke("browser_close", { label: meta.label }).catch(() => {});
+      }
+      browserMetaRef.current.clear();
       editorRef.current?.setModel(null);
       for (const model of modelsRef.current.values()) model.dispose();
       modelsRef.current.clear();
@@ -623,6 +649,16 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     async (path: string, mode: CodeEditorOpenMode = "auto") => {
       const normalized = path.trim();
       if (!normalized) return;
+
+      // Browser tabs have no backing file — just activate them.
+      if (isBrowserPath(normalized)) {
+        if (openPathsRef.current.has(normalized)) {
+          setActivePath(normalized);
+          activePathRef.current = normalized;
+          setEditorModel(null);
+        }
+        return;
+      }
 
       const reload = async () => {
         updateTab(normalized, (tab) => ({
@@ -721,6 +757,28 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     },
     [ensureModel, probeFile, readTextFile, setEditorModel, updateTab],
   );
+
+  // Open a new embedded-browser tab. The page runs in a native child WKWebView
+  // (created lazily by BrowserView on first layout) that has no app capabilities.
+  const openBrowserTab = React.useCallback(() => {
+    const seq = ++browserSeqRef.current;
+    const path = `${BROWSER_PREFIX}${seq}`;
+    const label = `browser-${seq}`;
+    browserMetaRef.current.set(path, { label, url: BROWSER_START_URL });
+    openPathsRef.current.add(path);
+    const tab: Tab = {
+      ...emptyTab(path),
+      title: "New tab",
+      viewerKind: "browser",
+      loading: false,
+    };
+    const next = [...tabsRef.current, tab];
+    tabsRef.current = next;
+    setTabs(next);
+    setActivePath(path);
+    activePathRef.current = path;
+    setEditorModel(null);
+  }, [setEditorModel]);
 
   React.useEffect(() => {
     if (restoredRef.current) return;
@@ -873,6 +931,11 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
 
   const closeTab = React.useCallback(
     (path: string) => {
+      const browserMeta = browserMetaRef.current.get(path);
+      if (browserMeta) {
+        void invoke("browser_close", { label: browserMeta.label }).catch(() => {});
+        browserMetaRef.current.delete(path);
+      }
       const editor = editorRef.current;
       if (editor && editor.getModel() === modelsRef.current.get(path)) {
         editor.setModel(null);
@@ -916,6 +979,11 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       if (toClose.size === 0) return;
       const editor = editorRef.current;
       for (const p of toClose) {
+        const browserMeta = browserMetaRef.current.get(p);
+        if (browserMeta) {
+          void invoke("browser_close", { label: browserMeta.label }).catch(() => {});
+          browserMetaRef.current.delete(p);
+        }
         const model = modelsRef.current.get(p);
         if (model) {
           if (editor && editor.getModel() === model) editor.setModel(null);
@@ -1340,6 +1408,15 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
         <div className="codeEditorActions">
           <button
             type="button"
+            className="btnSmall btnIcon"
+            onClick={openBrowserTab}
+            title="New browser tab"
+            aria-label="New browser tab"
+          >
+            <Icon name="globe" />
+          </button>
+          <button
+            type="button"
             className={`btnSmall btnIcon ${crossFindOpen ? "btnIconActive" : ""}`}
             onClick={() => setCrossFindOpen((v) => !v)}
             title="Find / replace across open files"
@@ -1445,7 +1522,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
         </div>
       ) : null}
 
-      {activeTab ? (
+      {activeTab && !isBrowserPath(activeTab.path) ? (
         <div className="codeEditorPathBar">
           <span className="codeEditorPathBarText" title={activeTab.path}>
             {activeTab.path}
@@ -1576,6 +1653,23 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
               size={activeTab.size ?? 0}
               readRange={readFileRange}
               onOpenBytes={() => void openFile(activeTab.path, "bytes")}
+            />
+          </React.Suspense>
+        ) : null}
+
+        {activeTab && activeTab.viewerKind === "browser" && browserMetaRef.current.has(activeTab.path) ? (
+          <React.Suspense fallback={<div className="codeEditorOverlay">Loading…</div>}>
+            <LazyBrowserView
+              key={`browser:${activeTab.path}`}
+              label={browserMetaRef.current.get(activeTab.path)!.label}
+              initialUrl={browserMetaRef.current.get(activeTab.path)!.url}
+              suppressed={tabsMenuOpen || crossFindOpen || Boolean(tabMenu) || Boolean(pendingClose) || Boolean(saveConflictPath)}
+              onUrlChange={(url) => {
+                const meta = browserMetaRef.current.get(activeTab.path);
+                if (meta) meta.url = url;
+                const host = urlHost(url);
+                updateTab(activeTab.path, (t) => (t.title === host ? t : { ...t, title: host }));
+              }}
             />
           </React.Suspense>
         ) : null}

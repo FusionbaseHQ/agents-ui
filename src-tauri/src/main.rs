@@ -1,5 +1,6 @@
 mod agent;
 mod api_bridge;
+mod browser;
 mod api_discovery;
 mod api_handlers;
 mod api_server;
@@ -202,7 +203,13 @@ fn main() {
             get_server_status,
             set_api_enabled,
             set_mcp_enabled,
-            register_mcp_with_agents
+            register_mcp_with_agents,
+            browser::browser_open,
+            browser::browser_set_bounds,
+            browser::browser_hide,
+            browser::browser_navigate,
+            browser::browser_action,
+            browser::browser_close
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

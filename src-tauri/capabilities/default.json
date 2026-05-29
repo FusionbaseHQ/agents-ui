@@ -3,6 +3,7 @@
   "identifier": "default",
   "description": "Default capabilities for the main window",
   "windows": ["main"],
+  "webviews": ["main"],
   "permissions": [
     "core:default",
     "core:event:default",

@@ -3029,6 +3029,35 @@ body::after {
   inset: 0;
 }
 
+/* Embedded browser tab: chrome (URL bar) over a viewport placeholder. The page
+   itself is a native child WKWebView positioned over .browserViewport. */
+.browserView {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+}
+
+.browserBar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.browserUrl {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.browserViewport {
+  flex: 1 1 auto;
+  min-height: 0;
+  /* The native webview paints here; keep it visually distinct while it loads. */
+  background: var(--panel);
+}
+
 .codeEditorMonacoHidden {
   visibility: hidden;
   pointer-events: none;
