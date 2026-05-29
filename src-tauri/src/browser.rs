@@ -58,11 +58,6 @@ fn child_physical_position(app: &AppHandle, dom_x: f64, dom_y: f64) -> PhysicalP
     PhysicalPosition::new(origin.0 + dom_x * scale, origin.1 + dom_y * scale)
 }
 
-fn emit_debug(app: &AppHandle, msg: String) {
-    eprintln!("[browser] {msg}");
-    let _ = app.emit_to("main", "browser://debug", msg);
-}
-
 fn emit_nav(app: &AppHandle, label: &str, url: &str, loading: bool) {
     let _ = app.emit_to(
         "main",
@@ -92,16 +87,6 @@ pub fn browser_open(
     if let Some(webview) = app.get_webview(&label) {
         let _ = webview.set_position(pos);
         let _ = webview.set_size(LogicalSize::new(w, h));
-        emit_debug(
-            &app,
-            format!(
-                "reposition dom=({x:.0},{y:.0},{w:.0},{h:.0}) set_phys=({:.0},{:.0}) main_pos={:?} readback={:?}",
-                pos.x,
-                pos.y,
-                app.get_webview("main").and_then(|m| m.position().ok()),
-                webview.position().ok(),
-            ),
-        );
         return Ok(());
     }
     let window = app
@@ -130,18 +115,7 @@ pub fn browser_open(
     // The main webview may not be positioned yet at first paint; reposition once
     // more now that the child exists, using the main webview's actual origin.
     if let Some(webview) = app.get_webview(&label) {
-        let pos2 = child_physical_position(&app, x, y);
-        let _ = webview.set_position(pos2);
-        emit_debug(
-            &app,
-            format!(
-                "created dom=({x:.0},{y:.0},{w:.0},{h:.0}) set_phys=({:.0},{:.0}) main_pos={:?} readback={:?}",
-                pos2.x,
-                pos2.y,
-                app.get_webview("main").and_then(|m| m.position().ok()),
-                webview.position().ok(),
-            ),
-        );
+        let _ = webview.set_position(child_physical_position(&app, x, y));
     }
     Ok(())
 }
