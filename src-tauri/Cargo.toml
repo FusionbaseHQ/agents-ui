@@ -29,3 +29,13 @@ fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs" }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+
+# Release tuning: thin-LTO + single codegen unit enable cross-crate inlining
+# across serde_json/tauri/portable-pty/tokio; strip shrinks the shipped binary.
+# NOTE: deliberately NOT setting panic = "abort" — tokio task isolation and the
+# agent.rs registration-thread join().unwrap_or(...) recovery rely on unwinding;
+# aborting would turn a recoverable per-connection/task panic into a full crash.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

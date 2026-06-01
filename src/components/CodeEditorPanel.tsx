@@ -25,6 +25,7 @@ export type CodeEditorPanelHandle = {
   browserAction: (input: { tabId?: string | null; action: "back" | "forward" | "reload" }) => Promise<CodeEditorWorkspaceTab>;
   browserSnapshot: (input?: { tabId?: string | null }) => CodeEditorBrowserSnapshot;
   fileViewerSnapshot: (input?: { tabId?: string | null; path?: string | null; maxContentLength?: number }) => CodeEditorFileViewerSnapshot;
+  captureScreenshot: (input?: CodeEditorCaptureScreenshotInput) => Promise<CodeEditorCaptureScreenshotResult>;
 };
 
 export type CodeEditorOpenMode = "auto" | "text" | "image" | "bytes" | "markdown" | "json" | "csv";
@@ -82,6 +83,32 @@ export type CodeEditorFileViewerSnapshot = {
   contentTruncated: boolean;
 };
 
+export type CodeEditorCaptureScreenshotInput = {
+  target?: "file_viewer" | "browser" | null;
+  tabId?: string | null;
+  path?: string | null;
+  maxWidth?: number;
+  maxHeight?: number;
+};
+
+export type CodeEditorCaptureScreenshotResult = {
+  mimeType: "image/png";
+  data: string;
+  width: number;
+  height: number;
+  sourceWidth: number;
+  sourceHeight: number;
+  target: "file_viewer" | "browser";
+  capturedElement: "image" | "pdf_page" | "browser_webview";
+  page: number | null;
+  tab: CodeEditorWorkspaceTab;
+};
+
+type NativeBrowserScreenshot = Pick<
+  CodeEditorCaptureScreenshotResult,
+  "mimeType" | "data" | "width" | "height" | "sourceWidth" | "sourceHeight"
+>;
+
 // Heavier / rarely-needed viewers load lazily — same approach as LazyCodeEditorPanel.
 const LazyPdfViewer = React.lazy(() => import("../pdf/PdfViewer"));
 const LazyMarkdownViewer = React.lazy(() => import("../fileViewer/MarkdownViewer"));
@@ -136,6 +163,9 @@ const IMAGE_PREVIEW_MAX_BYTES = 64 * 1024 * 1024;
 const RANGE_CHUNK_BYTES = 256 * 1024;
 const MAX_RANGE_BYTES = 1024 * 1024;
 const MAX_VIEWER_CACHE_BYTES = 8 * 1024 * 1024;
+const SCREENSHOT_DEFAULT_MAX_DIMENSION = 1600;
+const SCREENSHOT_MAX_DIMENSION = 4096;
+const SCREENSHOT_SURFACE_WAIT_MS = 2_500;
 
 export type CodeEditorPersistedTab = {
   path: string;
@@ -253,6 +283,136 @@ function formatBytes(value: number | null | undefined): string {
     idx += 1;
   }
   return `${n >= 10 ? n.toFixed(1) : n.toFixed(2)} ${units[idx]}`;
+}
+
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+function normalizeScreenshotDimension(value: number | undefined, fallback: number): number {
+  if (value == null || !Number.isFinite(value)) return fallback;
+  return Math.min(SCREENSHOT_MAX_DIMENSION, Math.max(1, Math.floor(value)));
+}
+
+function fitScreenshotDimensions(sourceWidth: number, sourceHeight: number, maxWidth: number, maxHeight: number) {
+  const scale = Math.min(1, maxWidth / sourceWidth, maxHeight / sourceHeight);
+  return {
+    width: Math.max(1, Math.round(sourceWidth * scale)),
+    height: Math.max(1, Math.round(sourceHeight * scale)),
+  };
+}
+
+function stripPngDataUrl(dataUrl: string): string {
+  const prefix = "data:image/png;base64,";
+  if (!dataUrl.startsWith(prefix)) throw new Error("screenshot encoder did not return PNG data");
+  return dataUrl.slice(prefix.length);
+}
+
+function visibleArea(rect: DOMRect, viewport: DOMRect): number {
+  const width = Math.max(0, Math.min(rect.right, viewport.right) - Math.max(rect.left, viewport.left));
+  const height = Math.max(0, Math.min(rect.bottom, viewport.bottom) - Math.max(rect.top, viewport.top));
+  return width * height;
+}
+
+function findVisiblePdfCanvas(root: HTMLElement): { canvas: HTMLCanvasElement; page: number | null } | null {
+  const canvases = Array.from(root.querySelectorAll<HTMLCanvasElement>("canvas.pdfPageCanvas"))
+    .filter((canvas) => canvas.width > 0 && canvas.height > 0);
+  if (!canvases.length) return null;
+  const viewport = root.getBoundingClientRect();
+  let best = canvases[0];
+  let bestScore = -1;
+  for (const canvas of canvases) {
+    const rect = canvas.getBoundingClientRect();
+    const score = visibleArea(rect, viewport) || rect.width * rect.height;
+    if (score > bestScore) {
+      best = canvas;
+      bestScore = score;
+    }
+  }
+  const pageRaw = best.closest<HTMLElement>(".pdfPage")?.dataset.page;
+  const page = pageRaw ? Number(pageRaw) : NaN;
+  return { canvas: best, page: Number.isFinite(page) ? page : null };
+}
+
+function encodeCanvasScreenshot(
+  source: HTMLCanvasElement,
+  maxWidth: number,
+  maxHeight: number,
+): Pick<CodeEditorCaptureScreenshotResult, "data" | "width" | "height" | "sourceWidth" | "sourceHeight"> {
+  const sourceWidth = source.width;
+  const sourceHeight = source.height;
+  if (sourceWidth <= 0 || sourceHeight <= 0) throw new Error("screenshot source has no pixels");
+  const { width, height } = fitScreenshotDimensions(sourceWidth, sourceHeight, maxWidth, maxHeight);
+  const output = document.createElement("canvas");
+  output.width = width;
+  output.height = height;
+  const ctx = output.getContext("2d");
+  if (!ctx) throw new Error("could not create screenshot canvas");
+  ctx.drawImage(source, 0, 0, width, height);
+  return {
+    data: stripPngDataUrl(output.toDataURL("image/png")),
+    width,
+    height,
+    sourceWidth,
+    sourceHeight,
+  };
+}
+
+function encodeImageScreenshot(
+  image: HTMLImageElement,
+  maxWidth: number,
+  maxHeight: number,
+): Pick<CodeEditorCaptureScreenshotResult, "data" | "width" | "height" | "sourceWidth" | "sourceHeight"> {
+  const sourceWidth = image.naturalWidth;
+  const sourceHeight = image.naturalHeight;
+  if (sourceWidth <= 0 || sourceHeight <= 0) throw new Error("image has no decoded pixels");
+  const { width, height } = fitScreenshotDimensions(sourceWidth, sourceHeight, maxWidth, maxHeight);
+  const output = document.createElement("canvas");
+  output.width = width;
+  output.height = height;
+  const ctx = output.getContext("2d");
+  if (!ctx) throw new Error("could not create screenshot canvas");
+  ctx.drawImage(image, 0, 0, width, height);
+  return {
+    data: stripPngDataUrl(output.toDataURL("image/png")),
+    width,
+    height,
+    sourceWidth,
+    sourceHeight,
+  };
+}
+
+function loadPngData(data: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("could not decode screenshot PNG"));
+    image.src = `data:image/png;base64,${data}`;
+  });
+}
+
+async function fitPngScreenshot(
+  input: NativeBrowserScreenshot,
+  maxWidth: number,
+  maxHeight: number,
+): Promise<NativeBrowserScreenshot> {
+  const { width, height } = fitScreenshotDimensions(input.sourceWidth, input.sourceHeight, maxWidth, maxHeight);
+  if (width === input.width && height === input.height) return input;
+  const image = await loadPngData(input.data);
+  const output = document.createElement("canvas");
+  output.width = width;
+  output.height = height;
+  const ctx = output.getContext("2d");
+  if (!ctx) throw new Error("could not create screenshot canvas");
+  ctx.drawImage(image, 0, 0, width, height);
+  return {
+    mimeType: "image/png",
+    data: stripPngDataUrl(output.toDataURL("image/png")),
+    width,
+    height,
+    sourceWidth: input.sourceWidth,
+    sourceHeight: input.sourceHeight,
+  };
 }
 
 function byteToAscii(byte: number): string {
@@ -474,6 +634,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   const tabsMenuButtonRef = React.useRef<HTMLButtonElement | null>(null);
   const [canScrollLeft, setCanScrollLeft] = React.useState(false);
   const [canScrollRight, setCanScrollRight] = React.useState(false);
+  const bodyRef = React.useRef<HTMLDivElement | null>(null);
   // Browser tabs: synthetic-path tab → its native child-webview label + last URL.
   // Kept in a ref (not state) because BrowserView owns the live URL; we only need
   // it here to address browser_close on tab close and to seed BrowserView.
@@ -484,7 +645,16 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     (monaco: MonacoType, path: string) => {
       if (provider === "ssh") {
         const authority = encodeURIComponent(sshTargetValue ?? "ssh");
-        return monaco.Uri.from({ scheme: "ssh", authority, path });
+        // Monaco/vscode-uri requires the path to be empty or begin with "/"
+        // whenever an authority is present, otherwise Uri.from throws
+        // ("[UriError]: If a URI contains an authority component, then the path
+        // component must either be empty or begin with a slash"). Real remote
+        // paths are absolute, but synthetic keys like browser tabs
+        // ("browser://<n>") are not — normalize so constructing the model URI
+        // never throws. These synthetic keys never back a real Monaco model, so
+        // the leading-slash form is only ever used for a (null) getModel lookup.
+        const safePath = path.startsWith("/") ? path : `/${path}`;
+        return monaco.Uri.from({ scheme: "ssh", authority, path: safePath });
       }
       return monaco.Uri.file(path);
     },
@@ -830,6 +1000,121 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       };
     },
     [readModelValue, resolveExistingTabPath, serializeWorkspaceTab],
+  );
+
+  const captureScreenshot = React.useCallback(
+    async (input?: CodeEditorCaptureScreenshotInput): Promise<CodeEditorCaptureScreenshotResult> => {
+      const maxWidth = normalizeScreenshotDimension(input?.maxWidth, SCREENSHOT_DEFAULT_MAX_DIMENSION);
+      const maxHeight = normalizeScreenshotDimension(input?.maxHeight, SCREENSHOT_DEFAULT_MAX_DIMENSION);
+      if (input?.target === "browser") {
+        const requested = input.tabId ?? input.path ?? null;
+        const browserPath = resolveBrowserPath(requested);
+        if (!browserPath) throw new Error("browser tab not found");
+        const meta = browserMetaRef.current.get(browserPath);
+        if (!meta) throw new Error("browser tab not found");
+        const tab = tabsRef.current.find((it) => it.path === browserPath);
+        if (!tab) throw new Error("browser tab not found");
+        if (activePathRef.current !== browserPath) {
+          setActivePath(browserPath);
+          activePathRef.current = browserPath;
+          setEditorModel(null);
+          await nextFrame();
+          await nextFrame();
+        }
+        const native = await invoke<NativeBrowserScreenshot>("browser_capture_screenshot", { label: meta.label });
+        const fitted = await fitPngScreenshot(native, maxWidth, maxHeight);
+        return {
+          ...fitted,
+          target: "browser",
+          capturedElement: "browser_webview",
+          page: null,
+          tab: serializeWorkspaceTab(tab),
+        };
+      }
+
+      const resolved = resolveExistingTabPath(input);
+      if (!resolved) throw new Error("file viewer tab not found");
+      const tab = tabsRef.current.find((it) => it.path === resolved);
+      if (!tab) throw new Error("file viewer tab not found");
+      if (browserMetaRef.current.has(resolved)) {
+        const meta = browserMetaRef.current.get(resolved);
+        if (!meta) throw new Error("browser tab not found");
+        if (activePathRef.current !== resolved) {
+          setActivePath(resolved);
+          activePathRef.current = resolved;
+          setEditorModel(null);
+          await nextFrame();
+          await nextFrame();
+        }
+        const fitted = await fitPngScreenshot(
+          await invoke<NativeBrowserScreenshot>("browser_capture_screenshot", { label: meta.label }),
+          maxWidth,
+          maxHeight,
+        );
+        return {
+          ...fitted,
+          target: "browser",
+          capturedElement: "browser_webview",
+          page: null,
+          tab: serializeWorkspaceTab(tab),
+        };
+      }
+      if (tab.loading) throw new Error("file viewer tab is still loading");
+      if (tab.error) throw new Error(`file viewer tab has an error: ${tab.error}`);
+
+      if (activePathRef.current !== resolved) {
+        setActivePath(resolved);
+        activePathRef.current = resolved;
+        if (tab.viewerKind === "text") setEditorModel(resolved);
+        else setEditorModel(null);
+        await nextFrame();
+        await nextFrame();
+      }
+
+      const deadline = Date.now() + SCREENSHOT_SURFACE_WAIT_MS;
+
+      while (Date.now() <= deadline) {
+        const root = bodyRef.current;
+        if (!root) throw new Error("file viewer body is not mounted");
+
+        if (tab.viewerKind === "image") {
+          const image = root.querySelector<HTMLImageElement>("img.imageViewerImg");
+          if (image?.complete && image.naturalWidth > 0 && image.naturalHeight > 0) {
+            const encoded = encodeImageScreenshot(image, maxWidth, maxHeight);
+            return {
+              mimeType: "image/png",
+              ...encoded,
+              target: "file_viewer",
+              capturedElement: "image",
+              page: null,
+              tab: serializeWorkspaceTab(tab),
+            };
+          }
+        } else if (tab.viewerKind === "pdf") {
+          const match = findVisiblePdfCanvas(root);
+          if (match) {
+            const encoded = encodeCanvasScreenshot(match.canvas, maxWidth, maxHeight);
+            return {
+              mimeType: "image/png",
+              ...encoded,
+              target: "file_viewer",
+              capturedElement: "pdf_page",
+              page: match.page,
+              tab: serializeWorkspaceTab(tab),
+            };
+          }
+        } else {
+          throw new Error(
+            "capture_screenshot currently supports image tabs and rendered PDF pages. Use file_viewer_snapshot for text content and metadata.",
+          );
+        }
+
+        await nextFrame();
+      }
+
+      throw new Error("no rendered screenshot surface is available yet; wait for the file viewer to finish rendering and retry");
+    },
+    [resolveBrowserPath, resolveExistingTabPath, serializeWorkspaceTab, setEditorModel],
   );
 
   const openFile = React.useCallback(
@@ -1654,11 +1939,13 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       browserAction,
       browserSnapshot,
       fileViewerSnapshot,
+      captureScreenshot,
     }),
     [
       browserAction,
       browserNavigate,
       browserSnapshot,
+      captureScreenshot,
       closeWorkspaceTab,
       fileViewerSnapshot,
       focusWorkspaceTab,
@@ -1926,7 +2213,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
         </div>
       ) : null}
 
-      <div className="codeEditorBody">
+      <div className="codeEditorBody" ref={bodyRef}>
         {!activeTab ? <div className="empty">No file selected.</div> : null}
 
         {tabs.length ? (

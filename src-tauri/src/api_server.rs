@@ -172,15 +172,34 @@ async fn run_server(
     let event_bus = app_handle.state::<ApiEventBus>().inner().clone();
     let event_sender = event_bus.sender().clone();
 
+    // Typed payloads for the pty-output / pty-exit events. Avoids allocating a
+    // dynamic serde_json::Value tree per batch on the output path; the extraction
+    // is byte-for-byte equivalent to the previous .get()/unwrap_or("") logic
+    // (serde(default) reproduces the empty-string / null fallbacks).
+    #[derive(serde::Deserialize)]
+    struct PtyOutputEvent {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        data: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct PtyExitEvent {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        exit_code: Option<u32>,
+    }
+
     // Forward pty-output events to the event bus
     let sender_clone = event_sender.clone();
     app_handle.listen("pty-output", move |event| {
-        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(event.payload()) {
+        if let Ok(payload) = serde_json::from_str::<PtyOutputEvent>(event.payload()) {
             let notification = StateChangeNotification {
                 event: "sessions.output".to_string(),
                 data: serde_json::json!({
-                    "sessionId": payload.get("id").and_then(|v| v.as_str()).unwrap_or(""),
-                    "output": payload.get("data").and_then(|v| v.as_str()).unwrap_or(""),
+                    "sessionId": payload.id,
+                    "output": payload.data,
                 }),
             };
             let _ = sender_clone.send(notification);
@@ -190,12 +209,12 @@ async fn run_server(
     // Forward pty-exit events to the event bus
     let sender_clone = event_sender.clone();
     app_handle.listen("pty-exit", move |event| {
-        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(event.payload()) {
+        if let Ok(payload) = serde_json::from_str::<PtyExitEvent>(event.payload()) {
             let notification = StateChangeNotification {
                 event: "sessions.exit".to_string(),
                 data: serde_json::json!({
-                    "sessionId": payload.get("id").and_then(|v| v.as_str()).unwrap_or(""),
-                    "exitCode": payload.get("exit_code"),
+                    "sessionId": payload.id,
+                    "exitCode": payload.exit_code,
                 }),
             };
             let _ = sender_clone.send(notification);

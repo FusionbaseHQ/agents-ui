@@ -328,12 +328,12 @@ pub fn tool_list() -> Vec<Value> {
             },
             "required": ["host", "root", "path", "content"]
         })),
-        // Workspace viewer/browser
-        tool_def("list_workspace_tabs", "List open workspace file-viewer/editor tabs and embedded browser tabs. Returns tab IDs, active tab, file paths, browser URLs, viewer modes, dirty state, and loading/errors.", json!({
+        // File viewer / embedded browser tabs
+        tool_def("list_file_viewer_tabs", "List open file-viewer/editor tabs and embedded browser tabs. This is not for terminal sessions; use list_sessions for terminal tabs. Returns tab IDs, active tab, file paths, browser URLs, viewer modes, dirty state, and loading/errors.", json!({
             "type": "object",
             "properties": {}
         })),
-        tool_def("open_workspace_tab", "Open a workspace tab. Use kind=file with path to show a file in the file viewer/editor, or kind=browser with url to open an embedded browser tab.", json!({
+        tool_def("open_file_viewer_tab", "Open a file-viewer/editor tab or embedded browser tab. Use kind=file with path to show a file, or kind=browser with url to open an embedded browser tab. This does not create terminal sessions.", json!({
             "type": "object",
             "properties": {
                 "kind": { "type": "string", "enum": ["file", "browser"], "description": "Tab kind to open" },
@@ -344,22 +344,22 @@ pub fn tool_list() -> Vec<Value> {
             },
             "required": ["kind"]
         })),
-        tool_def("focus_workspace_tab", "Focus an open file-viewer/editor or embedded browser tab by tabId. Browser tab IDs look like browser://1; browser labels like browser-1 are also accepted.", json!({
+        tool_def("focus_file_viewer_tab", "Focus an open file-viewer/editor or embedded browser tab by tabId. Browser tab IDs look like browser://1; browser labels like browser-1 are also accepted.", json!({
             "type": "object",
             "properties": {
-                "tabId": { "type": "string", "description": "Workspace tab ID or browser label" }
+                "tabId": { "type": "string", "description": "File-viewer/editor tab ID, file path, browser tab ID, or browser label" }
             },
             "required": ["tabId"]
         })),
-        tool_def("close_workspace_tab", "Close an open workspace tab. Pass force=true to close locked tabs or discard unsaved editor changes.", json!({
+        tool_def("close_file_viewer_tab", "Close an open file-viewer/editor or embedded browser tab. Pass force=true to close locked tabs or discard unsaved editor changes.", json!({
             "type": "object",
             "properties": {
-                "tabId": { "type": "string", "description": "Workspace tab ID or browser label" },
+                "tabId": { "type": "string", "description": "File-viewer/editor tab ID, file path, browser tab ID, or browser label" },
                 "force": { "type": "boolean", "description": "Close locked or dirty tabs" }
             },
             "required": ["tabId"]
         })),
-        tool_def("browser_navigate", "Navigate an embedded browser tab. If tabId is omitted, the active browser tab is used, or a new browser tab is opened when the workspace editor is not mounted.", json!({
+        tool_def("browser_navigate", "Navigate an embedded browser tab inside the file-viewer area. If tabId is omitted, the active browser tab is used, or a new browser tab is opened when the file viewer/editor is not mounted.", json!({
             "type": "object",
             "properties": {
                 "tabId": { "type": "string", "description": "Optional browser tab ID or label" },
@@ -388,6 +388,16 @@ pub fn tool_list() -> Vec<Value> {
                 "tabId": { "type": "string", "description": "Optional file tab ID/path" },
                 "path": { "type": "string", "description": "Optional file path" },
                 "maxContentLength": { "type": "number", "description": "Maximum text characters to return for editable text tabs (default: 20000, max: 200000)" }
+            }
+        })),
+        tool_def("capture_screenshot", "Capture a PNG screenshot from the active file-viewer or embedded-browser visual surface and return it as MCP image content plus JSON metadata. Supports image tabs, rendered PDF pages, and browser tabs. Browser screenshots use macOS Screen Recording permission; if permission is missing, the app shows the user a permission item and the tool returns a clear error.", json!({
+            "type": "object",
+            "properties": {
+                "target": { "type": "string", "enum": ["file_viewer", "browser"], "description": "Capture target. Defaults to the active file-viewer/browser tab." },
+                "tabId": { "type": "string", "description": "Optional file-viewer tab ID/path or browser tab ID/label" },
+                "path": { "type": "string", "description": "Optional file path for a file-viewer tab" },
+                "maxWidth": { "type": "number", "description": "Maximum output PNG width in pixels (default 1600, max 4096)" },
+                "maxHeight": { "type": "number", "description": "Maximum output PNG height in pixels (default 1600, max 4096)" }
             }
         })),
         // Prompts
@@ -527,14 +537,15 @@ fn tool_to_method(name: &str) -> Option<&'static str> {
         "ssh_files_list" => Some("ssh_files.list"),
         "ssh_files_read" => Some("ssh_files.read"),
         "ssh_files_write" => Some("ssh_files.write"),
-        "list_workspace_tabs" => Some("workspace.tabs.list"),
-        "open_workspace_tab" => Some("workspace.tabs.open"),
-        "focus_workspace_tab" => Some("workspace.tabs.focus"),
-        "close_workspace_tab" => Some("workspace.tabs.close"),
+        "list_file_viewer_tabs" => Some("file_viewer.tabs.list"),
+        "open_file_viewer_tab" => Some("file_viewer.tabs.open"),
+        "focus_file_viewer_tab" => Some("file_viewer.tabs.focus"),
+        "close_file_viewer_tab" => Some("file_viewer.tabs.close"),
         "browser_navigate" => Some("browser.navigate"),
         "browser_action" => Some("browser.action"),
         "browser_snapshot" => Some("browser.snapshot"),
         "file_viewer_snapshot" => Some("file_viewer.snapshot"),
+        "capture_screenshot" => Some("capture.screenshot"),
         "list_prompts" => Some("prompts.list"),
         "send_prompt" => Some("prompts.send"),
         "get_app_info" => Some("app.info"),
@@ -565,7 +576,7 @@ fn map_params(name: &str, args: &Value) -> Value {
             if let Some(v) = args.get("command") { p["command"] = v.clone(); }
             if let Some(v) = args.get("cwd") { p["cwd"] = v.clone(); }
             p
-        }
+        },
         "close_session" => json!({ "id": args.get("sessionId") }),
         "rename_session" => json!({ "id": args.get("sessionId"), "name": args.get("name") }),
         "write_to_session" => json!({ "id": args.get("sessionId"), "data": args.get("data") }),
@@ -579,7 +590,7 @@ fn map_params(name: &str, args: &Value) -> Value {
             if let Some(v) = args.get("sshTarget") { p["sshTarget"] = v.clone(); }
             if let Some(v) = args.get("sshRemotePath") { p["sshRemotePath"] = v.clone(); }
             p
-        }
+        },
         "update_project" => {
             let mut p = json!({ "id": args.get("projectId") });
             if let Some(v) = args.get("title") { p["title"] = v.clone(); }
@@ -587,7 +598,7 @@ fn map_params(name: &str, args: &Value) -> Value {
             if let Some(v) = args.get("sshTarget") { p["sshTarget"] = v.clone(); }
             if let Some(v) = args.get("sshRemotePath") { p["sshRemotePath"] = v.clone(); }
             p
-        }
+        },
         "delete_project" => json!({ "id": args.get("projectId") }),
         "activate_project" => json!({ "id": args.get("projectId") }),
         "reorder_projects" => json!({ "ids": args.get("projectIds") }),
@@ -596,7 +607,7 @@ fn map_params(name: &str, args: &Value) -> Value {
             if let Some(v) = args.get("remoteDir") { p["remoteDir"] = v.clone(); }
             if let Some(v) = args.get("name") { p["name"] = v.clone(); }
             p
-        }
+        },
         "ssh_list_hosts" => json!({}),
         "list_files" => json!({ "root": args.get("root"), "path": args.get("path") }),
         "read_file" => json!({ "root": args.get("root"), "path": args.get("path") }),
@@ -604,8 +615,8 @@ fn map_params(name: &str, args: &Value) -> Value {
         "ssh_files_list" => json!({ "host": args.get("host"), "root": args.get("root"), "path": args.get("path") }),
         "ssh_files_read" => json!({ "host": args.get("host"), "root": args.get("root"), "path": args.get("path") }),
         "ssh_files_write" => json!({ "host": args.get("host"), "root": args.get("root"), "path": args.get("path"), "content": args.get("content") }),
-        "list_workspace_tabs" => json!({}),
-        "open_workspace_tab" => {
+        "list_file_viewer_tabs" => json!({}),
+        "open_file_viewer_tab" => {
             let mut p = json!({ "kind": args.get("kind") });
             if let Some(v) = args.get("path") { p["path"] = v.clone(); }
             if let Some(v) = args.get("url") { p["url"] = v.clone(); }
@@ -613,8 +624,8 @@ fn map_params(name: &str, args: &Value) -> Value {
             if let Some(v) = args.get("mode") { p["mode"] = v.clone(); }
             p
         },
-        "focus_workspace_tab" => json!({ "tabId": args.get("tabId") }),
-        "close_workspace_tab" => {
+        "focus_file_viewer_tab" => json!({ "tabId": args.get("tabId") }),
+        "close_file_viewer_tab" => {
             let mut p = json!({ "tabId": args.get("tabId") });
             if let Some(v) = args.get("force") { p["force"] = v.clone(); }
             p
@@ -642,6 +653,15 @@ fn map_params(name: &str, args: &Value) -> Value {
             if let Some(v) = args.get("maxContentLength") { p["maxContentLength"] = v.clone(); }
             p
         },
+        "capture_screenshot" => {
+            let mut p = json!({});
+            if let Some(v) = args.get("target") { p["target"] = v.clone(); }
+            if let Some(v) = args.get("tabId") { p["tabId"] = v.clone(); }
+            if let Some(v) = args.get("path") { p["path"] = v.clone(); }
+            if let Some(v) = args.get("maxWidth") { p["maxWidth"] = v.clone(); }
+            if let Some(v) = args.get("maxHeight") { p["maxHeight"] = v.clone(); }
+            p
+        },
         "list_prompts" => json!({}),
         "send_prompt" => {
             let mut p = json!({ "sessionId": args.get("sessionId") });
@@ -649,7 +669,7 @@ fn map_params(name: &str, args: &Value) -> Value {
             if let Some(v) = args.get("content") { p["content"] = v.clone(); }
             if let Some(v) = args.get("mode") { p["mode"] = v.clone(); }
             p
-        }
+        },
         "get_app_info" => json!({}),
         "get_ui_state" => json!({}),
         "get_theme" => json!({}),
@@ -659,7 +679,7 @@ fn map_params(name: &str, args: &Value) -> Value {
             let mut p = json!({ "sessionId": args.get("sessionId") });
             if let Some(v) = args.get("limit") { p["limit"] = v.clone(); }
             p
-        }
+        },
         "get_last_command_result" => json!({ "sessionId": args.get("sessionId") }),
         "read_screen" => json!({ "sessionId": args.get("sessionId") }),
         "read_scrollback" => {
@@ -667,7 +687,7 @@ fn map_params(name: &str, args: &Value) -> Value {
             if let Some(v) = args.get("lines") { p["lines"] = v.clone(); }
             if let Some(v) = args.get("offset") { p["offset"] = v.clone(); }
             p
-        }
+        },
         "get_session_status" => json!({ "sessionId": args.get("sessionId") }),
         "send_signal" => json!({}),     // handled as special case
         "wait_for_idle" => json!({}),   // handled as special case
@@ -873,6 +893,7 @@ pub async fn call_tool(
     let params = map_params(name, &args);
 
     match api_handlers::dispatch(ctx, method, params).await {
+        Ok(result) if name == "capture_screenshot" => mcp_screenshot_result(&result),
         Ok(result) => Ok(mcp_text_result(&serde_json::to_string_pretty(&result).unwrap_or_default())),
         Err(err) => Err(err.message),
     }
@@ -882,4 +903,28 @@ fn mcp_text_result(text: &str) -> Value {
     json!({
         "content": [{ "type": "text", "text": text }]
     })
+}
+
+fn mcp_screenshot_result(result: &Value) -> Result<Value, String> {
+    let data = result
+        .get("data")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "capture_screenshot response did not include PNG data".to_string())?;
+    let mime_type = result
+        .get("mimeType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("image/png");
+
+    let mut metadata = result.clone();
+    if let Value::Object(map) = &mut metadata {
+        map.remove("data");
+    }
+    let text = serde_json::to_string_pretty(&metadata).unwrap_or_else(|_| "{}".to_string());
+
+    Ok(json!({
+        "content": [
+            { "type": "text", "text": text },
+            { "type": "image", "mimeType": mime_type, "data": data }
+        ]
+    }))
 }

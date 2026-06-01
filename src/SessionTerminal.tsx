@@ -8,7 +8,7 @@ import { SessionShellIntegration, type CommandBlock } from "./shellIntegration";
 import { notifyStateChange } from "./apiBridge";
 
 export type CanvasRecoveryOptions = { force?: boolean; source?: string };
-export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon; search: SearchAddon; shellInt?: SessionShellIntegration; recoverCanvas: (options?: CanvasRecoveryOptions) => void }>;
+export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon; search: SearchAddon; shellInt?: SessionShellIntegration; recoverCanvas: (options?: CanvasRecoveryOptions) => void; needsCanvasRecovery?: boolean }>;
 export type PendingDataBuffer = Map<string, string[]>;
 
 type RenderDimension = { width: number; height: number };
@@ -1076,6 +1076,16 @@ function SessionTerminal(props: SessionTerminalProps) {
     const container = containerRef.current;
     if (!term || !fit || !container) return;
 
+    // If a display-wake / GPU-reset recovery occurred while this session was
+    // hidden, its canvas rebuild was deferred (see App.recoverAllCanvases).
+    // Rebuild it now, before we fit/refresh for activation, so the user never
+    // sees a stale or blank canvas on switch-in.
+    const registryEntry = props.registry.current.get(props.id);
+    if (registryEntry?.needsCanvasRecovery) {
+      registryEntry.needsCanvasRecovery = false;
+      recoverCanvasRef.current({ force: true, source: "activation" });
+    }
+
     let cancelled = false;
 	    const attemptFit = (attemptsLeft: number) => {
 	      if (cancelled) return;
@@ -1135,11 +1145,16 @@ function SessionTerminal(props: SessionTerminalProps) {
   useEffect(() => {
     const term = termRef.current;
     if (!term) return;
+    // Setting options.theme already fires xterm's color-change path, which
+    // recolors the glyph atlas and triggers a full refresh. A full CanvasAddon
+    // dispose+rebuild here is redundant and causes a visible multi-terminal
+    // stutter on every theme toggle; clearing the texture atlas + one refresh
+    // produces the identical new palette without tearing down the renderer.
+    // Real GPU desyncs remain covered by the sleep/wake watchdog and the
+    // per-canvas contextlost listeners.
     term.options.theme = terminalThemeForUiTheme(props.uiTheme);
-    // Theme switches can desync the canvas renderer on some GPUs/sleep cycles.
-    // Rebind canvas and repaint without touching terminal buffer content.
-    recoverCanvasRef.current();
     try {
+      canvasAddonRef.current?.clearTextureAtlas?.();
       fitRef.current?.fit();
       term.refresh(0, Math.max(0, term.rows - 1));
     } catch {

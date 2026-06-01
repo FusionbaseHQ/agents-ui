@@ -3,7 +3,10 @@
 // gets no app capabilities (see capabilities/default.json `webviews:["main"]`),
 // so pages it loads cannot call any Tauri command.
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use serde::Serialize;
+use std::{fs, process::Command, time::{SystemTime, UNIX_EPOCH}};
 use tauri::{
     webview::{PageLoadEvent, WebviewBuilder},
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, Rect, WebviewUrl,
@@ -19,6 +22,22 @@ struct BrowserNavEvent {
     url: String,
     loading: bool,
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserScreenshot {
+    mime_type: &'static str,
+    data: String,
+    width: u32,
+    height: u32,
+    source_width: u32,
+    source_height: u32,
+    target: &'static str,
+    captured_element: &'static str,
+}
+
+const SCREEN_RECORDING_PERMISSION_REQUIRED: &str =
+    "SCREEN_RECORDING_PERMISSION_REQUIRED: macOS Screen Recording permission is required to capture the embedded browser. Open System Settings > Privacy & Security > Screen Recording, enable Agents UI (or the terminal/editor that launched the app in dev mode), then restart the app.";
 
 fn normalize_url(input: &str) -> Result<tauri::Url, String> {
     let trimmed = input.trim();
@@ -164,9 +183,126 @@ pub fn browser_action(app: AppHandle, label: String, action: String) -> Result<(
 }
 
 #[tauri::command]
+pub fn browser_capture_screenshot(app: AppHandle, label: String) -> Result<BrowserScreenshot, String> {
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| "browser not found".to_string())?;
+    let window = app
+        .get_window("main")
+        .ok_or_else(|| "main window not found".to_string())?;
+
+    let child_position = webview
+        .position()
+        .map_err(|e| format!("browser position unavailable: {e}"))?;
+    if child_position.x < -10_000 || child_position.y < -10_000 {
+        return Err("browser tab is not visible yet; focus it and retry".to_string());
+    }
+    let child_size = webview
+        .size()
+        .map_err(|e| format!("browser size unavailable: {e}"))?;
+    if child_size.width < 2 || child_size.height < 2 {
+        return Err("browser tab has no visible capture area".to_string());
+    }
+
+    let window_position = window
+        .outer_position()
+        .map_err(|e| format!("window position unavailable: {e}"))?;
+    let x = window_position.x.saturating_add(child_position.x);
+    let y = window_position.y.saturating_add(child_position.y);
+    capture_region(x, y, child_size.width, child_size.height)
+}
+
+#[tauri::command]
+pub fn open_screen_recording_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+            .status()
+            .map_err(|e| format!("failed to open System Settings: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("failed to open System Settings: exit status {status}"))
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Screen Recording permission settings are only available on macOS".to_string())
+    }
+}
+
+#[tauri::command]
 pub fn browser_close(app: AppHandle, label: String) -> Result<(), String> {
     if let Some(webview) = app.get_webview(&label) {
         let _ = webview.close();
     }
     Ok(())
+}
+
+fn capture_region(x: i32, y: i32, width: u32, height: u32) -> Result<BrowserScreenshot, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = temp_screenshot_path();
+        let region = format!("{x},{y},{width},{height}");
+        let output = Command::new("/usr/sbin/screencapture")
+            .arg("-x")
+            .arg("-R")
+            .arg(&region)
+            .arg(&path)
+            .output()
+            .map_err(|e| format!("failed to run screencapture: {e}"))?;
+
+        let bytes = fs::read(&path).unwrap_or_default();
+        let _ = fs::remove_file(&path);
+        if !output.status.success() || bytes.len() < 32 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.trim();
+            if detail.is_empty() {
+                return Err(SCREEN_RECORDING_PERMISSION_REQUIRED.to_string());
+            }
+            return Err(format!("{SCREEN_RECORDING_PERMISSION_REQUIRED} screencapture said: {detail}"));
+        }
+
+        let (png_width, png_height) = png_dimensions(&bytes)
+            .ok_or_else(|| "screencapture did not produce a valid PNG".to_string())?;
+        Ok(BrowserScreenshot {
+            mime_type: "image/png",
+            data: BASE64.encode(bytes),
+            width: png_width,
+            height: png_height,
+            source_width: png_width,
+            source_height: png_height,
+            target: "browser",
+            captured_element: "browser_webview",
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (x, y, width, height);
+        Err("embedded browser screenshot capture is currently implemented for macOS only".to_string())
+    }
+}
+
+fn temp_screenshot_path() -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("agents-ui-browser-screenshot-{}-{nanos}.png", std::process::id()))
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIG: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.len() < 24 || &bytes[..8] != PNG_SIG {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some((width, height))
 }

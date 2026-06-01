@@ -205,6 +205,12 @@ const DISPLAY_WAKE_TIMER_INTERVAL_MS = 2_000;
 const DISPLAY_WAKE_RECOVERY_MIN_GAP_MS = 4_000;
 const DISPLAY_WAKE_RECOVERY_DELAYS_MS = [0, 250, 1_000, 3_000] as const;
 const SYSTEM_HEALTH_REFRESH_MS = 5_000;
+// Cursor Position Report echo (ESC[row;colR). TUI apps query via ESC[6n and the
+// PTY kernel can echo xterm's response back as visible garbage, so we strip it.
+// Non-global RE is used as a cheap presence gate (no lastIndex state); the
+// global RE only runs the allocating .replace when a real CPR is actually present.
+const CPR_RESPONSE_RE = /\x1b\[\d{1,4};\d{1,4}R/;
+const CPR_RESPONSE_RE_GLOBAL = /\x1b\[\d{1,4};\d{1,4}R/g;
 const COMMAND_ACTIVITY_IDLE_MS = 3_000;
 
 const DEFAULT_AGENT_SHORTCUT_IDS = ["codex", "claude"];
@@ -742,6 +748,25 @@ function hasSystemHealthStats(stats: SystemHealthStats | null | undefined): stat
     isFiniteNumber(stats.memoryFreeBytes) ||
     isFiniteNumber(stats.diskUsedBytes) ||
     isFiniteNumber(stats.diskFreeBytes)
+  );
+}
+
+// Exact field comparison so an unchanged poll result (common while idle / when
+// CPU% holds steady) can bail the state update entirely instead of re-running
+// App's body every few seconds. Compares every field buildSystemHealthDisplay
+// reads — cpuPercent plus all six byte fields (the *Total fields feed tooltips).
+// Object.is so a steady NaN doesn't read as a perpetual change.
+function sameHealthStats(a: SystemHealthStats | null, b: SystemHealthStats | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    Object.is(a.cpuPercent, b.cpuPercent) &&
+    Object.is(a.memoryUsedBytes, b.memoryUsedBytes) &&
+    Object.is(a.memoryFreeBytes, b.memoryFreeBytes) &&
+    Object.is(a.memoryTotalBytes, b.memoryTotalBytes) &&
+    Object.is(a.diskUsedBytes, b.diskUsedBytes) &&
+    Object.is(a.diskFreeBytes, b.diskFreeBytes) &&
+    Object.is(a.diskTotalBytes, b.diskTotalBytes)
   );
 }
 
@@ -1836,6 +1861,7 @@ export default function App() {
   const [secureStorageSettingsError, setSecureStorageSettingsError] = useState<string | null>(null);
   const [secureStorageRetrying, setSecureStorageRetrying] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [screenCapturePermissionIssue, setScreenCapturePermissionIssue] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [autoRenamingSessions, setAutoRenamingSessions] = useState(false);
   const [autoRenameActivity, setAutoRenameActivity] = useState<AutoRenameActivity | null>(null);
@@ -2357,12 +2383,15 @@ export default function App() {
 
     const flushAllChunks = (id: string, chunks: string[]) => {
       if (closingSessions.current.has(id) || chunks.length === 0) return;
+      const text = chunks.length === 1 ? chunks[0] : chunks.join("");
       const entry = registry.current.get(id);
       if (entry) {
-        for (const chunk of chunks) entry.term.write(chunk);
+        // One write() per flush rather than per chunk: the VT stream parser
+        // sees the identical byte sequence, but with a single WriteBuffer
+        // entry/exit transition instead of N.
+        entry.term.write(text);
         return;
       }
-      const text = chunks.length === 1 ? chunks[0] : chunks.join("");
       pushPendingData(id, text);
     };
 
@@ -2477,6 +2506,7 @@ export default function App() {
     let i = 0;
     while (i < data.length) {
       const ch = data[i];
+      const cc = ch.charCodeAt(0);
       if (ch === "\u001b") {
         i = skipEscapeSequence(data, i + 1);
         continue;
@@ -2485,14 +2515,23 @@ export default function App() {
         i += 1;
         continue;
       }
-      if (ch.trim() === "") {
+      // Whitespace at code >= 0x20 — mirrors String.prototype.trim's set
+      // (SP, NBSP, the Unicode Zs separators, LS/PS, ZWNBSP/BOM) without the
+      // per-char string allocation of `ch.trim() === ""`.
+      if (
+        cc === 0x20 || cc === 0xa0 || cc === 0x1680 ||
+        (cc >= 0x2000 && cc <= 0x200a) ||
+        cc === 0x2028 || cc === 0x2029 || cc === 0x202f ||
+        cc === 0x205f || cc === 0x3000 || cc === 0xfeff
+      ) {
         i += 1;
         continue;
       }
 
       visibleNonWhitespace += 1;
       if (visibleNonWhitespace >= 2) return true;
-      if (/[0-9A-Za-z]/.test(ch)) hasAlphaNum = true;
+      // ASCII digit / letter via code ranges (no regex, no allocation).
+      if ((cc >= 0x30 && cc <= 0x39) || (cc >= 0x41 && cc <= 0x5a) || (cc >= 0x61 && cc <= 0x7a)) hasAlphaNum = true;
 
       i += 1;
     }
@@ -2540,7 +2579,9 @@ export default function App() {
   const clearSessionRuntimeBuffers = useCallback((id: string) => {
     clearAgentIdleTimer(id);
     clearCommandActivityTimer(id);
-    agentWorkingMapRef.current.set(id, false);
+    // delete (not set false) so the map doesn't accrue a permanent key per
+    // session ever opened — all readers use `?? false`, so this is identical.
+    agentWorkingMapRef.current.delete(id);
     lastResizeAtRef.current.delete(id);
     pendingData.current.delete(id);
     outputQueueRef.current.delete(id);
@@ -2621,6 +2662,7 @@ export default function App() {
 
     let cancelled = false;
     let inFlight = false;
+    let interval: number | null = null;
 
     const refresh = async () => {
       if (cancelled || inFlight) return;
@@ -2630,7 +2672,8 @@ export default function App() {
           ? await invoke<SystemHealthStats | null>("ssh_system_health_stats", { target })
           : await invoke<SystemHealthStats | null>("system_health_stats");
         if (!cancelled) {
-          setSystemHealthStats(hasSystemHealthStats(next) ? next : null);
+          const normalized = hasSystemHealthStats(next) ? next : null;
+          setSystemHealthStats((prev) => (sameHealthStats(prev, normalized) ? prev : normalized));
         }
       } catch {
         if (!cancelled) setSystemHealthStats(null);
@@ -2639,14 +2682,35 @@ export default function App() {
       }
     };
 
-    void refresh();
-    const interval = window.setInterval(() => {
+    // Only poll while the window is visible: a backgrounded window issuing a
+    // backend IPC (and, for SSH, a remote command that wakes the radio + host)
+    // every few seconds defeats App Nap. On returning to visible we refresh
+    // immediately, so the status-bar snapshot is at most one tick stale.
+    const startPolling = () => {
+      if (interval !== null) return;
       void refresh();
-    }, SYSTEM_HEALTH_REFRESH_MS);
+      interval = window.setInterval(() => {
+        void refresh();
+      }, SYSTEM_HEALTH_REFRESH_MS);
+    };
+    const stopPolling = () => {
+      if (interval !== null) {
+        window.clearInterval(interval);
+        interval = null;
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") startPolling();
+      else stopPolling();
+    };
+
+    if (document.visibilityState === "visible") startPolling();
+    document.addEventListener("visibilitychange", onVisibility);
 
     return () => {
       cancelled = true;
-      window.clearInterval(interval);
+      stopPolling();
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [activeHealthConnectionState, activeHealthSessionId, activeIsSsh, activeSshTarget, hydrated]);
 
@@ -3289,6 +3353,7 @@ export default function App() {
     let lastRecoveryRequestedAt = 0;
     let recoveryBatch = 0;
     let frameId: number | null = null;
+    let frameProbeRemaining = 0;
     let disposed = false;
     const recoveryTimers: number[] = [];
     const windowUnlisteners: Array<() => void> = [];
@@ -3314,8 +3379,22 @@ export default function App() {
 
     const recoverAllCanvases = (source: string, force = false) => {
       forceWebviewRepaint();
+      const visibleActiveId = activeIdRef.current;
+      const visibleSecondaryId = splitPaneRef.current?.secondaryId ?? null;
       for (const [id, entry] of registry.current.entries()) {
-        try { entry.recoverCanvas({ force, source }); } catch { console.warn("[agents-ui] Failed to recover canvas for session", id); }
+        const isVisible = id === visibleActiveId || id === visibleSecondaryId;
+        if (isVisible) {
+          try { entry.recoverCanvas({ force, source }); } catch { console.warn("[agents-ui] Failed to recover canvas for session", id); }
+        } else {
+          // Rebuilding a hidden terminal's canvas (CanvasAddon dispose+recreate +
+          // repaints) on every wake/focus/scale/resize event is wasted work that
+          // scales linearly with session count and is invisible to the user.
+          // Defer it: flag the session so its canvas is rebuilt only when the
+          // user actually switches to it (SessionTerminal activation effect).
+          // The per-canvas contextlost/webglcontextlost listeners still catch a
+          // genuine GPU loss on any terminal immediately.
+          entry.needsCanvasRecovery = true;
+        }
       }
     };
 
@@ -3363,12 +3442,14 @@ export default function App() {
       lastActiveAt = Date.now();
       runSessionHealthCheckRef.current("visibility", true);
       maybeTriggerCanvasRecovery(elapsed, "visibilitychange");
+      runFrameGapProbe();
     };
     const onFocus = () => {
       const elapsed = Date.now() - lastActiveAt;
       lastActiveAt = Date.now();
       runSessionHealthCheckRef.current("focus", true);
       maybeTriggerCanvasRecovery(elapsed, "focus");
+      runFrameGapProbe();
     };
     const onPageShow = (event: PageTransitionEvent) => {
       const elapsed = Date.now() - lastActiveAt;
@@ -3397,7 +3478,31 @@ export default function App() {
       if (document.visibilityState === "visible" && elapsed > DISPLAY_WAKE_RENDER_GAP_MS) {
         scheduleCanvasRecovery(`render-frame-gap-${Math.round(elapsed)}ms`, { force: true, healthCheck: true });
       }
-      frameId = window.requestAnimationFrame(onFrame);
+      // Self-limiting: only keep stepping while a probe is active, then stop.
+      // A perpetual rAF here would pin the compositor at ~60fps even when fully
+      // idle and defeat macOS low-power coalescing.
+      if (frameProbeRemaining > 0) {
+        frameProbeRemaining -= 1;
+        frameId = window.requestAnimationFrame(onFrame);
+      } else {
+        frameId = null;
+      }
+    };
+
+    // Run a short rAF burst to catch a render stall right around a wake/focus/
+    // visibility signal. Real sleep/GPU-reset recovery is independently covered
+    // by the 2s timer-gap watchdog, the explicit wake events (system-resumed,
+    // visibility, focus, pageshow, scale, resize) and the per-canvas
+    // contextlost/webglcontextlost listeners — so the burst is supplemental and
+    // stops on its own, letting the app idle at ~0 wakeups when nothing happens.
+    const runFrameGapProbe = () => {
+      // Reset the baseline so the first probe frame doesn't false-positive on
+      // the idle gap accumulated since the previous burst.
+      lastFrameAt = performance.now();
+      frameProbeRemaining = 12;
+      if (frameId === null) {
+        frameId = window.requestAnimationFrame(onFrame);
+      }
     };
     const interval = window.setInterval(() => {
       if (document.visibilityState !== "visible") return;
@@ -3409,6 +3514,7 @@ export default function App() {
       lastTimerTickAt = now;
       if (document.visibilityState === "visible" && elapsed > DISPLAY_WAKE_RENDER_GAP_MS) {
         scheduleCanvasRecovery(`timer-gap-${elapsed}ms`, { force: true, healthCheck: true });
+        runFrameGapProbe();
       }
     }, DISPLAY_WAKE_TIMER_INTERVAL_MS);
 
@@ -3417,7 +3523,7 @@ export default function App() {
     window.addEventListener("focus", onFocus);
     window.addEventListener("pageshow", onPageShow);
     window.addEventListener("resize", onWindowResize);
-    frameId = window.requestAnimationFrame(onFrame);
+    runFrameGapProbe();
     runSessionHealthCheckRef.current("startup", true);
 
     // Tauri emits "system-resumed" when macOS wakes from sleep — more reliable than timestamp gaps
@@ -3833,7 +3939,7 @@ export default function App() {
 
     function requireWorkspaceEditor(): CodeEditorPanelHandle {
       const handle = codeEditorPanelRef.current;
-      if (!handle) throw new Error("workspace editor is not open");
+      if (!handle) throw new Error("file viewer/editor is not open");
       return handle;
     }
 
@@ -3871,6 +3977,78 @@ export default function App() {
         openWorkspaceTabRequest: request,
       }));
       return { queued: true, request, workspace: fallbackWorkspaceSnapshot() };
+    }
+
+    function listFileViewerTabs() {
+      return codeEditorPanelRef.current?.workspaceSnapshot() ?? fallbackWorkspaceSnapshot();
+    }
+
+    async function openFileViewerTab(p: Record<string, unknown>) {
+      const kind = p.kind === "browser" || p.kind === "file"
+        ? p.kind
+        : typeof p.url === "string"
+          ? "browser"
+          : "file";
+      const request: CodeEditorOpenWorkspaceTabRequest = {
+        nonce: Date.now(),
+        kind,
+        path: typeof p.path === "string" ? p.path : null,
+        url: typeof p.url === "string" ? p.url : null,
+        title: typeof p.title === "string" ? p.title : null,
+      };
+      if (kind === "file" && !request.path?.trim()) throw new Error("path is required");
+      if (kind === "browser" && request.url?.trim()) request.url = normalizeBrowserApiUrl(request.url);
+      const mode = parseEditorMode(p.mode);
+      if (mode) request.mode = mode;
+      const handle = codeEditorPanelRef.current;
+      if (!handle) {
+        const queued = queueWorkspaceTabRequest(request);
+        notifyStateChange("file_viewer.tabs.open_queued", queued);
+        return queued;
+      }
+      const tab = await handle.openWorkspaceTab(request);
+      notifyStateChange("file_viewer.tabs.opened", { tab });
+      return { queued: false, tab };
+    }
+
+    function focusFileViewerTab(p: Record<string, unknown>) {
+      const tab = requireWorkspaceEditor().focusWorkspaceTab({
+        tabId: typeof p.tabId === "string" ? p.tabId : null,
+        path: typeof p.path === "string" ? p.path : null,
+      });
+      notifyStateChange("file_viewer.tabs.focused", { tabId: tab.id });
+      return tab;
+    }
+
+    function closeFileViewerTab(p: Record<string, unknown>) {
+      const tab = requireWorkspaceEditor().closeWorkspaceTab({
+        tabId: typeof p.tabId === "string" ? p.tabId : null,
+        path: typeof p.path === "string" ? p.path : null,
+        force: p.force === true,
+      });
+      notifyStateChange("file_viewer.tabs.closed", { tabId: tab.id });
+      return tab;
+    }
+
+    function captureScreenshot(p: Record<string, unknown>) {
+      try {
+        return requireWorkspaceEditor().captureScreenshot({
+          target: p.target === "browser" || p.target === "file_viewer" ? p.target : null,
+          tabId: typeof p.tabId === "string" ? p.tabId : null,
+          path: typeof p.path === "string" ? p.path : null,
+          maxWidth: typeof p.maxWidth === "number" ? p.maxWidth : undefined,
+          maxHeight: typeof p.maxHeight === "number" ? p.maxHeight : undefined,
+        }).then((result) => {
+          if (result.target === "browser") setScreenCapturePermissionIssue(null);
+          return result;
+        }).catch((err) => {
+          if (isScreenRecordingPermissionError(err)) showScreenCapturePermissionRequired(err);
+          throw err;
+        });
+      } catch (err) {
+        if (isScreenRecordingPermissionError(err)) showScreenCapturePermissionRequired(err);
+        throw err;
+      }
     }
 
     registerHandlers({
@@ -4357,60 +4535,22 @@ export default function App() {
         notifyStateChange("split_views.closed", { splitViewId: id });
         return null;
       },
-      // ── workspace file viewer / browser ──
-      "workspace.tabs.list": () => {
-        return codeEditorPanelRef.current?.workspaceSnapshot() ?? fallbackWorkspaceSnapshot();
-      },
-      "workspace.tabs.open": async (p) => {
-        const kind = p.kind === "browser" || p.kind === "file"
-          ? p.kind
-          : typeof p.url === "string"
-            ? "browser"
-            : "file";
-        const request: CodeEditorOpenWorkspaceTabRequest = {
-          nonce: Date.now(),
-          kind,
-          path: typeof p.path === "string" ? p.path : null,
-          url: typeof p.url === "string" ? p.url : null,
-          title: typeof p.title === "string" ? p.title : null,
-        };
-        if (kind === "file" && !request.path?.trim()) throw new Error("path is required");
-        if (kind === "browser" && request.url?.trim()) request.url = normalizeBrowserApiUrl(request.url);
-        const mode = parseEditorMode(p.mode);
-        if (mode) request.mode = mode;
-        const handle = codeEditorPanelRef.current;
-        if (!handle) {
-          const queued = queueWorkspaceTabRequest(request);
-          notifyStateChange("workspace.tabs.open_queued", queued);
-          return queued;
-        }
-        const tab = await handle.openWorkspaceTab(request);
-        notifyStateChange("workspace.tabs.opened", { tab });
-        return { queued: false, tab };
-      },
-      "workspace.tabs.focus": (p) => {
-        const tab = requireWorkspaceEditor().focusWorkspaceTab({
-          tabId: typeof p.tabId === "string" ? p.tabId : null,
-          path: typeof p.path === "string" ? p.path : null,
-        });
-        notifyStateChange("workspace.tabs.focused", { tabId: tab.id });
-        return tab;
-      },
-      "workspace.tabs.close": (p) => {
-        const tab = requireWorkspaceEditor().closeWorkspaceTab({
-          tabId: typeof p.tabId === "string" ? p.tabId : null,
-          path: typeof p.path === "string" ? p.path : null,
-          force: p.force === true,
-        });
-        notifyStateChange("workspace.tabs.closed", { tabId: tab.id });
-        return tab;
-      },
+      // ── file viewer / embedded browser tabs ──
+      "file_viewer.tabs.list": listFileViewerTabs,
+      "file_viewer.tabs.open": openFileViewerTab,
+      "file_viewer.tabs.focus": focusFileViewerTab,
+      "file_viewer.tabs.close": closeFileViewerTab,
+      // Compatibility aliases for clients created before the clearer naming.
+      "workspace.tabs.list": listFileViewerTabs,
+      "workspace.tabs.open": openFileViewerTab,
+      "workspace.tabs.focus": focusFileViewerTab,
+      "workspace.tabs.close": closeFileViewerTab,
       "browser.navigate": async (p) => {
         const url = normalizeBrowserApiUrl(typeof p.url === "string" ? p.url : "");
         const tabId = typeof p.tabId === "string" ? p.tabId : null;
         const handle = codeEditorPanelRef.current;
         if (!handle) {
-          if (tabId) throw new Error("workspace editor is not open");
+          if (tabId) throw new Error("file viewer/editor is not open");
           const queued = queueWorkspaceTabRequest({
             nonce: Date.now(),
             kind: "browser",
@@ -4441,7 +4581,7 @@ export default function App() {
       "browser.snapshot": (p) => {
         const handle = codeEditorPanelRef.current;
         if (!handle) {
-          if (typeof p.tabId === "string" && p.tabId.trim()) throw new Error("workspace editor is not open");
+          if (typeof p.tabId === "string" && p.tabId.trim()) throw new Error("file viewer/editor is not open");
           return { activeTabId: null, activeBrowserTabId: null, tabs: [] };
         }
         return handle.browserSnapshot({ tabId: typeof p.tabId === "string" ? p.tabId : null });
@@ -4454,6 +4594,7 @@ export default function App() {
         if (typeof p.maxContentLength === "number") input.maxContentLength = p.maxContentLength;
         return requireWorkspaceEditor().fileViewerSnapshot(input);
       },
+      "capture.screenshot": captureScreenshot,
       // ── ui ──
       "ui.state": () => ({
         activeProjectId: activeProjectIdRef.current,
@@ -5582,6 +5723,22 @@ export default function App() {
     }
   }
 
+  function isScreenRecordingPermissionError(err: unknown): boolean {
+    const message = formatError(err);
+    return (
+      message.includes("SCREEN_RECORDING_PERMISSION_REQUIRED") ||
+      /screen recording permission/i.test(message)
+    );
+  }
+
+  function showScreenCapturePermissionRequired(err: unknown) {
+    const message = formatError(err).replace(/^SCREEN_RECORDING_PERMISSION_REQUIRED:\s*/, "");
+    setScreenCapturePermissionIssue(message);
+    setAppSettingsOpen(false);
+    setActivityCenterAutoOpenSource(null);
+    setActivityCenterOpen(true);
+  }
+
   const KNOWN_XTERM_RESIZE_RACE_SIGNATURES = [
     "this._renderer.value.handleresize",
     "undefined is not an object (evaluating 'this._renderer.value.handleresize')",
@@ -5594,6 +5751,14 @@ export default function App() {
   const reportError = useCallback((prefix: string, err: unknown) => {
     setError(`${prefix}: ${formatError(err)}`);
   }, []);
+
+  const openScreenRecordingSettings = useCallback(async () => {
+    try {
+      await invoke("open_screen_recording_settings");
+    } catch (err) {
+      reportError("Failed to open Screen Recording settings", err);
+    }
+  }, [reportError]);
 
   const reportErrorRef = useRef(reportError);
   const suppressedKnownXtermResizeRaceRef = useRef(false);
@@ -6770,14 +6935,6 @@ export default function App() {
     [],
   );
 
-  const refreshRunningCommandActivityFromOutput = useCallback((_id: string, _data: string) => {
-    // Intentionally a no-op: output no longer extends the running-command
-    // timeout.  The timeout set when the command starts (3s / 10s) will
-    // fire on its own; OSC 133 lifecycle events clear it sooner when
-    // available.  Resetting on every output chunk caused fast commands
-    // (e.g. `ls`) to appear "active" for too long.
-  }, []);
-
   function openPathPicker(target: "project" | "session" | "ssh-remote", initial: string | null) {
     setPathPickerTarget(target);
     pathPickerInitialPathRef.current = initial;
@@ -7210,16 +7367,16 @@ export default function App() {
 
 	    const setup = async () => {
 	      // Set up event listeners FIRST, before creating any sessions
-			      const unlistenOutput = await listen<PtyOutput>("pty-output", (event) => {
-			        if (cancelled) return;
-			        const { id, data } = event.payload as { id: string; data?: unknown };
-              let text = coercePtyDataToString(data);
-              if (!text) return;
+      const unlistenOutput = await listen<PtyOutput>("pty-output", (event) => {
+        if (cancelled) return;
+        const { id, data } = event.payload as { id: string; data?: unknown };
+        let text = coercePtyDataToString(data);
+        if (!text) return;
               // Strip echoed Cursor Position Report responses (ESC[row;colR).
               // TUI apps send ESC[6n to query cursor position; xterm.js responds
               // via onData which the PTY kernel may echo back as visible garbage.
-              if (text.includes("\x1b[") && text.includes("R")) {
-                text = text.replace(/\x1b\[\d{1,4};\d{1,4}R/g, "");
+              if (CPR_RESPONSE_RE.test(text)) {
+                text = text.replace(CPR_RESPONSE_RE_GLOBAL, "");
                 if (!text) return;
               }
 
@@ -7227,7 +7384,6 @@ export default function App() {
 		        if (closingSessions.current.has(id)) return;
               markSessionAliveFromOutput(id);
 			        markAgentWorkingFromOutput(id, text);
-              refreshRunningCommandActivityFromOutput(id, text);
               const queue = outputQueueRef.current.get(id) ?? [];
               if (queue.length === 0) {
                 queue.push(text);
@@ -7244,7 +7400,7 @@ export default function App() {
               }
               outputQueueRef.current.set(id, queue);
               scheduleOutputFlush();
-		      });
+      });
       unlisteners.push(unlistenOutput);
 
       const unlistenExit = await listen<PtyExit>("pty-exit", (event) => {
@@ -9115,6 +9271,22 @@ export default function App() {
       });
     }
 
+    if (screenCapturePermissionIssue) {
+      items.push({
+        id: "screen-capture-permission",
+        title: "Screen Recording permission required",
+        summary: "macOS blocked browser screenshot capture.",
+        tone: "warning",
+        details: [
+          screenCapturePermissionIssue,
+          "Enable Agents UI, or the terminal/editor that launched the dev app, then restart the app.",
+        ],
+        actionLabel: "Open Settings",
+        onAction: () => void openScreenRecordingSettings(),
+        onDismiss: () => setScreenCapturePermissionIssue(null),
+      });
+    }
+
     if (error) {
       items.push({
         id: "app-error",
@@ -9141,6 +9313,8 @@ export default function App() {
     dismissAutoRenameActivity,
     dismissNotice,
     error,
+    screenCapturePermissionIssue,
+    openScreenRecordingSettings,
     agentWorkingIds,
     handleReconnectSession,
     notice,

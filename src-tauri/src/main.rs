@@ -209,6 +209,8 @@ fn main() {
             browser::browser_hide,
             browser::browser_navigate,
             browser::browser_action,
+            browser::browser_capture_screenshot,
+            browser::open_screen_recording_settings,
             browser::browser_close
         ])
         .build(tauri::generate_context!())
