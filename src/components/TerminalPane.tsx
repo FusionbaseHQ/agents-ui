@@ -16,7 +16,10 @@ type UiTheme =
   | "midnight"
   | "cobalt"
   | "neon"
-  | "forest";
+  | "forest"
+  | "matrix"
+  | "synthwave"
+  | "quantum";
 
 export type TerminalPaneSession = {
   id: string;

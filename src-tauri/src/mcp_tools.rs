@@ -390,7 +390,7 @@ pub fn tool_list() -> Vec<Value> {
                 "maxContentLength": { "type": "number", "description": "Maximum text characters to return for editable text tabs (default: 20000, max: 200000)" }
             }
         })),
-        tool_def("capture_screenshot", "Capture a PNG screenshot from the active file-viewer or embedded-browser visual surface and return it as MCP image content plus JSON metadata. Supports image tabs, rendered PDF pages, and browser tabs. Browser screenshots use macOS Screen Recording permission; if permission is missing, the app shows the user a permission item and the tool returns a clear error.", json!({
+        tool_def("capture_screenshot", "Capture a PNG screenshot from the active file-viewer or embedded-browser visual surface and return it as MCP image content plus JSON metadata. Supports image tabs, rendered PDF pages, and browser tabs. Browser screenshots use native WKWebView capture on macOS, so they capture only the browser viewport and do not require Screen Recording permission. If the target is closed, hidden, loading, or replaced during capture, the tool returns structured failure text with a recovery hint.", json!({
             "type": "object",
             "properties": {
                 "target": { "type": "string", "enum": ["file_viewer", "browser"], "description": "Capture target. Defaults to the active file-viewer/browser tab." },
@@ -895,6 +895,7 @@ pub async fn call_tool(
     match api_handlers::dispatch(ctx, method, params).await {
         Ok(result) if name == "capture_screenshot" => mcp_screenshot_result(&result),
         Ok(result) => Ok(mcp_text_result(&serde_json::to_string_pretty(&result).unwrap_or_default())),
+        Err(err) if name == "capture_screenshot" => Ok(mcp_capture_failure_result(&err.message)),
         Err(err) => Err(err.message),
     }
 }
@@ -927,4 +928,35 @@ fn mcp_screenshot_result(result: &Value) -> Result<Value, String> {
             { "type": "image", "mimeType": mime_type, "data": data }
         ]
     }))
+}
+
+fn mcp_capture_failure_result(message: &str) -> Value {
+    let error_code = if message.starts_with("CAPTURE_SCREENSHOT_FAILED:") {
+        "CAPTURE_SCREENSHOT_FAILED"
+    } else if message.starts_with("BROWSER_SNAPSHOT_FAILED:") {
+        "BROWSER_SNAPSHOT_FAILED"
+    } else if message.contains("not found") {
+        "CAPTURE_TARGET_NOT_FOUND"
+    } else {
+        "CAPTURE_FAILED"
+    };
+
+    let recovery = if message.contains("list_file_viewer_tabs") || message.contains("tabId") {
+        "Call list_file_viewer_tabs, choose an open tabId, wait for loading to finish, then call capture_screenshot again."
+    } else if message.contains("loading") || message.contains("render") {
+        "Wait for the file viewer or browser to finish loading/rendering, then retry capture_screenshot."
+    } else {
+        "Retry capture_screenshot after the file viewer is idle. If the target was closed, open or focus a current tab first."
+    };
+
+    mcp_text_result(
+        &serde_json::to_string_pretty(&json!({
+            "status": "failed",
+            "tool": "capture_screenshot",
+            "errorCode": error_code,
+            "message": message,
+            "recovery": recovery
+        }))
+        .unwrap_or_default(),
+    )
 }

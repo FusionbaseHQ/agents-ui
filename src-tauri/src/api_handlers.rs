@@ -129,7 +129,12 @@ async fn dispatch_bridge(
         });
     }
 
-    match tokio::time::timeout(Duration::from_secs(5), rx).await {
+    let timeout = match method {
+        "capture.screenshot" => Duration::from_secs(8),
+        _ => Duration::from_secs(5),
+    };
+
+    match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(result)) => {
             if let Some(err) = result.error {
                 Err(JsonRpcError {
@@ -150,9 +155,14 @@ async fn dispatch_bridge(
         }
         Err(_) => {
             ctx.pending.cancel(&request_id);
+            let message = if method == "capture.screenshot" {
+                "CAPTURE_SCREENSHOT_FAILED: frontend did not finish capture_screenshot within 8s. The file viewer or browser tab may have been closed, hidden, replaced, or left in a loading state while capture was running. Call list_file_viewer_tabs and retry with a current tabId after the viewer is idle.".into()
+            } else {
+                "Frontend bridge timed out (5s)".into()
+            };
             Err(JsonRpcError {
                 code: FRONTEND_TIMEOUT,
-                message: "Frontend bridge timed out (5s)".into(),
+                message,
                 data: None,
             })
         }

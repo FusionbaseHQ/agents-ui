@@ -11,7 +11,10 @@ type TerminalSearchBarProps = {
     | "midnight"
     | "cobalt"
     | "neon"
-    | "forest";
+    | "forest"
+    | "matrix"
+    | "synthwave"
+    | "quantum";
   query: string;
   onQueryChange: (value: string) => void;
   caseSensitive: boolean;
@@ -84,6 +87,30 @@ const DECORATIONS_BY_THEME = {
     activeMatchBackground: "#4eca7a",
     activeMatchBorder: "#d4f5e1",
     activeMatchColorOverviewRuler: "#4eca7a",
+  },
+  matrix: {
+    matchBackground: "#12351f",
+    matchBorder: "#39ff88",
+    matchOverviewRuler: "#39ff88",
+    activeMatchBackground: "#39ff88",
+    activeMatchBorder: "#e1ffe8",
+    activeMatchColorOverviewRuler: "#39ff88",
+  },
+  synthwave: {
+    matchBackground: "#3a204f",
+    matchBorder: "#ff71ce",
+    matchOverviewRuler: "#2de2e6",
+    activeMatchBackground: "#ff71ce",
+    activeMatchBorder: "#f8e7ff",
+    activeMatchColorOverviewRuler: "#ff71ce",
+  },
+  quantum: {
+    matchBackground: "#173c43",
+    matchBorder: "#8ee6d8",
+    matchOverviewRuler: "#8ee6d8",
+    activeMatchBackground: "#8ee6d8",
+    activeMatchBorder: "#e9fffb",
+    activeMatchColorOverviewRuler: "#8ee6d8",
   },
 };
 

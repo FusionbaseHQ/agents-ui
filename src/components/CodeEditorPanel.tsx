@@ -8,6 +8,7 @@ import { Icon } from "./Icon";
 import { ConfirmActionModal } from "./modals/ConfirmActionModal";
 import { concatBytes } from "../fileViewer/bytes";
 import { useChunkCache } from "../fileViewer/useChunkCache";
+import { registerCodeEditorThemes, type CodeEditorThemeId } from "../monaco/editorThemes";
 
 type MonacoType = typeof import("monaco-editor");
 
@@ -100,13 +101,14 @@ export type CodeEditorCaptureScreenshotResult = {
   sourceHeight: number;
   target: "file_viewer" | "browser";
   capturedElement: "image" | "pdf_page" | "browser_webview";
+  captureMethod?: "dom_canvas" | "wkwebview_snapshot" | "screencapture_region";
   page: number | null;
   tab: CodeEditorWorkspaceTab;
 };
 
 type NativeBrowserScreenshot = Pick<
   CodeEditorCaptureScreenshotResult,
-  "mimeType" | "data" | "width" | "height" | "sourceWidth" | "sourceHeight"
+  "mimeType" | "data" | "width" | "height" | "sourceWidth" | "sourceHeight" | "captureMethod"
 >;
 
 // Heavier / rarely-needed viewers load lazily — same approach as LazyCodeEditorPanel.
@@ -166,6 +168,8 @@ const MAX_VIEWER_CACHE_BYTES = 8 * 1024 * 1024;
 const SCREENSHOT_DEFAULT_MAX_DIMENSION = 1600;
 const SCREENSHOT_MAX_DIMENSION = 4096;
 const SCREENSHOT_SURFACE_WAIT_MS = 2_500;
+const BROWSER_SCREENSHOT_WAIT_MS = 3_750;
+const FRAME_FALLBACK_MS = 80;
 
 export type CodeEditorPersistedTab = {
   path: string;
@@ -286,7 +290,45 @@ function formatBytes(value: number | null | undefined): string {
 }
 
 function nextFrame(): Promise<void> {
-  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      window.clearTimeout(timer);
+      resolve();
+    };
+    const timer = window.setTimeout(finish, FRAME_FALLBACK_MS);
+    requestAnimationFrame(finish);
+  });
+}
+
+function screenshotError(message: string): Error {
+  return new Error(`CAPTURE_SCREENSHOT_FAILED: ${message}`);
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function isScreenshotError(err: unknown): boolean {
+  return errorMessage(err).startsWith("CAPTURE_SCREENSHOT_FAILED:");
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(screenshotError(message)), ms);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        window.clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
 }
 
 function normalizeScreenshotDimension(value: number | undefined, fallback: number): number {
@@ -412,6 +454,7 @@ async function fitPngScreenshot(
     height,
     sourceWidth: input.sourceWidth,
     sourceHeight: input.sourceHeight,
+    captureMethod: input.captureMethod,
   };
 }
 
@@ -509,7 +552,7 @@ function preferredLanguageId(ext: string): string | null {
 
 type CodeEditorPanelProps = {
   provider: "local" | "ssh";
-  editorTheme: "vs" | "vs-dark";
+  editorTheme: CodeEditorThemeId;
   sshTarget?: string | null;
   rootDir: string;
   openFileRequest: CodeEditorOpenFileRequest | null;
@@ -1006,14 +1049,34 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     async (input?: CodeEditorCaptureScreenshotInput): Promise<CodeEditorCaptureScreenshotResult> => {
       const maxWidth = normalizeScreenshotDimension(input?.maxWidth, SCREENSHOT_DEFAULT_MAX_DIMENSION);
       const maxHeight = normalizeScreenshotDimension(input?.maxHeight, SCREENSHOT_DEFAULT_MAX_DIMENSION);
-      if (input?.target === "browser") {
-        const requested = input.tabId ?? input.path ?? null;
-        const browserPath = resolveBrowserPath(requested);
-        if (!browserPath) throw new Error("browser tab not found");
+
+      const activeLabel = () => activePathRef.current ?? "none";
+      const liveTab = (path: string, expected: "browser" | "file_viewer", phase: string): Tab => {
+        if (!openPathsRef.current.has(path)) {
+          throw screenshotError(`target tab ${path} was closed before ${phase}. Call list_file_viewer_tabs and retry with an open tabId.`);
+        }
+        const tab = tabsRef.current.find((it) => it.path === path);
+        if (!tab) {
+          throw screenshotError(`target tab ${path} is no longer listed before ${phase}. Call list_file_viewer_tabs and retry.`);
+        }
+        const isBrowser = browserMetaRef.current.has(path);
+        if (expected === "browser" && !isBrowser) {
+          throw screenshotError(`target tab ${path} is no longer a browser tab before ${phase}. Call list_file_viewer_tabs and retry.`);
+        }
+        if (expected === "file_viewer" && isBrowser) {
+          throw screenshotError(`target tab ${path} became a browser tab before ${phase}. Call list_file_viewer_tabs and retry.`);
+        }
+        if (activePathRef.current !== path) {
+          throw screenshotError(`active tab changed from ${path} to ${activeLabel()} during ${phase}. Retry after the file viewer is idle, or pass an explicit tabId.`);
+        }
+        return tab;
+      };
+
+      const captureBrowser = async (browserPath: string): Promise<CodeEditorCaptureScreenshotResult> => {
         const meta = browserMetaRef.current.get(browserPath);
-        if (!meta) throw new Error("browser tab not found");
+        if (!meta) throw screenshotError("browser tab not found. Call list_file_viewer_tabs and retry with an open browser tabId.");
         const tab = tabsRef.current.find((it) => it.path === browserPath);
-        if (!tab) throw new Error("browser tab not found");
+        if (!tab) throw screenshotError("browser tab not found. Call list_file_viewer_tabs and retry with an open browser tabId.");
         if (activePathRef.current !== browserPath) {
           setActivePath(browserPath);
           activePathRef.current = browserPath;
@@ -1021,46 +1084,50 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
           await nextFrame();
           await nextFrame();
         }
-        const native = await invoke<NativeBrowserScreenshot>("browser_capture_screenshot", { label: meta.label });
+
+        liveTab(browserPath, "browser", "browser screenshot preparation");
+        let native: NativeBrowserScreenshot;
+        try {
+          native = await withTimeout(
+            invoke<NativeBrowserScreenshot>("browser_capture_screenshot", { label: meta.label }),
+            BROWSER_SCREENSHOT_WAIT_MS,
+            `browser screenshot timed out for ${browserPath}. The browser tab may have been hidden, closed, or replaced while capture was running.`,
+          );
+        } catch (err) {
+          if (isScreenshotError(err)) throw err;
+          throw screenshotError(`browser screenshot failed for ${browserPath}: ${errorMessage(err)}`);
+        }
+
+        liveTab(browserPath, "browser", "browser screenshot finalization");
         const fitted = await fitPngScreenshot(native, maxWidth, maxHeight);
+        const live = liveTab(browserPath, "browser", "browser screenshot encoding");
         return {
           ...fitted,
           target: "browser",
           capturedElement: "browser_webview",
           page: null,
-          tab: serializeWorkspaceTab(tab),
+          tab: serializeWorkspaceTab(live),
         };
+      };
+
+      if (input?.target === "browser") {
+        const requested = input.tabId ?? input.path ?? null;
+        const browserPath = resolveBrowserPath(requested);
+        if (!browserPath) {
+          throw screenshotError("browser tab not found. Call list_file_viewer_tabs and retry with an open browser tabId.");
+        }
+        return captureBrowser(browserPath);
       }
 
       const resolved = resolveExistingTabPath(input);
-      if (!resolved) throw new Error("file viewer tab not found");
+      if (!resolved) throw screenshotError("file viewer tab not found. Call list_file_viewer_tabs and retry with an open tabId or path.");
       const tab = tabsRef.current.find((it) => it.path === resolved);
-      if (!tab) throw new Error("file viewer tab not found");
+      if (!tab) throw screenshotError("file viewer tab not found. Call list_file_viewer_tabs and retry with an open tabId or path.");
       if (browserMetaRef.current.has(resolved)) {
-        const meta = browserMetaRef.current.get(resolved);
-        if (!meta) throw new Error("browser tab not found");
-        if (activePathRef.current !== resolved) {
-          setActivePath(resolved);
-          activePathRef.current = resolved;
-          setEditorModel(null);
-          await nextFrame();
-          await nextFrame();
-        }
-        const fitted = await fitPngScreenshot(
-          await invoke<NativeBrowserScreenshot>("browser_capture_screenshot", { label: meta.label }),
-          maxWidth,
-          maxHeight,
-        );
-        return {
-          ...fitted,
-          target: "browser",
-          capturedElement: "browser_webview",
-          page: null,
-          tab: serializeWorkspaceTab(tab),
-        };
+        return captureBrowser(resolved);
       }
-      if (tab.loading) throw new Error("file viewer tab is still loading");
-      if (tab.error) throw new Error(`file viewer tab has an error: ${tab.error}`);
+      if (tab.loading) throw screenshotError(`file viewer tab ${resolved} is still loading. Retry after it finishes loading.`);
+      if (tab.error) throw screenshotError(`file viewer tab ${resolved} has an error: ${tab.error}`);
 
       if (activePathRef.current !== resolved) {
         setActivePath(resolved);
@@ -1071,48 +1138,60 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
         await nextFrame();
       }
 
+      liveTab(resolved, "file_viewer", "file viewer screenshot preparation");
       const deadline = Date.now() + SCREENSHOT_SURFACE_WAIT_MS;
 
       while (Date.now() <= deadline) {
+        const currentTab = liveTab(resolved, "file_viewer", "file viewer screenshot rendering");
+        if (currentTab.loading) {
+          throw screenshotError(`file viewer tab ${resolved} started loading during screenshot capture. Retry after it finishes loading.`);
+        }
+        if (currentTab.error) {
+          throw screenshotError(`file viewer tab ${resolved} entered an error state during screenshot capture: ${currentTab.error}`);
+        }
         const root = bodyRef.current;
-        if (!root) throw new Error("file viewer body is not mounted");
+        if (!root) throw screenshotError("file viewer body is not mounted. Reopen the file viewer and retry.");
 
-        if (tab.viewerKind === "image") {
+        if (currentTab.viewerKind === "image") {
           const image = root.querySelector<HTMLImageElement>("img.imageViewerImg");
           if (image?.complete && image.naturalWidth > 0 && image.naturalHeight > 0) {
             const encoded = encodeImageScreenshot(image, maxWidth, maxHeight);
+            const live = liveTab(resolved, "file_viewer", "image screenshot encoding");
             return {
               mimeType: "image/png",
               ...encoded,
               target: "file_viewer",
               capturedElement: "image",
+              captureMethod: "dom_canvas",
               page: null,
-              tab: serializeWorkspaceTab(tab),
+              tab: serializeWorkspaceTab(live),
             };
           }
-        } else if (tab.viewerKind === "pdf") {
+        } else if (currentTab.viewerKind === "pdf") {
           const match = findVisiblePdfCanvas(root);
           if (match) {
             const encoded = encodeCanvasScreenshot(match.canvas, maxWidth, maxHeight);
+            const live = liveTab(resolved, "file_viewer", "PDF screenshot encoding");
             return {
               mimeType: "image/png",
               ...encoded,
               target: "file_viewer",
               capturedElement: "pdf_page",
+              captureMethod: "dom_canvas",
               page: match.page,
-              tab: serializeWorkspaceTab(tab),
+              tab: serializeWorkspaceTab(live),
             };
           }
         } else {
-          throw new Error(
-            "capture_screenshot currently supports image tabs and rendered PDF pages. Use file_viewer_snapshot for text content and metadata.",
+          throw screenshotError(
+            `tab ${resolved} is a ${currentTab.viewerKind ?? "unknown"} viewer. capture_screenshot supports image tabs, rendered PDF pages, and browser tabs. Use file_viewer_snapshot for text content and metadata.`,
           );
         }
 
         await nextFrame();
       }
 
-      throw new Error("no rendered screenshot surface is available yet; wait for the file viewer to finish rendering and retry");
+      throw screenshotError(`no rendered screenshot surface is available for ${resolved} yet. Wait for rendering to finish and retry.`);
     },
     [resolveBrowserPath, resolveExistingTabPath, serializeWorkspaceTab, setEditorModel],
   );
@@ -1650,10 +1729,15 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     onCloseEditor();
   }, [onCloseEditor]);
 
+  const beforeMount = React.useCallback((monaco: MonacoType) => {
+    registerCodeEditorThemes(monaco);
+  }, []);
+
   const onMount = React.useCallback(
     (editor: import("monaco-editor").editor.IStandaloneCodeEditor, monaco: MonacoType) => {
       editorRef.current = editor;
       monacoRef.current = monaco;
+      registerCodeEditorThemes(monaco);
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
         void saveActive();
       });
@@ -2187,28 +2271,33 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
             {activeTab.path}
           </span>
           {!activeTab.loading && !activeTab.error ? (
-            <select
-              className="codeEditorViewAs"
-              title="View as"
-              value={activeTab.requestedMode}
-              onChange={(e) => {
-                const value = e.target.value;
-                if (value === "browser") {
-                  void openHtmlInBrowser(activeTab.path);
-                  return;
-                }
-                void openFile(activeTab.path, value as CodeEditorOpenMode);
-              }}
-            >
-              <option value="auto">Auto</option>
-              <option value="text">Text</option>
-              <option value="markdown">Markdown</option>
-              <option value="json">JSON tree</option>
-              <option value="csv">CSV table</option>
-              <option value="image">Image</option>
-              <option value="bytes">Bytes</option>
-              {isHtmlPath(activeTab.path) ? <option value="browser">Browser</option> : null}
-            </select>
+            <span className="codeEditorViewAsControl btnSmall">
+              <Icon name="code" size={13} className="codeEditorViewAsIcon" />
+              <select
+                className="codeEditorViewAs"
+                title="View as"
+                aria-label="View as"
+                value={activeTab.requestedMode}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  if (value === "browser") {
+                    void openHtmlInBrowser(activeTab.path);
+                    return;
+                  }
+                  void openFile(activeTab.path, value as CodeEditorOpenMode);
+                }}
+              >
+                <option value="auto">Auto</option>
+                <option value="text">Text</option>
+                <option value="markdown">Markdown</option>
+                <option value="json">JSON tree</option>
+                <option value="csv">CSV table</option>
+                <option value="image">Image</option>
+                <option value="bytes">Bytes</option>
+                {isHtmlPath(activeTab.path) ? <option value="browser">Browser</option> : null}
+              </select>
+              <Icon name="chevron-down" size={13} className="codeEditorViewAsChevron" />
+            </span>
           ) : null}
         </div>
       ) : null}
@@ -2220,6 +2309,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
           <div className={`codeEditorMonaco ${activeTab?.viewerKind === "text" || !activeTab?.viewerKind ? "" : "codeEditorMonacoHidden"}`}>
             <Editor
               theme={editorTheme}
+              beforeMount={beforeMount}
               onMount={onMount}
               keepCurrentModel
               defaultLanguage="plaintext"

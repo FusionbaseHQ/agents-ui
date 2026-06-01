@@ -23,6 +23,11 @@ tauri-plugin-drag = "2.1.0"
 notify = "7"
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
+objc2 = "0.6.4"
+block2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSString", "std"], default-features = false }
+objc2-app-kit = { version = "0.3.2", features = ["NSBitmapImageRep", "NSImage", "NSImageRep"], default-features = false }
+objc2-web-kit = { version = "0.3.2", features = ["WKWebView", "WKSnapshotConfiguration", "block2", "objc2-app-kit"], default-features = false }
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs" }

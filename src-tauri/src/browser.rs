@@ -34,8 +34,10 @@ pub struct BrowserScreenshot {
     source_height: u32,
     target: &'static str,
     captured_element: &'static str,
+    capture_method: &'static str,
 }
 
+#[allow(dead_code)]
 const SCREEN_RECORDING_PERMISSION_REQUIRED: &str =
     "SCREEN_RECORDING_PERMISSION_REQUIRED: macOS Screen Recording permission is required to capture the embedded browser. Open System Settings > Privacy & Security > Screen Recording, enable Agents UI (or the terminal/editor that launched the app in dev mode), then restart the app.";
 
@@ -183,13 +185,10 @@ pub fn browser_action(app: AppHandle, label: String, action: String) -> Result<(
 }
 
 #[tauri::command]
-pub fn browser_capture_screenshot(app: AppHandle, label: String) -> Result<BrowserScreenshot, String> {
+pub async fn browser_capture_screenshot(app: AppHandle, label: String) -> Result<BrowserScreenshot, String> {
     let webview = app
         .get_webview(&label)
         .ok_or_else(|| "browser not found".to_string())?;
-    let window = app
-        .get_window("main")
-        .ok_or_else(|| "main window not found".to_string())?;
 
     let child_position = webview
         .position()
@@ -204,12 +203,16 @@ pub fn browser_capture_screenshot(app: AppHandle, label: String) -> Result<Brows
         return Err("browser tab has no visible capture area".to_string());
     }
 
-    let window_position = window
-        .outer_position()
-        .map_err(|e| format!("window position unavailable: {e}"))?;
-    let x = window_position.x.saturating_add(child_position.x);
-    let y = window_position.y.saturating_add(child_position.y);
-    capture_region(x, y, child_size.width, child_size.height)
+    #[cfg(target_os = "macos")]
+    {
+        return macos_browser_capture::capture(webview).await;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = webview;
+        Err("embedded browser screenshot capture is currently implemented for macOS only".to_string())
+    }
 }
 
 #[tauri::command]
@@ -241,6 +244,7 @@ pub fn browser_close(app: AppHandle, label: String) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn capture_region(x: i32, y: i32, width: u32, height: u32) -> Result<BrowserScreenshot, String> {
     #[cfg(target_os = "macos")]
     {
@@ -276,6 +280,7 @@ fn capture_region(x: i32, y: i32, width: u32, height: u32) -> Result<BrowserScre
             source_height: png_height,
             target: "browser",
             captured_element: "browser_webview",
+            capture_method: "screencapture_region",
         })
     }
 
@@ -286,6 +291,112 @@ fn capture_region(x: i32, y: i32, width: u32, height: u32) -> Result<BrowserScre
     }
 }
 
+#[cfg(target_os = "macos")]
+mod macos_browser_capture {
+    use super::{png_dimensions, BrowserScreenshot, BASE64};
+    use base64::Engine;
+    use block2::RcBlock;
+    use objc2::runtime::AnyObject;
+    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey, NSImage};
+    use objc2_foundation::{NSDictionary, NSError};
+    use objc2_web_kit::WKWebView;
+    use std::{
+        sync::{mpsc, Mutex},
+        time::Duration,
+    };
+    use tauri::Webview;
+
+    const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(3);
+
+    pub async fn capture(webview: Webview) -> Result<BrowserScreenshot, String> {
+        let (tx, rx) = mpsc::channel::<Result<BrowserScreenshot, String>>();
+        webview
+            .with_webview(move |platform| {
+                let inner = platform.inner();
+                if inner.is_null() {
+                    let _ = tx.send(Err(
+                        "BROWSER_SNAPSHOT_FAILED: native WKWebView handle is null".to_string(),
+                    ));
+                    return;
+                }
+
+                let sender = Mutex::new(Some(tx));
+                let completion = RcBlock::new(move |image: *mut NSImage, error: *mut NSError| {
+                    let result = unsafe { snapshot_callback_result(image, error) };
+                    if let Ok(mut sender) = sender.lock() {
+                        if let Some(sender) = sender.take() {
+                            let _ = sender.send(result);
+                        }
+                    }
+                });
+
+                unsafe {
+                    let wk_webview = &*(inner as *mut WKWebView);
+                    wk_webview.takeSnapshotWithConfiguration_completionHandler(None, &completion);
+                }
+            })
+            .map_err(|e| format!("BROWSER_SNAPSHOT_FAILED: unable to access native WKWebView: {e}"))?;
+
+        let received = tauri::async_runtime::spawn_blocking(move || rx.recv_timeout(SNAPSHOT_TIMEOUT))
+            .await
+            .map_err(|e| format!("BROWSER_SNAPSHOT_FAILED: snapshot wait failed: {e}"))?;
+
+        match received {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err("BROWSER_SNAPSHOT_FAILED: WKWebView snapshot timed out".to_string())
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("BROWSER_SNAPSHOT_FAILED: WKWebView snapshot callback was dropped".to_string())
+            }
+        }
+    }
+
+    unsafe fn snapshot_callback_result(
+        image: *mut NSImage,
+        error: *mut NSError,
+    ) -> Result<BrowserScreenshot, String> {
+        if !error.is_null() {
+            return Err(format!("BROWSER_SNAPSHOT_FAILED: {}", unsafe { &*error }));
+        }
+
+        let bytes = unsafe { image_to_png_bytes(image) }?;
+        let (png_width, png_height) = png_dimensions(&bytes)
+            .ok_or_else(|| "BROWSER_SNAPSHOT_FAILED: WKWebView did not produce a valid PNG".to_string())?;
+
+        Ok(BrowserScreenshot {
+            mime_type: "image/png",
+            data: BASE64.encode(bytes),
+            width: png_width,
+            height: png_height,
+            source_width: png_width,
+            source_height: png_height,
+            target: "browser",
+            captured_element: "browser_webview",
+            capture_method: "wkwebview_snapshot",
+        })
+    }
+
+    unsafe fn image_to_png_bytes(image: *mut NSImage) -> Result<Vec<u8>, String> {
+        let image = unsafe { image.as_ref() }
+            .ok_or_else(|| "BROWSER_SNAPSHOT_FAILED: WKWebView returned no snapshot image".to_string())?;
+        let tiff = image
+            .TIFFRepresentation()
+            .ok_or_else(|| "BROWSER_SNAPSHOT_FAILED: WKWebView snapshot could not be converted to TIFF".to_string())?;
+        let bitmap = NSBitmapImageRep::imageRepWithData(&tiff)
+            .ok_or_else(|| "BROWSER_SNAPSHOT_FAILED: WKWebView snapshot could not be converted to a bitmap".to_string())?;
+        let properties = NSDictionary::<NSBitmapImageRepPropertyKey, AnyObject>::dictionary();
+        let png = unsafe { bitmap.representationUsingType_properties(NSBitmapImageFileType::PNG, &properties) }
+            .ok_or_else(|| "BROWSER_SNAPSHOT_FAILED: WKWebView snapshot could not be encoded as PNG".to_string())?;
+        let bytes = png.to_vec();
+        if bytes.is_empty() {
+            return Err("BROWSER_SNAPSHOT_FAILED: WKWebView snapshot PNG was empty".to_string());
+        }
+        Ok(bytes)
+    }
+}
+
+#[allow(dead_code)]
 fn temp_screenshot_path() -> std::path::PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

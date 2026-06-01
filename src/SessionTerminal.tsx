@@ -20,7 +20,10 @@ type UiTheme =
   | "midnight"
   | "cobalt"
   | "neon"
-  | "forest";
+  | "forest"
+  | "matrix"
+  | "synthwave"
+  | "quantum";
 type TerminalTheme = {
   background: string;
   foreground: string;
@@ -88,6 +91,24 @@ const TERMINAL_THEME_BY_UI_THEME: Record<UiTheme, TerminalTheme> = {
     foreground: "#d4e8db",
     cursor: "#4eca7a",
     selectionBackground: "rgba(78,202,122,0.26)",
+  },
+  matrix: {
+    background: "#030704",
+    foreground: "#b9ffc9",
+    cursor: "#39ff88",
+    selectionBackground: "rgba(57,255,136,0.25)",
+  },
+  synthwave: {
+    background: "#10071a",
+    foreground: "#f8e7ff",
+    cursor: "#ff71ce",
+    selectionBackground: "rgba(255,113,206,0.26)",
+  },
+  quantum: {
+    background: "#061016",
+    foreground: "#e1f7f3",
+    cursor: "#8ee6d8",
+    selectionBackground: "rgba(142,230,216,0.24)",
   },
 };
 

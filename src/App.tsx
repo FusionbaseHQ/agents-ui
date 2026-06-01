@@ -22,6 +22,7 @@ import { TerminalPane, type TerminalPaneSession } from "./components/TerminalPan
 import { Icon } from "./components/Icon";
 import { ActivityCenter, type ActivityCenterItem } from "./components/ActivityCenter";
 import { FileExplorerPanel, type FileExplorerPersistedState } from "./components/FileExplorerPanel";
+import { EDITOR_THEME_BY_UI_THEME } from "./monaco/editorThemes";
 import type {
   CodeEditorFsEvent,
   CodeEditorOpenFileRequest,
@@ -173,7 +174,10 @@ type UiTheme =
   | "midnight"
   | "cobalt"
   | "neon"
-  | "forest";
+  | "forest"
+  | "matrix"
+  | "synthwave"
+  | "quantum";
 
 const STORAGE_PROJECTS_KEY = "agents-ui-projects";
 const STORAGE_ACTIVE_PROJECT_KEY = "agents-ui-active-project-id";
@@ -310,7 +314,19 @@ function summarizeAutoRenameUpdate(update: ParsedUpdate, sessions: Session[]): A
   }
 }
 
-const VALID_THEMES = new Set<UiTheme>(["dawn", "sepia", "ember", "slate", "midnight", "cobalt", "neon", "forest"]);
+const VALID_THEMES = new Set<UiTheme>([
+  "dawn",
+  "sepia",
+  "ember",
+  "slate",
+  "midnight",
+  "cobalt",
+  "neon",
+  "forest",
+  "matrix",
+  "synthwave",
+  "quantum",
+]);
 const LEGACY_THEME_MAP: Record<string, UiTheme> = {
   "paper-light": "dawn",
   "paper-sepia": "sepia",
@@ -9482,6 +9498,9 @@ export default function App() {
                 ["cobalt", "Cobalt"],
                 ["neon", "Neon"],
                 ["forest", "Forest"],
+                ["matrix", "Matrix"],
+                ["synthwave", "Synthwave"],
+                ["quantum", "Quantum"],
               ] as const).map(([id, label]) => (
                 <button
                   key={id}
@@ -9703,7 +9722,7 @@ export default function App() {
                 key={`code-editor:${activeWorkspaceKey}`}
                 ref={codeEditorPanelRef}
                 provider={activeIsSsh ? "ssh" : "local"}
-                editorTheme={uiTheme === "dawn" || uiTheme === "sepia" ? "vs" : "vs-dark"}
+                editorTheme={EDITOR_THEME_BY_UI_THEME[uiTheme]}
                 sshTarget={activeIsSsh ? activeSshTarget : null}
                 rootDir={
                   (
