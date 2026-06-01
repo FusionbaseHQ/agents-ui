@@ -170,6 +170,15 @@ const SCREENSHOT_MAX_DIMENSION = 4096;
 const SCREENSHOT_SURFACE_WAIT_MS = 2_500;
 const BROWSER_SCREENSHOT_WAIT_MS = 3_750;
 const FRAME_FALLBACK_MS = 80;
+const VIEW_MODE_OPTIONS: Array<{ value: CodeEditorOpenMode; label: string; detail: string }> = [
+  { value: "auto", label: "Auto", detail: "Pick the best viewer" },
+  { value: "text", label: "Text", detail: "Editable source" },
+  { value: "markdown", label: "Markdown", detail: "Rendered preview" },
+  { value: "json", label: "JSON tree", detail: "Structured tree" },
+  { value: "csv", label: "CSV table", detail: "Rows and columns" },
+  { value: "image", label: "Image", detail: "Bitmap preview" },
+  { value: "bytes", label: "Bytes", detail: "Hex and ASCII" },
+];
 
 export type CodeEditorPersistedTab = {
   path: string;
@@ -675,6 +684,9 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   const [tabsMenuOpen, setTabsMenuOpen] = React.useState(false);
   const tabsMenuRef = React.useRef<HTMLDivElement | null>(null);
   const tabsMenuButtonRef = React.useRef<HTMLButtonElement | null>(null);
+  const [viewAsMenuOpen, setViewAsMenuOpen] = React.useState(false);
+  const viewAsMenuRef = React.useRef<HTMLDivElement | null>(null);
+  const viewAsButtonRef = React.useRef<HTMLButtonElement | null>(null);
   const [canScrollLeft, setCanScrollLeft] = React.useState(false);
   const [canScrollRight, setCanScrollRight] = React.useState(false);
   const bodyRef = React.useRef<HTMLDivElement | null>(null);
@@ -1506,6 +1518,30 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     };
   }, [tabsMenuOpen]);
 
+  React.useEffect(() => {
+    if (!viewAsMenuOpen) return;
+
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (viewAsMenuRef.current?.contains(target)) return;
+      if (viewAsButtonRef.current?.contains(target)) return;
+      setViewAsMenuOpen(false);
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setViewAsMenuOpen(false);
+    };
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [viewAsMenuOpen]);
+
   const updateScrollState = React.useCallback(() => {
     const el = tabStripRef.current;
     if (!el) {
@@ -1909,6 +1945,10 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   }, [fsEvent, markDirty, modelUriForPath, onCloseEditor, setEditorModel]);
 
   const activeTab = React.useMemo(() => tabs.find((t) => t.path === activePath) ?? null, [activePath, tabs]);
+  const activeViewModeLabel = React.useMemo(() => {
+    const mode = activeTab?.requestedMode ?? "auto";
+    return VIEW_MODE_OPTIONS.find((option) => option.value === mode)?.label ?? "Auto";
+  }, [activeTab?.requestedMode]);
   const dirtyCount = React.useMemo(() => tabs.reduce((count, tab) => count + (tab.dirty ? 1 : 0), 0), [tabs]);
   const tabTitleCounts = React.useMemo(() => {
     const counts = new Map<string, number>();
@@ -2271,33 +2311,56 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
             {activeTab.path}
           </span>
           {!activeTab.loading && !activeTab.error ? (
-            <span className="codeEditorViewAsControl btnSmall">
-              <Icon name="code" size={13} className="codeEditorViewAsIcon" />
-              <select
-                className="codeEditorViewAs"
+            <div className="sidebarActionMenu codeEditorViewAsMenu">
+              <button
+                type="button"
+                ref={viewAsButtonRef}
+                className={`btnSmall codeEditorViewAsButton ${viewAsMenuOpen ? "btnIconActive" : ""}`}
                 title="View as"
                 aria-label="View as"
-                value={activeTab.requestedMode}
-                onChange={(e) => {
-                  const value = e.target.value;
-                  if (value === "browser") {
-                    void openHtmlInBrowser(activeTab.path);
-                    return;
-                  }
-                  void openFile(activeTab.path, value as CodeEditorOpenMode);
-                }}
+                aria-haspopup="menu"
+                aria-expanded={viewAsMenuOpen}
+                onClick={() => setViewAsMenuOpen((open) => !open)}
               >
-                <option value="auto">Auto</option>
-                <option value="text">Text</option>
-                <option value="markdown">Markdown</option>
-                <option value="json">JSON tree</option>
-                <option value="csv">CSV table</option>
-                <option value="image">Image</option>
-                <option value="bytes">Bytes</option>
-                {isHtmlPath(activeTab.path) ? <option value="browser">Browser</option> : null}
-              </select>
-              <Icon name="chevron-down" size={13} className="codeEditorViewAsChevron" />
-            </span>
+                <Icon name="code" size={13} />
+                <span>{activeViewModeLabel}</span>
+                <Icon name="chevron-down" size={13} />
+              </button>
+              {viewAsMenuOpen ? (
+                <div className="sidebarActionMenuDropdown codeEditorViewAsDropdown" ref={viewAsMenuRef} role="menu">
+                  {VIEW_MODE_OPTIONS.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      className={`sidebarActionMenuItem codeEditorViewAsItem ${activeTab.requestedMode === option.value ? "codeEditorViewAsItemActive" : ""}`}
+                      role="menuitemradio"
+                      aria-checked={activeTab.requestedMode === option.value}
+                      onClick={() => {
+                        setViewAsMenuOpen(false);
+                        void openFile(activeTab.path, option.value);
+                      }}
+                    >
+                      <span className="codeEditorViewAsItemText">{option.label}</span>
+                      <span className="codeEditorViewAsItemDetail">{option.detail}</span>
+                    </button>
+                  ))}
+                  {isHtmlPath(activeTab.path) ? (
+                    <button
+                      type="button"
+                      className="sidebarActionMenuItem codeEditorViewAsItem"
+                      role="menuitem"
+                      onClick={() => {
+                        setViewAsMenuOpen(false);
+                        void openHtmlInBrowser(activeTab.path);
+                      }}
+                    >
+                      <span className="codeEditorViewAsItemText">Browser</span>
+                      <span className="codeEditorViewAsItemDetail">Open HTML preview</span>
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
           ) : null}
         </div>
       ) : null}

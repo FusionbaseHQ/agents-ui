@@ -22,6 +22,7 @@ import { TerminalPane, type TerminalPaneSession } from "./components/TerminalPan
 import { Icon } from "./components/Icon";
 import { ActivityCenter, type ActivityCenterItem } from "./components/ActivityCenter";
 import { FileExplorerPanel, type FileExplorerPersistedState } from "./components/FileExplorerPanel";
+import { WorkspaceFileSearch } from "./components/WorkspaceFileSearch";
 import { EDITOR_THEME_BY_UI_THEME } from "./monaco/editorThemes";
 import type {
   CodeEditorFsEvent,
@@ -1925,6 +1926,7 @@ export default function App() {
   const [slidePanelTab, setSlidePanelTab] = useState<"prompts" | "recordings" | "assets">("prompts");
   const [slidePanelWidth, setSlidePanelWidth] = useState(360);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [workspaceFileSearchOpen, setWorkspaceFileSearchOpen] = useState(false);
   const [promptSearch, setPromptSearch] = useState("");
   const [recordingSearch, setRecordingSearch] = useState("");
   const [assetSearch, setAssetSearch] = useState("");
@@ -2980,6 +2982,25 @@ export default function App() {
   const activeProject = useMemo(
     () => projects.find((p) => p.id === activeProjectId) ?? null,
     [projects, activeProjectId],
+  );
+
+  const activeWorkspaceFileRoot = useMemo(
+    () =>
+      (
+        activeWorkspaceView.fileExplorerRootDir ??
+        activeWorkspaceView.codeEditorRootDir ??
+        (activeIsSsh ? active?.sshRootDir ?? activeProject?.sshRemotePath : activeProject?.basePath ?? active?.cwd) ??
+        ""
+      ).trim(),
+    [
+      active?.cwd,
+      active?.sshRootDir,
+      activeIsSsh,
+      activeProject?.basePath,
+      activeProject?.sshRemotePath,
+      activeWorkspaceView.codeEditorRootDir,
+      activeWorkspaceView.fileExplorerRootDir,
+    ],
   );
 
   const projectSessions = useMemo(
@@ -5390,6 +5411,14 @@ export default function App() {
           e.stopPropagation();
           (document.activeElement as HTMLElement | null)?.blur?.();
           setCommandPaletteOpen(true);
+          return;
+        }
+
+        if (modKey && e.key.toLowerCase() === "p" && !workspaceFileSearchOpen && activeWorkspaceFileRoot) {
+          e.preventDefault();
+          e.stopPropagation();
+          (document.activeElement as HTMLElement | null)?.blur?.();
+          setWorkspaceFileSearchOpen(true);
           return;
         }
 
@@ -9631,6 +9660,15 @@ export default function App() {
               <Icon name="folder" />
             </button>
 
+            <button
+              className="iconBtn"
+              onClick={() => setWorkspaceFileSearchOpen(true)}
+              disabled={!activeWorkspaceFileRoot}
+              title={activeWorkspaceFileRoot ? "Open file (Ctrl/Cmd+P)" : "Open file"}
+            >
+              <Icon name="search" />
+            </button>
+
             {/* Panels Button */}
             <button
               className={`iconBtn ${slidePanelOpen ? "iconBtnActive" : ""}`}
@@ -11345,6 +11383,14 @@ export default function App() {
           setSlidePanelOpen(true);
         }}
       />}
+      <WorkspaceFileSearch
+        isOpen={workspaceFileSearchOpen}
+        provider={activeIsSsh ? "ssh" : "local"}
+        rootDir={activeWorkspaceFileRoot}
+        sshTarget={activeIsSsh ? activeSshTarget : null}
+        onOpenFile={(path) => handleSelectWorkspaceFile(path, "auto")}
+        onClose={() => setWorkspaceFileSearchOpen(false)}
+      />
     </div>
   );
 }

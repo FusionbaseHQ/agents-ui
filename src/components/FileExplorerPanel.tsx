@@ -20,6 +20,12 @@ type FsEntry = {
   size: number;
 };
 
+type GitStatusKind = "modified" | "added" | "deleted" | "renamed" | "untracked" | "conflicted";
+type GitStatusEntry = {
+  path: string;
+  status: GitStatusKind;
+};
+
 type DirectoryState = {
   entries: FsEntry[];
   loading: boolean;
@@ -144,6 +150,23 @@ function joinPath(dir: string, name: string): string {
   return `${base}/${name}`;
 }
 
+function ancestorDirsWithinRoot(path: string, root: string): string[] {
+  const target = normalizePath(path);
+  const base = normalizePath(root);
+  if (!target || !base) return [];
+  if (target !== base && !target.startsWith(base === "/" ? "/" : `${base}/`)) return [];
+
+  const dirs: string[] = [];
+  let cur = dirname(target);
+  const seen = new Set<string>();
+  while (cur && cur !== base && cur !== "." && !seen.has(cur)) {
+    dirs.push(cur);
+    seen.add(cur);
+    cur = dirname(cur);
+  }
+  return [base, ...dirs.reverse()];
+}
+
 function parseFileUrlPath(data: string): string | null {
   if (!data.startsWith("file://")) return null;
   const rest = data.slice("file://".length);
@@ -212,6 +235,43 @@ const POLL_INTERVAL_MS = 5_000;
 const POLL_TIMEOUT_MS = 15_000;
 const POLL_MAX_PER_TICK = 5;
 const MUTATION_COOLDOWN_MS = 8_000;
+const FILE_EXPLORER_ROW_HEIGHT = 28;
+
+function gitStatusLabel(status: GitStatusKind): string {
+  switch (status) {
+    case "added":
+      return "A";
+    case "deleted":
+      return "D";
+    case "renamed":
+      return "R";
+    case "untracked":
+      return "?";
+    case "conflicted":
+      return "!";
+    case "modified":
+    default:
+      return "M";
+  }
+}
+
+function gitStatusPriority(status: GitStatusKind): number {
+  switch (status) {
+    case "conflicted":
+      return 6;
+    case "deleted":
+      return 5;
+    case "added":
+      return 4;
+    case "renamed":
+      return 3;
+    case "modified":
+      return 2;
+    case "untracked":
+    default:
+      return 1;
+  }
+}
 
 type FileRowProps = {
   entry: FsEntry;
@@ -228,6 +288,8 @@ type FileRowProps = {
   onMouseDown: (e: React.MouseEvent, entry: FsEntry) => void;
   onMouseMove: (e: React.MouseEvent) => void;
   onMouseUp: () => void;
+  gitStatus?: GitStatusKind | null;
+  gitNested?: boolean;
 };
 
 const FileRow = React.memo(function FileRow({
@@ -245,6 +307,8 @@ const FileRow = React.memo(function FileRow({
   onMouseDown,
   onMouseMove,
   onMouseUp,
+  gitStatus,
+  gitNested,
 }: FileRowProps) {
   const indent = 12 + depth * 14;
   const fileTypeBadge = entry.isDir ? null : getFileTypeBadge(entry.name);
@@ -302,6 +366,11 @@ const FileRow = React.memo(function FileRow({
         )}
       </span>
       <span className="fileExplorerName">{entry.name}</span>
+      {gitStatus ? (
+        <span className={`fileExplorerGitBadge fileExplorerGitBadge-${gitStatus} ${gitNested ? "fileExplorerGitBadgeNested" : ""}`}>
+          {gitStatusLabel(gitStatus)}
+        </span>
+      ) : null}
     </button>
   );
 });
@@ -381,10 +450,12 @@ export function FileExplorerPanel({
   }, [provider, root, rootDir, sshTargetValue]);
   const [expandedDirs, setExpandedDirs] = React.useState<Set<string>>(() => new Set([root]));
   const [dirStateByPath, setDirStateByPath] = React.useState<Record<string, DirectoryState>>({});
+  const [gitStatusEntries, setGitStatusEntries] = React.useState<GitStatusEntry[]>([]);
   const panelRef = React.useRef<HTMLElement | null>(null);
   const listRef = React.useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = React.useState(0);
   const [listHeight, setListHeight] = React.useState(0);
+  const lastRevealPathRef = React.useRef<string | null>(null);
 
   const [contextMenu, setContextMenu] = React.useState<{ x: number; y: number; entry: FsEntry } | null>(null);
   const contextMenuRef = React.useRef<HTMLDivElement | null>(null);
@@ -582,6 +653,26 @@ export function FileExplorerPanel({
     },
     [provider, root, sshTargetValue],
   );
+
+  const refreshGitStatus = React.useCallback(async () => {
+    if (provider !== "local") {
+      setGitStatusEntries([]);
+      return;
+    }
+    try {
+      const entries = await invoke<GitStatusEntry[]>("git_status_entries", { root });
+      setGitStatusEntries(entries);
+    } catch {
+      setGitStatusEntries([]);
+    }
+  }, [provider, root]);
+
+  React.useEffect(() => {
+    if (!isOpen) return;
+    void refreshGitStatus();
+    const timer = window.setInterval(() => void refreshGitStatus(), 8_000);
+    return () => window.clearInterval(timer);
+  }, [isOpen, refreshGitStatus]);
 
   /**
    * Silent background poll for a single directory.
@@ -1153,6 +1244,73 @@ export function FileExplorerPanel({
     return out;
   }, [dirStateByPath, expandedDirs, isOpen, root]);
 
+  const gitDecorations = React.useMemo(() => {
+    const direct = new Map<string, GitStatusKind>();
+    const nested = new Map<string, GitStatusKind>();
+    const assignBest = (map: Map<string, GitStatusKind>, path: string, status: GitStatusKind) => {
+      const current = map.get(path);
+      if (!current || gitStatusPriority(status) > gitStatusPriority(current)) map.set(path, status);
+    };
+
+    for (const entry of gitStatusEntries) {
+      const path = normalizePath(entry.path);
+      if (!path) continue;
+      assignBest(direct, path, entry.status);
+      let dir = dirname(path);
+      while (dir && dir !== "." && (dir === root || dir.startsWith(root === "/" ? "/" : `${root}/`))) {
+        assignBest(nested, dir, entry.status);
+        if (dir === root) break;
+        dir = dirname(dir);
+      }
+    }
+    return { direct, nested };
+  }, [gitStatusEntries, root]);
+
+  React.useEffect(() => {
+    if (!isOpen || !activeFilePath) return;
+    const active = normalizePath(activeFilePath);
+    if (!active || lastRevealPathRef.current === active) return;
+    const ancestors = ancestorDirsWithinRoot(active, root);
+    if (ancestors.length === 0) return;
+
+    lastRevealPathRef.current = active;
+    setExpandedDirs((prev) => {
+      const next = new Set(prev);
+      for (const dir of ancestors) next.add(dir);
+      return next;
+    });
+    if (provider === "local" && watcherIdRef.current) {
+      for (const dir of ancestors) {
+        if (dir === root) continue;
+        invoke("watch_directory", { watcherId: watcherIdRef.current, path: dir }).catch(() => {});
+      }
+    }
+    void (async () => {
+      for (const dir of ancestors) {
+        const state = dirStateByPathRef.current[dir];
+        if (!state || state.error) await loadDirectory(dir);
+      }
+    })();
+  }, [activeFilePath, isOpen, loadDirectory, provider, root]);
+
+  React.useEffect(() => {
+    if (!activeFilePath || !listRef.current) return;
+    const active = normalizePath(activeFilePath);
+    const index = visibleItems.findIndex((item) => item.type === "entry" && normalizePath(item.entry.path) === active);
+    if (index < 0) return;
+
+    const el = listRef.current;
+    const top = index * FILE_EXPLORER_ROW_HEIGHT;
+    const bottom = top + FILE_EXPLORER_ROW_HEIGHT;
+    const visibleTop = el.scrollTop;
+    const visibleBottom = visibleTop + el.clientHeight;
+    if (top >= visibleTop && bottom <= visibleBottom) return;
+
+    const nextTop = Math.max(0, top - Math.max(0, Math.floor((el.clientHeight - FILE_EXPLORER_ROW_HEIGHT) / 2)));
+    el.scrollTop = nextTop;
+    setScrollTop(nextTop);
+  }, [activeFilePath, visibleItems]);
+
   const toggleDir = React.useCallback(
     (dirPath: string) => {
       const path = normalizePath(dirPath);
@@ -1691,7 +1849,7 @@ export function FileExplorerPanel({
           <div className="empty">No files.</div>
         ) : (
           (() => {
-            const rowHeight = 28;
+            const rowHeight = FILE_EXPLORER_ROW_HEIGHT;
             const overscan = 12;
             const total = visibleItems.length;
             const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
@@ -1729,6 +1887,8 @@ export function FileExplorerPanel({
                   }
 
                   const entry = item.entry;
+                  const directGitStatus = gitDecorations.direct.get(entry.path) ?? null;
+                  const nestedGitStatus = entry.isDir ? gitDecorations.nested.get(entry.path) ?? null : null;
                   return (
                     <FileRow
                       key={entry.path}
@@ -1746,6 +1906,8 @@ export function FileExplorerPanel({
                       onMouseDown={handleMouseDown}
                       onMouseMove={handleMouseMove}
                       onMouseUp={handleMouseUp}
+                      gitStatus={directGitStatus ?? nestedGitStatus}
+                      gitNested={!directGitStatus && Boolean(nestedGitStatus)}
                     />
                   );
                 })}

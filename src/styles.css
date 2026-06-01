@@ -2751,6 +2751,47 @@ body::after {
   white-space: nowrap;
 }
 
+.fileExplorerGitBadge {
+  margin-left: auto;
+  min-width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  font-weight: 700;
+  border: 1px solid rgba(var(--ink-rgb), 0.18);
+  color: rgba(var(--ink-rgb), 0.9);
+  background: rgba(var(--ink-rgb), 0.08);
+}
+
+.fileExplorerGitBadgeNested {
+  opacity: 0.58;
+}
+
+.fileExplorerGitBadge-added {
+  border-color: rgba(var(--success-rgb), 0.45);
+  background: rgba(var(--success-rgb), 0.18);
+}
+
+.fileExplorerGitBadge-modified,
+.fileExplorerGitBadge-renamed {
+  border-color: rgba(var(--warning-rgb), 0.45);
+  background: rgba(var(--warning-rgb), 0.18);
+}
+
+.fileExplorerGitBadge-deleted,
+.fileExplorerGitBadge-conflicted {
+  border-color: rgba(var(--danger-rgb), 0.45);
+  background: rgba(var(--danger-rgb), 0.18);
+}
+
+.fileExplorerGitBadge-untracked {
+  border-color: rgba(var(--accent-rgb), 0.4);
+  background: rgba(var(--accent-rgb), 0.15);
+}
+
 .fileExplorerMeta {
   color: var(--muted);
 }
@@ -3134,78 +3175,59 @@ body::after {
   text-overflow: ellipsis;
 }
 
-.codeEditorViewAsControl {
-  position: relative;
+.codeEditorViewAsMenu {
   flex: 0 0 auto;
+}
+
+.codeEditorViewAsButton {
+  height: 26px;
+  min-width: 112px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 132px;
-  max-width: 164px;
-  height: 26px;
-  padding: 0;
-  overflow: hidden;
+  gap: 6px;
+  padding: 0 7px;
+  font-family:
+    'JetBrains Mono',
+    ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Monaco,
+    Consolas,
+    monospace;
+  font-size: 11px;
+  font-weight: 400;
 }
 
-.codeEditorViewAsControl:focus-within {
-  border-color: rgba(var(--accent-rgb), 0.72);
-  background: rgba(var(--ink-rgb), 0.06);
+.codeEditorViewAsDropdown {
+  right: 0;
+  left: auto;
+  min-width: 218px;
 }
 
-.codeEditorViewAsIcon,
-.codeEditorViewAsChevron {
-  position: absolute;
-  pointer-events: none;
-  color: rgba(var(--ink-rgb), 0.62);
+.codeEditorViewAsItem {
+  display: grid;
+  grid-template-columns: minmax(0, 88px) minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
 }
 
-.codeEditorViewAsIcon {
-  left: 8px;
+.codeEditorViewAsItemActive {
+  border-color: rgba(var(--accent-rgb), 0.35);
+  background: rgba(var(--accent-rgb), 0.12);
 }
 
-.codeEditorViewAsChevron {
-  right: 8px;
-  color: rgba(var(--ink-rgb), 0.62);
-}
-
-.codeEditorViewAs {
-  position: relative;
-  z-index: 1;
-  flex: 0 0 auto;
-  width: 100%;
-  height: 100%;
+.codeEditorViewAsItemText,
+.codeEditorViewAsItemDetail {
   min-width: 0;
-  padding: 0 28px 0 28px;
-  font-family:
-    'JetBrains Mono',
-    Menlo,
-    Monaco,
-    Consolas,
-    monospace;
-  font-size: 11px;
-  font-weight: 400;
-  line-height: 1;
-  color: var(--text);
-  background: transparent;
-  border: 0;
-  border-radius: inherit;
-  outline: none;
-  appearance: none;
-  -webkit-appearance: none;
-  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.codeEditorViewAs option {
-  font-family:
-    'JetBrains Mono',
-    Menlo,
-    Monaco,
-    Consolas,
-    monospace;
-  font-size: 11px;
-  font-weight: 400;
-  color: var(--text);
-  background: var(--menu-bg);
+.codeEditorViewAsItemDetail {
+  color: var(--muted);
+  font-size: 10px;
 }
 
 .codeEditorCrossFind {
@@ -3515,6 +3537,12 @@ body::after {
   align-items: baseline;
   gap: 2px;
   white-space: pre;
+  border-radius: var(--radius-sm);
+  padding: 1px 4px 1px 0;
+}
+
+.jsonRowMatch {
+  background: rgba(var(--accent-rgb), 0.14);
 }
 
 .jsonToggle {
@@ -3543,6 +3571,26 @@ body::after {
 .jsonNull,
 .jsonMuted {
   color: var(--muted);
+}
+
+.jsonPathButton {
+  margin-left: 8px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 10px;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.jsonRow:hover .jsonPathButton,
+.jsonPathButton:focus-visible {
+  opacity: 1;
+}
+
+.jsonPathButton:hover {
+  color: var(--accent);
 }
 
 .csvTableBody {
@@ -3588,10 +3636,20 @@ body::after {
   flex-direction: column;
 }
 
-.markdownViewerBody {
+.markdownViewerContent {
   flex: 1;
   min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
   overflow: auto;
+}
+
+.markdownViewerToc {
+  display: none;
+}
+
+.markdownViewerBody {
+  min-height: 0;
   padding: 20px 28px;
   max-width: 920px;
   margin: 0 auto;
@@ -3600,6 +3658,53 @@ body::after {
   font-size: 13px;
   line-height: 1.6;
   word-wrap: break-word;
+}
+
+@media (min-width: 980px) {
+  .markdownViewerContent {
+    grid-template-columns: 220px minmax(0, 1fr);
+  }
+
+  .markdownViewerToc {
+    position: sticky;
+    top: 0;
+    align-self: start;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-height: 100%;
+    overflow: auto;
+    padding: 14px 8px 14px 12px;
+    border-right: 1px solid rgba(var(--ink-rgb), 0.08);
+    background: rgba(var(--shadow-rgb), 0.08);
+  }
+}
+
+.markdownViewerTocItem {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  text-align: left;
+  cursor: pointer;
+  border-radius: var(--radius-control);
+  padding: 4px 6px;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.markdownViewerTocItem:hover {
+  color: var(--text);
+  background: rgba(var(--ink-rgb), 0.05);
+}
+
+.markdownViewerTocItem-2 {
+  padding-left: 14px;
+}
+
+.markdownViewerTocItem-3 {
+  padding-left: 22px;
 }
 
 .markdownViewerBody h1,
@@ -4988,6 +5093,125 @@ select.input {
   font-family: ui-monospace, monospace;
   font-size: 10px;
   margin-right: 4px;
+}
+
+.workspaceFileSearchBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.28);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 12vh;
+}
+
+.workspaceFileSearch {
+  width: min(720px, calc(100vw - 32px));
+  max-height: min(680px, calc(100vh - 96px));
+  display: flex;
+  flex-direction: column;
+  border: 1px solid rgba(var(--ink-rgb), 0.12);
+  border-radius: var(--radius-lg);
+  background: rgba(var(--paper-panel-rgb), 0.96);
+  box-shadow: 0 18px 60px rgba(var(--shadow-rgb), 0.5);
+  overflow: hidden;
+}
+
+.workspaceFileSearchInputRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(var(--ink-rgb), 0.08);
+  color: var(--muted);
+}
+
+.workspaceFileSearchInput {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font: 14px 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.workspaceFileSearchInput::placeholder {
+  color: var(--muted);
+}
+
+.workspaceFileSearchStatus {
+  padding: 6px 14px;
+  border-bottom: 1px solid rgba(var(--ink-rgb), 0.06);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.workspaceFileSearchList {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px;
+}
+
+.workspaceFileSearchItem {
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text);
+  display: grid;
+  grid-template-columns: 18px minmax(120px, 0.35fr) minmax(0, 0.65fr);
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  text-align: left;
+  cursor: pointer;
+  font: 11px 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.workspaceFileSearchItem:hover,
+.workspaceFileSearchItemSelected {
+  border-color: rgba(var(--accent-rgb), 0.28);
+  background: rgba(var(--accent-rgb), 0.12);
+}
+
+.workspaceFileSearchName,
+.workspaceFileSearchPath {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspaceFileSearchPath {
+  color: var(--muted);
+}
+
+.workspaceFileSearchEmpty {
+  padding: 20px 12px;
+  color: var(--muted);
+  text-align: center;
+  font-size: 12px;
+}
+
+.workspaceFileSearchFooter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-top: 1px solid rgba(var(--ink-rgb), 0.08);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.workspaceFileSearchFooter kbd {
+  background: rgba(var(--ink-rgb), 0.08);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 5px;
+  color: var(--text);
 }
 
 /* Quick Prompts Sidebar */
