@@ -55,9 +55,10 @@
 - Projects, prompts & assets
 - Recording & replay
 - Local + SSH file explorer + Monaco editor
+- Rich file viewers (PDF, images, CSV, JSON, Markdown, hex) + embedded browser tabs
 - Context-aware `Cmd/Ctrl+F`: terminal find vs editor find
 - Drag & drop file transfers: **Finder ↔ local ↔ SSH**
-- 8 built-in themes (Dawn, Sepia, Ember, Slate, Midnight, Cobalt, Neon, Forest)
+- 11 built-in themes (Dawn, Sepia, Ember, Slate, Midnight, Cobalt, Neon, Forest, Matrix, Synthwave, Quantum)
 - Shell integration with command markers (OSC 133)
 - MCP server + JSON-RPC API for full programmatic control (Python SDK)
 - Session history quick-switch bar
@@ -102,6 +103,19 @@
 - Works with both local and SSH-backed files
 - `Cmd/Ctrl+F` uses Monaco find when the editor is focused (terminal find otherwise)
 
+### File Viewers
+- Non-code files open automatically in rich viewers (or pick one via the "view as" switcher):
+  - **PDF** — streaming, virtualized rendering with text selection, find-in-page, and an outline sidebar
+  - **Images** — zoom / pan / fit
+  - **CSV** tables and **JSON** collapsible tree
+  - **Markdown** rendered preview
+  - **Hex / byte** viewer with a data inspector for binary files
+- Large files load via chunked range reads; works for both local and SSH files
+
+### Embedded Browser
+- Native child-WKWebView browser tabs for previewing local servers / HTML output
+- Navigation controls plus screenshot capture via the API/MCP
+
 ### Command Palette
 - Quick access with `Cmd+K` / `Ctrl+K`
 - Fuzzy search across prompts, recordings, and sessions
@@ -114,7 +128,7 @@
 - Asset templates for one-click file creation
 
 ### Themes
-- 8 built-in themes: **Dawn** (light), **Sepia** (warm light), **Ember** (warm dark), **Slate** (cool dark), **Midnight** (deep dark), **Cobalt** (blue dark), **Neon** (cyberpunk), **Forest** (green dark)
+- 11 built-in themes: **Dawn** (light), **Sepia** (warm light), **Ember** (warm dark), **Slate** (cool dark), **Midnight** (deep dark), **Cobalt** (blue dark), **Neon** (cyberpunk), **Forest** (green dark), **Matrix** (green terminal), **Synthwave** (retro neon), **Quantum** (teal dark)
 - Switchable via settings menu or programmatically via MCP/API
 - Each theme provides coordinated colors for the UI, terminal, editor, and search decorations
 
