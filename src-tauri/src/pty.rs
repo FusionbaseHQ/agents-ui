@@ -1803,7 +1803,11 @@ pub fn create_session(
     // Reader thread: reads from PTY, decodes UTF-8, sends strings to channel.
     // Blocking reader.read() is isolated here so the emitter can flush on timeout.
     std::thread::spawn(move || {
-        let mut buf = [0u8; 16384];
+        // 64 KiB read buffer: read() returns as soon as data is available (so
+        // interactive echo latency is unaffected by the size), but a larger
+        // buffer means far fewer read syscalls + channel sends when a program
+        // floods output, which keeps the pipeline ahead of the producer.
+        let mut buf = [0u8; 65536];
         let mut utf8_carry: Vec<u8> = Vec::new();
         loop {
             match reader.read(&mut buf) {
@@ -1828,17 +1832,24 @@ pub fn create_session(
         // tx dropped here → emitter receives Disconnected
     });
 
-    // Emitter thread: buffers received strings and emits batched pty-output events.
-    // recv_timeout ensures the buffer is flushed even when the reader blocks on I/O.
+    // Emitter thread: coalesces reader chunks into batched pty-output events.
+    //
+    // Strategy: leading-edge emit + trailing coalesce. The first chunk of every
+    // burst is emitted immediately (after a non-blocking drain of anything else
+    // already queued), so interactive keystroke echo reaches the UI with the
+    // lowest possible latency instead of waiting out a batching interval.
+    // Remaining chunks of the same burst are then coalesced for up to
+    // OUTPUT_EMIT_INTERVAL, and flushed early whenever the buffer reaches
+    // OUTPUT_EMIT_BYTES — so heavy output still collapses into a few large IPC
+    // messages. When a burst goes idle we flush the tail and block until the
+    // next chunk, so the thread parks at ~0 wakeups when nothing is happening.
     std::thread::spawn(move || {
         const OUTPUT_EMIT_BYTES: usize = 32 * 1024;
-        const OUTPUT_EMIT_INTERVAL_FAST: Duration = Duration::from_millis(8);
-        const OUTPUT_EMIT_INTERVAL_SLOW: Duration = Duration::from_millis(24);
+        const OUTPUT_EMIT_INTERVAL: Duration = Duration::from_millis(8);
 
         let mut output_buffer = String::new();
-        let mut last_emit_at = Instant::now();
 
-        let emit_buffered_output = |buffer: &mut String, emit_at: &mut Instant| {
+        let emit_buffered_output = |buffer: &mut String| {
             if buffer.is_empty() {
                 return;
             }
@@ -1850,30 +1861,48 @@ pub fn create_session(
                     data,
                 },
             );
-            *emit_at = Instant::now();
         };
 
-        loop {
-            // Adaptive interval: batch more aggressively when buffer is large
-            // to reduce IPC overhead under heavy output.
-            let interval = if output_buffer.len() > OUTPUT_EMIT_BYTES {
-                OUTPUT_EMIT_INTERVAL_SLOW
-            } else {
-                OUTPUT_EMIT_INTERVAL_FAST
-            };
-            match rx.recv_timeout(interval) {
-                Ok(data) => {
-                    output_buffer.push_str(&data);
-                    if output_buffer.len() >= OUTPUT_EMIT_BYTES {
-                        emit_buffered_output(&mut output_buffer, &mut last_emit_at);
+        // Pull everything already waiting in the channel into the buffer without
+        // blocking, stopping once we have a full batch's worth of bytes.
+        let drain_available = |buffer: &mut String| {
+            while buffer.len() < OUTPUT_EMIT_BYTES {
+                match rx.try_recv() {
+                    Ok(data) => buffer.push_str(&data),
+                    Err(_) => break,
+                }
+            }
+        };
+
+        'bursts: loop {
+            // Block until the first chunk of a new burst arrives.
+            match rx.recv() {
+                Ok(data) => output_buffer.push_str(&data),
+                Err(_) => break, // reader disconnected
+            }
+            // Leading edge: grab anything else already queued, then emit at once.
+            drain_available(&mut output_buffer);
+            emit_buffered_output(&mut output_buffer);
+
+            // Trailing coalesce: keep batching while the burst continues.
+            loop {
+                match rx.recv_timeout(OUTPUT_EMIT_INTERVAL) {
+                    Ok(data) => {
+                        output_buffer.push_str(&data);
+                        drain_available(&mut output_buffer);
+                        if output_buffer.len() >= OUTPUT_EMIT_BYTES {
+                            emit_buffered_output(&mut output_buffer);
+                        }
                     }
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    emit_buffered_output(&mut output_buffer, &mut last_emit_at);
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    emit_buffered_output(&mut output_buffer, &mut last_emit_at);
-                    break;
+                    Err(RecvTimeoutError::Timeout) => {
+                        // Burst idled — flush the tail and wait for the next one.
+                        emit_buffered_output(&mut output_buffer);
+                        continue 'bursts;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        emit_buffered_output(&mut output_buffer);
+                        break 'bursts;
+                    }
                 }
             }
         }

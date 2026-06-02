@@ -199,6 +199,12 @@ const MAX_SSH_HISTORY = 10;
 const MAX_PENDING_SESSIONS = 32;
 const MAX_PENDING_CHUNKS_PER_SESSION = 200;
 const MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION = 64;
+// Chunks at or below this size that target the visible terminal (and have
+// nothing queued ahead of them) are written straight to xterm in the event
+// handler instead of waiting for the next RAF flush — this is the interactive
+// echo path, where shaving a frame is felt. Larger chunks are bulk/flood
+// output and stay on the batched queue path for throughput.
+const IMMEDIATE_WRITE_MAX_CHARS = 8 * 1024;
 const SSH_RECONNECT_BASE_MS = 1000;
 const SSH_RECONNECT_MAX_MS = 30_000;
 const SSH_RECONNECT_MAX_ATTEMPTS = 6;
@@ -7437,7 +7443,29 @@ export default function App() {
 		        if (closingSessions.current.has(id)) return;
               markSessionAliveFromOutput(id);
 			        markAgentWorkingFromOutput(id, text);
-              const queue = outputQueueRef.current.get(id) ?? [];
+              // Low-latency fast path: when this chunk targets a visible
+              // terminal, nothing is queued ahead of it, and it's small enough
+              // to be interactive output (not a flood), write it straight to
+              // xterm instead of deferring to the next animation frame. This is
+              // behaviorally identical to what the RAF flush would do for a
+              // visible session (flushAllChunks) — just one frame sooner, which
+              // is exactly what makes keystroke echo feel instant. Bulk/flood
+              // chunks and hidden sessions keep batching through the queue.
+              const existingQueue = outputQueueRef.current.get(id);
+              if (
+                (!existingQueue || existingQueue.length === 0) &&
+                text.length <= IMMEDIATE_WRITE_MAX_CHARS &&
+                (id === activeIdRef.current ||
+                  id === (splitPaneRef.current?.secondaryId ?? null))
+              ) {
+                const entry = registry.current.get(id);
+                if (entry) {
+                  entry.term.write(text);
+                  return;
+                }
+              }
+
+              const queue = existingQueue ?? [];
               if (queue.length === 0) {
                 queue.push(text);
               } else if (queue.length >= MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION) {
