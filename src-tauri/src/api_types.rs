@@ -341,6 +341,14 @@ pub fn method_catalog() -> Vec<MethodInfo> {
         MethodInfo { name: "ui.toggle_panel".into(), description: "Toggle a UI panel".into(), category: "ui".into(), bridge: true },
         MethodInfo { name: "ui.command_palette".into(), description: "Open/close command palette".into(), category: "ui".into(), bridge: true },
         MethodInfo { name: "ui.navigate_session".into(), description: "Navigate to next/prev session".into(), category: "ui".into(), bridge: true },
+        MethodInfo { name: "ui.get_theme".into(), description: "Get the current UI theme".into(), category: "ui".into(), bridge: true },
+        MethodInfo { name: "ui.set_theme".into(), description: "Set the UI theme".into(), category: "ui".into(), bridge: true },
+        // shell integration (OSC 133)
+        MethodInfo { name: "shell.read_screen".into(), description: "Read the visible terminal viewport content".into(), category: "shell".into(), bridge: true },
+        MethodInfo { name: "shell.read_scrollback".into(), description: "Read lines from the terminal scrollback buffer".into(), category: "shell".into(), bridge: true },
+        MethodInfo { name: "shell.get_status".into(), description: "Get session shell status (idle/running, cwd, exit info)".into(), category: "shell".into(), bridge: true },
+        MethodInfo { name: "shell.command_history".into(), description: "Get recent completed command results".into(), category: "shell".into(), bridge: true },
+        MethodInfo { name: "shell.last_result".into(), description: "Get the most recent completed command result".into(), category: "shell".into(), bridge: true },
         // app
         MethodInfo { name: "app.info".into(), description: "Get app info".into(), category: "app".into(), bridge: false },
         MethodInfo { name: "app.state".into(), description: "Get full persisted state snapshot".into(), category: "app".into(), bridge: true },
@@ -377,7 +385,7 @@ pub fn is_bridge_method(method: &str) -> bool {
         "capture.screenshot" |
         "split_views.list" | "split_views.create" | "split_views.update" | "split_views.close" |
         "ui.state" | "ui.activate_session" | "ui.toggle_panel" | "ui.command_palette" |
-        "ui.navigate_session" |
+        "ui.navigate_session" | "ui.get_theme" | "ui.set_theme" |
         "app.state" |
         "shell.command_history" | "shell.last_result" |
         "shell.read_screen" | "shell.read_scrollback" | "shell.get_status"
@@ -394,7 +402,11 @@ pub fn rate_category(method: &str) -> RateCategory {
             || m == "api.methods" || m == "api.describe"
             || m == "auth.authenticate"
             || m == "recordings.load" || m == "files.read" || m == "ssh_files.read"
-            || m == "ssh_files.default_root" => RateCategory::Read,
+            || m == "ssh_files.default_root"
+            || m == "ui.get_theme"
+            || m == "shell.read_screen" || m == "shell.read_scrollback"
+            || m == "shell.get_status" || m == "shell.command_history"
+            || m == "shell.last_result" => RateCategory::Read,
         _ => RateCategory::Write,
     }
 }

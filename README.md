@@ -59,7 +59,7 @@
 - Drag & drop file transfers: **Finder ↔ local ↔ SSH**
 - 8 built-in themes (Dawn, Sepia, Ember, Slate, Midnight, Cobalt, Neon, Forest)
 - Shell integration with command markers (OSC 133)
-- MCP server for AI agent integration
+- MCP server + JSON-RPC API for full programmatic control (Python SDK)
 - Session history quick-switch bar
 
 ## Features
@@ -79,8 +79,8 @@
 - Quick-start shortcuts for **Claude**, **Codex**, and **Gemini** (and configurable shortcuts for other agents)
 - Activity indicators show when agents are working
 - Automatic agent detection with branded icons
-- Built-in MCP server for programmatic control by AI agents (sessions, projects, files, themes)
-- [Python SDK](https://github.com/FusionbaseHQ/agents-ui-python-sdk) for steering the application programmatically
+- Built-in MCP server **and JSON-RPC API** for full programmatic control: terminal sessions & I/O, projects, prompts, files (local + SSH), the embedded browser & file viewer, screenshots, themes (`get_theme`/`set_theme`), and live shell state (screen, scrollback, command history via OSC 133)
+- [Python SDK](https://github.com/FusionbaseHQ/agents-ui-python-sdk) for steering the entire application programmatically (async + sync clients across all API namespaces)
 
 ### Projects & Workspace
 - Project-based organization (sessions, base paths, and environment sets)
