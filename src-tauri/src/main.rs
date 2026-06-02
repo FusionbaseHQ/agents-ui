@@ -1,6 +1,7 @@
 mod agent;
 mod api_bridge;
 mod browser;
+mod display_recovery;
 mod api_discovery;
 mod api_handlers;
 mod api_server;
@@ -102,6 +103,10 @@ fn main() {
                 tray::StatusTrayState::disabled()
             });
             app.manage(tray);
+
+            // Recover the main WKWebView from the post-display-sleep compositing
+            // wedge that otherwise leaves the window permanently blank (macOS).
+            display_recovery::start(app.handle().clone());
 
             // Server control: create shutdown channels and read persisted settings
             let settings = server_control::load_settings();
