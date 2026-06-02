@@ -38,7 +38,7 @@ type Props = {
 
 const COORDINATOR_MODELS = [
   { value: "", label: "Default" },
-  { value: "opus", label: "Opus 4.7" },
+  { value: "opus", label: "Opus 4.8" },
   { value: "sonnet", label: "Sonnet 4.7" },
   { value: "haiku", label: "Haiku 4.5" },
 ];

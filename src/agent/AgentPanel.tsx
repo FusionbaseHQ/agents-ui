@@ -43,7 +43,7 @@ type McpRegistrationResult = {
 
 const CLAUDE_MODELS = [
   { value: "", label: "Default" },
-  { value: "opus", label: "Opus 4.7" },
+  { value: "opus", label: "Opus 4.8" },
   { value: "sonnet", label: "Sonnet 4.7" },
   { value: "haiku", label: "Haiku 4.5" },
 ];
@@ -524,7 +524,7 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
                 }}
               >
                 <option value="">Default</option>
-                <option value="opus">Opus 4.7</option>
+                <option value="opus">Opus 4.8</option>
                 <option value="sonnet">Sonnet 4.7</option>
                 <option value="haiku">Haiku 4.5</option>
                 <option value="custom">Custom...</option>
