@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::{
+    collections::VecDeque,
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -11,6 +12,27 @@ const MAX_TEXT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const BINARY_CHECK_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_RANGE_READ_BYTES: usize = 1024 * 1024;
 pub(crate) const PROBE_BYTES: usize = 64 * 1024;
+const MAX_FILE_SEARCH_RESULTS: usize = 1_000;
+const MAX_FILE_SEARCH_DIRS: usize = 50_000;
+const FILE_SEARCH_IGNORED_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    ".cache",
+    ".turbo",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".npm",
+    ".pnpm-store",
+    ".yarn",
+];
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -254,6 +276,87 @@ pub fn list_fs_entries(root: String, path: String) -> Result<Vec<FsEntry>, Strin
     let entries: Vec<FsEntry> = sortable.into_iter().map(|(_, e)| e).collect();
 
     Ok(entries)
+}
+
+fn is_file_search_ignored_dir(name: &str) -> bool {
+    FILE_SEARCH_IGNORED_DIRS.iter().any(|ignored| *ignored == name)
+}
+
+fn file_search_sort_key(name: &str) -> (bool, String) {
+    (name.starts_with('.'), name.to_lowercase())
+}
+
+#[tauri::command]
+pub fn search_fs_entries(root: String, query: String, limit: Option<usize>) -> Result<Vec<FsEntry>, String> {
+    let root = ensure_root_dir(Path::new(root.trim()))?;
+    let query = query.trim().to_lowercase();
+    if query.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let limit = limit.unwrap_or(200).clamp(1, MAX_FILE_SEARCH_RESULTS);
+
+    let mut out: Vec<FsEntry> = Vec::new();
+    let mut queue: VecDeque<PathBuf> = VecDeque::from([root.clone()]);
+    let mut scanned_dirs = 0usize;
+
+    while let Some(dir) = queue.pop_front() {
+        if out.len() >= limit || scanned_dirs >= MAX_FILE_SEARCH_DIRS {
+            break;
+        }
+        scanned_dirs += 1;
+
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+        let mut files: Vec<(String, PathBuf, u64)> = Vec::new();
+
+        for item in read_dir.flatten() {
+            let name = item.file_name().to_string_lossy().to_string();
+            let path = item.path();
+            let meta = match fs::metadata(&path) {
+                Ok(meta) => meta,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                if !is_file_search_ignored_dir(&name) {
+                    dirs.push((name, path));
+                }
+            } else if meta.is_file() {
+                files.push((name, path, meta.len()));
+            }
+        }
+
+        dirs.sort_by_key(|(name, _)| file_search_sort_key(name));
+        files.sort_by_key(|(name, _path, _size)| file_search_sort_key(name));
+
+        for (name, path, size) in files {
+            let rel = path
+                .strip_prefix(&root)
+                .ok()
+                .and_then(|p| p.to_str())
+                .unwrap_or(&name)
+                .to_lowercase();
+            if name.to_lowercase().contains(&query) || rel.contains(&query) {
+                out.push(FsEntry {
+                    name,
+                    path: path.to_string_lossy().to_string(),
+                    is_dir: false,
+                    size,
+                });
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        for (_name, path) in dirs {
+            queue.push_back(path);
+        }
+    }
+
+    Ok(out)
 }
 
 fn git_status_kind(code: &str) -> &'static str {

@@ -2413,6 +2413,14 @@ export default function App() {
       pushPendingData(id, text);
     };
 
+    if (activeId && queue.size === 1) {
+      const activeChunks = queue.get(activeId);
+      if (activeChunks) {
+        flushAllChunks(activeId, activeChunks);
+        return;
+      }
+    }
+
     const flushHiddenChunksWithBudget = (id: string, chunks: string[]) => {
       if (closingSessions.current.has(id) || chunks.length === 0) return;
       const entry = registry.current.get(id);

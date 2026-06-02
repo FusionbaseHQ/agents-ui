@@ -680,6 +680,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   const saveTimerRef = React.useRef<number | null>(null);
   const sshTargetValue = React.useMemo(() => (sshTarget ?? "").trim() || null, [sshTarget]);
   const tabStripRef = React.useRef<HTMLDivElement | null>(null);
+  const tabScrollStateRafRef = React.useRef<number | null>(null);
   const tabButtonRefs = React.useRef<Map<string, HTMLButtonElement>>(new Map());
   const [tabsMenuOpen, setTabsMenuOpen] = React.useState(false);
   const tabsMenuRef = React.useRef<HTMLDivElement | null>(null);
@@ -1553,6 +1554,13 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     setCanScrollLeft(scrollLeft > 1);
     setCanScrollRight(scrollLeft + clientWidth < scrollWidth - 1);
   }, []);
+  const scheduleScrollStateUpdate = React.useCallback(() => {
+    if (tabScrollStateRafRef.current !== null) return;
+    tabScrollStateRafRef.current = window.requestAnimationFrame(() => {
+      tabScrollStateRafRef.current = null;
+      updateScrollState();
+    });
+  }, [updateScrollState]);
 
   React.useEffect(() => {
     const el = tabStripRef.current;
@@ -1560,17 +1568,21 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
 
     updateScrollState();
 
-    const handleScroll = () => updateScrollState();
+    const handleScroll = () => scheduleScrollStateUpdate();
     el.addEventListener("scroll", handleScroll, { passive: true });
 
-    const resizeObserver = new ResizeObserver(() => updateScrollState());
+    const resizeObserver = new ResizeObserver(() => scheduleScrollStateUpdate());
     resizeObserver.observe(el);
 
     return () => {
       el.removeEventListener("scroll", handleScroll);
       resizeObserver.disconnect();
+      if (tabScrollStateRafRef.current !== null) {
+        window.cancelAnimationFrame(tabScrollStateRafRef.current);
+        tabScrollStateRafRef.current = null;
+      }
     };
-  }, [updateScrollState, tabs.length]);
+  }, [scheduleScrollStateUpdate, tabs.length, updateScrollState]);
 
   const scrollTabs = React.useCallback((direction: "left" | "right") => {
     const el = tabStripRef.current;
@@ -2836,17 +2848,26 @@ function ByteViewer({ path, size, readRange }: { path: string; size: number; rea
   React.useEffect(() => {
     const el = listRef.current;
     if (!el) return;
+    let raf: number | null = null;
     const sync = () => {
-      setScrollTop(el.scrollTop);
-      setListHeight(el.clientHeight);
+      raf = null;
+      const nextScrollTop = el.scrollTop;
+      const nextListHeight = el.clientHeight;
+      setScrollTop((prev) => (prev === nextScrollTop ? prev : nextScrollTop));
+      setListHeight((prev) => (prev === nextListHeight ? prev : nextListHeight));
+    };
+    const scheduleSync = () => {
+      if (raf !== null) return;
+      raf = window.requestAnimationFrame(sync);
     };
     sync();
-    el.addEventListener("scroll", sync, { passive: true });
-    const ro = new ResizeObserver(sync);
+    el.addEventListener("scroll", scheduleSync, { passive: true });
+    const ro = new ResizeObserver(scheduleSync);
     ro.observe(el);
     return () => {
-      el.removeEventListener("scroll", sync);
+      el.removeEventListener("scroll", scheduleSync);
       ro.disconnect();
+      if (raf !== null) window.cancelAnimationFrame(raf);
     };
   }, []);
 
@@ -3165,17 +3186,26 @@ function LargeTextViewer({
   React.useEffect(() => {
     const el = listRef.current;
     if (!el) return;
+    let raf: number | null = null;
     const sync = () => {
-      setScrollTop(el.scrollTop);
-      setListHeight(el.clientHeight);
+      raf = null;
+      const nextScrollTop = el.scrollTop;
+      const nextListHeight = el.clientHeight;
+      setScrollTop((prev) => (prev === nextScrollTop ? prev : nextScrollTop));
+      setListHeight((prev) => (prev === nextListHeight ? prev : nextListHeight));
+    };
+    const scheduleSync = () => {
+      if (raf !== null) return;
+      raf = window.requestAnimationFrame(sync);
     };
     sync();
-    el.addEventListener("scroll", sync, { passive: true });
-    const ro = new ResizeObserver(sync);
+    el.addEventListener("scroll", scheduleSync, { passive: true });
+    const ro = new ResizeObserver(scheduleSync);
     ro.observe(el);
     return () => {
-      el.removeEventListener("scroll", sync);
+      el.removeEventListener("scroll", scheduleSync);
       ro.disconnect();
+      if (raf !== null) window.cancelAnimationFrame(raf);
     };
   }, []);
 

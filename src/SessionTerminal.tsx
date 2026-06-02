@@ -43,6 +43,7 @@ const KNOWN_XTERM_RESIZE_RACE_SIGNATURES = [
   "this._renderer.value.handleresize",
   "undefined is not an object (evaluating 'this._renderer.value.handleresize')",
 ];
+const TERMINAL_FONT_FAMILY = "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
 const TERMINAL_THEME_BY_UI_THEME: Record<UiTheme, TerminalTheme> = {
   dawn: {
     background: "#1f1915",
@@ -113,13 +114,7 @@ const TERMINAL_THEME_BY_UI_THEME: Record<UiTheme, TerminalTheme> = {
 };
 
 function terminalThemeForUiTheme(uiTheme: UiTheme): TerminalTheme {
-  const selected = TERMINAL_THEME_BY_UI_THEME[uiTheme];
-  return {
-    background: selected.background,
-    foreground: selected.foreground,
-    cursor: selected.cursor,
-    selectionBackground: selected.selectionBackground,
-  };
+  return TERMINAL_THEME_BY_UI_THEME[uiTheme] ?? TERMINAL_THEME_BY_UI_THEME.midnight;
 }
 
 function createEmptyRenderDimensions(): RenderDimensionsFallback {
@@ -382,8 +377,7 @@ function SessionTerminal(props: SessionTerminalProps) {
       allowProposedApi: true,
       cursorBlink: true,
       disableStdin: props.readOnly,
-      fontFamily:
-        'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+      fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: 13,
       theme: terminalThemeForUiTheme(props.uiTheme),
       scrollback: 5000,
@@ -416,7 +410,9 @@ function SessionTerminal(props: SessionTerminalProps) {
       const fitAddon = fitRef.current;
       if (!t || !t.element) return;
 
-      if (fitAddon && container.getBoundingClientRect().width > 0 && container.getBoundingClientRect().height > 0) {
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      if (fitAddon && width > 0 && height > 0) {
         try {
           fitAddon.fit();
           const { cols, rows } = t;
@@ -932,8 +928,7 @@ function SessionTerminal(props: SessionTerminalProps) {
 	      const fit = fitRef.current;
 	      if (!term || !fit) return;
 	      if (!term.element) return;
-	      const rect = container.getBoundingClientRect();
-	      if (rect.width === 0 || rect.height === 0) return;
+	      if (container.clientWidth === 0 || container.clientHeight === 0) return;
 
 	      if (!isXtermRendererReady(term)) {
 	        resizeRetryCountRef.current += 1;
@@ -980,9 +975,7 @@ function SessionTerminal(props: SessionTerminalProps) {
 	        return;
 	      }
 	      // xterm 5 safely queues writes before renderer init — no gate needed
-	      for (const chunk of buffered) {
-	        term.write(chunk);
-	      }
+	      term.write(buffered.length === 1 ? buffered[0] : buffered.join(""));
 	      props.pendingData.current.delete(props.id);
 	    };
 	    flushPendingRef.current = flushPending;
@@ -1110,8 +1103,7 @@ function SessionTerminal(props: SessionTerminalProps) {
     let cancelled = false;
 	    const attemptFit = (attemptsLeft: number) => {
 	      if (cancelled) return;
-	      const rect = container.getBoundingClientRect();
-	      if (rect.width === 0 || rect.height === 0) {
+	      if (container.clientWidth === 0 || container.clientHeight === 0) {
 	        if (attemptsLeft > 0) {
 	          window.requestAnimationFrame(() => attemptFit(attemptsLeft - 1));
 	        }
@@ -1176,7 +1168,6 @@ function SessionTerminal(props: SessionTerminalProps) {
     term.options.theme = terminalThemeForUiTheme(props.uiTheme);
     try {
       canvasAddonRef.current?.clearTextureAtlas?.();
-      fitRef.current?.fit();
       term.refresh(0, Math.max(0, term.rows - 1));
     } catch {
       // best-effort redraw

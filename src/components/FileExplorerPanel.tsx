@@ -455,6 +455,7 @@ export function FileExplorerPanel({
   const listRef = React.useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = React.useState(0);
   const [listHeight, setListHeight] = React.useState(0);
+  const listScrollSyncRafRef = React.useRef<number | null>(null);
   const lastRevealPathRef = React.useRef<string | null>(null);
 
   const [contextMenu, setContextMenu] = React.useState<{ x: number; y: number; entry: FsEntry } | null>(null);
@@ -768,22 +769,28 @@ export function FileExplorerPanel({
     const el = listRef.current;
     if (!el) return;
     const syncDimensions = () => {
-      setListHeight(el.clientHeight);
-      setScrollTop(el.scrollTop);
+      listScrollSyncRafRef.current = null;
+      const nextListHeight = el.clientHeight;
+      const nextScrollTop = el.scrollTop;
+      setListHeight((prev) => (prev === nextListHeight ? prev : nextListHeight));
+      setScrollTop((prev) => (prev === nextScrollTop ? prev : nextScrollTop));
+    };
+    const scheduleSyncDimensions = () => {
+      if (listScrollSyncRafRef.current !== null) return;
+      listScrollSyncRafRef.current = window.requestAnimationFrame(syncDimensions);
     };
     syncDimensions();
-    if (typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(() => syncDimensions());
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
-
-  React.useEffect(() => {
-    const el = listRef.current;
-    if (!el) return;
-    const onScroll = () => setScrollTop(el.scrollTop);
-    el.addEventListener("scroll", onScroll, { passive: true });
-    return () => el.removeEventListener("scroll", onScroll);
+    el.addEventListener("scroll", scheduleSyncDimensions, { passive: true });
+    const ro = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(scheduleSyncDimensions);
+    ro?.observe(el);
+    return () => {
+      el.removeEventListener("scroll", scheduleSyncDimensions);
+      ro?.disconnect();
+      if (listScrollSyncRafRef.current !== null) {
+        window.cancelAnimationFrame(listScrollSyncRafRef.current);
+        listScrollSyncRafRef.current = null;
+      }
+    };
   }, []);
 
   // Re-sync scroll position when window regains visibility — the browser may

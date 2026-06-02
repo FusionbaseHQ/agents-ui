@@ -18,8 +18,13 @@ type WorkspaceFileSearchProps = {
   onClose: () => void;
 };
 
-const MAX_SCAN_DIRS = 700;
-const MAX_SCAN_FILES = 5_000;
+const MAX_SAMPLE_DIRS_LOCAL = 160;
+const MAX_SAMPLE_DIRS_SSH = 45;
+const MAX_SAMPLE_FILES_LOCAL = 1_200;
+const MAX_SAMPLE_FILES_SSH = 450;
+const MAX_SAMPLE_FILES_PER_DIR = 60;
+const BACKEND_SEARCH_LIMIT = 300;
+const MIN_BACKEND_QUERY_LENGTH = 2;
 const MAX_RESULTS = 80;
 const IGNORED_DIRS = new Set([
   ".git",
@@ -42,6 +47,18 @@ function relativePath(rootDir: string, path: string): string {
   const root = rootDir.replace(/\/+$/, "");
   if (!root || path === root) return path;
   return path.startsWith(`${root}/`) ? path.slice(root.length + 1) : path;
+}
+
+function searchSortKey(entry: FsEntry): [number, string] {
+  return [entry.name.startsWith(".") ? 1 : 0, entry.name.toLowerCase()];
+}
+
+function sortForSearch(entries: FsEntry[]): FsEntry[] {
+  return entries.slice().sort((a, b) => {
+    const [aHidden, aName] = searchSortKey(a);
+    const [bHidden, bName] = searchSortKey(b);
+    return aHidden - bHidden || aName.localeCompare(bName);
+  });
 }
 
 function fuzzyScore(path: string, query: string): number | null {
@@ -82,8 +99,14 @@ export function WorkspaceFileSearch({
   onClose,
 }: WorkspaceFileSearchProps) {
   const [query, setQuery] = React.useState("");
-  const [entries, setEntries] = React.useState<FsEntry[]>([]);
-  const [status, setStatus] = React.useState("Ready");
+  const [sampleEntries, setSampleEntries] = React.useState<FsEntry[]>([]);
+  const [sampleStatus, setSampleStatus] = React.useState("Ready");
+  const [searchState, setSearchState] = React.useState<{
+    query: string;
+    entries: FsEntry[];
+    status: string;
+    loading: boolean;
+  }>({ query: "", entries: [], status: "", loading: false });
   const [selectedIndex, setSelectedIndex] = React.useState(0);
   const inputRef = React.useRef<HTMLInputElement | null>(null);
 
@@ -99,38 +122,59 @@ export function WorkspaceFileSearch({
     const root = rootDir.trim();
     const target = (sshTarget ?? "").trim();
     let cancelled = false;
-    setEntries([]);
-    setStatus(root ? "Scanning workspace..." : "Workspace root unavailable");
+    setSampleEntries([]);
+    setSearchState({ query: "", entries: [], status: "", loading: false });
+    setSampleStatus(root ? "Loading workspace sample..." : "Workspace root unavailable");
 
     if (!root) return;
+    if (provider === "ssh" && !target) {
+      setSampleStatus("Missing SSH target.");
+      return;
+    }
 
     void (async () => {
       const files: FsEntry[] = [];
-      const stack = [root];
+      const queue = [root];
+      const maxDirs = provider === "ssh" ? MAX_SAMPLE_DIRS_SSH : MAX_SAMPLE_DIRS_LOCAL;
+      const maxFiles = provider === "ssh" ? MAX_SAMPLE_FILES_SSH : MAX_SAMPLE_FILES_LOCAL;
       let scannedDirs = 0;
       let skipped = false;
+      let cursor = 0;
 
-      while (stack.length > 0 && !cancelled && scannedDirs < MAX_SCAN_DIRS && files.length < MAX_SCAN_FILES) {
-        const dir = stack.pop()!;
+      while (cursor < queue.length && !cancelled && scannedDirs < maxDirs && files.length < maxFiles) {
+        const dir = queue[cursor++]!;
         scannedDirs++;
         try {
           const children =
             provider === "ssh"
               ? await invoke<FsEntry[]>("ssh_list_fs_entries", { target, root, path: dir })
               : await invoke<FsEntry[]>("list_fs_entries", { root, path: dir });
-          for (let i = children.length - 1; i >= 0; i--) {
-            const child = children[i];
+
+          const sortedChildren = sortForSearch(children);
+          const dirs: FsEntry[] = [];
+          let filesFromDir = 0;
+
+          for (const child of sortedChildren) {
             if (child.isDir) {
               if (IGNORED_DIRS.has(child.name)) {
                 skipped = true;
-                continue;
+              } else {
+                dirs.push(child);
               }
-              stack.push(child.path);
-            } else {
-              files.push(child);
-              if (files.length % 150 === 0) setEntries(files.slice());
-              if (files.length >= MAX_SCAN_FILES) break;
+              continue;
             }
+            if (filesFromDir >= MAX_SAMPLE_FILES_PER_DIR) {
+              skipped = true;
+              continue;
+            }
+            files.push(child);
+            filesFromDir++;
+            if (files.length % 120 === 0) setSampleEntries(files.slice());
+            if (files.length >= maxFiles) break;
+          }
+
+          for (const child of dirs) {
+            queue.push(child.path);
           }
         } catch {
           skipped = true;
@@ -138,12 +182,13 @@ export function WorkspaceFileSearch({
       }
 
       if (cancelled) return;
-      setEntries(files.slice());
-      const capped = scannedDirs >= MAX_SCAN_DIRS || files.length >= MAX_SCAN_FILES;
-      setStatus(
-        `${files.length.toLocaleString()} files` +
-          (capped ? " (limited scan)" : "") +
-          (skipped ? " - some folders skipped" : ""),
+      setSampleEntries(files.slice());
+      const capped = scannedDirs >= maxDirs || files.length >= maxFiles;
+      setSampleStatus(
+        `${files.length.toLocaleString()} sampled` +
+          (capped ? " (limited)" : "") +
+          (skipped ? " - some folders skipped" : "") +
+          ` - type ${MIN_BACKEND_QUERY_LENGTH}+ chars to search all`,
       );
     })();
 
@@ -152,10 +197,68 @@ export function WorkspaceFileSearch({
     };
   }, [isOpen, provider, rootDir, sshTarget]);
 
+  React.useEffect(() => {
+    if (!isOpen) return;
+    const root = rootDir.trim();
+    const target = (sshTarget ?? "").trim();
+    const q = query.trim();
+    if (!root || q.length < MIN_BACKEND_QUERY_LENGTH) {
+      setSearchState((prev) =>
+        prev.query === "" && prev.entries.length === 0 && !prev.loading ? prev : { query: "", entries: [], status: "", loading: false },
+      );
+      return;
+    }
+    if (provider === "ssh" && !target) {
+      setSearchState({ query: q, entries: [], status: "Missing SSH target.", loading: false });
+      return;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      setSearchState({ query: q, entries: [], status: "Searching full workspace...", loading: true });
+      const command = provider === "ssh" ? "ssh_search_fs_entries" : "search_fs_entries";
+      const args =
+        provider === "ssh"
+          ? { target, root, query: q, limit: BACKEND_SEARCH_LIMIT }
+          : { root, query: q, limit: BACKEND_SEARCH_LIMIT };
+      void invoke<FsEntry[]>(command, args)
+        .then((found) => {
+          if (cancelled) return;
+          const limited = found.length >= BACKEND_SEARCH_LIMIT;
+          setSearchState({
+            query: q,
+            entries: found,
+            status:
+              `${found.length.toLocaleString()} full-search match${found.length === 1 ? "" : "es"}` +
+              (limited ? " (limited)" : ""),
+            loading: false,
+          });
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          const message = err instanceof Error ? err.message : String(err);
+          setSearchState({
+            query: q,
+            entries: [],
+            status: `Full search failed: ${message}`,
+            loading: false,
+          });
+        });
+    }, 180);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [isOpen, provider, query, rootDir, sshTarget]);
+
   const results = React.useMemo(() => {
     const root = rootDir.trim();
     const q = query.trim();
-    return entries
+    const fullSearchReady = q.length >= MIN_BACKEND_QUERY_LENGTH && searchState.query === q && !searchState.loading;
+    const fullSearchFailed = searchState.status.startsWith("Full search failed:");
+    const sourceEntries = fullSearchReady && !fullSearchFailed ? searchState.entries : sampleEntries;
+    return sourceEntries
       .map((entry) => {
         const rel = relativePath(root, entry.path);
         const score = fuzzyScore(rel, q);
@@ -164,7 +267,16 @@ export function WorkspaceFileSearch({
       .filter((item): item is { entry: FsEntry; rel: string; score: number } => item != null)
       .sort((a, b) => b.score - a.score || a.rel.localeCompare(b.rel))
       .slice(0, MAX_RESULTS);
-  }, [entries, query, rootDir]);
+  }, [query, rootDir, sampleEntries, searchState.entries, searchState.loading, searchState.query, searchState.status]);
+
+  const status = React.useMemo(() => {
+    const q = query.trim();
+    if (q.length >= MIN_BACKEND_QUERY_LENGTH) {
+      if (searchState.query === q && searchState.status) return searchState.status;
+      return "Preparing full workspace search...";
+    }
+    return sampleStatus;
+  }, [query, sampleStatus, searchState.query, searchState.status]);
 
   React.useEffect(() => {
     setSelectedIndex(0);
@@ -224,7 +336,13 @@ export function WorkspaceFileSearch({
         <div className="workspaceFileSearchStatus">{status}</div>
         <div className="workspaceFileSearchList">
           {results.length === 0 ? (
-            <div className="workspaceFileSearchEmpty">{entries.length ? "No matching files." : "Scanning..."}</div>
+            <div className="workspaceFileSearchEmpty">
+              {query.trim().length >= MIN_BACKEND_QUERY_LENGTH && searchState.loading
+                ? "Searching..."
+                : sampleEntries.length || searchState.entries.length
+                  ? "No matching files."
+                  : "Scanning..."}
+            </div>
           ) : (
             results.map((item, index) => (
               <button

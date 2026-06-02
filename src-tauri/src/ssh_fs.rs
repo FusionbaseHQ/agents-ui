@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -6,6 +7,7 @@ use crate::files::{probe_from_sample, FileProbe, FsEntry, MAX_RANGE_READ_BYTES, 
 
 const MAX_TEXT_FILE_BYTES: usize = 2 * 1024 * 1024;
 const BINARY_CHECK_BYTES: usize = 8 * 1024;
+const MAX_REMOTE_FILE_SEARCH_RESULTS: usize = 1_000;
 
 fn find_program_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -505,6 +507,109 @@ fn ssh_list_fs_entries_sync(target: String, root: String, path: String) -> Resul
         return Err(output_to_error("sftp failed", &output));
     }
     Ok(parse_sftp_ls(&path, &String::from_utf8_lossy(&output.stdout)))
+}
+
+#[tauri::command]
+pub async fn ssh_search_fs_entries(
+    target: String,
+    root: String,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<FsEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || ssh_search_fs_entries_sync(target, root, query, limit))
+        .await
+        .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+fn ssh_search_fs_entries_sync(
+    target: String,
+    root: String,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<FsEntry>, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("missing ssh target".to_string());
+    }
+    let root = normalize_posix_path(&root)?;
+    let query = query.trim().to_string();
+    if query.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let limit = limit.unwrap_or(200).clamp(1, MAX_REMOTE_FILE_SEARCH_RESULTS);
+
+    let mut out: Vec<FsEntry> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    ssh_search_pass(target, &root, &query, limit, false, &mut seen, &mut out)?;
+    if out.len() < limit {
+        ssh_search_pass(target, &root, &query, limit - out.len(), true, &mut seen, &mut out)?;
+    }
+
+    Ok(out)
+}
+
+fn ssh_search_pass(
+    target: &str,
+    root: &str,
+    query: &str,
+    limit: usize,
+    include_hidden_dirs: bool,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<FsEntry>,
+) -> Result<(), String> {
+    if limit == 0 {
+        return Ok(());
+    }
+
+    let script = r#"root=$1
+query=$2
+limit=$3
+include_hidden=$4
+q=$(printf '%s' "$query" | tr '[:upper:]' '[:lower:]')
+if [ "$include_hidden" = "1" ]; then
+  find "$root" -mindepth 1 \( -type d \( -name .git -o -name .hg -o -name .svn -o -name node_modules -o -name target -o -name dist -o -name build -o -name .next -o -name .nuxt -o -name .cache -o -name .turbo -o -name .venv -o -name venv -o -name __pycache__ -o -name .npm -o -name .pnpm-store -o -name .yarn \) -prune \) -o -type f -print 2>/dev/null
+else
+  find "$root" -mindepth 1 \( -type d \( -name .git -o -name .hg -o -name .svn -o -name node_modules -o -name target -o -name dist -o -name build -o -name .next -o -name .nuxt -o -name .cache -o -name .turbo -o -name .venv -o -name venv -o -name __pycache__ -o -name .npm -o -name .pnpm-store -o -name .yarn -o -name '.*' \) -prune \) -o -type f -print 2>/dev/null
+fi | awk -v q="$q" -v limit="$limit" 'BEGIN { count = 0 } { low = tolower($0); if (index(low, q) > 0) { print; count++; if (count >= limit) exit } }'
+"#;
+
+    let args = vec![
+        root.to_string(),
+        query.to_string(),
+        limit.to_string(),
+        if include_hidden_dirs { "1" } else { "0" }.to_string(),
+    ];
+    let command = build_sh_c_command(script, Some("--"), &args);
+    let output = run_ssh(target, &[command], None)?;
+    if !output.status.success() {
+        return Err(output_to_error("ssh search failed", &output));
+    }
+
+    for raw in String::from_utf8_lossy(&output.stdout).lines() {
+        let path = match normalize_posix_path(raw) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if root != "/" && path != root && !path.starts_with(&format!("{root}/")) {
+            continue;
+        }
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        if name.is_empty() {
+            continue;
+        }
+        out.push(FsEntry {
+            name,
+            path,
+            is_dir: false,
+            size: 0,
+        });
+    }
+
+    Ok(())
 }
 
 #[tauri::command]

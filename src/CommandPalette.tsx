@@ -612,8 +612,8 @@ export function CommandPalette({
         </div>
         <div className="commandPaletteFooter">
           <span className="commandPaletteHint">
-            <kbd>\u2191</kbd><kbd>\u2193</kbd> navigate
-            <kbd>\u21B5</kbd> select
+            <kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate
+            <kbd>&#8617;</kbd> select
             <kbd>esc</kbd> close
           </span>
         </div>
