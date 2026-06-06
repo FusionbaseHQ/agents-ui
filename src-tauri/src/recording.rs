@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use tauri::{Manager, WebviewWindow};
+use tauri::{AppHandle, Manager};
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -65,9 +65,8 @@ pub fn sanitize_recording_id(input: &str) -> String {
     }
 }
 
-pub fn recording_file_path(window: &WebviewWindow, recording_id: &str) -> Result<PathBuf, String> {
-    let app_data = window
-        .app_handle()
+pub fn recording_file_path(app: &AppHandle, recording_id: &str) -> Result<PathBuf, String> {
+    let app_data = app
         .path()
         .app_data_dir()
         .map_err(|_| "unknown app data dir".to_string())?;
@@ -76,9 +75,8 @@ pub fn recording_file_path(window: &WebviewWindow, recording_id: &str) -> Result
         .join(format!("{recording_id}.jsonl")))
 }
 
-fn recordings_dir(window: &WebviewWindow) -> Result<PathBuf, String> {
-    let app_data = window
-        .app_handle()
+fn recordings_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_data = app
         .path()
         .app_data_dir()
         .map_err(|_| "unknown app data dir".to_string())?;
@@ -110,12 +108,12 @@ fn read_recording_meta(path: &PathBuf) -> Result<Option<RecordingMetaV1>, String
 
 #[tauri::command]
 pub fn load_recording(
-    window: WebviewWindow,
+    app: AppHandle,
     recording_id: String,
     decrypt: Option<bool>,
 ) -> Result<LoadedRecordingV1, String> {
     let safe_id = sanitize_recording_id(&recording_id);
-    let path = recording_file_path(&window, &safe_id)?;
+    let path = recording_file_path(&app, &safe_id)?;
     let file = fs::File::open(&path).map_err(|e| format!("open failed: {e}"))?;
     let reader = BufReader::new(file);
 
@@ -147,7 +145,7 @@ pub fn load_recording(
                         );
                     }
                     if key.is_none() {
-                        key = Some(crate::secure::get_or_create_master_key(&window)?);
+                        key = Some(crate::secure::get_or_create_master_key(&app)?);
                     }
                     if let Some(key) = key.as_ref() {
                         ev.data = crate::secure::decrypt_string_with_key(
@@ -170,8 +168,8 @@ pub fn load_recording(
 }
 
 #[tauri::command]
-pub fn list_recordings(window: WebviewWindow) -> Result<Vec<RecordingIndexEntryV1>, String> {
-    let dir = recordings_dir(&window)?;
+pub fn list_recordings(app: AppHandle) -> Result<Vec<RecordingIndexEntryV1>, String> {
+    let dir = recordings_dir(&app)?;
     let read_dir = match fs::read_dir(&dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -210,9 +208,9 @@ pub fn list_recordings(window: WebviewWindow) -> Result<Vec<RecordingIndexEntryV
 }
 
 #[tauri::command]
-pub fn delete_recording(window: WebviewWindow, recording_id: String) -> Result<(), String> {
+pub fn delete_recording(app: AppHandle, recording_id: String) -> Result<(), String> {
     let safe_id = sanitize_recording_id(&recording_id);
-    let path = recording_file_path(&window, &safe_id)?;
+    let path = recording_file_path(&app, &safe_id)?;
     match fs::remove_file(&path) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

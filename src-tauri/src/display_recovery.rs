@@ -84,7 +84,11 @@ mod imp {
         let app1 = app.clone();
         let cell1 = size_cell.clone();
         let _ = app.run_on_main_thread(move || {
-            let Some(win) = app1.get_webview_window("main") else {
+            // Use get_window (not get_webview_window): once a browser child
+            // webview is attached to the main window, the main window is no
+            // longer a WebviewWindow, so get_webview_window("main") returns None
+            // and the recompose kick would silently never run.
+            let Some(win) = app1.get_window("main") else {
                 return;
             };
             let _ = win.emit("system-resumed", ());
@@ -110,7 +114,7 @@ mod imp {
             let Some((w, h)) = *cell2.lock().unwrap() else {
                 return;
             };
-            if let Some(win) = app2.get_webview_window("main") {
+            if let Some(win) = app2.get_window("main") {
                 let _ = win.set_size(tauri::PhysicalSize::new(w, h));
             }
         });

@@ -48,7 +48,10 @@ fn show_main_window(app: &AppHandle) {
         let _ = app.show();
     }
 
-    let Some(window) = app.get_webview_window("main") else {
+    // get_window, not get_webview_window: with a browser child webview attached
+    // the main window is no longer a WebviewWindow, so get_webview_window("main")
+    // returns None and the tray would fail to surface the window.
+    let Some(window) = app.get_window("main") else {
         return;
     };
 

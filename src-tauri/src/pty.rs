@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{Emitter, Manager, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 const AGENTS_UI_ZELLIJ_PREFIX: &str = "agents-ui-";
 #[cfg(target_family = "unix")]
@@ -410,8 +410,8 @@ struct ShellXdgPaths {
 }
 
 #[cfg(target_family = "unix")]
-fn ensure_shell_xdg_paths(window: &WebviewWindow) -> Option<ShellXdgPaths> {
-    let app_data = window.app_handle().path().app_data_dir().ok()?;
+fn ensure_shell_xdg_paths(app: &AppHandle) -> Option<ShellXdgPaths> {
+    let app_data = app.path().app_data_dir().ok()?;
     let base = app_data.join("shell");
     let config_home = base.join("xdg-config");
     let data_home = base.join("xdg-data");
@@ -444,8 +444,8 @@ struct ZellijPaths {
 }
 
 #[cfg(target_family = "unix")]
-fn ensure_preferred_zellij_socket_dir(window: &WebviewWindow) -> Option<PathBuf> {
-    let home = window.app_handle().path().home_dir().ok()?;
+fn ensure_preferred_zellij_socket_dir(app: &AppHandle) -> Option<PathBuf> {
+    let home = app.path().home_dir().ok()?;
     let base = home.join(".agents-ui-zellij");
     fs::create_dir_all(&base).ok()?;
     let socket_dir = base.join("sockets");
@@ -508,15 +508,15 @@ fn zellij_socket_dir_candidates(preferred: &Path) -> Vec<PathBuf> {
 }
 
 #[cfg(target_family = "unix")]
-fn ensure_zellij_paths(window: &WebviewWindow) -> Option<ZellijPaths> {
-    let app_data = window.app_handle().path().app_data_dir().ok()?;
+fn ensure_zellij_paths(app: &AppHandle) -> Option<ZellijPaths> {
+    let app_data = app.path().app_data_dir().ok()?;
     let base = app_data.join("zellij");
     fs::create_dir_all(&base).ok()?;
 
     // Store sockets in a stable per-user path so sessions survive app restarts without relying on /tmp.
     // Fallback to the legacy /tmp dir if we cannot create the preferred location (or in older installs).
     let socket_dir =
-        ensure_preferred_zellij_socket_dir(window).or_else(|| ensure_legacy_zellij_socket_dir())?;
+        ensure_preferred_zellij_socket_dir(app).or_else(|| ensure_legacy_zellij_socket_dir())?;
 
     Some(ZellijPaths {
         home_dir: base,
@@ -570,8 +570,8 @@ fn zellij_list_sessions(
 }
 
 #[cfg(target_family = "unix")]
-fn ensure_zellij_config(window: &WebviewWindow) -> Option<PathBuf> {
-    let zellij_paths = ensure_zellij_paths(window)?;
+fn ensure_zellij_config(app: &AppHandle) -> Option<PathBuf> {
+    let zellij_paths = ensure_zellij_paths(app)?;
     let config_dir = zellij_paths.home_dir.join(".config").join("zellij");
     fs::create_dir_all(&config_dir).ok()?;
     let config_path = config_dir.join("config.kdl");
@@ -598,8 +598,8 @@ show_release_notes false
 }
 
 #[cfg(target_family = "unix")]
-fn ensure_zellij_shell_wrapper(window: &WebviewWindow) -> Option<PathBuf> {
-    let app_data = window.app_handle().path().app_data_dir().ok()?;
+fn ensure_zellij_shell_wrapper(app: &AppHandle) -> Option<PathBuf> {
+    let app_data = app.path().app_data_dir().ok()?;
     let base = app_data.join("shell");
     fs::create_dir_all(&base).ok()?;
 
@@ -651,8 +651,8 @@ exec "$shell" "$@"
 }
 
 #[cfg(target_family = "unix")]
-fn zsh_zdotdir_path(window: &WebviewWindow, key: &str) -> Option<PathBuf> {
-    let app_data = window.app_handle().path().app_data_dir().ok()?;
+fn zsh_zdotdir_path(app: &AppHandle, key: &str) -> Option<PathBuf> {
+    let app_data = app.path().app_data_dir().ok()?;
     let base = app_data.join("shell").join("zsh");
     fs::create_dir_all(&base).ok()?;
     let safe = agents_ui_zellij_session_name(key);
@@ -669,16 +669,17 @@ pub struct PersistentSessionInfo {
 }
 
 #[tauri::command]
-pub fn list_persistent_sessions(window: WebviewWindow) -> Result<Vec<PersistentSessionInfo>, String> {
+pub fn list_persistent_sessions(app: AppHandle) -> Result<Vec<PersistentSessionInfo>, String> {
     #[cfg(not(target_family = "unix"))]
     {
+        let _ = app;
         return Err("persistent sessions are only supported on Unix".to_string());
     }
 
     #[cfg(target_family = "unix")]
     {
         let zellij = find_bundled_zellij().ok_or("bundled zellij missing in this build".to_string())?;
-        let zellij_paths = ensure_zellij_paths(&window).ok_or("unable to determine app data dir".to_string())?;
+        let zellij_paths = ensure_zellij_paths(&app).ok_or("unable to determine app data dir".to_string())?;
         let mut sessions: Vec<PersistentSessionInfo> = Vec::new();
         let mut list_errors: Vec<String> = Vec::new();
 
@@ -714,16 +715,17 @@ pub fn list_persistent_sessions(window: WebviewWindow) -> Result<Vec<PersistentS
 }
 
 #[tauri::command]
-pub fn kill_persistent_session(window: WebviewWindow, persist_id: String) -> Result<(), String> {
+pub fn kill_persistent_session(app: AppHandle, persist_id: String) -> Result<(), String> {
     #[cfg(not(target_family = "unix"))]
     {
+        let _ = (app, persist_id);
         return Err("persistent sessions are only supported on Unix".to_string());
     }
 
     #[cfg(target_family = "unix")]
     {
         let zellij = find_bundled_zellij().ok_or("bundled zellij missing in this build".to_string())?;
-        let zellij_paths = ensure_zellij_paths(&window).ok_or("unable to determine app data dir".to_string())?;
+        let zellij_paths = ensure_zellij_paths(&app).ok_or("unable to determine app data dir".to_string())?;
         let trimmed = persist_id.trim();
         if trimmed.is_empty() {
             return Err("missing persist id".to_string());
@@ -1105,8 +1107,8 @@ fn find_bundled_nu() -> Option<PathBuf> {
 }
 
 #[cfg(target_family = "unix")]
-fn ensure_nu_config(window: &WebviewWindow, env_keys: &[String]) -> Option<(String, String, String, String)> {
-    let xdg = ensure_shell_xdg_paths(window)?;
+fn ensure_nu_config(app: &AppHandle, env_keys: &[String]) -> Option<(String, String, String, String)> {
+    let xdg = ensure_shell_xdg_paths(app)?;
     let config_home = xdg.config_home;
     let data_home = xdg.data_home;
     let cache_home = xdg.cache_home;
@@ -1353,7 +1355,7 @@ pub fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionInfo>, Str
 
 #[tauri::command]
 pub fn create_session(
-    window: WebviewWindow,
+    app: AppHandle,
     state: State<'_, AppState>,
     name: Option<String>,
     command: Option<String>,
@@ -1416,8 +1418,8 @@ pub fn create_session(
         let zellij = find_bundled_zellij().ok_or("bundled zellij missing in this build".to_string())?;
         let persist_id = persist_id.clone().ok_or("persistId is required for persistent sessions")?;
         let zellij_session = agents_ui_zellij_session_name(&persist_id);
-        let zellij_config = ensure_zellij_config(&window).map(|p| p.to_string_lossy().to_string());
-        let zellij_paths = ensure_zellij_paths(&window).ok_or("unable to determine app data dir".to_string())?;
+        let zellij_config = ensure_zellij_config(&app).map(|p| p.to_string_lossy().to_string());
+        let zellij_paths = ensure_zellij_paths(&app).ok_or("unable to determine app data dir".to_string())?;
 
         let nu = find_bundled_nu();
         let inner_shell = if let Some(nu) = &nu {
@@ -1549,12 +1551,12 @@ pub fn create_session(
         if let Some((zellij_home, zellij_socket_dir)) = persistent_zellij_env.as_ref() {
             cmd.env("HOME", zellij_home.clone());
             cmd.env("ZELLIJ_SOCKET_DIR", zellij_socket_dir.clone());
-        } else if let Some(zellij_paths) = ensure_zellij_paths(&window) {
+        } else if let Some(zellij_paths) = ensure_zellij_paths(&app) {
             cmd.env("HOME", zellij_paths.home_dir.to_string_lossy().to_string());
             cmd.env("ZELLIJ_SOCKET_DIR", zellij_paths.socket_dir.to_string_lossy().to_string());
         }
 
-        if let Some(wrapper) = ensure_zellij_shell_wrapper(&window) {
+        if let Some(wrapper) = ensure_zellij_shell_wrapper(&app) {
             cmd.env("SHELL", wrapper.to_string_lossy().to_string());
             cmd.env("AGENTS_UI_ZELLIJ_REAL_SHELL", inner_shell.clone());
             cmd.env("AGENTS_UI_ZELLIJ_LOGIN", "1");
@@ -1688,7 +1690,7 @@ pub fn create_session(
     #[cfg(target_family = "unix")]
     if use_nu {
         if let Some((xdg_config_home, xdg_data_home, xdg_cache_home, xdg_runtime_dir)) =
-            ensure_nu_config(&window, &env_keys)
+            ensure_nu_config(&app, &env_keys)
         {
             cmd.env("XDG_CONFIG_HOME", xdg_config_home);
             cmd.env("XDG_DATA_HOME", xdg_data_home);
@@ -1696,7 +1698,7 @@ pub fn create_session(
             cmd.env("XDG_RUNTIME_DIR", xdg_runtime_dir);
         }
     } else if persistent {
-        if let Some(xdg) = ensure_shell_xdg_paths(&window) {
+        if let Some(xdg) = ensure_shell_xdg_paths(&app) {
             cmd.env("XDG_CONFIG_HOME", xdg.config_home.to_string_lossy().to_string());
             cmd.env("XDG_DATA_HOME", xdg.data_home.to_string_lossy().to_string());
             cmd.env("XDG_CACHE_HOME", xdg.cache_home.to_string_lossy().to_string());
@@ -1739,7 +1741,7 @@ pub fn create_session(
                 let dotdir = if persistent {
                     persist_id
                         .as_deref()
-                        .and_then(|pid| zsh_zdotdir_path(&window, pid))
+                        .and_then(|pid| zsh_zdotdir_path(&app, pid))
                 } else {
                     Some(std::env::temp_dir().join(format!("agents-ui-zdotdir-{id}")))
                 };
@@ -1798,6 +1800,7 @@ pub fn create_session(
     let id_for_reader = id.clone();
     let id_for_emitter: Arc<str> = Arc::from(id.as_str());
     let state_for_emitter = state.inner().clone();
+    let app_for_emitter = app.clone();
     let (tx, rx) = mpsc::channel::<String>();
 
     // Reader thread: reads from PTY, decodes UTF-8, sends strings to channel.
@@ -1854,7 +1857,8 @@ pub fn create_session(
                 return;
             }
             let data = std::mem::take(buffer);
-            let _ = window.emit(
+            let _ = app_for_emitter.emit_to(
+                "main",
                 "pty-output",
                 PtyOutput {
                     id: id_for_emitter.clone(),
@@ -1915,7 +1919,8 @@ pub fn create_session(
         let exit_code = session
             .and_then(|mut s| s.child.wait().ok().map(|status| status.exit_code()));
 
-        let _ = window.emit(
+        let _ = app_for_emitter.emit_to(
+            "main",
             "pty-exit",
             PtyExit {
                 id: id_for_reader,
@@ -1934,7 +1939,7 @@ pub fn create_session(
 
 #[tauri::command]
 pub fn start_session_recording(
-    window: WebviewWindow,
+    app: AppHandle,
     state: State<'_, AppState>,
     id: String,
     recording_id: String,
@@ -1949,7 +1954,7 @@ pub fn start_session_recording(
     let safe_id = crate::recording::sanitize_recording_id(&recording_id);
     let encrypt_enabled = encrypt.unwrap_or(true);
     let enc_key = if encrypt_enabled {
-        Some(crate::secure::get_or_create_master_key(&window)?)
+        Some(crate::secure::get_or_create_master_key(&app)?)
     } else {
         None
     };
@@ -1965,7 +1970,7 @@ pub fn start_session_recording(
         return Err("already recording".to_string());
     }
 
-    let path = crate::recording::recording_file_path(&window, &safe_id)?;
+    let path = crate::recording::recording_file_path(&app, &safe_id)?;
     let dir = path.parent().ok_or("invalid recording path")?;
     fs::create_dir_all(dir).map_err(|e| format!("create dir failed: {e}"))?;
 

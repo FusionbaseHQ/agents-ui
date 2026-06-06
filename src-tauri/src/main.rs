@@ -229,9 +229,10 @@ fn main() {
                     api_discovery::cleanup();
                 }
                 tauri::RunEvent::Resumed { .. } => {
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.emit("system-resumed", ());
-                    }
+                    // emit_to by label, not get_webview_window("main"): a browser
+                    // child webview makes the main window stop being a
+                    // WebviewWindow, which would make get_webview_window return None.
+                    let _ = app.emit_to("main", "system-resumed", ());
                 }
                 _ => {}
             }
