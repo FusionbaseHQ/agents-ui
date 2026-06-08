@@ -127,6 +127,7 @@ function getFileTypeBadge(name: string): FileTypeBadge | null {
   if (["css", "scss", "less"].includes(ext)) return { label: "CSS", kind: "styles" };
   if (["md", "mdx", "rst", "txt"].includes(ext)) return { label: "MD", kind: "markdown" };
   if (["sql"].includes(ext)) return { label: "SQL", kind: "sql" };
+  if (ext === "xlsx") return { label: "XLS", kind: "markup" };
   if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff"].includes(ext)) {
     return { label: "IMG", kind: "image" };
   }

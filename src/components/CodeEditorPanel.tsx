@@ -30,8 +30,8 @@ export type CodeEditorPanelHandle = {
   captureScreenshot: (input?: CodeEditorCaptureScreenshotInput) => Promise<CodeEditorCaptureScreenshotResult>;
 };
 
-export type CodeEditorOpenMode = "auto" | "text" | "image" | "bytes" | "markdown" | "json" | "csv";
-type ViewerKind = "text" | "largeText" | "image" | "bytes" | "pdf" | "markdown" | "json" | "csv" | "browser";
+export type CodeEditorOpenMode = "auto" | "text" | "image" | "bytes" | "markdown" | "json" | "csv" | "xlsx";
+type ViewerKind = "text" | "largeText" | "image" | "bytes" | "pdf" | "markdown" | "json" | "csv" | "xlsx" | "browser";
 
 export type CodeEditorOpenWorkspaceTabInput = {
   kind?: "file" | "browser";
@@ -117,6 +117,7 @@ const LazyPdfViewer = React.lazy(() => import("../pdf/PdfViewer"));
 const LazyMarkdownViewer = React.lazy(() => import("../fileViewer/MarkdownViewer"));
 const LazyJsonTreeViewer = React.lazy(() => import("../fileViewer/JsonTreeViewer"));
 const LazyCsvTableViewer = React.lazy(() => import("../fileViewer/CsvTableViewer"));
+const LazyXlsxWorkbookViewer = React.lazy(() => import("../fileViewer/XlsxWorkbookViewer"));
 const LazyBrowserView = React.lazy(() => import("../browser/BrowserView"));
 
 // Browser tabs aren't backed by a file; they use a synthetic, never-a-real-path
@@ -177,6 +178,7 @@ const VIEW_MODE_OPTIONS: Array<{ value: CodeEditorOpenMode; label: string; detai
   { value: "markdown", label: "Markdown", detail: "Rendered preview" },
   { value: "json", label: "JSON tree", detail: "Structured tree" },
   { value: "csv", label: "CSV table", detail: "Rows and columns" },
+  { value: "xlsx", label: "XLSX workbook", detail: "Sheets and cells" },
   { value: "image", label: "Image", detail: "Bitmap preview" },
   { value: "bytes", label: "Bytes", detail: "Hex and ASCII" },
 ];
@@ -263,6 +265,7 @@ function autoStructuredKind(path: string): ViewerKind | null {
   // files stay in the editor by default (JSON tree is available via "View as").
   if (ext === "md" || ext === "markdown" || ext === "mdown" || ext === "mkd" || ext === "mdx") return "markdown";
   if (ext === "csv" || ext === "tsv") return "csv";
+  if (ext === "xlsx") return "xlsx";
   return null;
 }
 
@@ -271,7 +274,9 @@ function chooseViewerKind(probe: FileProbe, mode: CodeEditorOpenMode, path: stri
   if (mode === "markdown") return "markdown";
   if (mode === "json") return "json";
   if (mode === "csv") return "csv";
+  if (mode === "xlsx") return "xlsx";
   if (probe.kind === "pdf" && mode !== "text") return "pdf";
+  if (probe.kind === "xlsx" && mode !== "text") return "xlsx";
   if (mode === "image") return probe.kind === "image" ? "image" : "bytes";
   if (probe.kind === "image" && mode !== "text") return "image";
   if (probe.kind === "text" && probe.validUtf8 && !probe.hasNul) {
@@ -1405,7 +1410,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       path: it.path,
       title: basename(it.path),
       viewerKind: it.dirty && it.content != null ? "text" : null,
-      requestedMode: it.viewerKind === "bytes" ? "bytes" : it.viewerKind === "image" ? "image" : "auto",
+      requestedMode: it.viewerKind === "bytes" ? "bytes" : it.viewerKind === "image" ? "image" : it.viewerKind === "xlsx" ? "xlsx" : "auto",
       dirty: it.dirty && it.content != null,
       loading: it.content == null,
       error: null,
@@ -2484,6 +2489,18 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
           <React.Suspense fallback={<div className="codeEditorOverlay">Loading…</div>}>
             <LazyCsvTableViewer
               key={`csv:${activeTab.path}:${activeTab.size ?? 0}`}
+              path={activeTab.path}
+              size={activeTab.size ?? 0}
+              readRange={readFileRange}
+              onOpenBytes={() => void openFile(activeTab.path, "bytes")}
+            />
+          </React.Suspense>
+        ) : null}
+
+        {activeTab && !activeTab.loading && !activeTab.error && activeTab.viewerKind === "xlsx" ? (
+          <React.Suspense fallback={<div className="codeEditorOverlay">Loading…</div>}>
+            <LazyXlsxWorkbookViewer
+              key={`xlsx:${activeTab.path}:${activeTab.size ?? 0}`}
               path={activeTab.path}
               size={activeTab.size ?? 0}
               readRange={readFileRange}

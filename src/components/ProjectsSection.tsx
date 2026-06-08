@@ -2,6 +2,7 @@ import React from "react";
 import { createPortal } from "react-dom";
 import { useClampedMenuPosition } from "../hooks/useClampedMenuPosition";
 import { Icon } from "./Icon";
+import { TAB_SYMBOLS, TabSymbolIcon, normalizeTabSymbolValue } from "../tabSymbols";
 
 const TAB_COLORS = [
   { name: "Blue", value: "107, 140, 222" },
@@ -12,13 +13,6 @@ const TAB_COLORS = [
   { name: "Red", value: "208, 100, 100" },
   { name: "Purple", value: "155, 120, 210" },
   { name: "Yellow", value: "210, 195, 80" },
-];
-
-const PROJECT_SYMBOLS = [
-  "\u{1F5A5}\uFE0F", "\u{1F4BB}", "\u{1F527}", "\u{1F680}", "\u26A1", "\u{1F41B}",
-  "\u{1F4E6}", "\u{1F9EA}", "\u{1F310}", "\u{1F512}", "\u{1F4DD}", "\u{1F3A8}",
-  "\u{1F5C4}\uFE0F", "\u{1F433}", "\u2601\uFE0F", "\u{1F4E1}", "\u{1F525}", "\u{1F4A1}",
-  "\u2B50", "\u{1F3E0}", "\u{1F6E0}\uFE0F", "\u{1F4CA}", "\u{1F916}", "\u{1F3AF}",
 ];
 
 type Project = {
@@ -159,7 +153,7 @@ export const ProjectsSection = React.memo(function ProjectsSection({
   const handleSymbolSelect = React.useCallback(
     (sym: string) => {
       if (!symbolPicker) return;
-      onSetProjectSymbol(symbolPicker.projectId, sym);
+      onSetProjectSymbol(symbolPicker.projectId, normalizeTabSymbolValue(sym));
       setSymbolPicker(null);
     },
     [symbolPicker, onSetProjectSymbol],
@@ -503,7 +497,7 @@ export const ProjectsSection = React.memo(function ProjectsSection({
                     .join("\n")
                 }
               >
-                {p.symbol && <span className="sessionSymbol">{p.symbol}</span>}
+                <TabSymbolIcon symbol={p.symbol} />
                 {renamingId === p.id ? (
                   <input
                     className="sessionNameInput"
@@ -618,14 +612,14 @@ export const ProjectsSection = React.memo(function ProjectsSection({
           className="sessionSymbolPicker"
           style={{ top: symbolPickerPos.top, left: symbolPickerPos.left }}
         >
-          {PROJECT_SYMBOLS.map((sym) => (
+          {TAB_SYMBOLS.map((sym) => (
             <button
-              key={sym}
+              key={sym.value}
               type="button"
-              onClick={() => handleSymbolSelect(sym)}
-              title={sym}
+              onClick={() => handleSymbolSelect(sym.value)}
+              title={sym.label}
             >
-              {sym}
+              <img className="tabSymbolPickerIcon" src={sym.src} alt={sym.label} draggable={false} />
             </button>
           ))}
         </div>,

@@ -137,6 +137,26 @@ fn looks_like_pdf(sample: &[u8]) -> bool {
     })
 }
 
+fn looks_like_xlsx(sample: &[u8], path: Option<&Path>) -> bool {
+    let is_xlsx_path = path
+        .and_then(|p| p.extension())
+        .and_then(|v| v.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("xlsx"));
+    if !is_xlsx_path {
+        return false;
+    }
+
+    // XLSX files are ZIP-based OOXML workbooks. The first local-file entry is
+    // commonly [Content_Types].xml, but extension + ZIP signature is the useful
+    // early probe for remote/local range-limited reads.
+    sample.starts_with(b"PK\x03\x04")
+        || sample.starts_with(b"PK\x05\x06")
+        || sample.starts_with(b"PK\x07\x08")
+        || sample
+            .windows(b"[Content_Types].xml".len())
+            .any(|window| window == b"[Content_Types].xml")
+}
+
 fn sample_is_valid_utf8(sample: &[u8]) -> bool {
     match std::str::from_utf8(sample) {
         Ok(_) => true,
@@ -154,6 +174,7 @@ pub(crate) fn probe_from_sample(
 ) -> FileProbe {
     let image = raster_image_type(sample, path);
     let is_pdf = looks_like_pdf(sample);
+    let is_xlsx = looks_like_xlsx(sample, path);
     let has_nul = sample[..sample.len().min(BINARY_CHECK_BYTES)]
         .iter()
         .any(|b| *b == 0);
@@ -162,6 +183,8 @@ pub(crate) fn probe_from_sample(
     // valid UTF-8 text near the header, so the magic-byte check must win.
     let kind = if is_pdf {
         "pdf"
+    } else if is_xlsx {
+        "xlsx"
     } else if image.is_some() {
         "image"
     } else if size == 0 || (!has_nul && valid_utf8) {
@@ -171,6 +194,11 @@ pub(crate) fn probe_from_sample(
     };
     let (image_type, mime) = if is_pdf {
         (None, Some("application/pdf".to_string()))
+    } else if is_xlsx {
+        (
+            None,
+            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string()),
+        )
     } else {
         match image {
             Some((kind, mime)) => (Some(kind.to_string()), Some(mime.to_string())),
@@ -679,9 +707,14 @@ pub fn copy_fs_entry(root: String, source_path: String, dest_path: String) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn kind_of(sample: &[u8]) -> String {
         probe_from_sample(sample.len() as u64, None, sample, None).kind
+    }
+
+    fn kind_of_path(sample: &[u8], path: &str) -> String {
+        probe_from_sample(sample.len() as u64, None, sample, Some(Path::new(path))).kind
     }
 
     #[test]
@@ -689,6 +722,29 @@ mod tests {
         let probe = probe_from_sample(2048, None, b"%PDF-1.7\n1 0 obj\n", None);
         assert_eq!(probe.kind, "pdf");
         assert_eq!(probe.mime.as_deref(), Some("application/pdf"));
+    }
+
+    #[test]
+    fn detects_xlsx_zip_header_for_xlsx_paths() {
+        let probe = probe_from_sample(
+            4096,
+            None,
+            b"PK\x03\x04\x14\x00\x00\x00\x08\x00[Content_Types].xml",
+            Some(Path::new("/tmp/report.xlsx")),
+        );
+        assert_eq!(probe.kind, "xlsx");
+        assert_eq!(
+            probe.mime.as_deref(),
+            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        );
+    }
+
+    #[test]
+    fn zip_header_without_xlsx_extension_stays_binary() {
+        assert_eq!(
+            kind_of_path(b"PK\x03\x04\x14\x00\x00\x00\x08\x00", "/tmp/archive.zip"),
+            "binary"
+        );
     }
 
     #[test]

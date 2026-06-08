@@ -24,6 +24,7 @@ import { ActivityCenter, type ActivityCenterItem } from "./components/ActivityCe
 import { FileExplorerPanel, type FileExplorerPersistedState } from "./components/FileExplorerPanel";
 import { WorkspaceFileSearch } from "./components/WorkspaceFileSearch";
 import { EDITOR_THEME_BY_UI_THEME } from "./monaco/editorThemes";
+import { TabSymbolIcon, normalizeTabSymbolValue } from "./tabSymbols";
 import type {
   CodeEditorFsEvent,
   CodeEditorOpenFileRequest,
@@ -1379,7 +1380,11 @@ function coerceCodeEditorPersistedState(value: unknown): CodeEditorPersistedStat
       const rec = t as Record<string, unknown>;
       const path = typeof rec.path === "string" ? rec.path.trim() : "";
       const viewerKind: CodeEditorPersistedState["tabs"][number]["viewerKind"] =
-        rec.viewerKind === "largeText" || rec.viewerKind === "image" || rec.viewerKind === "bytes" || rec.viewerKind === "text"
+        rec.viewerKind === "largeText" ||
+        rec.viewerKind === "image" ||
+        rec.viewerKind === "bytes" ||
+        rec.viewerKind === "text" ||
+        rec.viewerKind === "xlsx"
           ? rec.viewerKind
           : null;
       return { path, viewerKind };
@@ -4003,7 +4008,8 @@ export default function App() {
         value === "bytes" ||
         value === "markdown" ||
         value === "json" ||
-        value === "csv"
+        value === "csv" ||
+        value === "xlsx"
         ? value
         : undefined;
     }
@@ -4153,7 +4159,7 @@ export default function App() {
       },
       "sessions.set_symbol": (p) => {
         const id = p.id as string;
-        const symbol = (p.symbol as string) || null;
+        const symbol = normalizeTabSymbolValue(p.symbol as string | null);
         setSessionsSync((prev) => prev.map((s) => s.id === id ? { ...s, symbol } : s));
         notifyStateChange("sessions.updated", { sessionId: id, symbol });
         return null;
@@ -4278,7 +4284,7 @@ export default function App() {
             ...(p.basePath !== undefined && { basePath: p.basePath as string | null }),
             ...(p.environmentId !== undefined && { environmentId: p.environmentId as string | null }),
             ...(p.assetsEnabled !== undefined && { assetsEnabled: p.assetsEnabled as boolean }),
-            ...(p.symbol !== undefined && { symbol: p.symbol as string | null }),
+            ...(p.symbol !== undefined && { symbol: normalizeTabSymbolValue(p.symbol as string | null) }),
             ...(p.color !== undefined && { color: p.color as string | null }),
             ...(p.sshTarget !== undefined && { sshTarget: (p.sshTarget as string | null)?.trim() || null }),
             ...(p.sshRemotePath !== undefined && { sshRemotePath: (p.sshRemotePath as string | null)?.trim() || null }),
@@ -8919,13 +8925,14 @@ export default function App() {
   }, []);
 
   const handleSetSessionSymbol = useCallback((sessionId: string, symbol: string | null) => {
+    const nextSymbol = normalizeTabSymbolValue(symbol);
     setSessionsSync((prev) => {
       const idx = prev.findIndex((s) => s.id === sessionId);
       if (idx < 0) return prev;
       const current = prev[idx].symbol ?? null;
-      if (current === symbol) return prev;
+      if (current === nextSymbol) return prev;
       const next = prev.slice();
-      next[idx] = { ...prev[idx], symbol };
+      next[idx] = { ...prev[idx], symbol: nextSymbol };
       return next;
     });
   }, []);
@@ -9099,13 +9106,14 @@ export default function App() {
   }, []);
 
   const handleSetProjectSymbol = useCallback((projectId: string, symbol: string | null) => {
+    const nextSymbol = normalizeTabSymbolValue(symbol);
     setProjects((prev) => {
       const idx = prev.findIndex((p) => p.id === projectId);
       if (idx < 0) return prev;
       const current = prev[idx].symbol ?? null;
-      if (current === symbol) return prev;
+      if (current === nextSymbol) return prev;
       const next = prev.slice();
-      next[idx] = { ...prev[idx], symbol };
+      next[idx] = { ...prev[idx], symbol: nextSymbol };
       return next;
     });
   }, []);
@@ -10006,7 +10014,7 @@ export default function App() {
                     onClick={() => selectSessionById(sid)}
                   >
                     {s.symbol ? (
-                      <span className="sessionSymbol">{s.symbol}</span>
+                      <TabSymbolIcon symbol={s.symbol} />
                     ) : historyEffect?.iconSrc ? (
                       <span className={`agentBadge historyAgentBadge chip-${historyEffect.id}`} title={historyEffect.label}>
                         <img className="agentIcon" src={historyEffect.iconSrc} alt={historyEffect.label} />

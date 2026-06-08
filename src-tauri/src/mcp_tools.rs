@@ -340,7 +340,7 @@ pub fn tool_list() -> Vec<Value> {
                 "path": { "type": "string", "description": "File path for kind=file" },
                 "url": { "type": "string", "description": "URL for kind=browser" },
                 "title": { "type": "string", "description": "Optional browser tab title" },
-                "mode": { "type": "string", "enum": ["auto", "text", "image", "bytes", "markdown", "json", "csv"], "description": "File viewer mode for kind=file" }
+                "mode": { "type": "string", "enum": ["auto", "text", "image", "bytes", "markdown", "json", "csv", "xlsx"], "description": "File viewer mode for kind=file" }
             },
             "required": ["kind"]
         })),

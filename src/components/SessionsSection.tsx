@@ -4,6 +4,7 @@ import { detectProcessEffect, getProcessEffectById, type ProcessEffect } from ".
 import { shortenPathSmart } from "../pathDisplay";
 import { useClampedMenuPosition } from "../hooks/useClampedMenuPosition";
 import { Icon } from "./Icon";
+import { TAB_SYMBOLS, TabSymbolIcon, normalizeTabSymbolValue } from "../tabSymbols";
 
 function isSshCommand(commandLine: string | null | undefined): boolean {
   const trimmed = commandLine?.trim() ?? "";
@@ -22,13 +23,6 @@ const TAB_COLORS = [
   { name: "Red", value: "208, 100, 100" },
   { name: "Purple", value: "155, 120, 210" },
   { name: "Yellow", value: "210, 195, 80" },
-];
-
-const SESSION_SYMBOLS = [
-  "\u{1F5A5}\uFE0F", "\u{1F4BB}", "\u{1F527}", "\u{1F680}", "\u26A1", "\u{1F41B}",
-  "\u{1F4E6}", "\u{1F9EA}", "\u{1F310}", "\u{1F512}", "\u{1F4DD}", "\u{1F3A8}",
-  "\u{1F5C4}\uFE0F", "\u{1F433}", "\u2601\uFE0F", "\u{1F4E1}", "\u{1F525}", "\u{1F4A1}",
-  "\u2B50", "\u{1F3E0}", "\u{1F6E0}\uFE0F", "\u{1F4CA}", "\u{1F916}", "\u{1F3AF}",
 ];
 
 type Session = {
@@ -178,7 +172,7 @@ const SessionItem = React.memo(function SessionItem({
               {splitTag}
             </span>
           ) : null}
-          {s.symbol && <span className="sessionSymbol">{s.symbol}</span>}
+          <TabSymbolIcon symbol={s.symbol} />
           {hasAgentIcon && chipLabel && effect?.iconSrc && (
             <span className={`agentBadge chip-${effect.id}`} title={chipLabel}>
               <img className="agentIcon" src={effect.iconSrc} alt={chipLabel} />
@@ -425,7 +419,7 @@ export const SessionsSection = React.memo(function SessionsSection({
   const handleSymbolSelect = React.useCallback(
     (sym: string) => {
       if (!symbolPicker) return;
-      onSetSessionSymbol(symbolPicker.sessionId, sym);
+      onSetSessionSymbol(symbolPicker.sessionId, normalizeTabSymbolValue(sym));
       setSymbolPicker(null);
     },
     [symbolPicker, onSetSessionSymbol],
@@ -1001,7 +995,7 @@ export const SessionsSection = React.memo(function SessionsSection({
                         const aEffect =
                           getProcessEffectById(aSession.effectId) ??
                           detectProcessEffect({ command: aLaunchOrRestore, name: aSession.name });
-                        if (aSession.symbol) return <span className="sessionSymbol">{aSession.symbol}</span>;
+                        if (aSession.symbol) return <TabSymbolIcon symbol={aSession.symbol} />;
                         if (aEffect?.iconSrc) {
                           return (
                             <span className={`agentBadge sessionSplitViewAgentBadge chip-${aEffect.id}`} title={aEffect.label}>
@@ -1054,7 +1048,7 @@ export const SessionsSection = React.memo(function SessionsSection({
                         const bEffect =
                           getProcessEffectById(bSession.effectId) ??
                           detectProcessEffect({ command: bLaunchOrRestore, name: bSession.name });
-                        if (bSession.symbol) return <span className="sessionSymbol">{bSession.symbol}</span>;
+                        if (bSession.symbol) return <TabSymbolIcon symbol={bSession.symbol} />;
                         if (bEffect?.iconSrc) {
                           return (
                             <span className={`agentBadge sessionSplitViewAgentBadge chip-${bEffect.id}`} title={bEffect.label}>
@@ -1215,14 +1209,14 @@ export const SessionsSection = React.memo(function SessionsSection({
           className="sessionSymbolPicker"
           style={{ top: symbolPickerPos.top, left: symbolPickerPos.left }}
         >
-          {SESSION_SYMBOLS.map((sym) => (
+          {TAB_SYMBOLS.map((sym) => (
             <button
-              key={sym}
+              key={sym.value}
               type="button"
-              onClick={() => handleSymbolSelect(sym)}
-              title={sym}
+              onClick={() => handleSymbolSelect(sym.value)}
+              title={sym.label}
             >
-              {sym}
+              <img className="tabSymbolPickerIcon" src={sym.src} alt={sym.label} draggable={false} />
             </button>
           ))}
         </div>,
