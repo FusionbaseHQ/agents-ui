@@ -4,6 +4,7 @@ import Editor, { loader } from "@monaco-editor/react";
 import * as bundledMonaco from "monaco-editor";
 import React from "react";
 import { shortenPathSmart } from "../pathDisplay";
+import { useClampedMenuPosition } from "../hooks/useClampedMenuPosition";
 import { Icon } from "./Icon";
 import { ConfirmActionModal } from "./modals/ConfirmActionModal";
 import { concatBytes } from "../fileViewer/bytes";
@@ -668,6 +669,8 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   const [saveError, setSaveError] = React.useState<string | null>(null);
   const [pendingClose, setPendingClose] = React.useState<PendingCloseAction | null>(null);
   const [tabMenu, setTabMenu] = React.useState<TabMenuState | null>(null);
+  const tabMenuRef = React.useRef<HTMLDivElement | null>(null);
+  const tabMenuPos = useClampedMenuPosition(tabMenuRef, tabMenu);
   const [saveConflictPath, setSaveConflictPath] = React.useState<string | null>(null);
   const [crossFindOpen, setCrossFindOpen] = React.useState(false);
   const [crossFind, setCrossFind] = React.useState("");
@@ -2594,9 +2597,10 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
           }}
         >
           <div
+            ref={tabMenuRef}
             className="codeEditorTabMenu"
             role="menu"
-            style={{ left: Math.min(tabMenu.x, window.innerWidth - 190), top: Math.min(tabMenu.y, window.innerHeight - 240) }}
+            style={{ left: tabMenuPos.left, top: tabMenuPos.top }}
             onClick={(e) => e.stopPropagation()}
           >
             {(() => {

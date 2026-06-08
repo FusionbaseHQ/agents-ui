@@ -6,6 +6,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import React from "react";
 import { shortenPathSmart } from "../pathDisplay";
+import { useClampedMenuPosition } from "../hooks/useClampedMenuPosition";
 import { Icon } from "./Icon";
 import { ConfirmActionModal } from "./modals/ConfirmActionModal";
 
@@ -460,6 +461,7 @@ export function FileExplorerPanel({
 
   const [contextMenu, setContextMenu] = React.useState<{ x: number; y: number; entry: FsEntry } | null>(null);
   const contextMenuRef = React.useRef<HTMLDivElement | null>(null);
+  const contextMenuPos = useClampedMenuPosition(contextMenuRef, contextMenu);
   const contextMenuOpenPath = contextMenu?.entry.path ?? null;
 
   const [renameTarget, setRenameTarget] = React.useState<FsEntry | null>(null);
@@ -1797,13 +1799,6 @@ export function FileExplorerPanel({
 
   if (!isOpen) return null;
 
-  const menuX = contextMenu
-    ? Math.min(contextMenu.x, Math.max(8, window.innerWidth - 268))
-    : 0;
-  const menuY = contextMenu
-    ? Math.min(contextMenu.y, Math.max(8, window.innerHeight - 320))
-    : 0;
-
   return (
     <aside className="fileExplorerPanel" aria-label="Files" ref={panelRef}>
       <div className="fileExplorerHeader">
@@ -1930,7 +1925,7 @@ export function FileExplorerPanel({
           ref={contextMenuRef}
           role="menu"
           aria-label={`Actions for ${contextMenu.entry.name}`}
-          style={{ top: menuY, left: menuX }}
+          style={{ top: contextMenuPos.top, left: contextMenuPos.left }}
         >
           <button
             type="button"

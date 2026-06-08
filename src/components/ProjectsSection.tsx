@@ -1,5 +1,6 @@
 import React from "react";
 import { createPortal } from "react-dom";
+import { useClampedMenuPosition } from "../hooks/useClampedMenuPosition";
 import { Icon } from "./Icon";
 
 const TAB_COLORS = [
@@ -108,6 +109,11 @@ export const ProjectsSection = React.memo(function ProjectsSection({
     x: number;
     y: number;
   } | null>(null);
+
+  // Keep every floating menu fully on-screen (flip up/left near an edge).
+  const contextMenuPos = useClampedMenuPosition(contextMenuRef, contextMenu);
+  const symbolPickerPos = useClampedMenuPosition(symbolPickerRef, symbolPicker);
+  const colorPickerPos = useClampedMenuPosition(colorPickerRef, colorPicker);
 
   const handleRenameStart = React.useCallback(() => {
     if (!contextMenu) return;
@@ -541,7 +547,7 @@ export const ProjectsSection = React.memo(function ProjectsSection({
         <div
           ref={contextMenuRef}
           className="sessionContextMenu"
-          style={{ top: contextMenu.y, left: contextMenu.x }}
+          style={{ top: contextMenuPos.top, left: contextMenuPos.left }}
           role="menu"
         >
           <button
@@ -610,7 +616,7 @@ export const ProjectsSection = React.memo(function ProjectsSection({
         <div
           ref={symbolPickerRef}
           className="sessionSymbolPicker"
-          style={{ top: symbolPicker.y, left: symbolPicker.x }}
+          style={{ top: symbolPickerPos.top, left: symbolPickerPos.left }}
         >
           {PROJECT_SYMBOLS.map((sym) => (
             <button
@@ -631,10 +637,7 @@ export const ProjectsSection = React.memo(function ProjectsSection({
         <div
           ref={colorPickerRef}
           className="tabColorPicker"
-          style={{
-            top: Math.min(colorPicker.y, window.innerHeight - 100),
-            left: Math.min(colorPicker.x, window.innerWidth - 160),
-          }}
+          style={{ top: colorPickerPos.top, left: colorPickerPos.left }}
         >
           {TAB_COLORS.map((c) => (
             <button

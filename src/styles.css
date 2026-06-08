@@ -1679,6 +1679,11 @@ body::after {
 .sessionContextMenu {
   position: fixed;
   min-width: 200px;
+  /* Cap height so a menu with many items in a short window scrolls instead of
+     overflowing the viewport; useClampedMenuPosition then positions this box. */
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 6px;
   border: 1px solid rgba(var(--ink-rgb), 0.08);
   background: rgba(var(--paper-panel-rgb), 0.92);
@@ -2631,6 +2636,9 @@ body::after {
   position: fixed;
   min-width: 220px;
   max-width: 280px;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 6px;
   border: 1px solid rgba(var(--ink-rgb), 0.08);
   background: rgba(var(--paper-panel-rgb), 0.92);
@@ -3066,6 +3074,9 @@ body::after {
 .codeEditorTabMenu {
   position: fixed;
   min-width: 178px;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 4px;
   background: var(--panel);
   border: 1px solid var(--border);
