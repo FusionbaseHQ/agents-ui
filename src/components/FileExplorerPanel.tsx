@@ -21,12 +21,6 @@ type FsEntry = {
   size: number;
 };
 
-type GitStatusKind = "modified" | "added" | "deleted" | "renamed" | "untracked" | "conflicted" | "ignored";
-type GitStatusEntry = {
-  path: string;
-  status: GitStatusKind;
-};
-
 type DirectoryState = {
   entries: FsEntry[];
   loading: boolean;
@@ -153,14 +147,6 @@ function getFileTypeBadge(name: string): FileTypeBadge | null {
   return null;
 }
 
-function gitStatusEntriesEqual(a: GitStatusEntry[], b: GitStatusEntry[]): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i].path !== b[i].path || a[i].status !== b[i].status) return false;
-  }
-  return true;
-}
-
 function joinPath(dir: string, name: string): string {
   const base = normalizePath(dir);
   if (base === "/") return `/${name}`;
@@ -265,46 +251,6 @@ const POLL_MAX_PER_TICK = 5;
 const MUTATION_COOLDOWN_MS = 8_000;
 const FILE_EXPLORER_ROW_HEIGHT = 28;
 
-function gitStatusLabel(status: GitStatusKind): string {
-  switch (status) {
-    case "added":
-      return "A";
-    case "deleted":
-      return "D";
-    case "renamed":
-      return "R";
-    case "untracked":
-      return "?";
-    case "conflicted":
-      return "!";
-    case "ignored":
-      return "I";
-    case "modified":
-    default:
-      return "M";
-  }
-}
-
-function gitStatusPriority(status: GitStatusKind): number {
-  switch (status) {
-    case "conflicted":
-      return 6;
-    case "deleted":
-      return 5;
-    case "added":
-      return 4;
-    case "renamed":
-      return 3;
-    case "modified":
-      return 2;
-    case "untracked":
-      return 1;
-    case "ignored":
-    default:
-      return 0;
-  }
-}
-
 type FileRowProps = {
   entry: FsEntry;
   depth: number;
@@ -320,8 +266,6 @@ type FileRowProps = {
   onMouseDown: (e: React.MouseEvent, entry: FsEntry) => void;
   onMouseMove: (e: React.MouseEvent) => void;
   onMouseUp: () => void;
-  gitStatus?: GitStatusKind | null;
-  gitNested?: boolean;
 };
 
 const FileRow = React.memo(function FileRow({
@@ -339,8 +283,6 @@ const FileRow = React.memo(function FileRow({
   onMouseDown,
   onMouseMove,
   onMouseUp,
-  gitStatus,
-  gitNested,
 }: FileRowProps) {
   const indent = 12 + depth * 14;
   const fileTypeBadge = entry.isDir ? null : getFileTypeBadge(entry.name);
@@ -349,11 +291,6 @@ const FileRow = React.memo(function FileRow({
   if (isContextTarget) cn += " fileExplorerRowContext";
   if (isDropTarget) cn += " fileExplorerRowDropTarget";
   if (isPreparing) cn += " fileExplorerRowPreparing";
-  if (gitStatus) {
-    cn += ` fileExplorerRowGit fileExplorerRowGit-${gitStatus}`;
-    if (gitNested) cn += " fileExplorerRowGitNested";
-    else cn += " fileExplorerRowGitDirect";
-  }
 
   return (
     <button
@@ -403,11 +340,6 @@ const FileRow = React.memo(function FileRow({
         )}
       </span>
       <span className="fileExplorerName">{entry.name}</span>
-      {gitStatus ? (
-        <span className={`fileExplorerGitBadge fileExplorerGitBadge-${gitStatus} ${gitNested ? "fileExplorerGitBadgeNested" : ""}`}>
-          {gitStatusLabel(gitStatus)}
-        </span>
-      ) : null}
     </button>
   );
 });
@@ -487,7 +419,6 @@ export function FileExplorerPanel({
   }, [provider, root, rootDir, sshTargetValue]);
   const [expandedDirs, setExpandedDirs] = React.useState<Set<string>>(() => new Set([root]));
   const [dirStateByPath, setDirStateByPath] = React.useState<Record<string, DirectoryState>>({});
-  const [gitStatusEntries, setGitStatusEntries] = React.useState<GitStatusEntry[]>([]);
   const panelRef = React.useRef<HTMLElement | null>(null);
   const listRef = React.useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = React.useState(0);
@@ -498,8 +429,6 @@ export function FileExplorerPanel({
   const pendingScrollAnchorRef = React.useRef<ScrollAnchor | null>(null);
   const visibleItemsRef = React.useRef<VisibleItem[]>([]);
   const persistedTreeSnapshotRef = React.useRef<FileExplorerPersistedTreeSnapshot | null>(null);
-  const gitStatusInFlightKeyRef = React.useRef<string | null>(null);
-  const gitStatusRequestSeqRef = React.useRef(0);
 
   const [contextMenu, setContextMenu] = React.useState<{ x: number; y: number; entry: FsEntry } | null>(null);
   const contextMenuRef = React.useRef<HTMLDivElement | null>(null);
@@ -716,42 +645,6 @@ export function FileExplorerPanel({
     },
     [provider, root, sshTargetValue],
   );
-
-  const refreshGitStatus = React.useCallback(async () => {
-    if (provider === "ssh" && !sshTargetValue) {
-      gitStatusRequestSeqRef.current++;
-      gitStatusInFlightKeyRef.current = null;
-      setGitStatusEntries((prev) => (prev.length ? [] : prev));
-      return;
-    }
-    const requestKey = `${provider}:${sshTargetValue ?? ""}:${root}`;
-    if (gitStatusInFlightKeyRef.current === requestKey) return;
-    gitStatusInFlightKeyRef.current = requestKey;
-    const requestSeq = ++gitStatusRequestSeqRef.current;
-    try {
-      const entries =
-        provider === "ssh"
-          ? await invoke<GitStatusEntry[]>("ssh_git_status_entries", { target: sshTargetValue, root })
-          : await invoke<GitStatusEntry[]>("git_status_entries", { root });
-      if (requestSeq !== gitStatusRequestSeqRef.current) return;
-      setGitStatusEntries((prev) => (gitStatusEntriesEqual(prev, entries) ? prev : entries));
-    } catch {
-      if (requestSeq === gitStatusRequestSeqRef.current) {
-        setGitStatusEntries((prev) => (prev.length ? [] : prev));
-      }
-    } finally {
-      if (gitStatusInFlightKeyRef.current === requestKey) {
-        gitStatusInFlightKeyRef.current = null;
-      }
-    }
-  }, [provider, root, sshTargetValue]);
-
-  React.useEffect(() => {
-    if (!isOpen) return;
-    void refreshGitStatus();
-    const timer = window.setInterval(() => void refreshGitStatus(), 8_000);
-    return () => window.clearInterval(timer);
-  }, [isOpen, refreshGitStatus]);
 
   /**
    * Silent background poll for a single directory.
@@ -1351,28 +1244,6 @@ export function FileExplorerPanel({
     }
     setScrollTop((prev) => (prev === nextTop ? prev : nextTop));
   }, [visibleItems]);
-
-  const gitDecorations = React.useMemo(() => {
-    const direct = new Map<string, GitStatusKind>();
-    const nested = new Map<string, GitStatusKind>();
-    const assignBest = (map: Map<string, GitStatusKind>, path: string, status: GitStatusKind) => {
-      const current = map.get(path);
-      if (!current || gitStatusPriority(status) > gitStatusPriority(current)) map.set(path, status);
-    };
-
-    for (const entry of gitStatusEntries) {
-      const path = normalizePath(entry.path);
-      if (!path) continue;
-      assignBest(direct, path, entry.status);
-      let dir = dirname(path);
-      while (dir && dir !== "." && (dir === root || dir.startsWith(root === "/" ? "/" : `${root}/`))) {
-        assignBest(nested, dir, entry.status);
-        if (dir === root) break;
-        dir = dirname(dir);
-      }
-    }
-    return { direct, nested };
-  }, [gitStatusEntries, root]);
 
   React.useEffect(() => {
     if (!isOpen || !activeFilePath) {
@@ -2029,8 +1900,6 @@ export function FileExplorerPanel({
                   }
 
                   const entry = item.entry;
-                  const directGitStatus = gitDecorations.direct.get(entry.path) ?? null;
-                  const nestedGitStatus = entry.isDir ? gitDecorations.nested.get(entry.path) ?? null : null;
                   return (
                     <FileRow
                       key={entry.path}
@@ -2048,8 +1917,6 @@ export function FileExplorerPanel({
                       onMouseDown={handleMouseDown}
                       onMouseMove={handleMouseMove}
                       onMouseUp={handleMouseUp}
-                      gitStatus={directGitStatus ?? nestedGitStatus}
-                      gitNested={!directGitStatus && Boolean(nestedGitStatus)}
                     />
                   );
                 })}

@@ -4,8 +4,7 @@ use std::{
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::UNIX_EPOCH,
 };
 
 const MAX_TEXT_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -41,13 +40,6 @@ pub struct FsEntry {
     pub path: String,
     pub is_dir: bool,
     pub size: u64,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct GitStatusEntry {
-    pub path: String,
-    pub status: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -382,90 +374,6 @@ pub fn search_fs_entries(root: String, query: String, limit: Option<usize>) -> R
         for (_name, path) in dirs {
             queue.push_back(path);
         }
-    }
-
-    Ok(out)
-}
-
-pub(crate) fn git_status_kind(code: &str) -> &'static str {
-    if code == "!!" {
-        "ignored"
-    } else if code.contains('U') || code == "AA" || code == "DD" {
-        "conflicted"
-    } else if code.contains('R') || code.contains('C') {
-        "renamed"
-    } else if code.contains('A') {
-        "added"
-    } else if code.contains('D') {
-        "deleted"
-    } else if code == "??" {
-        "untracked"
-    } else {
-        "modified"
-    }
-}
-
-fn command_output_with_timeout(mut command: Command, timeout: Duration) -> io::Result<Option<Output>> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let start = Instant::now();
-    loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output().map(Some);
-        }
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(None);
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
-#[tauri::command]
-pub fn git_status_entries(root: String) -> Result<Vec<GitStatusEntry>, String> {
-    let root = ensure_root_dir(Path::new(root.trim()))?;
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(&root)
-        .arg("status")
-        .arg("--porcelain=v1")
-        .arg("-z")
-        .arg("--untracked-files=normal")
-        .arg("--ignored=matching");
-    let Some(output) = command_output_with_timeout(command, Duration::from_secs(5))
-        .map_err(|e| format!("git status failed: {e}"))?
-    else {
-        return Ok(Vec::new());
-    };
-
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-
-    let mut out = Vec::new();
-    let mut parts = output.stdout.split(|b| *b == 0).filter(|part| !part.is_empty());
-    while let Some(part) = parts.next() {
-        if part.len() < 4 {
-            continue;
-        }
-        let code = String::from_utf8_lossy(&part[..2]).to_string();
-        let rel = String::from_utf8_lossy(&part[3..]).to_string();
-        if code.contains('R') || code.contains('C') {
-            let _old_path = parts.next();
-        }
-        if rel.is_empty() {
-            continue;
-        }
-        let path = root.join(rel);
-        out.push(GitStatusEntry {
-            path: path.to_string_lossy().to_string(),
-            status: git_status_kind(&code).to_string(),
-        });
     }
 
     Ok(out)

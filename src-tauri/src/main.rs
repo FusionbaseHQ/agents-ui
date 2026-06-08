@@ -28,7 +28,7 @@ mod tray;
 use app_info::get_app_info;
 use assets::apply_text_assets;
 use app_menu::{build_app_menu, handle_app_menu_event};
-use files::{copy_fs_entry, create_directory, create_file, delete_fs_entry, git_status_entries, list_fs_entries, probe_file, read_file_range, read_text_file, rename_fs_entry, search_fs_entries, write_text_file};
+use files::{copy_fs_entry, create_directory, create_file, delete_fs_entry, list_fs_entries, probe_file, read_file_range, read_text_file, rename_fs_entry, search_fs_entries, write_text_file};
 use file_manager::{open_path_in_file_manager, open_path_in_vscode};
 use pty::{
     close_session, create_session, detach_session, kill_persistent_session, list_persistent_sessions,
@@ -42,7 +42,7 @@ use ssh::list_ssh_hosts;
 use ssh_fs::{
     ssh_create_directory, ssh_create_file, ssh_default_root, ssh_delete_fs_entry, ssh_download_file,
     ssh_download_to_temp, ssh_effective_user,
-    ssh_git_status_entries, ssh_list_fs_entries, ssh_probe_file, ssh_read_file_range, ssh_read_text_file, ssh_rename_fs_entry, ssh_search_fs_entries, ssh_upload_file,
+    ssh_list_fs_entries, ssh_probe_file, ssh_read_file_range, ssh_read_text_file, ssh_rename_fs_entry, ssh_search_fs_entries, ssh_upload_file,
     ssh_write_text_file,
 };
 use fs_watcher::{start_fs_watcher, stop_fs_watcher, watch_directory, unwatch_directory, FsWatcherState};
@@ -168,7 +168,6 @@ fn main() {
             ssh_create_file,
             ssh_create_directory,
             ssh_list_fs_entries,
-            ssh_git_status_entries,
             ssh_search_fs_entries,
             ssh_read_text_file,
             ssh_probe_file,
@@ -193,7 +192,6 @@ fn main() {
             set_tray_recent_sessions,
             open_path_in_file_manager,
             open_path_in_vscode,
-            git_status_entries,
             get_app_info,
             start_fs_watcher,
             stop_fs_watcher,

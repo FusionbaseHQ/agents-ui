@@ -2649,66 +2649,6 @@ body::after {
   background: rgba(var(--ink-rgb), 0.06);
 }
 
-.fileExplorerRowGit {
-  --git-row-rgb: var(--ink-rgb);
-  --git-row-alpha: 0.12;
-  --git-row-stripe-alpha: 0.72;
-  background:
-    linear-gradient(
-      90deg,
-      rgba(var(--git-row-rgb), var(--git-row-stripe-alpha)) 0,
-      rgba(var(--git-row-rgb), var(--git-row-stripe-alpha)) 3px,
-      rgba(var(--git-row-rgb), var(--git-row-alpha)) 3px,
-      rgba(var(--git-row-rgb), var(--git-row-alpha)) 100%
-    );
-}
-
-.fileExplorerRowGit:hover {
-  --git-row-alpha: 0.17;
-}
-
-.fileExplorerRowGit.fileExplorerRowActive {
-  --git-row-alpha: 0.18;
-  box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), 0.24);
-}
-
-.fileExplorerRowGit.fileExplorerRowContext {
-  --git-row-alpha: 0.18;
-}
-
-.fileExplorerRowGitNested {
-  --git-row-alpha: 0.06;
-  --git-row-stripe-alpha: 0.36;
-}
-
-.fileExplorerRowGitNested:hover {
-  --git-row-alpha: 0.1;
-}
-
-.fileExplorerRowGit-added {
-  --git-row-rgb: var(--success-rgb);
-}
-
-.fileExplorerRowGit-modified,
-.fileExplorerRowGit-renamed {
-  --git-row-rgb: var(--warning-rgb);
-}
-
-.fileExplorerRowGit-deleted,
-.fileExplorerRowGit-conflicted {
-  --git-row-rgb: var(--danger-rgb);
-}
-
-.fileExplorerRowGit-untracked {
-  --git-row-rgb: var(--accent-rgb);
-}
-
-.fileExplorerRowGit-ignored {
-  --git-row-rgb: var(--ink-rgb);
-  --git-row-alpha: 0.08;
-  --git-row-stripe-alpha: 0.42;
-}
-
 .fileContextMenu {
   position: fixed;
   min-width: 220px;
@@ -2834,53 +2774,6 @@ body::after {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.fileExplorerGitBadge {
-  margin-left: auto;
-  min-width: 16px;
-  height: 16px;
-  border-radius: 4px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 9px;
-  font-weight: 700;
-  border: 1px solid rgba(var(--ink-rgb), 0.18);
-  color: rgba(var(--ink-rgb), 0.9);
-  background: rgba(var(--ink-rgb), 0.08);
-}
-
-.fileExplorerGitBadgeNested {
-  opacity: 0.58;
-}
-
-.fileExplorerGitBadge-added {
-  border-color: rgba(var(--success-rgb), 0.45);
-  background: rgba(var(--success-rgb), 0.18);
-}
-
-.fileExplorerGitBadge-modified,
-.fileExplorerGitBadge-renamed {
-  border-color: rgba(var(--warning-rgb), 0.45);
-  background: rgba(var(--warning-rgb), 0.18);
-}
-
-.fileExplorerGitBadge-deleted,
-.fileExplorerGitBadge-conflicted {
-  border-color: rgba(var(--danger-rgb), 0.45);
-  background: rgba(var(--danger-rgb), 0.18);
-}
-
-.fileExplorerGitBadge-untracked {
-  border-color: rgba(var(--accent-rgb), 0.4);
-  background: rgba(var(--accent-rgb), 0.15);
-}
-
-.fileExplorerGitBadge-ignored {
-  border-color: rgba(var(--ink-rgb), 0.24);
-  background: rgba(var(--ink-rgb), 0.1);
-  color: var(--muted);
 }
 
 .fileExplorerMeta {
