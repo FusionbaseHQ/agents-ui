@@ -714,9 +714,17 @@ function ensureSshKeepAliveOptions(commandLine: string | null | undefined): stri
   const parts = trimmed.split(/\s+/).filter(Boolean);
   if (parts.length === 0) return trimmed;
 
+  // Keep the connection alive across brief network pauses (Wi-Fi power-save when
+  // the display turns off, VPN re-handshakes, roaming) so the session doesn't
+  // drop and force a reconnect. A probe every 15s keeps the server's idle timer
+  // and any NAT/firewall state fresh; tolerating 6 missed probes (~90s of
+  // silence) survives moderate pauses. A full system sleep takes the network
+  // down for minutes and will still drop — the auto-reconnect on exit covers
+  // that. Bumping CountMax also slows detection of a truly-dead link, which is
+  // an acceptable trade now that reconnect is automatic.
   const inject: string[] = [];
   if (!hasSshOption(parts, "serveraliveinterval")) inject.push("-o", "ServerAliveInterval=15");
-  if (!hasSshOption(parts, "serveralivecountmax")) inject.push("-o", "ServerAliveCountMax=3");
+  if (!hasSshOption(parts, "serveralivecountmax")) inject.push("-o", "ServerAliveCountMax=6");
   if (!hasSshOption(parts, "tcpkeepalive")) inject.push("-o", "TCPKeepAlive=yes");
   if (inject.length === 0) return trimmed;
 
@@ -750,18 +758,6 @@ function isSshSession(session: {
   return (
     Boolean((session.sshTarget ?? "").trim()) ||
     isSshCommandLine(session.launchCommand ?? session.restoreCommand ?? null)
-  );
-}
-
-// True when the user is actually present looking at the app: the webview is
-// visible AND focused AND we are past the brief window right after a display/
-// system wake (where visibility flips back before the user has really returned).
-// Used to decide whether a genuine SSH drop should auto-reconnect or just park.
-function isUserPresentNow(justResumedUntil: number): boolean {
-  return (
-    document.visibilityState === "visible" &&
-    document.hasFocus() &&
-    Date.now() >= justResumedUntil
   );
 }
 
@@ -2185,9 +2181,6 @@ export default function App() {
   const activeProjectIdRef = useRef<string>(activeProjectId);
   const reconnectTimersRef = useRef<Map<string, number>>(new Map());
   const reconnectInFlightRef = useRef<Set<string>>(new Set());
-  // Set to a near-future timestamp whenever we detect a display/system wake, so
-  // an SSH drop arriving right as the window becomes visible counts as "away".
-  const justResumedUntilRef = useRef(0);
   const healthCheckInFlightRef = useRef(false);
   const lastHealthCheckAtRef = useRef(0);
   const lastActiveByProject = useRef<Map<string, string>>(new Map());
@@ -3389,27 +3382,8 @@ export default function App() {
             }
           }
 
-          // SSH sessions that vanished from the backend are discovered here only
-          // on return-from-away (focus/visibility/resume/interval). Park them —
-          // preserve the terminal + output and offer a one-click Reconnect —
-          // instead of silently reconnecting under the user. pty-exit handles the
-          // seamless reconnect for a genuine loss that happens while present.
-          if (missingSsh.length > 0) {
-            const missingSshSet = new Set(missingSsh);
-            setSessionsSync((prev) =>
-              prev.map((s) =>
-                missingSshSet.has(s.id)
-                  ? {
-                      ...s,
-                      exited: true,
-                      recordingActive: false,
-                      connectionState: "disconnected",
-                      manualReconnectAvailable: true,
-                      disconnectReason: `Connection lost (${reason}) — click Reconnect.`,
-                    }
-                  : s,
-              ),
-            );
+          for (const id of missingSsh) {
+            reconnectSshSessionRef.current(id, `SSH lost (${reason}).`, { immediate: true });
           }
         } catch {
           // Best-effort reconciliation.
@@ -3592,7 +3566,6 @@ export default function App() {
       const elapsed = now - lastTimerTickAt;
       lastTimerTickAt = now;
       if (document.visibilityState === "visible" && elapsed > DISPLAY_WAKE_RENDER_GAP_MS) {
-        justResumedUntilRef.current = Date.now() + 8_000;
         scheduleCanvasRecovery(`timer-gap-${elapsed}ms`, { force: true, healthCheck: true });
         runFrameGapProbe();
       }
@@ -3612,7 +3585,6 @@ export default function App() {
       console.warn("[agents-ui] System resumed from sleep (Tauri event).");
       lastActiveAt = Date.now();
       lastTimerTickAt = Date.now();
-      justResumedUntilRef.current = Date.now() + 8_000;
       scheduleCanvasRecovery("sleep-resume", { force: true, healthCheck: true, bypassThrottle: true });
     }).then((fn) => {
       if (disposed) fn();
@@ -7509,28 +7481,17 @@ export default function App() {
         }
 
         const exitedSession = sessionByIdRef.current.get(id) ?? null;
-        // ssh's exit code tells us *why* the session ended. 255 means the SSH
-        // transport itself failed (reset / host unreachable / broken pipe /
-        // ServerAliveCountMax keepalive timeout) — a genuine disconnect. Any
-        // other code means the remote shell or command ended on purpose (you
-        // typed `exit`, a command finished), which must never auto-reconnect.
-        const sshGenuineLoss =
-          exitedSession != null && isSshSession(exitedSession) && exit_code === 255;
         if (
           exitedSession &&
-          sshGenuineLoss &&
-          !exitedSession.manualReconnectAvailable &&
-          isUserPresentNow(justResumedUntilRef.current)
+          isSshSession(exitedSession) &&
+          !exitedSession.manualReconnectAvailable
         ) {
-          // Lost while the user is here and active → reconnect seamlessly (the
-          // network-blip-while-working case).
-          reconnectSshSessionRef.current(id, "SSH connection lost (255).");
+          reconnectSshSessionRef.current(
+            id,
+            `SSH exited${exit_code != null ? ` (${exit_code})` : ""}.`,
+          );
           return;
         }
-        // Otherwise fall through to the disconnected/exited branch below. For a
-        // genuine loss while away/just-woken that parks the session (preserving
-        // its terminal + output) with a one-click Reconnect; for a clean exit it
-        // marks the session ended.
 
         setSessionsSync((prev) => {
           let found = false;
@@ -7555,10 +7516,8 @@ export default function App() {
           return next;
         });
 
-        // Auto-cleanup exited sessions after 120s if user is not viewing them.
-        // Skip SSH sessions parked after a genuine connection loss (255) so their
-        // finished output survives until the user reconnects or closes them.
-        if (!sshGenuineLoss && !exitedCleanupTimers.current.has(id)) {
+        // Auto-cleanup exited sessions after 120s if user is not viewing them
+        if (!exitedCleanupTimers.current.has(id)) {
           const timer = window.setTimeout(() => {
             exitedCleanupTimers.current.delete(id);
             if (activeIdRef.current !== id) {
