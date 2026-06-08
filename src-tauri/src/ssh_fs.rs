@@ -1,13 +1,18 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::files::{probe_from_sample, FileProbe, FsEntry, MAX_RANGE_READ_BYTES, PROBE_BYTES};
 
 const MAX_TEXT_FILE_BYTES: usize = 2 * 1024 * 1024;
 const BINARY_CHECK_BYTES: usize = 8 * 1024;
 const MAX_REMOTE_FILE_SEARCH_RESULTS: usize = 1_000;
+/// How many times an ssh/sftp op (or master-establish) is retried when it hits a
+/// transient transport error before giving up.
+const SSH_OP_ATTEMPTS: usize = 3;
 
 fn find_program_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -187,15 +192,20 @@ fn ssh_common_args() -> Result<Vec<String>, String> {
         "-o".to_string(),
         "ConnectionAttempts=1".to_string(),
         "-o".to_string(),
-        "ServerAliveInterval=10".to_string(),
+        // Tolerate ~60s of network silence before the shared master gives up, so
+        // it survives brief pauses (Wi-Fi power-save when the display turns off)
+        // instead of dying after 20s and forcing every next op to re-create it.
+        "ServerAliveInterval=15".to_string(),
         "-o".to_string(),
-        "ServerAliveCountMax=2".to_string(),
+        "ServerAliveCountMax=4".to_string(),
         "-o".to_string(),
         "StrictHostKeyChecking=yes".to_string(),
         "-o".to_string(),
         "ControlMaster=auto".to_string(),
         "-o".to_string(),
-        "ControlPersist=60".to_string(),
+        // Keep the master warm for 5 min after the last op so a burst of file
+        // actions reuses one connection instead of repeatedly re-establishing it.
+        "ControlPersist=300".to_string(),
         "-o".to_string(),
         format!("ControlPath={control}"),
     ]);
@@ -267,7 +277,115 @@ fn build_sh_c_command(script: &str, argv0: Option<&str>, args: &[String]) -> Str
     out
 }
 
-fn run_ssh(target: &str, remote_args: &[String], stdin: Option<&[u8]>) -> Result<Output, String> {
+/// Per-target lock guarding control-master creation, so concurrent file ops
+/// don't each open their own connection when the master is down.
+fn ssh_master_lock(target: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let registry = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = registry.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(target.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// True for SSH transport failures worth retrying — the server rate-limited /
+/// reset the connection, or the multiplexed master refused a session. NOT true
+/// for genuine command failures (e.g. "File exists"), which the caller surfaces.
+fn is_transient_ssh_error(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("connection reset by peer")
+        || s.contains("kex_exchange_identification")
+        || s.contains("session open refused")
+        || s.contains("mux_client")
+        || s.contains("control socket connect")
+        || s.contains("connection closed by")
+        || s.contains("broken pipe")
+        || s.contains("connection timed out")
+        || s.contains("operation timed out")
+}
+
+/// Whether a multiplexing master process is currently registered for `target`.
+fn master_is_alive(target: &str) -> bool {
+    let (Ok(ssh), Ok(common)) = (program_path("ssh"), ssh_common_args()) else {
+        return false;
+    };
+    Command::new(ssh)
+        .args(&common)
+        .args(["-O", "check"])
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Tear down the master for `target` (best effort) — used when it looks stale
+/// (process alive but its underlying connection dead).
+fn close_master(target: &str) {
+    let (Ok(ssh), Ok(common)) = (program_path("ssh"), ssh_common_args()) else {
+        return;
+    };
+    let _ = Command::new(ssh)
+        .args(&common)
+        .args(["-O", "exit"])
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Ensure the multiplexing master for `target` is up. Serialized per target so
+/// that, when no master exists, exactly one ssh process creates it instead of
+/// every concurrent op racing to open its own connection — a burst the server
+/// rate-limits, surfacing as "Connection reset by peer" /
+/// "kex_exchange_identification" / "Session open refused by peer".
+fn ensure_master(target: &str) -> Result<(), String> {
+    let lock = ssh_master_lock(target);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    if master_is_alive(target) {
+        return Ok(());
+    }
+
+    let ssh = program_path("ssh")?;
+    let common = ssh_common_args()?;
+    let mut last_err = String::new();
+    for attempt in 0..SSH_OP_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+            if master_is_alive(target) {
+                return Ok(());
+            }
+        }
+        // `true` is a trivial remote command; with ControlMaster=auto it opens
+        // and persists the shared master, then returns immediately.
+        let output = Command::new(&ssh)
+            .args(&common)
+            .arg(target)
+            .arg("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| format!("spawn ssh failed: {e}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        last_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !is_transient_ssh_error(&last_err) {
+            // Auth / host-key / DNS failures won't be fixed by retrying.
+            return Err(format!("ssh connect failed: {last_err}"));
+        }
+    }
+    Err(format!(
+        "ssh connect failed after {SSH_OP_ATTEMPTS} attempts: {last_err}"
+    ))
+}
+
+fn run_ssh_once(target: &str, remote_args: &[String], stdin: Option<&[u8]>) -> Result<Output, String> {
     let mut cmd = Command::new(program_path("ssh")?);
     cmd.args(ssh_common_args()?);
     cmd.arg(target);
@@ -298,12 +416,40 @@ fn run_ssh(target: &str, remote_args: &[String], stdin: Option<&[u8]>) -> Result
     }
 }
 
+fn run_ssh(target: &str, remote_args: &[String], stdin: Option<&[u8]>) -> Result<Output, String> {
+    let mut last_output: Option<Output> = None;
+    for attempt in 0..SSH_OP_ATTEMPTS {
+        if attempt > 0 {
+            // The previous attempt hit a transient transport error. The shared
+            // master may be stale (process alive but its connection dead); drop
+            // it so ensure_master rebuilds a fresh one, then back off.
+            close_master(target);
+            std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+        }
+        ensure_master(target)?;
+        let output = run_ssh_once(target, remote_args, stdin)?;
+        if output.status.success() {
+            return Ok(output);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !is_transient_ssh_error(&stderr) {
+            // Genuine remote-command failure (e.g. "File exists", permission
+            // denied) — return it so the caller surfaces the real message.
+            return Ok(output);
+        }
+        last_output = Some(output);
+    }
+    Ok(last_output.expect("ssh retry loop runs at least once"))
+}
+
 pub(crate) fn run_ssh_script(target: &str, script: &str) -> Result<Output, String> {
     let args = vec!["sh".to_string()];
     run_ssh(target, &args, Some(script.as_bytes()))
 }
 
 fn run_sftp_batch(target: &str, batch: &str) -> Result<Output, String> {
+    // Reuse the shared master rather than racing to open a fresh connection.
+    ensure_master(target)?;
     let mut cmd = Command::new(program_path("sftp")?);
     cmd.args(ssh_common_args()?);
     cmd.arg("-q");
