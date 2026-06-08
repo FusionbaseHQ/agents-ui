@@ -57,6 +57,11 @@ type VisibleItem =
   | { type: "loading"; path: string; depth: number }
   | { type: "error"; path: string; depth: number; message: string };
 
+type ScrollAnchor = {
+  path: string;
+  offsetTop: number;
+};
+
 type FileTypeBadgeKind =
   | "python"
   | "shell"
@@ -167,6 +172,17 @@ function ancestorDirsWithinRoot(path: string, root: string): string[] {
     cur = dirname(cur);
   }
   return [base, ...dirs.reverse()];
+}
+
+function findVisibleEntryIndex(items: VisibleItem[], path: string): number {
+  const normalized = normalizePath(path);
+  if (!normalized) return -1;
+  return items.findIndex((item) => item.type === "entry" && normalizePath(item.entry.path) === normalized);
+}
+
+function clampScrollTop(value: number, el: HTMLElement): number {
+  const maxScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+  return Math.max(0, Math.min(value, maxScrollTop));
 }
 
 function parseFileUrlPath(data: string): string | null {
@@ -459,6 +475,9 @@ export function FileExplorerPanel({
   const [listHeight, setListHeight] = React.useState(0);
   const listScrollSyncRafRef = React.useRef<number | null>(null);
   const lastRevealPathRef = React.useRef<string | null>(null);
+  const pendingRevealPathRef = React.useRef<string | null>(null);
+  const pendingScrollAnchorRef = React.useRef<ScrollAnchor | null>(null);
+  const visibleItemsRef = React.useRef<VisibleItem[]>([]);
 
   const [contextMenu, setContextMenu] = React.useState<{ x: number; y: number; entry: FsEntry } | null>(null);
   const contextMenuRef = React.useRef<HTMLDivElement | null>(null);
@@ -531,6 +550,9 @@ export function FileExplorerPanel({
   const rootRef = React.useRef(root);
   React.useLayoutEffect(() => {
     rootRef.current = root;
+    lastRevealPathRef.current = null;
+    pendingRevealPathRef.current = null;
+    pendingScrollAnchorRef.current = null;
   }, [root]);
 
   const onPersistStateRef = React.useRef(onPersistState);
@@ -1254,6 +1276,29 @@ export function FileExplorerPanel({
     return out;
   }, [dirStateByPath, expandedDirs, isOpen, root]);
 
+  React.useLayoutEffect(() => {
+    visibleItemsRef.current = visibleItems;
+  }, [visibleItems]);
+
+  React.useLayoutEffect(() => {
+    const anchor = pendingScrollAnchorRef.current;
+    const el = listRef.current;
+    if (!anchor || !el) return;
+
+    const index = findVisibleEntryIndex(visibleItems, anchor.path);
+    if (index < 0) {
+      pendingScrollAnchorRef.current = null;
+      return;
+    }
+
+    const nextTop = clampScrollTop(index * FILE_EXPLORER_ROW_HEIGHT - anchor.offsetTop, el);
+    pendingScrollAnchorRef.current = null;
+    if (Math.abs(el.scrollTop - nextTop) >= 0.5) {
+      el.scrollTop = nextTop;
+    }
+    setScrollTop((prev) => (prev === nextTop ? prev : nextTop));
+  }, [visibleItems]);
+
   const gitDecorations = React.useMemo(() => {
     const direct = new Map<string, GitStatusKind>();
     const nested = new Map<string, GitStatusKind>();
@@ -1277,17 +1322,36 @@ export function FileExplorerPanel({
   }, [gitStatusEntries, root]);
 
   React.useEffect(() => {
-    if (!isOpen || !activeFilePath) return;
+    if (!isOpen || !activeFilePath) {
+      lastRevealPathRef.current = null;
+      pendingRevealPathRef.current = null;
+      return;
+    }
     const active = normalizePath(activeFilePath);
-    if (!active || lastRevealPathRef.current === active) return;
+    if (!active) {
+      lastRevealPathRef.current = null;
+      pendingRevealPathRef.current = null;
+      return;
+    }
+    if (lastRevealPathRef.current === active) return;
     const ancestors = ancestorDirsWithinRoot(active, root);
-    if (ancestors.length === 0) return;
+    if (ancestors.length === 0) {
+      lastRevealPathRef.current = null;
+      pendingRevealPathRef.current = null;
+      return;
+    }
 
     lastRevealPathRef.current = active;
+    pendingRevealPathRef.current = active;
     setExpandedDirs((prev) => {
       const next = new Set(prev);
-      for (const dir of ancestors) next.add(dir);
-      return next;
+      let changed = false;
+      for (const dir of ancestors) {
+        if (next.has(dir)) continue;
+        next.add(dir);
+        changed = true;
+      }
+      return changed ? next : prev;
     });
     if (provider === "local" && watcherIdRef.current) {
       for (const dir of ancestors) {
@@ -1304,9 +1368,15 @@ export function FileExplorerPanel({
   }, [activeFilePath, isOpen, loadDirectory, provider, root]);
 
   React.useEffect(() => {
-    if (!activeFilePath || !listRef.current) return;
+    const pendingReveal = pendingRevealPathRef.current;
+    if (!pendingReveal || !activeFilePath || !listRef.current) return;
     const active = normalizePath(activeFilePath);
-    const index = visibleItems.findIndex((item) => item.type === "entry" && normalizePath(item.entry.path) === active);
+    if (active !== pendingReveal) {
+      pendingRevealPathRef.current = null;
+      return;
+    }
+
+    const index = findVisibleEntryIndex(visibleItems, active);
     if (index < 0) return;
 
     const el = listRef.current;
@@ -1314,9 +1384,16 @@ export function FileExplorerPanel({
     const bottom = top + FILE_EXPLORER_ROW_HEIGHT;
     const visibleTop = el.scrollTop;
     const visibleBottom = visibleTop + el.clientHeight;
-    if (top >= visibleTop && bottom <= visibleBottom) return;
+    if (top >= visibleTop && bottom <= visibleBottom) {
+      pendingRevealPathRef.current = null;
+      return;
+    }
 
-    const nextTop = Math.max(0, top - Math.max(0, Math.floor((el.clientHeight - FILE_EXPLORER_ROW_HEIGHT) / 2)));
+    const nextTop = clampScrollTop(
+      top - Math.max(0, Math.floor((el.clientHeight - FILE_EXPLORER_ROW_HEIGHT) / 2)),
+      el,
+    );
+    pendingRevealPathRef.current = null;
     el.scrollTop = nextTop;
     setScrollTop(nextTop);
   }, [activeFilePath, visibleItems]);
@@ -1324,7 +1401,17 @@ export function FileExplorerPanel({
   const toggleDir = React.useCallback(
     (dirPath: string) => {
       const path = normalizePath(dirPath);
-      let expanding = false;
+      const el = listRef.current;
+      const index = findVisibleEntryIndex(visibleItemsRef.current, path);
+      if (el && index >= 0) {
+        pendingScrollAnchorRef.current = {
+          path,
+          offsetTop: index * FILE_EXPLORER_ROW_HEIGHT - el.scrollTop,
+        };
+      }
+      pendingRevealPathRef.current = null;
+
+      const expanding = !expandedDirsRef.current.has(path);
       setExpandedDirs((prev) => {
         const next = new Set(prev);
         if (next.has(path)) {
@@ -1332,7 +1419,6 @@ export function FileExplorerPanel({
           return next;
         }
         next.add(path);
-        expanding = true;
         return next;
       });
       // Watch/unwatch for local filesystem watcher
