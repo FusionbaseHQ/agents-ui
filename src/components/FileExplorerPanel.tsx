@@ -52,6 +52,8 @@ export type FileExplorerPersistedState = {
   scrollTop: number;
 };
 
+type FileExplorerPersistedTreeSnapshot = Omit<FileExplorerPersistedState, "scrollTop">;
+
 type VisibleItem =
   | { type: "entry"; entry: FsEntry; depth: number }
   | { type: "loading"; path: string; depth: number }
@@ -149,6 +151,14 @@ function getFileTypeBadge(name: string): FileTypeBadge | null {
     return { label: "CFG", kind: "config" };
   }
   return null;
+}
+
+function gitStatusEntriesEqual(a: GitStatusEntry[], b: GitStatusEntry[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].path !== b[i].path || a[i].status !== b[i].status) return false;
+  }
+  return true;
 }
 
 function joinPath(dir: string, name: string): string {
@@ -478,6 +488,9 @@ export function FileExplorerPanel({
   const pendingRevealPathRef = React.useRef<string | null>(null);
   const pendingScrollAnchorRef = React.useRef<ScrollAnchor | null>(null);
   const visibleItemsRef = React.useRef<VisibleItem[]>([]);
+  const persistedTreeSnapshotRef = React.useRef<FileExplorerPersistedTreeSnapshot | null>(null);
+  const gitStatusInFlightKeyRef = React.useRef<string | null>(null);
+  const gitStatusRequestSeqRef = React.useRef(0);
 
   const [contextMenu, setContextMenu] = React.useState<{ x: number; y: number; entry: FsEntry } | null>(null);
   const contextMenuRef = React.useRef<HTMLDivElement | null>(null);
@@ -594,47 +607,62 @@ export function FileExplorerPanel({
     };
   }, []);
 
+  const buildPersistedTreeSnapshot = React.useCallback((): FileExplorerPersistedTreeSnapshot => {
+    const currentRoot = rootRef.current;
+    const expanded = Array.from(expandedDirsRef.current.values());
+    const states = dirStateByPathRef.current;
+    const persistedStates: Record<string, FileExplorerPersistedDirState> = {};
+    for (const [path, state] of Object.entries(states)) {
+      if (!state) continue;
+      if (state.loading) continue;
+      persistedStates[path] = {
+        entries: state.entries as unknown as FileExplorerPersistedEntry[],
+        error: state.error ?? null,
+      };
+    }
+    const snapshot = {
+      root: currentRoot,
+      expandedDirs: expanded,
+      dirStateByPath: persistedStates,
+    };
+    persistedTreeSnapshotRef.current = snapshot;
+    return snapshot;
+  }, []);
+
   const persistStateNow = React.useCallback(() => {
     const persist = onPersistStateRef.current;
     if (!persist) return;
     try {
-      const currentRoot = rootRef.current;
-      const expanded = Array.from(expandedDirsRef.current.values());
-      const states = dirStateByPathRef.current;
-      const persistedStates: Record<string, FileExplorerPersistedDirState> = {};
-      for (const [path, state] of Object.entries(states)) {
-        if (!state) continue;
-        if (state.loading) continue;
-        persistedStates[path] = {
-          entries: state.entries as unknown as FileExplorerPersistedEntry[],
-          error: state.error ?? null,
-        };
-      }
+      const snapshot = persistedTreeSnapshotRef.current ?? buildPersistedTreeSnapshot();
       persist({
-        root: currentRoot,
-        expandedDirs: expanded,
-        dirStateByPath: persistedStates,
+        ...snapshot,
         scrollTop: scrollTopRef.current,
       });
     } catch {
       // Best-effort.
     }
-  }, []);
+  }, [buildPersistedTreeSnapshot]);
 
   const persistTimerRef = React.useRef<number | null>(null);
-  const schedulePersist = React.useCallback(() => {
+  const schedulePersist = React.useCallback((delay = 250) => {
     if (!onPersistStateRef.current) return;
     if (persistTimerRef.current !== null) window.clearTimeout(persistTimerRef.current);
     persistTimerRef.current = window.setTimeout(() => {
       persistTimerRef.current = null;
       persistStateNow();
-    }, 250);
+    }, delay);
   }, [persistStateNow]);
 
   React.useEffect(() => {
     if (!isOpen) return;
-    schedulePersist();
-  }, [dirStateByPath, expandedDirs, isOpen, root, schedulePersist, scrollTop]);
+    buildPersistedTreeSnapshot();
+    schedulePersist(250);
+  }, [buildPersistedTreeSnapshot, dirStateByPath, expandedDirs, isOpen, root, schedulePersist]);
+
+  React.useEffect(() => {
+    if (!isOpen) return;
+    schedulePersist(700);
+  }, [isOpen, schedulePersist, scrollTop]);
 
   React.useLayoutEffect(() => {
     return () => {
@@ -682,14 +710,27 @@ export function FileExplorerPanel({
 
   const refreshGitStatus = React.useCallback(async () => {
     if (provider !== "local") {
-      setGitStatusEntries([]);
+      gitStatusRequestSeqRef.current++;
+      gitStatusInFlightKeyRef.current = null;
+      setGitStatusEntries((prev) => (prev.length ? [] : prev));
       return;
     }
+    const requestKey = root;
+    if (gitStatusInFlightKeyRef.current === requestKey) return;
+    gitStatusInFlightKeyRef.current = requestKey;
+    const requestSeq = ++gitStatusRequestSeqRef.current;
     try {
       const entries = await invoke<GitStatusEntry[]>("git_status_entries", { root });
-      setGitStatusEntries(entries);
+      if (requestSeq !== gitStatusRequestSeqRef.current) return;
+      setGitStatusEntries((prev) => (gitStatusEntriesEqual(prev, entries) ? prev : entries));
     } catch {
-      setGitStatusEntries([]);
+      if (requestSeq === gitStatusRequestSeqRef.current) {
+        setGitStatusEntries((prev) => (prev.length ? [] : prev));
+      }
+    } finally {
+      if (gitStatusInFlightKeyRef.current === requestKey) {
+        gitStatusInFlightKeyRef.current = null;
+      }
     }
   }, [provider, root]);
 

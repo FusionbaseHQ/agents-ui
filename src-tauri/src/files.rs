@@ -4,8 +4,8 @@ use std::{
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    process::Command,
-    time::UNIX_EPOCH,
+    process::{Command, Output, Stdio},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 const MAX_TEXT_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -403,18 +403,42 @@ fn git_status_kind(code: &str) -> &'static str {
     }
 }
 
+fn command_output_with_timeout(mut command: Command, timeout: Duration) -> io::Result<Option<Output>> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let start = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map(Some);
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 #[tauri::command]
 pub fn git_status_entries(root: String) -> Result<Vec<GitStatusEntry>, String> {
     let root = ensure_root_dir(Path::new(root.trim()))?;
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(&root)
         .arg("status")
         .arg("--porcelain=v1")
         .arg("-z")
-        .arg("--untracked-files=normal")
-        .output()
-        .map_err(|e| format!("git status failed: {e}"))?;
+        .arg("--untracked-files=normal");
+    let Some(output) = command_output_with_timeout(command, Duration::from_secs(5))
+        .map_err(|e| format!("git status failed: {e}"))?
+    else {
+        return Ok(Vec::new());
+    };
 
     if !output.status.success() {
         return Ok(Vec::new());

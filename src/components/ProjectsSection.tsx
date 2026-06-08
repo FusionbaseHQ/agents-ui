@@ -223,6 +223,8 @@ export const ProjectsSection = React.memo(function ProjectsSection({
     setDropTarget(null);
   }, []);
 
+  const projectOrderKey = React.useMemo(() => projects.map((project) => project.id).join("\0"), [projects]);
+
   React.useLayoutEffect(() => {
     const list = projectListRef.current;
     if (!list) return;
@@ -266,7 +268,7 @@ export const ProjectsSection = React.memo(function ProjectsSection({
     }
 
     previousItemRectsRef.current = nextRects;
-  }, [projects, draggingProjectId]);
+  }, [projectOrderKey, draggingProjectId]);
 
   return (
     <>

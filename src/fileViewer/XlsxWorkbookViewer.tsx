@@ -1,5 +1,5 @@
 import React from "react";
-import { read, utils, type CellObject, type Range, type WorkSheet } from "xlsx";
+import { utils, type CellObject, type WorkSheet } from "xlsx";
 import { concatBytes } from "./bytes";
 import type { ReadRangeFn } from "./useChunkCache";
 
@@ -28,6 +28,53 @@ type SheetPreview = {
   truncatedColumns: boolean;
 };
 
+type XlsxWorkerRequest =
+  | { type: "sheetNames"; bytes: Uint8Array }
+  | { type: "sheet"; bytes: Uint8Array; name: string };
+
+type XlsxWorkerResponse =
+  | { id: number; ok: true; sheetNames: string[] }
+  | { id: number; ok: true; sheet: SheetPreview }
+  | { id: number; ok: false; error: string };
+
+let xlsxWorkerMessageId = 0;
+
+function createXlsxWorker(): Worker {
+  return new Worker(new URL("./xlsxWorker.ts", import.meta.url), { type: "module" });
+}
+
+function callXlsxWorker<T>(worker: Worker, request: XlsxWorkerRequest): Promise<T> {
+  const id = ++xlsxWorkerMessageId;
+  return new Promise((resolve, reject) => {
+    function cleanup() {
+      worker.removeEventListener("message", onMessage);
+      worker.removeEventListener("error", onError);
+    }
+    function onMessage(event: MessageEvent<XlsxWorkerResponse>) {
+      const response = event.data;
+      if (!response || response.id !== id) return;
+      cleanup();
+      if (!response.ok) {
+        reject(new Error(response.error));
+        return;
+      }
+      resolve(("sheet" in response ? response.sheet : response.sheetNames) as T);
+    }
+    function onError(event: ErrorEvent) {
+      cleanup();
+      reject(new Error(event.message || "XLSX worker failed"));
+    }
+    worker.addEventListener("message", onMessage);
+    worker.addEventListener("error", onError);
+    try {
+      worker.postMessage({ id, ...request });
+    } catch (err) {
+      cleanup();
+      reject(err);
+    }
+  });
+}
+
 async function readAllBytes(
   readRange: ReadRangeFn,
   path: string,
@@ -52,63 +99,6 @@ function formatCell(cell: CellObject | undefined): string {
   if (cell.v != null) return String(cell.v);
   if (typeof cell.f === "string" && cell.f.trim()) return `=${cell.f}`;
   return "";
-}
-
-function decodeRange(ref: unknown): Range | null {
-  if (typeof ref !== "string" || !ref.trim()) return null;
-  try {
-    return utils.decode_range(ref);
-  } catch {
-    return null;
-  }
-}
-
-function rangeRows(range: Range | null): number {
-  return range ? Math.max(0, range.e.r - range.s.r + 1) : 0;
-}
-
-function rangeColumns(range: Range | null): number {
-  return range ? Math.max(0, range.e.c - range.s.c + 1) : 0;
-}
-
-function parseSheetNames(bytes: Uint8Array): string[] {
-  const workbook = read(bytes, { type: "array", bookSheets: true });
-  return workbook.SheetNames;
-}
-
-function parseSheet(bytes: Uint8Array, name: string): SheetPreview {
-  const workbook = read(bytes, {
-    type: "array",
-    sheets: name,
-    sheetRows: MAX_ROWS,
-    cellDates: true,
-    cellFormula: true,
-    cellHTML: false,
-    cellNF: false,
-    cellText: true,
-    dense: false,
-  });
-  const sheet = workbook.Sheets[name] ?? utils.sheet_new();
-  const parsedRange = decodeRange(sheet["!ref"]);
-  const fullRange = decodeRange(sheet["!fullref"]) ?? parsedRange;
-  const displayRange = parsedRange ?? fullRange;
-  const totalRows = rangeRows(fullRange);
-  const totalColumns = rangeColumns(fullRange);
-  const visibleRows = Math.min(rangeRows(displayRange), MAX_ROWS);
-  const visibleColumns = Math.min(rangeColumns(displayRange), MAX_COLUMNS);
-
-  return {
-    name,
-    sheet,
-    startRow: displayRange?.s.r ?? 0,
-    startColumn: displayRange?.s.c ?? 0,
-    totalRows,
-    totalColumns,
-    visibleRows,
-    visibleColumns,
-    truncatedRows: totalRows > MAX_ROWS,
-    truncatedColumns: totalColumns > MAX_COLUMNS,
-  };
 }
 
 function cellText(sheet: SheetPreview, rowOffset: number, colOffset: number): string {
@@ -334,6 +324,21 @@ export default function XlsxWorkbookViewer({
   const [sheet, setSheet] = React.useState<SheetPreview | null>(null);
   const [loadError, setLoadError] = React.useState<string | null>(null);
   const [sheetError, setSheetError] = React.useState<string | null>(null);
+  const workerRef = React.useRef<Worker | null>(null);
+
+  const getWorker = React.useCallback(() => {
+    if (!workerRef.current) {
+      workerRef.current = createXlsxWorker();
+    }
+    return workerRef.current;
+  }, []);
+
+  React.useEffect(() => {
+    return () => {
+      workerRef.current?.terminate();
+      workerRef.current = null;
+    };
+  }, []);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -350,7 +355,7 @@ export default function XlsxWorkbookViewer({
       try {
         const bytes = await readAllBytes(readRange, path, size, () => cancelled);
         if (cancelled) return;
-        const sheetNames = parseSheetNames(bytes);
+        const sheetNames = await callXlsxWorker<string[]>(getWorker(), { type: "sheetNames", bytes });
         if (cancelled) return;
         setSource({ bytes, sheetNames });
       } catch (err) {
@@ -360,7 +365,7 @@ export default function XlsxWorkbookViewer({
     return () => {
       cancelled = true;
     };
-  }, [path, readRange, size]);
+  }, [getWorker, path, readRange, size]);
 
   const activeIndex = source ? Math.min(activeSheet, Math.max(0, source.sheetNames.length - 1)) : 0;
 
@@ -375,20 +380,19 @@ export default function XlsxWorkbookViewer({
     const sheetName = source.sheetNames[activeIndex];
     setSheet(null);
     setSheetError(null);
-    const timer = window.setTimeout(() => {
+    void (async () => {
       try {
-        const parsed = parseSheet(source.bytes, sheetName);
+        const parsed = await callXlsxWorker<SheetPreview>(getWorker(), { type: "sheet", bytes: source.bytes, name: sheetName });
         if (!cancelled) setSheet(parsed);
       } catch (err) {
         if (!cancelled) setSheetError(err instanceof Error ? err.message : String(err));
       }
-    }, 0);
+    })();
 
     return () => {
       cancelled = true;
-      window.clearTimeout(timer);
     };
-  }, [activeIndex, source]);
+  }, [activeIndex, getWorker, source]);
 
   if (loadError) return errorView("Could not render workbook", loadError, onOpenBytes);
   if (!source) return loadingView("Loading workbook...");

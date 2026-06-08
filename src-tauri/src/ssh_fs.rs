@@ -447,9 +447,7 @@ pub(crate) fn run_ssh_script(target: &str, script: &str) -> Result<Output, Strin
     run_ssh(target, &args, Some(script.as_bytes()))
 }
 
-fn run_sftp_batch(target: &str, batch: &str) -> Result<Output, String> {
-    // Reuse the shared master rather than racing to open a fresh connection.
-    ensure_master(target)?;
+fn run_sftp_once(target: &str, batch: &str) -> Result<Output, String> {
     let mut cmd = Command::new(program_path("sftp")?);
     cmd.args(ssh_common_args()?);
     cmd.arg("-q");
@@ -469,6 +467,28 @@ fn run_sftp_batch(target: &str, batch: &str) -> Result<Output, String> {
     child
         .wait_with_output()
         .map_err(|e| format!("wait sftp failed: {e}"))
+}
+
+fn run_sftp_batch(target: &str, batch: &str) -> Result<Output, String> {
+    let mut last_output: Option<Output> = None;
+    for attempt in 0..SSH_OP_ATTEMPTS {
+        if attempt > 0 {
+            close_master(target);
+            std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+        }
+        // Reuse the shared master rather than racing to open a fresh connection.
+        ensure_master(target)?;
+        let output = run_sftp_once(target, batch)?;
+        if output.status.success() {
+            return Ok(output);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !is_transient_ssh_error(&stderr) {
+            return Ok(output);
+        }
+        last_output = Some(output);
+    }
+    Ok(last_output.expect("sftp retry loop runs at least once"))
 }
 
 fn sftp_escape_arg(value: &str) -> String {
@@ -894,20 +914,9 @@ file="$1"
 offset="$2"
 count="$3"
 [ -f "$file" ] || { echo "not a file" >&2; exit 1; }
-size="$(wc -c < "$file" | tr -d '[:space:]')"
-mtime=""
-if stat -c %Y "$file" >/dev/null 2>&1; then
-  mtime="$(stat -c %Y "$file" 2>/dev/null || true)"
-elif stat -f %m "$file" >/dev/null 2>&1; then
-  mtime="$(stat -f %m "$file" 2>/dev/null || true)"
-fi
-printf 'AGENTS_UI_RANGE size=%s mtime=%s\n' "$size" "$mtime" >&2
-if [ "$offset" -ge "$size" ]; then
-  exit 0
-fi
 start=$((offset + 1))
 if command -v tail >/dev/null 2>&1 && command -v head >/dev/null 2>&1; then
-  tail -c +"$start" "$file" | head -c "$count"
+  tail -c +"$start" "$file" 2>/dev/null | head -c "$count"
 else
   dd if="$file" bs=1 skip="$offset" count="$count" 2>/dev/null
 fi"#;

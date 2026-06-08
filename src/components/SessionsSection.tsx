@@ -467,6 +467,8 @@ export const SessionsSection = React.memo(function SessionsSection({
     setDropTarget(null);
   }, []);
 
+  const sessionOrderKey = React.useMemo(() => sessions.map((session) => session.id).join("\0"), [sessions]);
+
   React.useLayoutEffect(() => {
     const list = sessionListRef.current;
     if (!list) return;
@@ -510,7 +512,7 @@ export const SessionsSection = React.memo(function SessionsSection({
     }
 
     previousItemRectsRef.current = nextRects;
-  }, [sessions, draggingSessionId]);
+  }, [sessionOrderKey, draggingSessionId]);
 
   const handleDragHandlePointerDown = React.useCallback(
     (e: React.PointerEvent<HTMLButtonElement>, sessionId: string) => {

@@ -798,6 +798,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
 
   const openPathsRef = React.useRef<Set<string>>(new Set());
   const dirtyPathsRef = React.useRef<Set<string>>(new Set());
+  const programmaticModelUpdateRef = React.useRef<Set<string>>(new Set());
   const modelsRef = React.useRef<Map<string, import("monaco-editor").editor.ITextModel>>(new Map());
   const pendingContentRef = React.useRef<Map<string, string>>(new Map());
   const loadNonceByPathRef = React.useRef<Map<string, number>>(new Map());
@@ -911,6 +912,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
 
   const markDirty = React.useCallback(
     (path: string) => {
+      if (programmaticModelUpdateRef.current.has(path)) return;
       if (dirtyPathsRef.current.has(path)) return;
       dirtyPathsRef.current.add(path);
       updateTab(path, (tab) => (tab.dirty ? tab : { ...tab, dirty: true }));
@@ -930,8 +932,17 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       const existing = monaco.editor.getModel(uri);
       const language = inferLanguageId(path);
       if (existing) {
-        monaco.editor.setModelLanguage(existing, language);
-        existing.setValue(content);
+        if (existing.getLanguageId() !== language) {
+          monaco.editor.setModelLanguage(existing, language);
+        }
+        if (existing.getValue() !== content) {
+          programmaticModelUpdateRef.current.add(path);
+          try {
+            existing.setValue(content);
+          } finally {
+            programmaticModelUpdateRef.current.delete(path);
+          }
+        }
         if (!modelsRef.current.has(path)) {
           existing.onDidChangeContent(() => markDirty(path));
         }
@@ -951,12 +962,15 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     const monaco = monacoRef.current;
     if (!editor || !monaco) return;
     if (!path) {
-      editor.setModel(null);
+      if (editor.getModel() !== null) {
+        editor.setModel(null);
+      }
       return;
     }
     const model = modelsRef.current.get(path) ?? monaco.editor.getModel(modelUriForPath(monaco, path));
     if (!model) return;
     modelsRef.current.set(path, model);
+    if (editor.getModel() === model) return;
     editor.setModel(model);
   }, [modelUriForPath]);
 

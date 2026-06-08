@@ -35,7 +35,6 @@ import type {
   CodeEditorWorkspaceTab,
 } from "./components/CodeEditorPanel";
 import { AgentShortcutsModal } from "./components/AgentShortcutsModal";
-import { AgentPanel } from "./agent/AgentPanel";
 import { parseStreamLine, type ParsedUpdate } from "./agent/agentStreamParser";
 import { loadAgentSettings } from "./agent/agentStorage";
 import type { AgentLaunchSettings } from "./agent/agentTypes";
@@ -59,6 +58,9 @@ import {
 } from "./components/modals/SshManagerModal";
 
 const LazyCodeEditorPanel = React.lazy(() => import("./components/CodeEditorPanel"));
+const LazyAgentPanel = React.lazy(() =>
+  import("./agent/AgentPanel").then((module) => ({ default: module.AgentPanel })),
+);
 
 type Project = {
   id: string;
@@ -9917,42 +9919,50 @@ export default function App() {
               onMouseDown={beginWorkspaceResize("agent")}
               aria-hidden="true"
             />
-            <AgentPanel
-              onClose={() => setAgentPanelOpen(false)}
-              projectBasePath={activeProject?.basePath || homeDirRef.current || undefined}
-              onCreateTerminalSession={async (command) => {
-                try {
+            <React.Suspense
+              fallback={
+                <section className="agentPanel">
+                  <div className="empty">Loading agent...</div>
+                </section>
+              }
+            >
+              <LazyAgentPanel
+                onClose={() => setAgentPanelOpen(false)}
+                projectBasePath={activeProject?.basePath || homeDirRef.current || undefined}
+                onCreateTerminalSession={async (command) => {
+                  try {
+                    const cwd = activeProject?.basePath || homeDirRef.current || "";
+                    const createdRaw = await createSession({
+                      projectId: activeProjectId,
+                      name: "Agent",
+                      launchCommand: command,
+                      cwd,
+                      envVars: envVarsForProjectId(activeProjectId, projects, environments),
+                    });
+                    const s = applyPendingExit(createdRaw);
+                    addSessionWithProjectSafeActivation(s);
+                  } catch (err) {
+                    reportError("Failed to create agent terminal", err);
+                  }
+                }}
+                onCreateTaskSession={async (command, name) => {
                   const cwd = activeProject?.basePath || homeDirRef.current || "";
                   const createdRaw = await createSession({
                     projectId: activeProjectId,
-                    name: "Agent",
+                    name,
                     launchCommand: command,
                     cwd,
                     envVars: envVarsForProjectId(activeProjectId, projects, environments),
                   });
                   const s = applyPendingExit(createdRaw);
                   addSessionWithProjectSafeActivation(s);
-                } catch (err) {
-                  reportError("Failed to create agent terminal", err);
-                }
-              }}
-              onCreateTaskSession={async (command, name) => {
-                const cwd = activeProject?.basePath || homeDirRef.current || "";
-                const createdRaw = await createSession({
-                  projectId: activeProjectId,
-                  name,
-                  launchCommand: command,
-                  cwd,
-                  envVars: envVarsForProjectId(activeProjectId, projects, environments),
-                });
-                const s = applyPendingExit(createdRaw);
-                addSessionWithProjectSafeActivation(s);
-                return s.id;
-              }}
-              onActivateSession={(sessionId) => {
-                setActiveId(sessionId);
-              }}
-            />
+                  return s.id;
+                }}
+                onActivateSession={(sessionId) => {
+                  setActiveId(sessionId);
+                }}
+              />
+            </React.Suspense>
           </>
         )}
       </div>
