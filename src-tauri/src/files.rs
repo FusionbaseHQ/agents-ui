@@ -387,8 +387,10 @@ pub fn search_fs_entries(root: String, query: String, limit: Option<usize>) -> R
     Ok(out)
 }
 
-fn git_status_kind(code: &str) -> &'static str {
-    if code.contains('U') || code == "AA" || code == "DD" {
+pub(crate) fn git_status_kind(code: &str) -> &'static str {
+    if code == "!!" {
+        "ignored"
+    } else if code.contains('U') || code == "AA" || code == "DD" {
         "conflicted"
     } else if code.contains('R') || code.contains('C') {
         "renamed"
@@ -433,7 +435,8 @@ pub fn git_status_entries(root: String) -> Result<Vec<GitStatusEntry>, String> {
         .arg("status")
         .arg("--porcelain=v1")
         .arg("-z")
-        .arg("--untracked-files=normal");
+        .arg("--untracked-files=normal")
+        .arg("--ignored=matching");
     let Some(output) = command_output_with_timeout(command, Duration::from_secs(5))
         .map_err(|e| format!("git status failed: {e}"))?
     else {

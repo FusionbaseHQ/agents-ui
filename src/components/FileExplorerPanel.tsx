@@ -21,7 +21,7 @@ type FsEntry = {
   size: number;
 };
 
-type GitStatusKind = "modified" | "added" | "deleted" | "renamed" | "untracked" | "conflicted";
+type GitStatusKind = "modified" | "added" | "deleted" | "renamed" | "untracked" | "conflicted" | "ignored";
 type GitStatusEntry = {
   path: string;
   status: GitStatusKind;
@@ -277,6 +277,8 @@ function gitStatusLabel(status: GitStatusKind): string {
       return "?";
     case "conflicted":
       return "!";
+    case "ignored":
+      return "I";
     case "modified":
     default:
       return "M";
@@ -296,8 +298,10 @@ function gitStatusPriority(status: GitStatusKind): number {
     case "modified":
       return 2;
     case "untracked":
-    default:
       return 1;
+    case "ignored":
+    default:
+      return 0;
   }
 }
 
@@ -345,6 +349,11 @@ const FileRow = React.memo(function FileRow({
   if (isContextTarget) cn += " fileExplorerRowContext";
   if (isDropTarget) cn += " fileExplorerRowDropTarget";
   if (isPreparing) cn += " fileExplorerRowPreparing";
+  if (gitStatus) {
+    cn += ` fileExplorerRowGit fileExplorerRowGit-${gitStatus}`;
+    if (gitNested) cn += " fileExplorerRowGitNested";
+    else cn += " fileExplorerRowGitDirect";
+  }
 
   return (
     <button
@@ -709,18 +718,21 @@ export function FileExplorerPanel({
   );
 
   const refreshGitStatus = React.useCallback(async () => {
-    if (provider !== "local") {
+    if (provider === "ssh" && !sshTargetValue) {
       gitStatusRequestSeqRef.current++;
       gitStatusInFlightKeyRef.current = null;
       setGitStatusEntries((prev) => (prev.length ? [] : prev));
       return;
     }
-    const requestKey = root;
+    const requestKey = `${provider}:${sshTargetValue ?? ""}:${root}`;
     if (gitStatusInFlightKeyRef.current === requestKey) return;
     gitStatusInFlightKeyRef.current = requestKey;
     const requestSeq = ++gitStatusRequestSeqRef.current;
     try {
-      const entries = await invoke<GitStatusEntry[]>("git_status_entries", { root });
+      const entries =
+        provider === "ssh"
+          ? await invoke<GitStatusEntry[]>("ssh_git_status_entries", { target: sshTargetValue, root })
+          : await invoke<GitStatusEntry[]>("git_status_entries", { root });
       if (requestSeq !== gitStatusRequestSeqRef.current) return;
       setGitStatusEntries((prev) => (gitStatusEntriesEqual(prev, entries) ? prev : entries));
     } catch {
@@ -732,7 +744,7 @@ export function FileExplorerPanel({
         gitStatusInFlightKeyRef.current = null;
       }
     }
-  }, [provider, root]);
+  }, [provider, root, sshTargetValue]);
 
   React.useEffect(() => {
     if (!isOpen) return;

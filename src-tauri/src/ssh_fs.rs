@@ -5,7 +5,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::files::{probe_from_sample, FileProbe, FsEntry, MAX_RANGE_READ_BYTES, PROBE_BYTES};
+use crate::files::{git_status_kind, probe_from_sample, FileProbe, FsEntry, GitStatusEntry, MAX_RANGE_READ_BYTES, PROBE_BYTES};
 
 const MAX_TEXT_FILE_BYTES: usize = 2 * 1024 * 1024;
 const BINARY_CHECK_BYTES: usize = 8 * 1024;
@@ -673,6 +673,67 @@ fn ssh_list_fs_entries_sync(target: String, root: String, path: String) -> Resul
         return Err(output_to_error("sftp failed", &output));
     }
     Ok(parse_sftp_ls(&path, &String::from_utf8_lossy(&output.stdout)))
+}
+
+#[tauri::command]
+pub async fn ssh_git_status_entries(target: String, root: String) -> Result<Vec<GitStatusEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || ssh_git_status_entries_sync(target, root))
+        .await
+        .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+fn parse_remote_git_status(root: &str, stdout: &[u8]) -> Vec<GitStatusEntry> {
+    let mut out = Vec::new();
+    let mut parts = stdout.split(|b| *b == 0).filter(|part| !part.is_empty());
+    while let Some(part) = parts.next() {
+        if part.len() < 4 {
+            continue;
+        }
+        let code = String::from_utf8_lossy(&part[..2]).to_string();
+        let rel = String::from_utf8_lossy(&part[3..]).to_string();
+        if code.contains('R') || code.contains('C') {
+            let _old_path = parts.next();
+        }
+        if rel.is_empty() {
+            continue;
+        }
+        let raw_path = if rel.starts_with('/') {
+            rel.to_string()
+        } else {
+            join_posix_path(root, &rel)
+        };
+        let Ok(path) = normalize_posix_path(&raw_path) else {
+            continue;
+        };
+        if root != "/" && path != root && !path.starts_with(&format!("{root}/")) {
+            continue;
+        }
+        out.push(GitStatusEntry {
+            path,
+            status: git_status_kind(&code).to_string(),
+        });
+    }
+    out
+}
+
+fn ssh_git_status_entries_sync(target: String, root: String) -> Result<Vec<GitStatusEntry>, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("missing ssh target".to_string());
+    }
+    let root = normalize_posix_path(&root)?;
+
+    let script = r#"set -e
+root="$1"
+[ -d "$root" ] || { echo "not a directory" >&2; exit 1; }
+git -C "$root" status --porcelain=v1 -z --untracked-files=normal --ignored=matching
+"#;
+    let command = build_sh_c_command(script, Some("--"), &[root.clone()]);
+    let output = run_ssh(target, &[command], None)?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(parse_remote_git_status(&root, &output.stdout))
 }
 
 #[tauri::command]
