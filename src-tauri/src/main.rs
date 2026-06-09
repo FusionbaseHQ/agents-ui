@@ -28,7 +28,7 @@ mod tray;
 use app_info::get_app_info;
 use assets::apply_text_assets;
 use app_menu::{build_app_menu, handle_app_menu_event};
-use files::{copy_fs_entry, create_directory, create_file, delete_fs_entry, git_status_entries, list_fs_entries, probe_file, read_file_range, read_text_file, rename_fs_entry, search_fs_entries, write_text_file};
+use files::{copy_fs_entry, create_directory, create_file, delete_fs_entry, list_fs_entries, probe_file, read_file_range, read_text_file, rename_fs_entry, search_fs_entries, write_text_file};
 use file_manager::{open_path_in_file_manager, open_path_in_vscode};
 use pty::{
     close_session, create_session, detach_session, kill_persistent_session, list_persistent_sessions,
@@ -192,7 +192,6 @@ fn main() {
             set_tray_recent_sessions,
             open_path_in_file_manager,
             open_path_in_vscode,
-            git_status_entries,
             get_app_info,
             start_fs_watcher,
             stop_fs_watcher,
@@ -226,12 +225,19 @@ fn main() {
         .run(|app, event| {
             match event {
                 tauri::RunEvent::Exit => {
+                    // Flush recording buffers and kill PTY children before the
+                    // process exits — destructors won't run for managed state.
+                    {
+                        use tauri::Manager;
+                        pty::shutdown_flush_all(&app.state::<pty::AppState>());
+                    }
                     api_discovery::cleanup();
                 }
                 tauri::RunEvent::Resumed { .. } => {
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.emit("system-resumed", ());
-                    }
+                    // emit_to by label, not get_webview_window("main"): a browser
+                    // child webview makes the main window stop being a
+                    // WebviewWindow, which would make get_webview_window return None.
+                    let _ = app.emit_to("main", "system-resumed", ());
                 }
                 _ => {}
             }

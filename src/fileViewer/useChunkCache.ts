@@ -13,30 +13,31 @@ export type RangeChunk = { bytes: Uint8Array; eof: boolean };
 // invalidation; until then this removes redundant re-fetches on scroll-back and
 // collapses concurrent reads of the same offset into one IPC call.
 export function useChunkCache(maxBytes = 8 * 1024 * 1024) {
-  const cacheRef = React.useRef(new Map<number, { chunk: RangeChunk; touched: number }>());
-  const inflightRef = React.useRef(new Map<number, Promise<RangeChunk>>());
+  const cacheRef = React.useRef(new Map<string, { chunk: RangeChunk; touched: number }>());
+  const inflightRef = React.useRef(new Map<string, Promise<RangeChunk>>());
   const bytesRef = React.useRef(0);
   const clockRef = React.useRef(0);
 
   return React.useCallback(
-    (readRange: ReadRangeFn, path: string, offset: number, length: number): Promise<RangeChunk> => {
-      const need = Math.min(length, Math.max(0, length)); // requested span
-      const hit = cacheRef.current.get(offset);
+    (readRange: ReadRangeFn, path: string, offset: number, length: number, cacheGeneration = 0): Promise<RangeChunk> => {
+      const need = Math.max(0, length); // requested span
+      const cacheKey = `${cacheGeneration}:${offset}`;
+      const hit = cacheRef.current.get(cacheKey);
       if (hit && (hit.chunk.eof || hit.chunk.bytes.length >= need)) {
         hit.touched = ++clockRef.current;
         return Promise.resolve(hit.chunk);
       }
-      const pending = inflightRef.current.get(offset);
+      const pending = inflightRef.current.get(cacheKey);
       if (pending) return pending;
       const p = (async () => {
         const bytes = await readRange(path, offset, length);
         const chunk: RangeChunk = { bytes, eof: bytes.length < length };
-        const prev = cacheRef.current.get(offset);
+        const prev = cacheRef.current.get(cacheKey);
         if (prev) bytesRef.current -= prev.chunk.bytes.length;
-        cacheRef.current.set(offset, { chunk, touched: ++clockRef.current });
+        cacheRef.current.set(cacheKey, { chunk, touched: ++clockRef.current });
         bytesRef.current += chunk.bytes.length;
         while (bytesRef.current > maxBytes && cacheRef.current.size > 1) {
-          let oldestKey: number | null = null;
+          let oldestKey: string | null = null;
           let oldest = Number.POSITIVE_INFINITY;
           for (const [key, value] of cacheRef.current) {
             if (value.touched < oldest) {
@@ -49,8 +50,8 @@ export function useChunkCache(maxBytes = 8 * 1024 * 1024) {
           cacheRef.current.delete(oldestKey);
         }
         return chunk;
-      })().finally(() => inflightRef.current.delete(offset));
-      inflightRef.current.set(offset, p);
+      })().finally(() => inflightRef.current.delete(cacheKey));
+      inflightRef.current.set(cacheKey, p);
       return p;
     },
     [maxBytes],

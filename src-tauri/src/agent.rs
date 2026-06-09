@@ -77,6 +77,7 @@ impl Default for AgentLaunchSettings {
 #[tauri::command]
 pub async fn write_agent_mcp_config(mcp_port: Option<u16>) -> Result<String, String> {
     let port = mcp_port.unwrap_or(45557);
+    let token = crate::mcp_server::get_or_init_auth_token();
     let dir = agents_ui_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("create dir: {e}"))?;
     let path = dir.join("mcp-config.json");
@@ -85,7 +86,10 @@ pub async fn write_agent_mcp_config(mcp_port: Option<u16>) -> Result<String, Str
         "mcpServers": {
             "agents-ui": {
                 "type": "http",
-                "url": format!("http://127.0.0.1:{port}/mcp")
+                "url": format!("http://127.0.0.1:{port}/mcp"),
+                "headers": {
+                    "Authorization": format!("Bearer {token}")
+                }
             }
         }
     });
@@ -255,6 +259,10 @@ pub async fn start_agent_prompt(
     let mut child = Command::new(&shell)
         .arg("-lc")
         .arg(&shell_command)
+        .env(
+            crate::mcp_server::MCP_TOKEN_ENV_VAR,
+            crate::mcp_server::get_or_init_auth_token(),
+        )
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -447,9 +455,9 @@ pub struct RegistrationStatus {
 /// Register the MCP server with both Claude Code and Codex CLIs.
 /// Writes the mcp-config.json with the actual port, then runs CLI commands
 /// in parallel with a 10-second timeout per provider.
-pub fn do_register_mcp_with_agents(port: u16) -> McpRegistrationResult {
+pub fn do_register_mcp_with_agents(port: u16, token: &str) -> McpRegistrationResult {
     // Step 1: Write mcp-config.json with the actual port
-    let mcp_config_ok = match write_mcp_config_sync(port) {
+    let mcp_config_ok = match write_mcp_config_sync(port, token) {
         Ok(_) => true,
         Err(e) => {
             eprintln!("[mcp-reg] failed to write mcp-config.json: {e}");
@@ -464,14 +472,16 @@ pub fn do_register_mcp_with_agents(port: u16) -> McpRegistrationResult {
     // Step 2: Register with Claude Code and Codex in parallel
     let url_cc = url.clone();
     let shell_cc = shell.clone();
+    let token_cc = token.to_string();
     let cc_handle = std::thread::spawn(move || {
-        register_claude_code(&shell_cc, &url_cc, timeout)
+        register_claude_code(&shell_cc, &url_cc, &token_cc, timeout)
     });
 
     let url_cx = url.clone();
     let shell_cx = shell.clone();
+    let token_cx = token.to_string();
     let cx_handle = std::thread::spawn(move || {
-        register_codex(&shell_cx, &url_cx, timeout)
+        register_codex(&shell_cx, &url_cx, &token_cx, timeout)
     });
 
     let claude_code = cc_handle.join().unwrap_or(RegistrationStatus {
@@ -491,7 +501,7 @@ pub fn do_register_mcp_with_agents(port: u16) -> McpRegistrationResult {
     }
 }
 
-fn write_mcp_config_sync(port: u16) -> Result<(), String> {
+fn write_mcp_config_sync(port: u16, token: &str) -> Result<(), String> {
     let dir = agents_ui_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("create dir: {e}"))?;
     let path = dir.join("mcp-config.json");
@@ -500,7 +510,10 @@ fn write_mcp_config_sync(port: u16) -> Result<(), String> {
         "mcpServers": {
             "agents-ui": {
                 "type": "http",
-                "url": format!("http://127.0.0.1:{port}/mcp")
+                "url": format!("http://127.0.0.1:{port}/mcp"),
+                "headers": {
+                    "Authorization": format!("Bearer {token}")
+                }
             }
         }
     });
@@ -513,6 +526,7 @@ fn write_mcp_config_sync(port: u16) -> Result<(), String> {
 fn register_claude_code(
     shell: &str,
     url: &str,
+    token: &str,
     timeout: std::time::Duration,
 ) -> RegistrationStatus {
     // Remove first, ignore errors
@@ -523,8 +537,9 @@ fn register_claude_code(
     );
 
     let add_cmd = format!(
-        "claude mcp add --transport http -s user agents-ui {}",
-        shell_escape(url)
+        "claude mcp add --transport http -s user agents-ui {} --header {}",
+        shell_escape(url),
+        shell_escape(&format!("Authorization: Bearer {token}"))
     );
 
     match run_with_timeout(shell, &add_cmd, timeout) {
@@ -539,18 +554,38 @@ fn register_claude_code(
 fn register_codex(
     shell: &str,
     url: &str,
+    token: &str,
     timeout: std::time::Duration,
 ) -> RegistrationStatus {
     // Remove first, ignore errors
     let _ = run_with_timeout(shell, "codex mcp remove agents-ui", timeout);
 
+    // Codex reads the bearer token from an env var at connect time. The app
+    // injects MCP_TOKEN_ENV_VAR into its PTY sessions and agent processes, so
+    // codex launched from inside the app authenticates transparently.
+    let _ = token;
     let add_cmd = format!(
-        "codex mcp add agents-ui --url {}",
-        shell_escape(url)
+        "codex mcp add agents-ui --url {} --bearer-token-env-var {}",
+        shell_escape(url),
+        shell_escape(crate::mcp_server::MCP_TOKEN_ENV_VAR)
     );
 
     match run_with_timeout(shell, &add_cmd, timeout) {
-        Ok(output) => parse_cli_output(output),
+        Ok(output) => {
+            let status = parse_cli_output(output);
+            if let Some(err) = &status.error {
+                let lower = err.to_ascii_lowercase();
+                if lower.contains("unexpected argument") || lower.contains("unrecognized") {
+                    return RegistrationStatus {
+                        success: false,
+                        error: Some(
+                            "codex CLI does not support --bearer-token-env-var; upgrade codex to use the authenticated MCP server".into(),
+                        ),
+                    };
+                }
+            }
+            status
+        }
         Err(e) => RegistrationStatus {
             success: false,
             error: Some(e),
@@ -761,7 +796,8 @@ pub async fn orchestrate_read_file(path: String) -> Result<String, String> {
 #[tauri::command]
 pub async fn register_mcp_with_agents(port: Option<u16>) -> Result<McpRegistrationResult, String> {
     let port = port.unwrap_or(45557);
-    let result = tokio::task::spawn_blocking(move || do_register_mcp_with_agents(port))
+    let token = crate::mcp_server::get_or_init_auth_token();
+    let result = tokio::task::spawn_blocking(move || do_register_mcp_with_agents(port, &token))
         .await
         .map_err(|e| format!("join error: {e}"))?;
     Ok(result)

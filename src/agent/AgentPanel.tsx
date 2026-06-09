@@ -5,7 +5,7 @@ import { Icon } from "../components/Icon";
 import { AgentMessageView, AgentTypingIndicator } from "./AgentMessage";
 import { ConversationList } from "./ConversationList";
 import { OrchestratePanel } from "./OrchestratePanel";
-import { parseStreamLine, StreamingMessageBuilder, resetCodexTracking } from "./agentStreamParser";
+import { parseStreamLine, StreamingMessageBuilder, resetCodexTracking, type ParsedUpdate } from "./agentStreamParser";
 import {
   loadAgentSettings,
   saveAgentSettings,
@@ -43,10 +43,14 @@ type McpRegistrationResult = {
 
 const CLAUDE_MODELS = [
   { value: "", label: "Default" },
+  { value: "fable", label: "Fable 5" },
   { value: "opus", label: "Opus 4.8" },
   { value: "sonnet", label: "Sonnet 4.7" },
   { value: "haiku", label: "Haiku 4.5" },
 ];
+
+// Alias values the claude CLI accepts via --model (everything except "Default").
+const CLAUDE_MODEL_ALIASES = CLAUDE_MODELS.map((m) => m.value).filter(Boolean);
 
 const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const CODEX_MODELS = [
@@ -88,11 +92,15 @@ function effortDisplayLabel(effort: ReasoningEffort | undefined): string {
 
 export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, onCreateTaskSession, onActivateSession }: Props) {
   const [settings, setSettings] = useState<AgentSettings>(loadAgentSettings);
-  const [conversations, setConversations] = useState<AgentConversation[]>(() => loadConversations());
-  const [activeConvId, setActiveConvId] = useState<string | null>(() => {
-    const convs = loadConversations();
-    return convs.length > 0 ? convs[0].id : null;
+  const [{ conversations: initialConversations, activeConvId: initialActiveConvId }] = useState(() => {
+    const conversations = loadConversations();
+    return {
+      conversations,
+      activeConvId: conversations.length > 0 ? conversations[0].id : null,
+    };
   });
+  const [conversations, setConversations] = useState<AgentConversation[]>(initialConversations);
+  const [activeConvId, setActiveConvId] = useState<string | null>(initialActiveConvId);
   const [input, setInput] = useState("");
   const [running, setRunning] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -113,6 +121,10 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
   const effortDropdownRef = useRef<HTMLDivElement | null>(null);
   const builderRef = useRef(new StreamingMessageBuilder());
   const activeConvIdRef = useRef(activeConvId);
+  const latestConversationsRef = useRef<AgentConversation[]>(initialConversations);
+  const conversationSaveTimerRef = useRef<number | null>(null);
+  const saveImmediatelyRef = useRef(false);
+  const messagesScrollRafRef = useRef<number | null>(null);
 
   const doMcpRegistration = useCallback(async () => {
     setMcpRegLoading(true);
@@ -138,10 +150,39 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
     saveAgentSettings(settings);
   }, [settings]);
 
-  // Persist conversations
+  // Persist conversations. Debounced while streaming; a completed run saves
+  // immediately (saveImmediatelyRef) so quitting the app right after a
+  // response can't lose it to the debounce window.
   useEffect(() => {
-    saveConversations(conversations);
+    latestConversationsRef.current = conversations;
+    if (conversationSaveTimerRef.current !== null) {
+      window.clearTimeout(conversationSaveTimerRef.current);
+      conversationSaveTimerRef.current = null;
+    }
+    if (saveImmediatelyRef.current) {
+      saveImmediatelyRef.current = false;
+      saveConversations(conversations);
+      return;
+    }
+    conversationSaveTimerRef.current = window.setTimeout(() => {
+      conversationSaveTimerRef.current = null;
+      saveConversations(latestConversationsRef.current);
+    }, 500);
   }, [conversations]);
+
+  useEffect(() => {
+    return () => {
+      if (conversationSaveTimerRef.current !== null) {
+        window.clearTimeout(conversationSaveTimerRef.current);
+        conversationSaveTimerRef.current = null;
+      }
+      if (messagesScrollRafRef.current !== null) {
+        window.cancelAnimationFrame(messagesScrollRafRef.current);
+        messagesScrollRafRef.current = null;
+      }
+      saveConversations(latestConversationsRef.current);
+    };
+  }, []);
 
   // Sync provider/model to active conversation when switching
   useEffect(() => {
@@ -157,7 +198,13 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
 
   // Auto-scroll messages
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (messagesScrollRafRef.current !== null) {
+      window.cancelAnimationFrame(messagesScrollRafRef.current);
+    }
+    messagesScrollRafRef.current = window.requestAnimationFrame(() => {
+      messagesScrollRafRef.current = null;
+      messagesEndRef.current?.scrollIntoView({ block: "end" });
+    });
   }, [activeConv?.messages]);
 
   // Close model dropdown on click outside
@@ -226,22 +273,24 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
   useEffect(() => {
     let disposed = false;
     const cleanups: (() => void)[] = [];
+    let pendingUpdates: ParsedUpdate[] = [];
+    let flushRaf: number | null = null;
 
-    listen<{ runId: string; data: string }>("agent-output", (event) => {
-      if (event.payload.runId !== runIdRef.current) return;
-      const update = parseStreamLine(event.payload.data);
-      if (!update) return;
-
+    const applyUpdates = (updates: ParsedUpdate[]) => {
+      if (!updates.length) return;
       setConversations((prev) => {
         const convId = activeConvIdRef.current;
         const idx = prev.findIndex((c) => c.id === convId);
         if (idx < 0) return prev;
         const conv = prev[idx];
+        const update = updates.length === 1 ? updates[0] : { kind: "batch" as const, updates };
         const newMessages = builderRef.current.apply(conv.messages, update);
 
         let sessionId = conv.sessionId;
-        if (update.kind === "session") sessionId = update.sessionId;
-        else if (update.kind === "done" && update.sessionId) sessionId = update.sessionId;
+        for (const item of updates) {
+          if (item.kind === "session") sessionId = item.sessionId;
+          else if (item.kind === "done" && item.sessionId) sessionId = item.sessionId;
+        }
 
         if (newMessages === conv.messages && sessionId === conv.sessionId) return prev;
 
@@ -249,6 +298,27 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
         result[idx] = { ...conv, messages: newMessages, sessionId };
         return result;
       });
+    };
+
+    const flushPendingUpdates = () => {
+      flushRaf = null;
+      if (!pendingUpdates.length) return;
+      const updates = pendingUpdates;
+      pendingUpdates = [];
+      applyUpdates(updates);
+    };
+
+    const scheduleFlush = () => {
+      if (flushRaf !== null) return;
+      flushRaf = window.requestAnimationFrame(flushPendingUpdates);
+    };
+
+    listen<{ runId: string; data: string }>("agent-output", (event) => {
+      if (event.payload.runId !== runIdRef.current) return;
+      const update = parseStreamLine(event.payload.data);
+      if (!update) return;
+      pendingUpdates.push(update);
+      scheduleFlush();
     }).then((fn) => { if (disposed) fn(); else cleanups.push(fn); });
 
     listen<{ runId: string; data: string }>("agent-stderr", (event) => {
@@ -258,11 +328,17 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
 
     listen<{ runId: string; exitCode: number | null }>("agent-done", (event) => {
       if (event.payload.runId !== runIdRef.current) return;
+      if (flushRaf !== null) {
+        window.cancelAnimationFrame(flushRaf);
+        flushRaf = null;
+      }
+      flushPendingUpdates();
       const exitCode = event.payload.exitCode;
       const stderr = stderrRef.current.join("\n").trim();
       runIdRef.current = null;
       stderrRef.current = [];
       setRunning(false);
+      saveImmediatelyRef.current = true;
       setConversations((prev) => {
         const convId = activeConvIdRef.current;
         const idx = prev.findIndex((c) => c.id === convId);
@@ -292,6 +368,11 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
 
     return () => {
       disposed = true;
+      if (flushRaf !== null) {
+        window.cancelAnimationFrame(flushRaf);
+        flushRaf = null;
+      }
+      pendingUpdates = [];
       cleanups.forEach((fn) => fn());
     };
   }, []);
@@ -511,22 +592,23 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
                 className="agentSettingsSelect"
                 value={
                   settings.model === undefined || settings.model === "" ? ""
-                  : ["opus", "sonnet", "haiku"].includes(settings.model) ? settings.model
+                  : CLAUDE_MODEL_ALIASES.includes(settings.model) ? settings.model
                   : "custom"
                 }
                 onChange={(e) => {
                   const v = e.target.value;
                   if (v === "custom") {
-                    setSettings((s) => ({ ...s, model: s.model && !["opus", "sonnet", "haiku"].includes(s.model) ? s.model : "" }));
+                    setSettings((s) => ({ ...s, model: s.model && !CLAUDE_MODEL_ALIASES.includes(s.model) ? s.model : "" }));
                   } else {
                     setSettings((s) => ({ ...s, model: v || undefined }));
                   }
                 }}
               >
-                <option value="">Default</option>
-                <option value="opus">Opus 4.8</option>
-                <option value="sonnet">Sonnet 4.7</option>
-                <option value="haiku">Haiku 4.5</option>
+                {CLAUDE_MODELS.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                  </option>
+                ))}
                 <option value="custom">Custom...</option>
               </select>
             </label>
@@ -534,7 +616,7 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
           {settings.provider === "claude-code" &&
             settings.model !== undefined &&
             settings.model !== "" &&
-            !["opus", "sonnet", "haiku"].includes(settings.model) && (
+            !CLAUDE_MODEL_ALIASES.includes(settings.model) && (
             <label className="agentSettingsLabel">
               Custom Model ID
               <input

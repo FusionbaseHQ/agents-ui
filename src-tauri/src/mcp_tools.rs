@@ -3,13 +3,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 // ── Output buffer types ──
 
 pub struct OutputBuffer {
     pub chunks: Vec<String>,
     pub total_bytes: usize,
+    /// True if eviction dropped output since the last read — surfaced to the
+    /// reader so truncation is never silent.
+    pub overflowed: bool,
 }
 
 const MAX_BUFFER_BYTES: usize = 200 * 1024; // 200KB per session
@@ -19,6 +22,7 @@ impl OutputBuffer {
         Self {
             chunks: Vec::new(),
             total_bytes: 0,
+            overflowed: false,
         }
     }
 
@@ -30,16 +34,19 @@ impl OutputBuffer {
         while self.total_bytes > MAX_BUFFER_BYTES && !self.chunks.is_empty() {
             let removed = self.chunks.remove(0);
             self.total_bytes -= removed.len();
+            self.overflowed = true;
         }
     }
 
     pub fn read_and_clear(&mut self, raw: bool) -> String {
         let text: String = self.chunks.drain(..).collect();
         self.total_bytes = 0;
-        if raw {
-            text
+        let overflowed = std::mem::take(&mut self.overflowed);
+        let text = if raw { text } else { strip_ansi(&text) };
+        if overflowed {
+            format!("[note: output buffer overflowed; oldest output was dropped]\n{text}")
         } else {
-            strip_ansi(&text)
+            text
         }
     }
 
@@ -49,6 +56,25 @@ impl OutputBuffer {
 }
 
 pub type OutputBuffers = Arc<Mutex<HashMap<String, OutputBuffer>>>;
+
+pub type SessionNotifications = Arc<Mutex<HashMap<String, Arc<Notify>>>>;
+
+pub async fn session_notifier(notifications: &SessionNotifications, session_id: &str) -> Arc<Notify> {
+    let mut map = notifications.lock().await;
+    map.entry(session_id.to_string())
+        .or_insert_with(|| Arc::new(Notify::new()))
+        .clone()
+}
+
+pub async fn notify_session(notifications: &SessionNotifications, session_id: &str) {
+    let notify = {
+        let map = notifications.lock().await;
+        map.get(session_id).cloned()
+    };
+    if let Some(notify) = notify {
+        notify.notify_waiters();
+    }
+}
 
 // ── Idle notification buffer types ──
 
@@ -340,7 +366,7 @@ pub fn tool_list() -> Vec<Value> {
                 "path": { "type": "string", "description": "File path for kind=file" },
                 "url": { "type": "string", "description": "URL for kind=browser" },
                 "title": { "type": "string", "description": "Optional browser tab title" },
-                "mode": { "type": "string", "enum": ["auto", "text", "image", "bytes", "markdown", "json", "csv"], "description": "File viewer mode for kind=file" }
+                "mode": { "type": "string", "enum": ["auto", "text", "image", "bytes", "markdown", "json", "csv", "xlsx"], "description": "File viewer mode for kind=file" }
             },
             "required": ["kind"]
         })),
@@ -702,6 +728,9 @@ pub async fn call_tool(
     buffers: &OutputBuffers,
     completion_buffers: &CommandCompletionBuffers,
     idle_notifications: &IdleNotifications,
+    output_waiters: &SessionNotifications,
+    completion_waiters: &SessionNotifications,
+    idle_waiters: &SessionNotifications,
     name: &str,
     args: Value,
 ) -> Result<Value, String> {
@@ -731,6 +760,8 @@ pub async fn call_tool(
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
             loop {
+                let notify = session_notifier(output_waiters, &session_id).await;
+                let notified = notify.notified();
                 {
                     let bufs = buffers.lock().await;
                     if let Some(buf) = bufs.get(&session_id) {
@@ -742,7 +773,10 @@ pub async fn call_tool(
                 if std::time::Instant::now() >= deadline {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if tokio::time::timeout(remaining, notified).await.is_err() {
+                    break;
+                }
             }
 
             let mut bufs = buffers.lock().await;
@@ -797,6 +831,8 @@ pub async fn call_tool(
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
             loop {
+                let notify = session_notifier(completion_waiters, &session_id).await;
+                let notified = notify.notified();
                 {
                     let bufs = completion_buffers.lock().await;
                     if let Some(completions) = bufs.get(&session_id) {
@@ -808,7 +844,10 @@ pub async fn call_tool(
                 if std::time::Instant::now() >= deadline {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if tokio::time::timeout(remaining, notified).await.is_err() {
+                    break;
+                }
             }
 
             let mut bufs = completion_buffers.lock().await;
@@ -859,6 +898,8 @@ pub async fn call_tool(
             }
 
             loop {
+                let notify = session_notifier(idle_waiters, &session_id).await;
+                let notified = notify.notified();
                 {
                     let mut notifs = idle_notifications.lock().await;
                     if let Some(entries) = notifs.get_mut(&session_id) {
@@ -875,7 +916,10 @@ pub async fn call_tool(
                 if std::time::Instant::now() >= deadline {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if tokio::time::timeout(remaining, notified).await.is_err() {
+                    break;
+                }
             }
 
             return Ok(mcp_text_result(&json!({

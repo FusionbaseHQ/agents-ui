@@ -4,8 +4,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand_core::{OsRng, RngCore};
 use std::sync::{Mutex, OnceLock};
-use tauri::Manager;
-use tauri::WebviewWindow;
+use tauri::AppHandle;
 
 const KEYCHAIN_ACCOUNT: &str = "agents-ui-data-key-v1";
 const ENC_PREFIX: &str = "enc:v1:";
@@ -60,14 +59,13 @@ fn master_key_cache() -> &'static Mutex<MasterKeyCacheState> {
     CACHE.get_or_init(|| Mutex::new(MasterKeyCacheState::Uninitialized))
 }
 
-fn keychain_service(window: &WebviewWindow) -> String {
-    let app = window.app_handle();
+fn keychain_service(app: &AppHandle) -> String {
     let cfg = app.config();
     cfg.identifier.clone()
 }
 
-fn get_or_create_master_key_uncached(window: &WebviewWindow) -> Result<[u8; KEY_LEN], String> {
-    let service = keychain_service(window);
+fn get_or_create_master_key_uncached(app: &AppHandle) -> Result<[u8; KEY_LEN], String> {
+    let service = keychain_service(app);
     let entry = keyring::Entry::new(&service, KEYCHAIN_ACCOUNT)
         .map_err(|e| format!("keychain init failed: {e}"))?;
 
@@ -97,7 +95,7 @@ fn get_or_create_master_key_uncached(window: &WebviewWindow) -> Result<[u8; KEY_
     Ok(key)
 }
 
-pub fn get_or_create_master_key(window: &WebviewWindow) -> Result<[u8; KEY_LEN], String> {
+pub fn get_or_create_master_key(app: &AppHandle) -> Result<[u8; KEY_LEN], String> {
     let cache = master_key_cache();
     let mut state = cache.lock().map_err(|_| "secure storage cache poisoned".to_string())?;
     match &*state {
@@ -106,7 +104,7 @@ pub fn get_or_create_master_key(window: &WebviewWindow) -> Result<[u8; KEY_LEN],
         MasterKeyCacheState::Uninitialized => {}
     }
 
-    match get_or_create_master_key_uncached(window) {
+    match get_or_create_master_key_uncached(app) {
         Ok(key) => {
             *state = MasterKeyCacheState::Ready(key);
             Ok(key)
@@ -127,8 +125,8 @@ pub fn reset_master_key_cache() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn prepare_secure_storage(window: WebviewWindow) -> Result<(), String> {
-    let _ = get_or_create_master_key(&window)?;
+pub fn prepare_secure_storage(app: AppHandle) -> Result<(), String> {
+    let _ = get_or_create_master_key(&app)?;
     Ok(())
 }
 

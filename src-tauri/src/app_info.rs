@@ -1,5 +1,5 @@
 use serde::Serialize;
-use tauri::{Manager, WebviewWindow};
+use tauri::AppHandle;
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -10,8 +10,7 @@ pub struct AppInfo {
 }
 
 #[tauri::command]
-pub fn get_app_info(window: WebviewWindow) -> AppInfo {
-    let app = window.app_handle();
+pub fn get_app_info(app: AppHandle) -> AppInfo {
     let pkg = app.package_info();
     let config = app.config();
 

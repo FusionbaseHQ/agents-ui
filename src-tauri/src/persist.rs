@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use tauri::{Manager, WebviewWindow};
+use tauri::{AppHandle, Manager};
 
 use crate::secure::{decrypt_string_with_key, encrypt_string_with_key, get_or_create_master_key, SecretContext};
 
@@ -106,9 +106,8 @@ pub struct PersistedStateMetaV1 {
     pub secure_storage_mode: Option<SecureStorageModeV1>,
 }
 
-fn state_file_path(window: &WebviewWindow) -> Result<PathBuf, String> {
-    let dir = window
-        .app_handle()
+fn state_file_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
         .path()
         .app_data_dir()
         .map_err(|_| "unknown app data dir".to_string())?;
@@ -116,8 +115,8 @@ fn state_file_path(window: &WebviewWindow) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-pub fn load_persisted_state_meta(window: WebviewWindow) -> Result<Option<PersistedStateMetaV1>, String> {
-    let path = state_file_path(&window)?;
+pub fn load_persisted_state_meta(app: AppHandle) -> Result<Option<PersistedStateMetaV1>, String> {
+    let path = state_file_path(&app)?;
     let raw = match fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -169,8 +168,8 @@ fn home_dir() -> Option<String> {
 }
 
 #[tauri::command]
-pub fn load_persisted_state(window: WebviewWindow) -> Result<Option<PersistedStateV1>, String> {
-    let path = state_file_path(&window)?;
+pub fn load_persisted_state(app: AppHandle) -> Result<Option<PersistedStateV1>, String> {
+    let path = state_file_path(&app)?;
     let raw = match fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -189,7 +188,7 @@ pub fn load_persisted_state(window: WebviewWindow) -> Result<Option<PersistedSta
             .iter()
             .any(|env| crate::secure::is_probably_encrypted_value(&env.content));
     if needs_decrypt {
-        let key = match get_or_create_master_key(&window) {
+        let key = match get_or_create_master_key(&app) {
             Ok(key) => Some(key),
             Err(e) => {
                 eprintln!("Failed to read master key; leaving environments encrypted: {e}");
@@ -217,12 +216,12 @@ pub fn load_persisted_state(window: WebviewWindow) -> Result<Option<PersistedSta
 }
 
 #[tauri::command]
-pub fn save_persisted_state(window: WebviewWindow, state: PersistedStateV1) -> Result<(), String> {
+pub fn save_persisted_state(app: AppHandle, state: PersistedStateV1) -> Result<(), String> {
     if state.schema_version != 1 {
         return Err("unsupported schema version".to_string());
     }
 
-    let path = state_file_path(&window)?;
+    let path = state_file_path(&app)?;
     let dir = path.parent().ok_or("invalid state path")?;
     fs::create_dir_all(dir).map_err(|e| format!("create dir failed: {e}"))?;
 
@@ -230,7 +229,7 @@ pub fn save_persisted_state(window: WebviewWindow, state: PersistedStateV1) -> R
     let mut state = state;
     let encrypt_allowed = matches!(state.secure_storage_mode, Some(SecureStorageModeV1::Keychain));
     if encrypt_allowed && !state.environments.is_empty() {
-        let key = get_or_create_master_key(&window)?;
+        let key = get_or_create_master_key(&app)?;
         for env in &mut state.environments {
             if crate::secure::is_probably_encrypted_value(&env.content) {
                 continue;
@@ -241,15 +240,22 @@ pub fn save_persisted_state(window: WebviewWindow, state: PersistedStateV1) -> R
 
     let json = serde_json::to_string(&state).map_err(|e| format!("serialize failed: {e}"))?;
 
-    let mut file = fs::File::create(&tmp).map_err(|e| format!("write temp failed: {e}"))?;
-    file.write_all(json.as_bytes())
-        .map_err(|e| format!("write temp failed: {e}"))?;
-    file.write_all(b"\n")
-        .map_err(|e| format!("write temp failed: {e}"))?;
-    file.sync_all().ok();
-    drop(file);
+    let write_result = (|| -> Result<(), String> {
+        let mut file = fs::File::create(&tmp).map_err(|e| format!("write temp failed: {e}"))?;
+        file.write_all(json.as_bytes())
+            .map_err(|e| format!("write temp failed: {e}"))?;
+        file.write_all(b"\n")
+            .map_err(|e| format!("write temp failed: {e}"))?;
+        file.sync_all().ok();
+        drop(file);
 
-    fs::rename(&tmp, &path).map_err(|e| format!("rename failed: {e}"))?;
+        fs::rename(&tmp, &path).map_err(|e| format!("rename failed: {e}"))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_result?;
 
     // Best-effort: ensure the directory entry for the rename is durable.
     let _ = fs::File::open(dir).and_then(|dir_handle| dir_handle.sync_all());

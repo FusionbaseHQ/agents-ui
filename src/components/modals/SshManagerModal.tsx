@@ -77,8 +77,11 @@ function buildSshCommand(input: {
   if (!host) return null;
 
   const args: string[] = ["ssh"];
+  // Tolerate ~90s of network silence (6 missed 15s probes) before giving up, so
+  // brief pauses (display-off Wi-Fi power-save, VPN re-handshakes) don't drop the
+  // session. Keep in sync with ensureSshKeepAliveOptions in App.tsx.
   args.push("-o", "ServerAliveInterval=15");
-  args.push("-o", "ServerAliveCountMax=3");
+  args.push("-o", "ServerAliveCountMax=6");
   args.push("-o", "TCPKeepAlive=yes");
   if (input.exitOnForwardFailure && input.forwards.length > 0) {
     args.push("-o", "ExitOnForwardFailure=yes");

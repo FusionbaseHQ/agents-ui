@@ -26,6 +26,7 @@ const MAX_SAMPLE_FILES_PER_DIR = 60;
 const BACKEND_SEARCH_LIMIT = 300;
 const MIN_BACKEND_QUERY_LENGTH = 2;
 const MAX_RESULTS = 80;
+const SAMPLE_CACHE_TTL_MS = 60_000;
 const IGNORED_DIRS = new Set([
   ".git",
   ".hg",
@@ -42,6 +43,18 @@ const IGNORED_DIRS = new Set([
   "venv",
   "__pycache__",
 ]);
+
+type SampleCacheEntry = {
+  entries: FsEntry[];
+  status: string;
+  createdAt: number;
+};
+
+const sampleCache = new Map<string, SampleCacheEntry>();
+
+function sampleCacheKey(provider: "local" | "ssh", root: string, target: string): string {
+  return `${provider}\0${target}\0${root}`;
+}
 
 function relativePath(rootDir: string, path: string): string {
   const root = rootDir.replace(/\/+$/, "");
@@ -122,15 +135,29 @@ export function WorkspaceFileSearch({
     const root = rootDir.trim();
     const target = (sshTarget ?? "").trim();
     let cancelled = false;
-    setSampleEntries([]);
     setSearchState({ query: "", entries: [], status: "", loading: false });
-    setSampleStatus(root ? "Loading workspace sample..." : "Workspace root unavailable");
 
-    if (!root) return;
+    if (!root) {
+      setSampleEntries([]);
+      setSampleStatus("Workspace root unavailable");
+      return;
+    }
     if (provider === "ssh" && !target) {
+      setSampleEntries([]);
       setSampleStatus("Missing SSH target.");
       return;
     }
+
+    const cacheKey = sampleCacheKey(provider, root, provider === "ssh" ? target : "");
+    const cached = sampleCache.get(cacheKey);
+    if (cached && Date.now() - cached.createdAt <= SAMPLE_CACHE_TTL_MS) {
+      setSampleEntries(cached.entries);
+      setSampleStatus(cached.status);
+      return;
+    }
+
+    setSampleEntries([]);
+    setSampleStatus("Loading workspace sample...");
 
     void (async () => {
       const files: FsEntry[] = [];
@@ -182,14 +209,16 @@ export function WorkspaceFileSearch({
       }
 
       if (cancelled) return;
-      setSampleEntries(files.slice());
+      const finalEntries = files.slice();
       const capped = scannedDirs >= maxDirs || files.length >= maxFiles;
-      setSampleStatus(
+      const status =
         `${files.length.toLocaleString()} sampled` +
           (capped ? " (limited)" : "") +
           (skipped ? " - some folders skipped" : "") +
-          ` - type ${MIN_BACKEND_QUERY_LENGTH}+ chars to search all`,
-      );
+          ` - type ${MIN_BACKEND_QUERY_LENGTH}+ chars to search all`;
+      sampleCache.set(cacheKey, { entries: finalEntries, status, createdAt: Date.now() });
+      setSampleEntries(finalEntries);
+      setSampleStatus(status);
     })();
 
     return () => {

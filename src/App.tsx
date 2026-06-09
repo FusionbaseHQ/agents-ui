@@ -14,6 +14,7 @@ import {
 } from "./processEffects";
 import { shortenPathSmart } from "./pathDisplay";
 import { SlidePanel } from "./SlidePanel";
+import { PanelErrorBoundary } from "./ErrorBoundary";
 import { CommandPalette } from "./CommandPalette";
 import { ProjectsSection } from "./components/ProjectsSection";
 import { QuickPromptsSection } from "./components/QuickPromptsSection";
@@ -24,6 +25,7 @@ import { ActivityCenter, type ActivityCenterItem } from "./components/ActivityCe
 import { FileExplorerPanel, type FileExplorerPersistedState } from "./components/FileExplorerPanel";
 import { WorkspaceFileSearch } from "./components/WorkspaceFileSearch";
 import { EDITOR_THEME_BY_UI_THEME } from "./monaco/editorThemes";
+import { TabSymbolIcon, normalizeTabSymbolValue } from "./tabSymbols";
 import type {
   CodeEditorFsEvent,
   CodeEditorOpenFileRequest,
@@ -34,7 +36,6 @@ import type {
   CodeEditorWorkspaceTab,
 } from "./components/CodeEditorPanel";
 import { AgentShortcutsModal } from "./components/AgentShortcutsModal";
-import { AgentPanel } from "./agent/AgentPanel";
 import { parseStreamLine, type ParsedUpdate } from "./agent/agentStreamParser";
 import { loadAgentSettings } from "./agent/agentStorage";
 import type { AgentLaunchSettings } from "./agent/agentTypes";
@@ -58,6 +59,9 @@ import {
 } from "./components/modals/SshManagerModal";
 
 const LazyCodeEditorPanel = React.lazy(() => import("./components/CodeEditorPanel"));
+const LazyAgentPanel = React.lazy(() =>
+  import("./agent/AgentPanel").then((module) => ({ default: module.AgentPanel })),
+);
 
 type Project = {
   id: string;
@@ -199,6 +203,12 @@ const MAX_SSH_HISTORY = 10;
 const MAX_PENDING_SESSIONS = 32;
 const MAX_PENDING_CHUNKS_PER_SESSION = 200;
 const MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION = 64;
+// Byte cap for output deferred for a hidden session. The terminal keeps 5000
+// lines of scrollback (~1.25 MB of typical text), so anything beyond the
+// newest few MiB could never survive switch-in anyway — dropping the oldest
+// overflow bounds memory during background floods (`yes`, runaway logs) and
+// keeps switch-in fast, with no reachable scrollback lost.
+const MAX_DEFERRED_OUTPUT_BYTES_PER_SESSION = 4 * 1024 * 1024;
 const SSH_RECONNECT_BASE_MS = 1000;
 const SSH_RECONNECT_MAX_MS = 30_000;
 const SSH_RECONNECT_MAX_ATTEMPTS = 6;
@@ -234,6 +244,57 @@ const MIN_AGENT_PANEL_WIDTH = 320;
 const MAX_AGENT_PANEL_WIDTH = 700;
 const AUTO_RENAME_LOG_ENTRY_LIMIT = 6;
 const AGENTS_UI_MCP_PREFIX = "mcp__agents-ui__";
+
+function selectEditableElement(element: Element | null): boolean {
+  const editable = element?.closest("input, textarea, [contenteditable]") ?? null;
+  if (!editable) return false;
+
+  if (editable instanceof HTMLInputElement || editable instanceof HTMLTextAreaElement) {
+    if (editable.disabled) return false;
+    try {
+      editable.select();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  if (editable instanceof HTMLElement && editable.isContentEditable) {
+    const selection = window.getSelection();
+    if (!selection) return false;
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(editable);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
+}
+
+function selectDocumentContents(): void {
+  try {
+    if (document.execCommand("selectAll")) return;
+  } catch {
+    /* fall through to Selection API */
+  }
+
+  const selection = window.getSelection();
+  const body = document.body;
+  if (!selection || !body) return;
+  try {
+    const range = document.createRange();
+    range.selectNodeContents(body);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  } catch {
+    /* ignore */
+  }
+}
 
 type AutoRenameLogTone = "info" | "success" | "error";
 type AutoRenameActivity = {
@@ -714,9 +775,17 @@ function ensureSshKeepAliveOptions(commandLine: string | null | undefined): stri
   const parts = trimmed.split(/\s+/).filter(Boolean);
   if (parts.length === 0) return trimmed;
 
+  // Keep the connection alive across brief network pauses (Wi-Fi power-save when
+  // the display turns off, VPN re-handshakes, roaming) so the session doesn't
+  // drop and force a reconnect. A probe every 15s keeps the server's idle timer
+  // and any NAT/firewall state fresh; tolerating 6 missed probes (~90s of
+  // silence) survives moderate pauses. A full system sleep takes the network
+  // down for minutes and will still drop — the auto-reconnect on exit covers
+  // that. Bumping CountMax also slows detection of a truly-dead link, which is
+  // an acceptable trade now that reconnect is automatic.
   const inject: string[] = [];
   if (!hasSshOption(parts, "serveraliveinterval")) inject.push("-o", "ServerAliveInterval=15");
-  if (!hasSshOption(parts, "serveralivecountmax")) inject.push("-o", "ServerAliveCountMax=3");
+  if (!hasSshOption(parts, "serveralivecountmax")) inject.push("-o", "ServerAliveCountMax=6");
   if (!hasSshOption(parts, "tcpkeepalive")) inject.push("-o", "TCPKeepAlive=yes");
   if (inject.length === 0) return trimmed;
 
@@ -840,6 +909,99 @@ function buildSystemHealthDisplay(stats: SystemHealthStats | null): SystemHealth
 
   return items;
 }
+
+// Self-contained so the 5s poll re-renders only this span, not the whole App
+// (setSystemHealthStats used to live at App's top level, re-running every memo
+// in the 11k-line component on each tick).
+const SystemHealthIndicator = React.memo(function SystemHealthIndicator(props: {
+  hydrated: boolean;
+  sessionId: string | null;
+  isSsh: boolean;
+  sshTarget: string | null;
+  connectionState: string;
+}) {
+  const { hydrated, sessionId, isSsh, sshTarget, connectionState } = props;
+  const [stats, setStats] = useState<SystemHealthStats | null>(null);
+
+  useEffect(() => {
+    if (!hydrated || !sessionId) {
+      setStats(null);
+      return;
+    }
+
+    const target = sshTarget?.trim() ?? "";
+    if (isSsh && (!target || connectionState !== "connected")) {
+      setStats(null);
+      return;
+    }
+
+    let cancelled = false;
+    let inFlight = false;
+    let interval: number | null = null;
+
+    const refresh = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        const next = isSsh
+          ? await invoke<SystemHealthStats | null>("ssh_system_health_stats", { target })
+          : await invoke<SystemHealthStats | null>("system_health_stats");
+        if (!cancelled) {
+          const normalized = hasSystemHealthStats(next) ? next : null;
+          setStats((prev) => (sameHealthStats(prev, normalized) ? prev : normalized));
+        }
+      } catch {
+        if (!cancelled) setStats(null);
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    // Only poll while the window is visible: a backgrounded window issuing a
+    // backend IPC (and, for SSH, a remote command that wakes the radio + host)
+    // every few seconds defeats App Nap. On returning to visible we refresh
+    // immediately, so the status-bar snapshot is at most one tick stale.
+    const startPolling = () => {
+      if (interval !== null) return;
+      void refresh();
+      interval = window.setInterval(() => {
+        void refresh();
+      }, SYSTEM_HEALTH_REFRESH_MS);
+    };
+    const stopPolling = () => {
+      if (interval !== null) {
+        window.clearInterval(interval);
+        interval = null;
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") startPolling();
+      else stopPolling();
+    };
+
+    if (document.visibilityState === "visible") startPolling();
+    document.addEventListener("visibilitychange", onVisibility);
+
+    return () => {
+      cancelled = true;
+      stopPolling();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [connectionState, sessionId, isSsh, sshTarget, hydrated]);
+
+  const items = useMemo(() => buildSystemHealthDisplay(stats), [stats]);
+  if (items.length === 0) return null;
+  return (
+    <span className="systemHealthStats" aria-label="System health">
+      {items.map((item) => (
+        <span key={item.key} className="systemHealthItem" title={item.title}>
+          <span className="systemHealthLabel">{item.label}</span>
+          <span className="systemHealthValue">{item.value}</span>
+        </span>
+      ))}
+    </span>
+  );
+});
 
 type SessionActivityState = {
   effect: ProcessEffect | null;
@@ -1371,7 +1533,11 @@ function coerceCodeEditorPersistedState(value: unknown): CodeEditorPersistedStat
       const rec = t as Record<string, unknown>;
       const path = typeof rec.path === "string" ? rec.path.trim() : "";
       const viewerKind: CodeEditorPersistedState["tabs"][number]["viewerKind"] =
-        rec.viewerKind === "largeText" || rec.viewerKind === "image" || rec.viewerKind === "bytes" || rec.viewerKind === "text"
+        rec.viewerKind === "largeText" ||
+        rec.viewerKind === "image" ||
+        rec.viewerKind === "bytes" ||
+        rec.viewerKind === "text" ||
+        rec.viewerKind === "xlsx"
           ? rec.viewerKind
           : null;
       return { path, viewerKind };
@@ -2363,8 +2529,16 @@ export default function App() {
 
   const pushPendingData = useCallback((id: string, text: string) => {
     if (!pendingData.current.has(id) && pendingData.current.size >= MAX_PENDING_SESSIONS) {
-      const oldest = pendingData.current.keys().next().value as string | undefined;
-      if (oldest) pendingData.current.delete(oldest);
+      // Evict the oldest buffer, but never the active session's — dropping the
+      // visible terminal's pre-mount output would be user-visible data loss.
+      let victim: string | undefined;
+      for (const key of pendingData.current.keys()) {
+        if (key !== activeIdRef.current) {
+          victim = key;
+          break;
+        }
+      }
+      if (victim !== undefined) pendingData.current.delete(victim);
     }
     const buffer = pendingData.current.get(id) || [];
     buffer.push(text);
@@ -2389,7 +2563,20 @@ export default function App() {
     const requeueDeferredChunks = (id: string, chunks: string[]) => {
       if (!chunks.length) return;
       const existing = outputQueueRef.current.get(id) ?? [];
-      const merged = chunks.concat(existing);
+      let merged = chunks.concat(existing);
+
+      // Bound deferred bytes by dropping the OLDEST chunks (ordering here is
+      // oldest → newest). Without this, the count cap below still allows one
+      // ever-growing merged tail string during a background flood.
+      let totalBytes = 0;
+      for (const chunk of merged) totalBytes += chunk.length;
+      let start = 0;
+      while (totalBytes > MAX_DEFERRED_OUTPUT_BYTES_PER_SESSION && start < merged.length - 1) {
+        totalBytes -= merged[start].length;
+        start += 1;
+      }
+      if (start > 0) merged = merged.slice(start);
+
       if (merged.length <= MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION) {
         outputQueueRef.current.set(id, merged);
         return;
@@ -2666,79 +2853,8 @@ export default function App() {
     return sshTargetFromCommandLine(active.launchCommand ?? active.restoreCommand ?? null);
   }, [active]);
 
-  const [systemHealthStats, setSystemHealthStats] = useState<SystemHealthStats | null>(null);
-  const systemHealthItems = useMemo(
-    () => buildSystemHealthDisplay(systemHealthStats),
-    [systemHealthStats],
-  );
   const activeHealthSessionId = active?.id ?? null;
   const activeHealthConnectionState = active?.connectionState ?? "connected";
-
-  useEffect(() => {
-    if (!hydrated || !activeHealthSessionId) {
-      setSystemHealthStats(null);
-      return;
-    }
-
-    const target = activeSshTarget?.trim() ?? "";
-    if (activeIsSsh && (!target || activeHealthConnectionState !== "connected")) {
-      setSystemHealthStats(null);
-      return;
-    }
-
-    let cancelled = false;
-    let inFlight = false;
-    let interval: number | null = null;
-
-    const refresh = async () => {
-      if (cancelled || inFlight) return;
-      inFlight = true;
-      try {
-        const next = activeIsSsh
-          ? await invoke<SystemHealthStats | null>("ssh_system_health_stats", { target })
-          : await invoke<SystemHealthStats | null>("system_health_stats");
-        if (!cancelled) {
-          const normalized = hasSystemHealthStats(next) ? next : null;
-          setSystemHealthStats((prev) => (sameHealthStats(prev, normalized) ? prev : normalized));
-        }
-      } catch {
-        if (!cancelled) setSystemHealthStats(null);
-      } finally {
-        inFlight = false;
-      }
-    };
-
-    // Only poll while the window is visible: a backgrounded window issuing a
-    // backend IPC (and, for SSH, a remote command that wakes the radio + host)
-    // every few seconds defeats App Nap. On returning to visible we refresh
-    // immediately, so the status-bar snapshot is at most one tick stale.
-    const startPolling = () => {
-      if (interval !== null) return;
-      void refresh();
-      interval = window.setInterval(() => {
-        void refresh();
-      }, SYSTEM_HEALTH_REFRESH_MS);
-    };
-    const stopPolling = () => {
-      if (interval !== null) {
-        window.clearInterval(interval);
-        interval = null;
-      }
-    };
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") startPolling();
-      else stopPolling();
-    };
-
-    if (document.visibilityState === "visible") startPolling();
-    document.addEventListener("visibilitychange", onVisibility);
-
-    return () => {
-      cancelled = true;
-      stopPolling();
-      document.removeEventListener("visibilitychange", onVisibility);
-    };
-  }, [activeHealthConnectionState, activeHealthSessionId, activeIsSsh, activeSshTarget, hydrated]);
 
   const sshRootResolveInFlightRef = useRef<Set<string>>(new Set());
   useEffect(() => {
@@ -3995,7 +4111,8 @@ export default function App() {
         value === "bytes" ||
         value === "markdown" ||
         value === "json" ||
-        value === "csv"
+        value === "csv" ||
+        value === "xlsx"
         ? value
         : undefined;
     }
@@ -4145,7 +4262,7 @@ export default function App() {
       },
       "sessions.set_symbol": (p) => {
         const id = p.id as string;
-        const symbol = (p.symbol as string) || null;
+        const symbol = normalizeTabSymbolValue(p.symbol as string | null);
         setSessionsSync((prev) => prev.map((s) => s.id === id ? { ...s, symbol } : s));
         notifyStateChange("sessions.updated", { sessionId: id, symbol });
         return null;
@@ -4270,7 +4387,7 @@ export default function App() {
             ...(p.basePath !== undefined && { basePath: p.basePath as string | null }),
             ...(p.environmentId !== undefined && { environmentId: p.environmentId as string | null }),
             ...(p.assetsEnabled !== undefined && { assetsEnabled: p.assetsEnabled as boolean }),
-            ...(p.symbol !== undefined && { symbol: p.symbol as string | null }),
+            ...(p.symbol !== undefined && { symbol: normalizeTabSymbolValue(p.symbol as string | null) }),
             ...(p.color !== undefined && { color: p.color as string | null }),
             ...(p.sshTarget !== undefined && { sshTarget: (p.sshTarget as string | null)?.trim() || null }),
             ...(p.sshRemotePath !== undefined && { sshRemotePath: (p.sshRemotePath as string | null)?.trim() || null }),
@@ -7528,6 +7645,25 @@ export default function App() {
           void checkForUpdates();
           return;
         }
+        if (event.payload.id === "edit-select-all") {
+          const activeEl = document.activeElement;
+          const activeElement = activeEl instanceof Element ? activeEl : null;
+          const inCodeEditor = activeElement ? Boolean(activeElement.closest(".codeEditorPanel")) : false;
+          if (inCodeEditor && codeEditorPanelRef.current?.selectAll()) return;
+
+          const terminalElement = activeElement?.closest(".xterm") ?? null;
+          const terminalId = terminalElement?.closest<HTMLElement>("[data-session-id]")?.dataset.sessionId ?? null;
+          const terminalEntry = terminalId ? registry.current.get(terminalId) ?? null : null;
+          if (terminalEntry) {
+            terminalEntry.term.selectAll();
+            terminalEntry.term.focus();
+            return;
+          }
+
+          if (selectEditableElement(activeElement)) return;
+          selectDocumentContents();
+          return;
+        }
         if (event.payload.id === "window-toggle-terminal-search") {
           const now = Date.now();
           if (now - terminalSearchTriggerAtRef.current < 180) return;
@@ -8911,13 +9047,14 @@ export default function App() {
   }, []);
 
   const handleSetSessionSymbol = useCallback((sessionId: string, symbol: string | null) => {
+    const nextSymbol = normalizeTabSymbolValue(symbol);
     setSessionsSync((prev) => {
       const idx = prev.findIndex((s) => s.id === sessionId);
       if (idx < 0) return prev;
       const current = prev[idx].symbol ?? null;
-      if (current === symbol) return prev;
+      if (current === nextSymbol) return prev;
       const next = prev.slice();
-      next[idx] = { ...prev[idx], symbol };
+      next[idx] = { ...prev[idx], symbol: nextSymbol };
       return next;
     });
   }, []);
@@ -9091,13 +9228,14 @@ export default function App() {
   }, []);
 
   const handleSetProjectSymbol = useCallback((projectId: string, symbol: string | null) => {
+    const nextSymbol = normalizeTabSymbolValue(symbol);
     setProjects((prev) => {
       const idx = prev.findIndex((p) => p.id === projectId);
       if (idx < 0) return prev;
       const current = prev[idx].symbol ?? null;
-      if (current === symbol) return prev;
+      if (current === nextSymbol) return prev;
       const next = prev.slice();
-      next[idx] = { ...prev[idx], symbol };
+      next[idx] = { ...prev[idx], symbol: nextSymbol };
       return next;
     });
   }, []);
@@ -9318,7 +9456,7 @@ export default function App() {
         summary: persistenceDisabledReason,
         tone: "warning",
         actionLabel: isKeychainIssue ? (secureStorageRetrying ? "Retrying…" : "Retry") : undefined,
-        onAction: isKeychainIssue ? () => void retrySecureStorage() : undefined,
+        onAction: isKeychainIssue ? () => retrySecureStorage() : undefined,
         actionDisabled: secureStorageRetrying,
         onDismiss: () => setPersistenceDisabledReason(null),
       });
@@ -9335,7 +9473,7 @@ export default function App() {
           "Enable Agents UI, or the terminal/editor that launched the dev app, then restart the app.",
         ],
         actionLabel: "Open Settings",
-        onAction: () => void openScreenRecordingSettings(),
+        onAction: () => openScreenRecordingSettings(),
         onDismiss: () => setScreenCapturePermissionIssue(null),
       });
     }
@@ -9493,16 +9631,13 @@ export default function App() {
             <span className="chipLabel">ssh</span>
           </span>
         ) : null}
-        {systemHealthItems.length > 0 ? (
-          <span className="systemHealthStats" aria-label="System health">
-            {systemHealthItems.map((item) => (
-              <span key={item.key} className="systemHealthItem" title={item.title}>
-                <span className="systemHealthLabel">{item.label}</span>
-                <span className="systemHealthValue">{item.value}</span>
-              </span>
-            ))}
-          </span>
-        ) : null}
+        <SystemHealthIndicator
+          hydrated={hydrated}
+          sessionId={activeHealthSessionId}
+          isSsh={activeIsSsh}
+          sshTarget={activeSshTarget}
+          connectionState={activeHealthConnectionState}
+        />
       </div>
       <div className="topbarRight">
         <ActivityCenter
@@ -9510,6 +9645,7 @@ export default function App() {
           open={activityCenterOpen}
           items={activityItems}
           onToggle={handleToggleActivityCenter}
+          onActionError={(item, err) => reportError(`Activity action failed: ${item.title}`, err)}
         />
         <div className="topbarSettingsMenu sidebarActionMenu" ref={appSettingsMenuRef}>
           <button
@@ -9707,7 +9843,7 @@ export default function App() {
       </div>
     </div>
   ), [
-    active, activeProject, activeIsSsh, activeSshTarget, activeWorkspaceView, systemHealthItems,
+    active, activeProject, activeIsSsh, activeSshTarget, activeWorkspaceView, hydrated,
     activityCenterOpen, activityItems, slidePanelOpen, agentPanelOpen, appSettingsOpen,
     uiTheme,
     handleToggleActivityCenter, handleToggleAppSettings, reportError,
@@ -9757,6 +9893,7 @@ export default function App() {
               onMouseDown={beginWorkspaceResize("editor")}
               aria-hidden="true"
             />
+            <PanelErrorBoundary label="File viewer">
             <React.Suspense
               fallback={
                 <section className="codeEditorPanel" aria-label="Editor">
@@ -9808,6 +9945,7 @@ export default function App() {
                 onCloseEditor={closeCodeEditor}
               />
             </React.Suspense>
+            </PanelErrorBoundary>
           </>
         ) : null}
 
@@ -9823,6 +9961,7 @@ export default function App() {
               onMouseDown={beginWorkspaceResize("tree")}
               aria-hidden="true"
             />
+            <PanelErrorBoundary label="File tree">
             <FileExplorerPanel
               key={`file-tree:${activeWorkspaceKey}`}
               isOpen
@@ -9855,6 +9994,7 @@ export default function App() {
                 }))
               }
             />
+            </PanelErrorBoundary>
           </>
         ) : activeWorkspaceView.fileExplorerOpen && activeIsSsh ? (
           <>
@@ -9901,42 +10041,52 @@ export default function App() {
               onMouseDown={beginWorkspaceResize("agent")}
               aria-hidden="true"
             />
-            <AgentPanel
-              onClose={() => setAgentPanelOpen(false)}
-              projectBasePath={activeProject?.basePath || homeDirRef.current || undefined}
-              onCreateTerminalSession={async (command) => {
-                try {
+            <PanelErrorBoundary label="Agent panel">
+            <React.Suspense
+              fallback={
+                <section className="agentPanel">
+                  <div className="empty">Loading agent...</div>
+                </section>
+              }
+            >
+              <LazyAgentPanel
+                onClose={() => setAgentPanelOpen(false)}
+                projectBasePath={activeProject?.basePath || homeDirRef.current || undefined}
+                onCreateTerminalSession={async (command) => {
+                  try {
+                    const cwd = activeProject?.basePath || homeDirRef.current || "";
+                    const createdRaw = await createSession({
+                      projectId: activeProjectId,
+                      name: "Agent",
+                      launchCommand: command,
+                      cwd,
+                      envVars: envVarsForProjectId(activeProjectId, projects, environments),
+                    });
+                    const s = applyPendingExit(createdRaw);
+                    addSessionWithProjectSafeActivation(s);
+                  } catch (err) {
+                    reportError("Failed to create agent terminal", err);
+                  }
+                }}
+                onCreateTaskSession={async (command, name) => {
                   const cwd = activeProject?.basePath || homeDirRef.current || "";
                   const createdRaw = await createSession({
                     projectId: activeProjectId,
-                    name: "Agent",
+                    name,
                     launchCommand: command,
                     cwd,
                     envVars: envVarsForProjectId(activeProjectId, projects, environments),
                   });
                   const s = applyPendingExit(createdRaw);
                   addSessionWithProjectSafeActivation(s);
-                } catch (err) {
-                  reportError("Failed to create agent terminal", err);
-                }
-              }}
-              onCreateTaskSession={async (command, name) => {
-                const cwd = activeProject?.basePath || homeDirRef.current || "";
-                const createdRaw = await createSession({
-                  projectId: activeProjectId,
-                  name,
-                  launchCommand: command,
-                  cwd,
-                  envVars: envVarsForProjectId(activeProjectId, projects, environments),
-                });
-                const s = applyPendingExit(createdRaw);
-                addSessionWithProjectSafeActivation(s);
-                return s.id;
-              }}
-              onActivateSession={(sessionId) => {
-                setActiveId(sessionId);
-              }}
-            />
+                  return s.id;
+                }}
+                onActivateSession={(sessionId) => {
+                  setActiveId(sessionId);
+                }}
+              />
+            </React.Suspense>
+            </PanelErrorBoundary>
           </>
         )}
       </div>
@@ -9998,7 +10148,7 @@ export default function App() {
                     onClick={() => selectSessionById(sid)}
                   >
                     {s.symbol ? (
-                      <span className="sessionSymbol">{s.symbol}</span>
+                      <TabSymbolIcon symbol={s.symbol} />
                     ) : historyEffect?.iconSrc ? (
                       <span className={`agentBadge historyAgentBadge chip-${historyEffect.id}`} title={historyEffect.label}>
                         <img className="agentIcon" src={historyEffect.iconSrc} alt={historyEffect.label} />

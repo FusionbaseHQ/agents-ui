@@ -84,7 +84,11 @@ mod imp {
         let app1 = app.clone();
         let cell1 = size_cell.clone();
         let _ = app.run_on_main_thread(move || {
-            let Some(win) = app1.get_webview_window("main") else {
+            // Use get_window (not get_webview_window): once a browser child
+            // webview is attached to the main window, the main window is no
+            // longer a WebviewWindow, so get_webview_window("main") returns None
+            // and the recompose kick would silently never run.
+            let Some(win) = app1.get_window("main") else {
                 return;
             };
             let _ = win.emit("system-resumed", ());
@@ -96,7 +100,13 @@ mod imp {
             if let Ok(sz) = win.inner_size() {
                 let w = sz.width.max(2);
                 let h = sz.height.max(2);
-                *cell1.lock().unwrap() = Some((w, h));
+                // These closures run on the main thread — never panic here, a
+                // poisoned lock just skips the kick (the JS recovery still ran).
+                let Ok(mut guard) = cell1.lock() else {
+                    return;
+                };
+                *guard = Some((w, h));
+                drop(guard);
                 let _ = win.set_size(tauri::PhysicalSize::new(w - 1, h));
             }
         });
@@ -107,10 +117,10 @@ mod imp {
         let app2 = app.clone();
         let cell2 = size_cell;
         let _ = app.run_on_main_thread(move || {
-            let Some((w, h)) = *cell2.lock().unwrap() else {
+            let Some((w, h)) = cell2.lock().ok().and_then(|guard| *guard) else {
                 return;
             };
-            if let Some(win) = app2.get_webview_window("main") {
+            if let Some(win) = app2.get_window("main") {
                 let _ = win.set_size(tauri::PhysicalSize::new(w, h));
             }
         });

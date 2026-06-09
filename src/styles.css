@@ -1325,16 +1325,16 @@ body::after {
 /* Split view member colored overrides (--tab-color set via inline style). */
 /* :not(.sessionSplitViewMemberActive) gives 0-3-0 specificity to beat type-based selectors. */
 .sessionSplitViewMember.sessionSplitViewMemberColored:not(.sessionSplitViewMemberActive) {
-  background: rgba(var(--tab-color), 0.13);
-  box-shadow: inset 0 0 0 1px rgba(var(--tab-color), 0.08);
+  background: rgba(var(--tab-color), 0.28);
+  box-shadow: inset 0 0 0 1px rgba(var(--tab-color), 0.22);
 }
 .sessionSplitViewMember.sessionSplitViewMemberColored:not(.sessionSplitViewMemberActive):hover {
-  background: rgba(var(--tab-color), 0.18);
-  box-shadow: 0 0 8px rgba(var(--tab-color), 0.08), inset 0 0 0 1px rgba(var(--tab-color), 0.12);
+  background: rgba(var(--tab-color), 0.36);
+  box-shadow: 0 0 10px rgba(var(--tab-color), 0.18), inset 0 0 0 1px rgba(var(--tab-color), 0.3);
 }
 .sessionSplitViewMember.sessionSplitViewMemberColored.sessionSplitViewMemberActive {
-  background: rgba(var(--tab-color), 0.22);
-  box-shadow: 0 0 14px rgba(var(--tab-color), 0.15), inset 0 0 0 1px rgba(var(--tab-color), 0.2);
+  background: rgba(var(--tab-color), 0.46);
+  box-shadow: 0 0 16px rgba(var(--tab-color), 0.28), inset 0 0 0 1px rgba(var(--tab-color), 0.42);
 }
 
 .sessionSplitViewMember + .sessionSplitViewMember {
@@ -1652,9 +1652,21 @@ body::after {
 }
 
 .sessionSymbol {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
   flex-shrink: 0;
   font-size: 12px;
   line-height: 1;
+}
+
+.tabSymbolIcon {
+  display: block;
+  width: 15px;
+  height: 15px;
+  object-fit: contain;
 }
 
 .sessionNameInput {
@@ -1679,6 +1691,11 @@ body::after {
 .sessionContextMenu {
   position: fixed;
   min-width: 200px;
+  /* Cap height so a menu with many items in a short window scrolls instead of
+     overflowing the viewport; useClampedMenuPosition then positions this box. */
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 6px;
   border: 1px solid rgba(var(--ink-rgb), 0.08);
   background: rgba(var(--paper-panel-rgb), 0.92);
@@ -1725,8 +1742,8 @@ body::after {
 .sessionSymbolPicker {
   position: fixed;
   display: grid;
-  grid-template-columns: repeat(6, 1fr);
-  gap: 2px;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
   padding: 8px;
   border: 1px solid rgba(var(--ink-rgb), 0.08);
   background: rgba(var(--paper-panel-rgb), 0.92);
@@ -1738,20 +1755,25 @@ body::after {
 }
 
 .sessionSymbolPicker button {
-  width: 32px;
-  height: 32px;
+  width: 34px;
+  height: 34px;
   display: flex;
   align-items: center;
   justify-content: center;
   border: none;
   background: transparent;
   border-radius: var(--radius-control);
-  font-size: 18px;
   cursor: pointer;
 }
 
 .sessionSymbolPicker button:hover {
   background: rgba(var(--ink-rgb), 0.1);
+}
+
+.tabSymbolPickerIcon {
+  width: 22px;
+  height: 22px;
+  object-fit: contain;
 }
 
 .tabColorPicker {
@@ -1786,36 +1808,36 @@ body::after {
 /* Session colored tab overrides (--tab-color is set via inline style) */
 /* :not(.sessionItemActive) gives 0-3-0 specificity to beat type-based selectors */
 .sessionItem.sessionItemColored:not(.sessionItemActive) {
-  border-color: rgba(var(--tab-color), 0.35);
-  background: rgba(var(--tab-color), 0.13);
-  box-shadow: inset 0 0 0 1px rgba(var(--tab-color), 0.08);
+  border-color: rgba(var(--tab-color), 0.62);
+  background: rgba(var(--tab-color), 0.28);
+  box-shadow: inset 0 0 0 1px rgba(var(--tab-color), 0.2);
 }
 .sessionItem.sessionItemColored:not(.sessionItemActive):hover {
-  border-color: rgba(var(--tab-color), 0.45);
-  background: rgba(var(--tab-color), 0.18);
-  box-shadow: 0 0 8px rgba(var(--tab-color), 0.08), inset 0 0 0 1px rgba(var(--tab-color), 0.12);
+  border-color: rgba(var(--tab-color), 0.76);
+  background: rgba(var(--tab-color), 0.36);
+  box-shadow: 0 0 10px rgba(var(--tab-color), 0.18), inset 0 0 0 1px rgba(var(--tab-color), 0.3);
 }
 .sessionItem.sessionItemColored.sessionItemActive {
-  border-color: rgba(var(--tab-color), 0.6);
-  background: rgba(var(--tab-color), 0.22);
-  box-shadow: 0 0 14px rgba(var(--tab-color), 0.15), inset 0 0 0 1px rgba(var(--tab-color), 0.2);
+  border-color: rgba(var(--tab-color), 0.9);
+  background: rgba(var(--tab-color), 0.46);
+  box-shadow: 0 0 16px rgba(var(--tab-color), 0.28), inset 0 0 0 1px rgba(var(--tab-color), 0.42);
 }
 
 /* Project colored tab overrides */
 .projectItem.projectItemColored:not(.projectItemActive) {
-  border-color: rgba(var(--tab-color), 0.35);
-  background: rgba(var(--tab-color), 0.13);
-  box-shadow: inset 0 0 0 1px rgba(var(--tab-color), 0.08);
+  border-color: rgba(var(--tab-color), 0.62);
+  background: rgba(var(--tab-color), 0.28);
+  box-shadow: inset 0 0 0 1px rgba(var(--tab-color), 0.2);
 }
 .projectItem.projectItemColored:not(.projectItemActive):hover {
-  border-color: rgba(var(--tab-color), 0.45);
-  background: rgba(var(--tab-color), 0.18);
-  box-shadow: 0 0 8px rgba(var(--tab-color), 0.08), inset 0 0 0 1px rgba(var(--tab-color), 0.12);
+  border-color: rgba(var(--tab-color), 0.76);
+  background: rgba(var(--tab-color), 0.36);
+  box-shadow: 0 0 10px rgba(var(--tab-color), 0.18), inset 0 0 0 1px rgba(var(--tab-color), 0.3);
 }
 .projectItem.projectItemColored.projectItemActive {
-  border-color: rgba(var(--tab-color), 0.6);
-  background: rgba(var(--tab-color), 0.22);
-  box-shadow: 0 0 14px rgba(var(--tab-color), 0.15), inset 0 0 0 1px rgba(var(--tab-color), 0.2);
+  border-color: rgba(var(--tab-color), 0.9);
+  background: rgba(var(--tab-color), 0.46);
+  box-shadow: 0 0 16px rgba(var(--tab-color), 0.28), inset 0 0 0 1px rgba(var(--tab-color), 0.42);
 }
 
 .sessionStatus {
@@ -2235,18 +2257,18 @@ body::after {
 }
 
 .historyTab.sessionItemColored:not(.historyTabActive) {
-  border-color: rgba(var(--tab-color), 0.25);
-  background: rgba(var(--tab-color), 0.10);
+  border-color: rgba(var(--tab-color), 0.58);
+  background: rgba(var(--tab-color), 0.26);
 }
 
 .historyTab.sessionItemColored:not(.historyTabActive):hover {
-  border-color: rgba(var(--tab-color), 0.40);
-  background: rgba(var(--tab-color), 0.16);
+  border-color: rgba(var(--tab-color), 0.74);
+  background: rgba(var(--tab-color), 0.34);
 }
 
 .historyTab.sessionItemColored.historyTabActive {
-  border-color: rgba(var(--tab-color), 0.55);
-  background: rgba(var(--tab-color), 0.20);
+  border-color: rgba(var(--tab-color), 0.88);
+  background: rgba(var(--tab-color), 0.44);
 }
 
 .historyTabProject {
@@ -2631,6 +2653,9 @@ body::after {
   position: fixed;
   min-width: 220px;
   max-width: 280px;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 6px;
   border: 1px solid rgba(var(--ink-rgb), 0.08);
   background: rgba(var(--paper-panel-rgb), 0.92);
@@ -2749,47 +2774,6 @@ body::after {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.fileExplorerGitBadge {
-  margin-left: auto;
-  min-width: 16px;
-  height: 16px;
-  border-radius: 4px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 9px;
-  font-weight: 700;
-  border: 1px solid rgba(var(--ink-rgb), 0.18);
-  color: rgba(var(--ink-rgb), 0.9);
-  background: rgba(var(--ink-rgb), 0.08);
-}
-
-.fileExplorerGitBadgeNested {
-  opacity: 0.58;
-}
-
-.fileExplorerGitBadge-added {
-  border-color: rgba(var(--success-rgb), 0.45);
-  background: rgba(var(--success-rgb), 0.18);
-}
-
-.fileExplorerGitBadge-modified,
-.fileExplorerGitBadge-renamed {
-  border-color: rgba(var(--warning-rgb), 0.45);
-  background: rgba(var(--warning-rgb), 0.18);
-}
-
-.fileExplorerGitBadge-deleted,
-.fileExplorerGitBadge-conflicted {
-  border-color: rgba(var(--danger-rgb), 0.45);
-  background: rgba(var(--danger-rgb), 0.18);
-}
-
-.fileExplorerGitBadge-untracked {
-  border-color: rgba(var(--accent-rgb), 0.4);
-  background: rgba(var(--accent-rgb), 0.15);
 }
 
 .fileExplorerMeta {
@@ -3066,6 +3050,9 @@ body::after {
 .codeEditorTabMenu {
   position: fixed;
   min-width: 178px;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 4px;
   background: var(--panel);
   border: 1px solid var(--border);
@@ -3509,7 +3496,8 @@ body::after {
 .pdfViewer,
 .markdownViewer,
 .jsonTreeViewer,
-.csvTableViewer {
+.csvTableViewer,
+.xlsxWorkbookViewer {
   position: absolute;
   inset: 0;
   min-width: 0;
@@ -3518,7 +3506,8 @@ body::after {
 }
 
 .jsonTreeViewer,
-.csvTableViewer {
+.csvTableViewer,
+.xlsxWorkbookViewer {
   display: flex;
   flex-direction: column;
 }
@@ -3629,6 +3618,137 @@ body::after {
   user-select: none;
   text-align: right;
   background: rgba(var(--ink-rgb), 0.03);
+}
+
+.xlsxWorkbookToolbar {
+  gap: 10px;
+  overflow: hidden;
+}
+
+.xlsxSheetTabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: auto hidden;
+  scrollbar-width: thin;
+}
+
+.xlsxSheetTab {
+  height: 24px;
+  max-width: 160px;
+  padding: 3px 9px;
+  border: 1px solid rgba(var(--ink-rgb), 0.1);
+  border-radius: var(--radius-control);
+  background: var(--paper);
+  color: var(--muted);
+  font: 12px var(--font);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.xlsxSheetTab:hover {
+  color: var(--text);
+  border-color: rgba(var(--accent-rgb), 0.35);
+}
+
+.xlsxSheetTabActive {
+  color: var(--accent);
+  border-color: rgba(var(--accent-rgb), 0.5);
+  background: rgba(var(--accent-rgb), 0.08);
+}
+
+.xlsxWorkbookMeta {
+  min-width: 0;
+  max-width: min(420px, 42vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 0 1 auto;
+}
+
+.xlsxTableBody {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: rgba(var(--shadow-rgb), 0.1);
+}
+
+.xlsxTable {
+  border-collapse: collapse;
+  table-layout: fixed;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text);
+}
+
+.xlsxRowNumCol {
+  width: 54px;
+}
+
+.xlsxDataCol {
+  width: 120px;
+}
+
+.xlsxTable th,
+.xlsxTable td {
+  box-sizing: border-box;
+  width: 120px;
+  max-width: 120px;
+  border: 1px solid rgba(var(--ink-rgb), 0.12);
+  padding: 3px 8px;
+  text-align: left;
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  height: 24px;
+  line-height: 16px;
+}
+
+.xlsxTable tr {
+  height: 24px;
+}
+
+.xlsxTable thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--panel);
+  color: var(--muted);
+  font-weight: 650;
+  text-align: center;
+}
+
+.xlsxCornerCell {
+  left: 0;
+  z-index: 4 !important;
+  width: 54px !important;
+  max-width: 54px !important;
+}
+
+.xlsxRowNum {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  width: 54px !important;
+  max-width: 54px !important;
+  color: var(--muted);
+  user-select: none;
+  text-align: right !important;
+  background: var(--panel);
+}
+
+.xlsxSpacerRow td {
+  height: inherit;
+  padding: 0 !important;
+  border: 0 !important;
+  background: transparent;
+}
+
+.xlsxEmptyCell {
+  color: var(--muted);
 }
 
 .markdownViewer {

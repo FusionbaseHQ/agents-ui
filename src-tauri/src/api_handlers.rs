@@ -202,16 +202,14 @@ fn handle_sessions_detach(ctx: &HandlerContext, params: Value) -> Result<Value, 
 // ── Persistent sessions ──
 
 fn handle_persistent_sessions_list(ctx: &HandlerContext) -> Result<Value, JsonRpcError> {
-    let window = get_window(&ctx.app_handle)?;
-    let result = crate::pty::list_persistent_sessions(window)
+    let result = crate::pty::list_persistent_sessions(ctx.app_handle.clone())
         .map_err(|e| op_failed(&e))?;
     serde_json::to_value(result).map_err(|e| internal(&e.to_string()))
 }
 
 fn handle_persistent_sessions_kill(ctx: &HandlerContext, params: Value) -> Result<Value, JsonRpcError> {
     let persist_id = require_str(&params, "persistId")?;
-    let window = get_window(&ctx.app_handle)?;
-    crate::pty::kill_persistent_session(window, persist_id)
+    crate::pty::kill_persistent_session(ctx.app_handle.clone(), persist_id)
         .map(|_| Value::Null)
         .map_err(|e| op_failed(&e))
 }
@@ -219,16 +217,14 @@ fn handle_persistent_sessions_kill(ctx: &HandlerContext, params: Value) -> Resul
 // ── Recordings ──
 
 fn handle_recordings_list(ctx: &HandlerContext) -> Result<Value, JsonRpcError> {
-    let window = get_window(&ctx.app_handle)?;
-    let result = crate::recording::list_recordings(window)
+    let result = crate::recording::list_recordings(ctx.app_handle.clone())
         .map_err(|e| op_failed(&e))?;
     serde_json::to_value(result).map_err(|e| internal(&e.to_string()))
 }
 
 fn handle_recordings_get(ctx: &HandlerContext, params: Value) -> Result<Value, JsonRpcError> {
     let id = require_str(&params, "id")?;
-    let window = get_window(&ctx.app_handle)?;
-    let all = crate::recording::list_recordings(window)
+    let all = crate::recording::list_recordings(ctx.app_handle.clone())
         .map_err(|e| op_failed(&e))?;
     let entry = all.into_iter().find(|r| r.recording_id == id)
         .ok_or_else(|| not_found("recording"))?;
@@ -238,16 +234,14 @@ fn handle_recordings_get(ctx: &HandlerContext, params: Value) -> Result<Value, J
 fn handle_recordings_load(ctx: &HandlerContext, params: Value) -> Result<Value, JsonRpcError> {
     let id = require_str(&params, "id")?;
     let decrypt = params.get("decrypt").and_then(|v| v.as_bool());
-    let window = get_window(&ctx.app_handle)?;
-    let result = crate::recording::load_recording(window, id, decrypt)
+    let result = crate::recording::load_recording(ctx.app_handle.clone(), id, decrypt)
         .map_err(|e| op_failed(&e))?;
     serde_json::to_value(result).map_err(|e| internal(&e.to_string()))
 }
 
 fn handle_recordings_delete(ctx: &HandlerContext, params: Value) -> Result<Value, JsonRpcError> {
     let id = require_str(&params, "id")?;
-    let window = get_window(&ctx.app_handle)?;
-    crate::recording::delete_recording(window, id)
+    crate::recording::delete_recording(ctx.app_handle.clone(), id)
         .map(|_| Value::Null)
         .map_err(|e| op_failed(&e))
 }
@@ -411,8 +405,7 @@ async fn handle_ssh_files_download(params: Value) -> Result<Value, JsonRpcError>
 // ── App ──
 
 fn handle_app_info(ctx: &HandlerContext) -> Result<Value, JsonRpcError> {
-    let window = get_window(&ctx.app_handle)?;
-    let info = crate::app_info::get_app_info(window);
+    let info = crate::app_info::get_app_info(ctx.app_handle.clone());
     serde_json::to_value(info).map_err(|e| internal(&e.to_string()))
 }
 
@@ -432,11 +425,6 @@ fn handle_api_describe(params: Value) -> Result<Value, JsonRpcError> {
 }
 
 // ── Helpers ──
-
-fn get_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, JsonRpcError> {
-    app.get_webview_window("main")
-        .ok_or_else(|| internal("main window not found"))
-}
 
 fn require_str(params: &Value, key: &str) -> Result<String, JsonRpcError> {
     params

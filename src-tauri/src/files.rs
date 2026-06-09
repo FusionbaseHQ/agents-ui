@@ -2,9 +2,8 @@ use serde::Serialize;
 use std::{
     collections::VecDeque,
     fs::{self, File},
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::Command,
     time::UNIX_EPOCH,
 };
 
@@ -41,13 +40,6 @@ pub struct FsEntry {
     pub path: String,
     pub is_dir: bool,
     pub size: u64,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct GitStatusEntry {
-    pub path: String,
-    pub status: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -137,6 +129,26 @@ fn looks_like_pdf(sample: &[u8]) -> bool {
     })
 }
 
+fn looks_like_xlsx(sample: &[u8], path: Option<&Path>) -> bool {
+    let is_xlsx_path = path
+        .and_then(|p| p.extension())
+        .and_then(|v| v.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("xlsx"));
+    if !is_xlsx_path {
+        return false;
+    }
+
+    // XLSX files are ZIP-based OOXML workbooks. The first local-file entry is
+    // commonly [Content_Types].xml, but extension + ZIP signature is the useful
+    // early probe for remote/local range-limited reads.
+    sample.starts_with(b"PK\x03\x04")
+        || sample.starts_with(b"PK\x05\x06")
+        || sample.starts_with(b"PK\x07\x08")
+        || sample
+            .windows(b"[Content_Types].xml".len())
+            .any(|window| window == b"[Content_Types].xml")
+}
+
 fn sample_is_valid_utf8(sample: &[u8]) -> bool {
     match std::str::from_utf8(sample) {
         Ok(_) => true,
@@ -154,6 +166,7 @@ pub(crate) fn probe_from_sample(
 ) -> FileProbe {
     let image = raster_image_type(sample, path);
     let is_pdf = looks_like_pdf(sample);
+    let is_xlsx = looks_like_xlsx(sample, path);
     let has_nul = sample[..sample.len().min(BINARY_CHECK_BYTES)]
         .iter()
         .any(|b| *b == 0);
@@ -162,6 +175,8 @@ pub(crate) fn probe_from_sample(
     // valid UTF-8 text near the header, so the magic-byte check must win.
     let kind = if is_pdf {
         "pdf"
+    } else if is_xlsx {
+        "xlsx"
     } else if image.is_some() {
         "image"
     } else if size == 0 || (!has_nul && valid_utf8) {
@@ -171,6 +186,11 @@ pub(crate) fn probe_from_sample(
     };
     let (image_type, mime) = if is_pdf {
         (None, Some("application/pdf".to_string()))
+    } else if is_xlsx {
+        (
+            None,
+            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string()),
+        )
     } else {
         match image {
             Some((kind, mime)) => (Some(kind.to_string()), Some(mime.to_string())),
@@ -359,63 +379,6 @@ pub fn search_fs_entries(root: String, query: String, limit: Option<usize>) -> R
     Ok(out)
 }
 
-fn git_status_kind(code: &str) -> &'static str {
-    if code.contains('U') || code == "AA" || code == "DD" {
-        "conflicted"
-    } else if code.contains('R') || code.contains('C') {
-        "renamed"
-    } else if code.contains('A') {
-        "added"
-    } else if code.contains('D') {
-        "deleted"
-    } else if code == "??" {
-        "untracked"
-    } else {
-        "modified"
-    }
-}
-
-#[tauri::command]
-pub fn git_status_entries(root: String) -> Result<Vec<GitStatusEntry>, String> {
-    let root = ensure_root_dir(Path::new(root.trim()))?;
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&root)
-        .arg("status")
-        .arg("--porcelain=v1")
-        .arg("-z")
-        .arg("--untracked-files=normal")
-        .output()
-        .map_err(|e| format!("git status failed: {e}"))?;
-
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-
-    let mut out = Vec::new();
-    let mut parts = output.stdout.split(|b| *b == 0).filter(|part| !part.is_empty());
-    while let Some(part) = parts.next() {
-        if part.len() < 4 {
-            continue;
-        }
-        let code = String::from_utf8_lossy(&part[..2]).to_string();
-        let rel = String::from_utf8_lossy(&part[3..]).to_string();
-        if code.contains('R') || code.contains('C') {
-            let _old_path = parts.next();
-        }
-        if rel.is_empty() {
-            continue;
-        }
-        let path = root.join(rel);
-        out.push(GitStatusEntry {
-            path: path.to_string_lossy().to_string(),
-            status: git_status_kind(&code).to_string(),
-        });
-    }
-
-    Ok(out)
-}
-
 #[tauri::command]
 pub fn read_text_file(root: String, path: String) -> Result<String, String> {
     let root = Path::new(root.trim());
@@ -517,7 +480,39 @@ pub fn write_text_file(root: String, path: String, content: String) -> Result<()
     if !file.is_file() {
         return Err("not a file".to_string());
     }
-    fs::write(&file, content.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
+
+    // Write to a sibling temp file and rename over the original so a crash or
+    // full disk mid-write can never leave the file truncated. The rename also
+    // means the watcher/editor sees either the old or the new content, never a
+    // partial state.
+    let original_perms = fs::metadata(&file).ok().map(|m| m.permissions());
+    let dir = file.parent().ok_or("invalid file path")?;
+    let file_name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("invalid file name")?;
+    let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
+
+    let write_result = (|| -> Result<(), String> {
+        let mut out = File::create(&tmp).map_err(|e| format!("write failed: {e}"))?;
+        out.write_all(content.as_bytes())
+            .map_err(|e| format!("write failed: {e}"))?;
+        out.sync_all().map_err(|e| format!("sync failed: {e}"))?;
+        drop(out);
+        if let Some(perms) = original_perms {
+            let _ = fs::set_permissions(&tmp, perms);
+        }
+        fs::rename(&tmp, &file).map_err(|e| format!("rename failed: {e}"))?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_result?;
+
+    // Best-effort: make the directory entry for the rename durable.
+    let _ = File::open(dir).and_then(|d| d.sync_all());
     Ok(())
 }
 
@@ -679,9 +674,14 @@ pub fn copy_fs_entry(root: String, source_path: String, dest_path: String) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn kind_of(sample: &[u8]) -> String {
         probe_from_sample(sample.len() as u64, None, sample, None).kind
+    }
+
+    fn kind_of_path(sample: &[u8], path: &str) -> String {
+        probe_from_sample(sample.len() as u64, None, sample, Some(Path::new(path))).kind
     }
 
     #[test]
@@ -689,6 +689,29 @@ mod tests {
         let probe = probe_from_sample(2048, None, b"%PDF-1.7\n1 0 obj\n", None);
         assert_eq!(probe.kind, "pdf");
         assert_eq!(probe.mime.as_deref(), Some("application/pdf"));
+    }
+
+    #[test]
+    fn detects_xlsx_zip_header_for_xlsx_paths() {
+        let probe = probe_from_sample(
+            4096,
+            None,
+            b"PK\x03\x04\x14\x00\x00\x00\x08\x00[Content_Types].xml",
+            Some(Path::new("/tmp/report.xlsx")),
+        );
+        assert_eq!(probe.kind, "xlsx");
+        assert_eq!(
+            probe.mime.as_deref(),
+            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        );
+    }
+
+    #[test]
+    fn zip_header_without_xlsx_extension_stays_binary() {
+        assert_eq!(
+            kind_of_path(b"PK\x03\x04\x14\x00\x00\x00\x08\x00", "/tmp/archive.zip"),
+            "binary"
+        );
     }
 
     #[test]

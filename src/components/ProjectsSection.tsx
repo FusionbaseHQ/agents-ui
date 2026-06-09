@@ -1,6 +1,8 @@
 import React from "react";
 import { createPortal } from "react-dom";
+import { useClampedMenuPosition } from "../hooks/useClampedMenuPosition";
 import { Icon } from "./Icon";
+import { TAB_SYMBOLS, TabSymbolIcon, normalizeTabSymbolValue } from "../tabSymbols";
 
 const TAB_COLORS = [
   { name: "Blue", value: "107, 140, 222" },
@@ -11,13 +13,6 @@ const TAB_COLORS = [
   { name: "Red", value: "208, 100, 100" },
   { name: "Purple", value: "155, 120, 210" },
   { name: "Yellow", value: "210, 195, 80" },
-];
-
-const PROJECT_SYMBOLS = [
-  "\u{1F5A5}\uFE0F", "\u{1F4BB}", "\u{1F527}", "\u{1F680}", "\u26A1", "\u{1F41B}",
-  "\u{1F4E6}", "\u{1F9EA}", "\u{1F310}", "\u{1F512}", "\u{1F4DD}", "\u{1F3A8}",
-  "\u{1F5C4}\uFE0F", "\u{1F433}", "\u2601\uFE0F", "\u{1F4E1}", "\u{1F525}", "\u{1F4A1}",
-  "\u2B50", "\u{1F3E0}", "\u{1F6E0}\uFE0F", "\u{1F4CA}", "\u{1F916}", "\u{1F3AF}",
 ];
 
 type Project = {
@@ -109,6 +104,11 @@ export const ProjectsSection = React.memo(function ProjectsSection({
     y: number;
   } | null>(null);
 
+  // Keep every floating menu fully on-screen (flip up/left near an edge).
+  const contextMenuPos = useClampedMenuPosition(contextMenuRef, contextMenu);
+  const symbolPickerPos = useClampedMenuPosition(symbolPickerRef, symbolPicker);
+  const colorPickerPos = useClampedMenuPosition(colorPickerRef, colorPicker);
+
   const handleRenameStart = React.useCallback(() => {
     if (!contextMenu) return;
     const project = projects.find((p) => p.id === contextMenu.projectId);
@@ -153,7 +153,7 @@ export const ProjectsSection = React.memo(function ProjectsSection({
   const handleSymbolSelect = React.useCallback(
     (sym: string) => {
       if (!symbolPicker) return;
-      onSetProjectSymbol(symbolPicker.projectId, sym);
+      onSetProjectSymbol(symbolPicker.projectId, normalizeTabSymbolValue(sym));
       setSymbolPicker(null);
     },
     [symbolPicker, onSetProjectSymbol],
@@ -223,6 +223,8 @@ export const ProjectsSection = React.memo(function ProjectsSection({
     setDropTarget(null);
   }, []);
 
+  const projectOrderKey = React.useMemo(() => projects.map((project) => project.id).join("\0"), [projects]);
+
   React.useLayoutEffect(() => {
     const list = projectListRef.current;
     if (!list) return;
@@ -266,7 +268,7 @@ export const ProjectsSection = React.memo(function ProjectsSection({
     }
 
     previousItemRectsRef.current = nextRects;
-  }, [projects, draggingProjectId]);
+  }, [projectOrderKey, draggingProjectId]);
 
   return (
     <>
@@ -497,7 +499,7 @@ export const ProjectsSection = React.memo(function ProjectsSection({
                     .join("\n")
                 }
               >
-                {p.symbol && <span className="sessionSymbol">{p.symbol}</span>}
+                <TabSymbolIcon symbol={p.symbol} />
                 {renamingId === p.id ? (
                   <input
                     className="sessionNameInput"
@@ -541,7 +543,7 @@ export const ProjectsSection = React.memo(function ProjectsSection({
         <div
           ref={contextMenuRef}
           className="sessionContextMenu"
-          style={{ top: contextMenu.y, left: contextMenu.x }}
+          style={{ top: contextMenuPos.top, left: contextMenuPos.left }}
           role="menu"
         >
           <button
@@ -610,16 +612,16 @@ export const ProjectsSection = React.memo(function ProjectsSection({
         <div
           ref={symbolPickerRef}
           className="sessionSymbolPicker"
-          style={{ top: symbolPicker.y, left: symbolPicker.x }}
+          style={{ top: symbolPickerPos.top, left: symbolPickerPos.left }}
         >
-          {PROJECT_SYMBOLS.map((sym) => (
+          {TAB_SYMBOLS.map((sym) => (
             <button
-              key={sym}
+              key={sym.value}
               type="button"
-              onClick={() => handleSymbolSelect(sym)}
-              title={sym}
+              onClick={() => handleSymbolSelect(sym.value)}
+              title={sym.label}
             >
-              {sym}
+              <img className="tabSymbolPickerIcon" src={sym.src} alt={sym.label} draggable={false} />
             </button>
           ))}
         </div>,
@@ -631,10 +633,7 @@ export const ProjectsSection = React.memo(function ProjectsSection({
         <div
           ref={colorPickerRef}
           className="tabColorPicker"
-          style={{
-            top: Math.min(colorPicker.y, window.innerHeight - 100),
-            left: Math.min(colorPicker.x, window.innerWidth - 160),
-          }}
+          style={{ top: colorPickerPos.top, left: colorPickerPos.left }}
         >
           {TAB_COLORS.map((c) => (
             <button

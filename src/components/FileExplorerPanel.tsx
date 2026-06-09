@@ -6,6 +6,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import React from "react";
 import { shortenPathSmart } from "../pathDisplay";
+import { useClampedMenuPosition } from "../hooks/useClampedMenuPosition";
 import { Icon } from "./Icon";
 import { ConfirmActionModal } from "./modals/ConfirmActionModal";
 
@@ -18,12 +19,6 @@ type FsEntry = {
   path: string;
   isDir: boolean;
   size: number;
-};
-
-type GitStatusKind = "modified" | "added" | "deleted" | "renamed" | "untracked" | "conflicted";
-type GitStatusEntry = {
-  path: string;
-  status: GitStatusKind;
 };
 
 type DirectoryState = {
@@ -51,10 +46,17 @@ export type FileExplorerPersistedState = {
   scrollTop: number;
 };
 
+type FileExplorerPersistedTreeSnapshot = Omit<FileExplorerPersistedState, "scrollTop">;
+
 type VisibleItem =
   | { type: "entry"; entry: FsEntry; depth: number }
   | { type: "loading"; path: string; depth: number }
   | { type: "error"; path: string; depth: number; message: string };
+
+type ScrollAnchor = {
+  path: string;
+  offsetTop: number;
+};
 
 type FileTypeBadgeKind =
   | "python"
@@ -126,6 +128,7 @@ function getFileTypeBadge(name: string): FileTypeBadge | null {
   if (["css", "scss", "less"].includes(ext)) return { label: "CSS", kind: "styles" };
   if (["md", "mdx", "rst", "txt"].includes(ext)) return { label: "MD", kind: "markdown" };
   if (["sql"].includes(ext)) return { label: "SQL", kind: "sql" };
+  if (ext === "xlsx") return { label: "XLS", kind: "markup" };
   if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff"].includes(ext)) {
     return { label: "IMG", kind: "image" };
   }
@@ -165,6 +168,17 @@ function ancestorDirsWithinRoot(path: string, root: string): string[] {
     cur = dirname(cur);
   }
   return [base, ...dirs.reverse()];
+}
+
+function findVisibleEntryIndex(items: VisibleItem[], path: string): number {
+  const normalized = normalizePath(path);
+  if (!normalized) return -1;
+  return items.findIndex((item) => item.type === "entry" && normalizePath(item.entry.path) === normalized);
+}
+
+function clampScrollTop(value: number, el: HTMLElement): number {
+  const maxScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+  return Math.max(0, Math.min(value, maxScrollTop));
 }
 
 function parseFileUrlPath(data: string): string | null {
@@ -237,42 +251,6 @@ const POLL_MAX_PER_TICK = 5;
 const MUTATION_COOLDOWN_MS = 8_000;
 const FILE_EXPLORER_ROW_HEIGHT = 28;
 
-function gitStatusLabel(status: GitStatusKind): string {
-  switch (status) {
-    case "added":
-      return "A";
-    case "deleted":
-      return "D";
-    case "renamed":
-      return "R";
-    case "untracked":
-      return "?";
-    case "conflicted":
-      return "!";
-    case "modified":
-    default:
-      return "M";
-  }
-}
-
-function gitStatusPriority(status: GitStatusKind): number {
-  switch (status) {
-    case "conflicted":
-      return 6;
-    case "deleted":
-      return 5;
-    case "added":
-      return 4;
-    case "renamed":
-      return 3;
-    case "modified":
-      return 2;
-    case "untracked":
-    default:
-      return 1;
-  }
-}
-
 type FileRowProps = {
   entry: FsEntry;
   depth: number;
@@ -288,8 +266,6 @@ type FileRowProps = {
   onMouseDown: (e: React.MouseEvent, entry: FsEntry) => void;
   onMouseMove: (e: React.MouseEvent) => void;
   onMouseUp: () => void;
-  gitStatus?: GitStatusKind | null;
-  gitNested?: boolean;
 };
 
 const FileRow = React.memo(function FileRow({
@@ -307,8 +283,6 @@ const FileRow = React.memo(function FileRow({
   onMouseDown,
   onMouseMove,
   onMouseUp,
-  gitStatus,
-  gitNested,
 }: FileRowProps) {
   const indent = 12 + depth * 14;
   const fileTypeBadge = entry.isDir ? null : getFileTypeBadge(entry.name);
@@ -366,11 +340,6 @@ const FileRow = React.memo(function FileRow({
         )}
       </span>
       <span className="fileExplorerName">{entry.name}</span>
-      {gitStatus ? (
-        <span className={`fileExplorerGitBadge fileExplorerGitBadge-${gitStatus} ${gitNested ? "fileExplorerGitBadgeNested" : ""}`}>
-          {gitStatusLabel(gitStatus)}
-        </span>
-      ) : null}
     </button>
   );
 });
@@ -450,16 +419,20 @@ export function FileExplorerPanel({
   }, [provider, root, rootDir, sshTargetValue]);
   const [expandedDirs, setExpandedDirs] = React.useState<Set<string>>(() => new Set([root]));
   const [dirStateByPath, setDirStateByPath] = React.useState<Record<string, DirectoryState>>({});
-  const [gitStatusEntries, setGitStatusEntries] = React.useState<GitStatusEntry[]>([]);
   const panelRef = React.useRef<HTMLElement | null>(null);
   const listRef = React.useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = React.useState(0);
   const [listHeight, setListHeight] = React.useState(0);
   const listScrollSyncRafRef = React.useRef<number | null>(null);
   const lastRevealPathRef = React.useRef<string | null>(null);
+  const pendingRevealPathRef = React.useRef<string | null>(null);
+  const pendingScrollAnchorRef = React.useRef<ScrollAnchor | null>(null);
+  const visibleItemsRef = React.useRef<VisibleItem[]>([]);
+  const persistedTreeSnapshotRef = React.useRef<FileExplorerPersistedTreeSnapshot | null>(null);
 
   const [contextMenu, setContextMenu] = React.useState<{ x: number; y: number; entry: FsEntry } | null>(null);
   const contextMenuRef = React.useRef<HTMLDivElement | null>(null);
+  const contextMenuPos = useClampedMenuPosition(contextMenuRef, contextMenu);
   const contextMenuOpenPath = contextMenu?.entry.path ?? null;
 
   const [renameTarget, setRenameTarget] = React.useState<FsEntry | null>(null);
@@ -528,6 +501,9 @@ export function FileExplorerPanel({
   const rootRef = React.useRef(root);
   React.useLayoutEffect(() => {
     rootRef.current = root;
+    lastRevealPathRef.current = null;
+    pendingRevealPathRef.current = null;
+    pendingScrollAnchorRef.current = null;
   }, [root]);
 
   const onPersistStateRef = React.useRef(onPersistState);
@@ -569,47 +545,62 @@ export function FileExplorerPanel({
     };
   }, []);
 
+  const buildPersistedTreeSnapshot = React.useCallback((): FileExplorerPersistedTreeSnapshot => {
+    const currentRoot = rootRef.current;
+    const expanded = Array.from(expandedDirsRef.current.values());
+    const states = dirStateByPathRef.current;
+    const persistedStates: Record<string, FileExplorerPersistedDirState> = {};
+    for (const [path, state] of Object.entries(states)) {
+      if (!state) continue;
+      if (state.loading) continue;
+      persistedStates[path] = {
+        entries: state.entries as unknown as FileExplorerPersistedEntry[],
+        error: state.error ?? null,
+      };
+    }
+    const snapshot = {
+      root: currentRoot,
+      expandedDirs: expanded,
+      dirStateByPath: persistedStates,
+    };
+    persistedTreeSnapshotRef.current = snapshot;
+    return snapshot;
+  }, []);
+
   const persistStateNow = React.useCallback(() => {
     const persist = onPersistStateRef.current;
     if (!persist) return;
     try {
-      const currentRoot = rootRef.current;
-      const expanded = Array.from(expandedDirsRef.current.values());
-      const states = dirStateByPathRef.current;
-      const persistedStates: Record<string, FileExplorerPersistedDirState> = {};
-      for (const [path, state] of Object.entries(states)) {
-        if (!state) continue;
-        if (state.loading) continue;
-        persistedStates[path] = {
-          entries: state.entries as unknown as FileExplorerPersistedEntry[],
-          error: state.error ?? null,
-        };
-      }
+      const snapshot = persistedTreeSnapshotRef.current ?? buildPersistedTreeSnapshot();
       persist({
-        root: currentRoot,
-        expandedDirs: expanded,
-        dirStateByPath: persistedStates,
+        ...snapshot,
         scrollTop: scrollTopRef.current,
       });
     } catch {
       // Best-effort.
     }
-  }, []);
+  }, [buildPersistedTreeSnapshot]);
 
   const persistTimerRef = React.useRef<number | null>(null);
-  const schedulePersist = React.useCallback(() => {
+  const schedulePersist = React.useCallback((delay = 250) => {
     if (!onPersistStateRef.current) return;
     if (persistTimerRef.current !== null) window.clearTimeout(persistTimerRef.current);
     persistTimerRef.current = window.setTimeout(() => {
       persistTimerRef.current = null;
       persistStateNow();
-    }, 250);
+    }, delay);
   }, [persistStateNow]);
 
   React.useEffect(() => {
     if (!isOpen) return;
-    schedulePersist();
-  }, [dirStateByPath, expandedDirs, isOpen, root, schedulePersist, scrollTop]);
+    buildPersistedTreeSnapshot();
+    schedulePersist(250);
+  }, [buildPersistedTreeSnapshot, dirStateByPath, expandedDirs, isOpen, root, schedulePersist]);
+
+  React.useEffect(() => {
+    if (!isOpen) return;
+    schedulePersist(700);
+  }, [isOpen, schedulePersist, scrollTop]);
 
   React.useLayoutEffect(() => {
     return () => {
@@ -654,26 +645,6 @@ export function FileExplorerPanel({
     },
     [provider, root, sshTargetValue],
   );
-
-  const refreshGitStatus = React.useCallback(async () => {
-    if (provider !== "local") {
-      setGitStatusEntries([]);
-      return;
-    }
-    try {
-      const entries = await invoke<GitStatusEntry[]>("git_status_entries", { root });
-      setGitStatusEntries(entries);
-    } catch {
-      setGitStatusEntries([]);
-    }
-  }, [provider, root]);
-
-  React.useEffect(() => {
-    if (!isOpen) return;
-    void refreshGitStatus();
-    const timer = window.setInterval(() => void refreshGitStatus(), 8_000);
-    return () => window.clearInterval(timer);
-  }, [isOpen, refreshGitStatus]);
 
   /**
    * Silent background poll for a single directory.
@@ -1251,40 +1222,60 @@ export function FileExplorerPanel({
     return out;
   }, [dirStateByPath, expandedDirs, isOpen, root]);
 
-  const gitDecorations = React.useMemo(() => {
-    const direct = new Map<string, GitStatusKind>();
-    const nested = new Map<string, GitStatusKind>();
-    const assignBest = (map: Map<string, GitStatusKind>, path: string, status: GitStatusKind) => {
-      const current = map.get(path);
-      if (!current || gitStatusPriority(status) > gitStatusPriority(current)) map.set(path, status);
-    };
+  React.useLayoutEffect(() => {
+    visibleItemsRef.current = visibleItems;
+  }, [visibleItems]);
 
-    for (const entry of gitStatusEntries) {
-      const path = normalizePath(entry.path);
-      if (!path) continue;
-      assignBest(direct, path, entry.status);
-      let dir = dirname(path);
-      while (dir && dir !== "." && (dir === root || dir.startsWith(root === "/" ? "/" : `${root}/`))) {
-        assignBest(nested, dir, entry.status);
-        if (dir === root) break;
-        dir = dirname(dir);
-      }
+  React.useLayoutEffect(() => {
+    const anchor = pendingScrollAnchorRef.current;
+    const el = listRef.current;
+    if (!anchor || !el) return;
+
+    const index = findVisibleEntryIndex(visibleItems, anchor.path);
+    if (index < 0) {
+      pendingScrollAnchorRef.current = null;
+      return;
     }
-    return { direct, nested };
-  }, [gitStatusEntries, root]);
+
+    const nextTop = clampScrollTop(index * FILE_EXPLORER_ROW_HEIGHT - anchor.offsetTop, el);
+    pendingScrollAnchorRef.current = null;
+    if (Math.abs(el.scrollTop - nextTop) >= 0.5) {
+      el.scrollTop = nextTop;
+    }
+    setScrollTop((prev) => (prev === nextTop ? prev : nextTop));
+  }, [visibleItems]);
 
   React.useEffect(() => {
-    if (!isOpen || !activeFilePath) return;
+    if (!isOpen || !activeFilePath) {
+      lastRevealPathRef.current = null;
+      pendingRevealPathRef.current = null;
+      return;
+    }
     const active = normalizePath(activeFilePath);
-    if (!active || lastRevealPathRef.current === active) return;
+    if (!active) {
+      lastRevealPathRef.current = null;
+      pendingRevealPathRef.current = null;
+      return;
+    }
+    if (lastRevealPathRef.current === active) return;
     const ancestors = ancestorDirsWithinRoot(active, root);
-    if (ancestors.length === 0) return;
+    if (ancestors.length === 0) {
+      lastRevealPathRef.current = null;
+      pendingRevealPathRef.current = null;
+      return;
+    }
 
     lastRevealPathRef.current = active;
+    pendingRevealPathRef.current = active;
     setExpandedDirs((prev) => {
       const next = new Set(prev);
-      for (const dir of ancestors) next.add(dir);
-      return next;
+      let changed = false;
+      for (const dir of ancestors) {
+        if (next.has(dir)) continue;
+        next.add(dir);
+        changed = true;
+      }
+      return changed ? next : prev;
     });
     if (provider === "local" && watcherIdRef.current) {
       for (const dir of ancestors) {
@@ -1301,9 +1292,15 @@ export function FileExplorerPanel({
   }, [activeFilePath, isOpen, loadDirectory, provider, root]);
 
   React.useEffect(() => {
-    if (!activeFilePath || !listRef.current) return;
+    const pendingReveal = pendingRevealPathRef.current;
+    if (!pendingReveal || !activeFilePath || !listRef.current) return;
     const active = normalizePath(activeFilePath);
-    const index = visibleItems.findIndex((item) => item.type === "entry" && normalizePath(item.entry.path) === active);
+    if (active !== pendingReveal) {
+      pendingRevealPathRef.current = null;
+      return;
+    }
+
+    const index = findVisibleEntryIndex(visibleItems, active);
     if (index < 0) return;
 
     const el = listRef.current;
@@ -1311,9 +1308,16 @@ export function FileExplorerPanel({
     const bottom = top + FILE_EXPLORER_ROW_HEIGHT;
     const visibleTop = el.scrollTop;
     const visibleBottom = visibleTop + el.clientHeight;
-    if (top >= visibleTop && bottom <= visibleBottom) return;
+    if (top >= visibleTop && bottom <= visibleBottom) {
+      pendingRevealPathRef.current = null;
+      return;
+    }
 
-    const nextTop = Math.max(0, top - Math.max(0, Math.floor((el.clientHeight - FILE_EXPLORER_ROW_HEIGHT) / 2)));
+    const nextTop = clampScrollTop(
+      top - Math.max(0, Math.floor((el.clientHeight - FILE_EXPLORER_ROW_HEIGHT) / 2)),
+      el,
+    );
+    pendingRevealPathRef.current = null;
     el.scrollTop = nextTop;
     setScrollTop(nextTop);
   }, [activeFilePath, visibleItems]);
@@ -1321,7 +1325,17 @@ export function FileExplorerPanel({
   const toggleDir = React.useCallback(
     (dirPath: string) => {
       const path = normalizePath(dirPath);
-      let expanding = false;
+      const el = listRef.current;
+      const index = findVisibleEntryIndex(visibleItemsRef.current, path);
+      if (el && index >= 0) {
+        pendingScrollAnchorRef.current = {
+          path,
+          offsetTop: index * FILE_EXPLORER_ROW_HEIGHT - el.scrollTop,
+        };
+      }
+      pendingRevealPathRef.current = null;
+
+      const expanding = !expandedDirsRef.current.has(path);
       setExpandedDirs((prev) => {
         const next = new Set(prev);
         if (next.has(path)) {
@@ -1329,7 +1343,6 @@ export function FileExplorerPanel({
           return next;
         }
         next.add(path);
-        expanding = true;
         return next;
       });
       // Watch/unwatch for local filesystem watcher
@@ -1797,13 +1810,6 @@ export function FileExplorerPanel({
 
   if (!isOpen) return null;
 
-  const menuX = contextMenu
-    ? Math.min(contextMenu.x, Math.max(8, window.innerWidth - 268))
-    : 0;
-  const menuY = contextMenu
-    ? Math.min(contextMenu.y, Math.max(8, window.innerHeight - 320))
-    : 0;
-
   return (
     <aside className="fileExplorerPanel" aria-label="Files" ref={panelRef}>
       <div className="fileExplorerHeader">
@@ -1894,8 +1900,6 @@ export function FileExplorerPanel({
                   }
 
                   const entry = item.entry;
-                  const directGitStatus = gitDecorations.direct.get(entry.path) ?? null;
-                  const nestedGitStatus = entry.isDir ? gitDecorations.nested.get(entry.path) ?? null : null;
                   return (
                     <FileRow
                       key={entry.path}
@@ -1913,8 +1917,6 @@ export function FileExplorerPanel({
                       onMouseDown={handleMouseDown}
                       onMouseMove={handleMouseMove}
                       onMouseUp={handleMouseUp}
-                      gitStatus={directGitStatus ?? nestedGitStatus}
-                      gitNested={!directGitStatus && Boolean(nestedGitStatus)}
                     />
                   );
                 })}
@@ -1930,7 +1932,7 @@ export function FileExplorerPanel({
           ref={contextMenuRef}
           role="menu"
           aria-label={`Actions for ${contextMenu.entry.name}`}
-          style={{ top: menuY, left: menuX }}
+          style={{ top: contextMenuPos.top, left: contextMenuPos.left }}
         >
           <button
             type="button"

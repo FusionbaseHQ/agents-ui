@@ -1,7 +1,7 @@
 use crate::api_bridge::ApiEventBus;
 use crate::api_handlers::HandlerContext;
 use crate::api_types::StateChangeNotification;
-use crate::mcp_tools::{self, CommandCompletion, CommandCompletionBuffers, IdleNotifications, OutputBuffer, OutputBuffers};
+use crate::mcp_tools::{self, CommandCompletion, CommandCompletionBuffers, IdleNotifications, OutputBuffer, OutputBuffers, SessionNotifications};
 use crate::server_control::ServerControl;
 use axum::http::HeaderMap;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Router};
@@ -15,13 +15,34 @@ use tokio::sync::watch;
 
 const MCP_PORT: u16 = 45557;
 
+/// Name of the environment variable carrying the MCP bearer token. Injected
+/// into PTY sessions and agent processes the app spawns, so CLIs registered
+/// with `--bearer-token-env-var` (Codex) authenticate transparently.
+pub const MCP_TOKEN_ENV_VAR: &str = "AGENTS_UI_MCP_TOKEN";
+
+/// Process-lifetime MCP auth token, created lazily on first use so PTY
+/// sessions spawned before the MCP server starts still carry the right value.
+/// Stable across MCP server restarts within one app run, so CLI registrations
+/// stay valid when the server is toggled off/on.
+static CURRENT_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn get_or_init_auth_token() -> String {
+    CURRENT_TOKEN
+        .get_or_init(crate::api_discovery::generate_token)
+        .clone()
+}
+
 struct McpState {
     ctx: Arc<HandlerContext>,
     output_buffers: OutputBuffers,
     completion_buffers: CommandCompletionBuffers,
     idle_notifications: IdleNotifications,
+    output_waiters: SessionNotifications,
+    completion_waiters: SessionNotifications,
+    idle_waiters: SessionNotifications,
     session_id: String,
     app_version: String,
+    auth_token: String,
 }
 
 #[allow(dead_code)]
@@ -48,6 +69,9 @@ async fn start_mcp_server_inner(
     let output_buffers: OutputBuffers = app_handle.state::<OutputBuffers>().inner().clone();
     let completion_buffers: CommandCompletionBuffers = Default::default();
     let idle_notifications: IdleNotifications = Default::default();
+    let output_waiters: SessionNotifications = Default::default();
+    let completion_waiters: SessionNotifications = Default::default();
+    let idle_waiters: SessionNotifications = Default::default();
     let app_version = app_handle
         .config()
         .version
@@ -59,19 +83,32 @@ async fn start_mcp_server_inner(
     OsRng.fill_bytes(&mut bytes);
     let session_id = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
 
+    // Bearer token required on every /mcp request. The MCP tools can spawn
+    // shells and run commands, so the TCP port must not be drivable by
+    // arbitrary local processes or DNS-rebound web pages. The token is shared
+    // with clients via the discovery file and CLI registration below.
+    let auth_token = get_or_init_auth_token();
+
     let state = Arc::new(McpState {
         ctx,
         output_buffers: output_buffers.clone(),
         completion_buffers: completion_buffers.clone(),
         idle_notifications: idle_notifications.clone(),
+        output_waiters: output_waiters.clone(),
+        completion_waiters: completion_waiters.clone(),
+        idle_waiters: idle_waiters.clone(),
         session_id,
         app_version,
+        auth_token: auth_token.clone(),
     });
 
     // Spawn output buffer background task
     let buffers_clone = output_buffers.clone();
     let completions_clone = completion_buffers.clone();
     let idle_clone = idle_notifications.clone();
+    let output_waiters_clone = output_waiters.clone();
+    let completion_waiters_clone = completion_waiters.clone();
+    let idle_waiters_clone = idle_waiters.clone();
     let event_bus = app_handle.state::<ApiEventBus>().inner().clone();
     let mut event_rx = event_bus.sender().subscribe();
 
@@ -79,7 +116,15 @@ async fn start_mcp_server_inner(
         loop {
             match event_rx.recv().await {
                 Ok(notification) => {
-                    handle_event_notification(&buffers_clone, &completions_clone, &idle_clone, &notification).await;
+                    handle_event_notification(
+                        &buffers_clone,
+                        &completions_clone,
+                        &idle_clone,
+                        &output_waiters_clone,
+                        &completion_waiters_clone,
+                        &idle_waiters_clone,
+                        &notification,
+                    ).await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     eprintln!("[mcp] output buffer lagged, missed {n} events");
@@ -116,7 +161,7 @@ async fn start_mcp_server_inner(
 
     // Update discovery file with MCP URL (retry — api_server may not have written it yet)
     for i in 0..20 {
-        match crate::api_discovery::update_mcp_url(port) {
+        match crate::api_discovery::update_mcp_url(port, &auth_token) {
             Ok(()) => {
                 eprintln!("[mcp] wrote mcp_url to discovery file");
                 break;
@@ -135,8 +180,9 @@ async fn start_mcp_server_inner(
 
     // Register MCP server with agent CLIs (non-blocking)
     let reg_port = port;
+    let reg_token = auth_token.clone();
     tokio::task::spawn_blocking(move || {
-        let result = crate::agent::do_register_mcp_with_agents(reg_port);
+        let result = crate::agent::do_register_mcp_with_agents(reg_port, &reg_token);
         if result.claude_code.success {
             eprintln!("[mcp-reg] Claude Code: registered");
         } else if let Some(ref e) = result.claude_code.error {
@@ -191,7 +237,12 @@ async fn start_mcp_server_inner(
         if disc_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&disc_path) {
                 if let Ok(mut file) = serde_json::from_str::<crate::api_discovery::DiscoveryFile>(&content) {
+                    // Don't clobber a discovery file another instance owns.
+                    if file.pid != std::process::id() {
+                        return;
+                    }
                     file.mcp_url = None;
+                    file.mcp_token = None;
                     if let Ok(json) = serde_json::to_string_pretty(&file) {
                         let _ = std::fs::write(&disc_path, &json);
                     }
@@ -205,6 +256,9 @@ async fn handle_event_notification(
     buffers: &OutputBuffers,
     completion_buffers: &CommandCompletionBuffers,
     idle_notifications: &IdleNotifications,
+    output_waiters: &SessionNotifications,
+    completion_waiters: &SessionNotifications,
+    idle_waiters: &SessionNotifications,
     notification: &StateChangeNotification,
 ) {
     match notification.event.as_str() {
@@ -213,10 +267,13 @@ async fn handle_event_notification(
                 notification.data.get("sessionId").and_then(|v| v.as_str()),
                 notification.data.get("output").and_then(|v| v.as_str()),
             ) {
-                let mut bufs = buffers.lock().await;
-                bufs.entry(session_id.to_string())
-                    .or_insert_with(OutputBuffer::new)
-                    .append(output.to_string());
+                {
+                    let mut bufs = buffers.lock().await;
+                    bufs.entry(session_id.to_string())
+                        .or_insert_with(OutputBuffer::new)
+                        .append(output.to_string());
+                }
+                mcp_tools::notify_session(output_waiters, session_id).await;
             }
         }
         "shell.command_complete" => {
@@ -227,13 +284,16 @@ async fn handle_event_notification(
                     output: notification.data.get("output").and_then(|v| v.as_str()).map(|s| s.to_string()),
                     duration_ms: notification.data.get("durationMs").and_then(|v| v.as_i64()),
                 };
-                let mut bufs = completion_buffers.lock().await;
-                let entries = bufs.entry(session_id.to_string()).or_insert_with(Vec::new);
-                entries.push(completion);
-                // Cap at MAX_COMPLETIONS_PER_SESSION
-                while entries.len() > mcp_tools::MAX_COMPLETIONS_PER_SESSION {
-                    entries.remove(0);
+                {
+                    let mut bufs = completion_buffers.lock().await;
+                    let entries = bufs.entry(session_id.to_string()).or_insert_with(Vec::new);
+                    entries.push(completion);
+                    // Cap at MAX_COMPLETIONS_PER_SESSION
+                    while entries.len() > mcp_tools::MAX_COMPLETIONS_PER_SESSION {
+                        entries.remove(0);
+                    }
                 }
+                mcp_tools::notify_session(completion_waiters, session_id).await;
             }
         }
         "shell.prompt_ready" => {
@@ -241,12 +301,15 @@ async fn handle_event_notification(
                 notification.data.get("sessionId").and_then(|v| v.as_str()),
                 notification.data.get("timestamp").and_then(|v| v.as_u64()),
             ) {
-                let mut notifs = idle_notifications.lock().await;
-                let entries = notifs.entry(session_id.to_string()).or_insert_with(Vec::new);
-                entries.push(timestamp);
-                while entries.len() > mcp_tools::MAX_IDLE_NOTIFICATIONS_PER_SESSION {
-                    entries.remove(0);
+                {
+                    let mut notifs = idle_notifications.lock().await;
+                    let entries = notifs.entry(session_id.to_string()).or_insert_with(Vec::new);
+                    entries.push(timestamp);
+                    while entries.len() > mcp_tools::MAX_IDLE_NOTIFICATIONS_PER_SESSION {
+                        entries.remove(0);
+                    }
                 }
+                mcp_tools::notify_session(idle_waiters, session_id).await;
             }
         }
         "sessions.exit" => {
@@ -256,12 +319,43 @@ async fn handle_event_notification(
     }
 }
 
+/// Compare tokens without early exit, so timing doesn't leak prefix matches.
+fn constant_time_token_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 async fn handle_mcp_request(
     State(state): State<Arc<McpState>>,
+    request_headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
     let mut headers = HeaderMap::new();
     headers.insert("content-type", "application/json".parse().unwrap());
+
+    let authorized = request_headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| constant_time_token_eq(t, &state.auth_token))
+        .unwrap_or(false);
+    if !authorized {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": { "code": -32001, "message": "Unauthorized: missing or invalid bearer token" }
+        })
+        .to_string();
+        return (StatusCode::UNAUTHORIZED, headers, body);
+    }
 
     // Try parsing as a single JSON-RPC message
     let parsed: Value = match serde_json::from_str(&body) {
@@ -338,7 +432,17 @@ async fn process_mcp_message(state: &McpState, msg: &Value) -> (Option<Value>, b
             let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-            match mcp_tools::call_tool(&state.ctx, &state.output_buffers, &state.completion_buffers, &state.idle_notifications, tool_name, arguments).await {
+            match mcp_tools::call_tool(
+                &state.ctx,
+                &state.output_buffers,
+                &state.completion_buffers,
+                &state.idle_notifications,
+                &state.output_waiters,
+                &state.completion_waiters,
+                &state.idle_waiters,
+                tool_name,
+                arguments,
+            ).await {
                 Ok(result) => result,
                 Err(err) => {
                     json!({

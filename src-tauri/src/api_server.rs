@@ -290,6 +290,7 @@ async fn handle_connection(
     let state_clone = state.clone();
     let out_tx_events = out_tx.clone();
     let event_task = tokio::spawn(async move {
+        let mut dropped_events: u64 = 0;
         loop {
             match event_rx.recv().await {
                 Ok(notification) => {
@@ -305,6 +306,21 @@ async fn handle_connection(
 
                     for sub in state.subscriptions.values() {
                         if sub.matches(&notification.event, session_id.as_deref()) {
+                            // A slow client gets an explicit gap notice as soon
+                            // as its channel has room again, so dropped events
+                            // are never silent — external tools know to re-sync.
+                            if dropped_events > 0 {
+                                let gap = JsonRpcNotification::new(
+                                    "event_gap",
+                                    serde_json::json!({ "droppedEvents": dropped_events }),
+                                );
+                                if let Ok(mut bytes) = serde_json::to_vec(&gap) {
+                                    bytes.push(b'\n');
+                                    if out_tx_events.try_send(bytes).is_ok() {
+                                        dropped_events = 0;
+                                    }
+                                }
+                            }
                             let payload = EventPayload {
                                 subscription_id: sub.id.clone(),
                                 event: notification.event.clone(),
@@ -317,14 +333,16 @@ async fn handle_connection(
                             if let Ok(mut bytes) = serde_json::to_vec(&notif) {
                                 bytes.push(b'\n');
                                 if out_tx_events.try_send(bytes).is_err() {
-                                    // Channel full — client not reading fast enough, drop event
+                                    // Channel full — client not reading fast enough
+                                    dropped_events += 1;
                                 }
                             }
                         }
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // Missed some events — continue
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    // Missed some events — counted into the next gap notice
+                    dropped_events += n;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     break;

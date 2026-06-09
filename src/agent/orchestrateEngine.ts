@@ -23,7 +23,7 @@ Rules:
 - Each task should be independently executable by a coding agent in a terminal
 - Use "dependencies" to specify task IDs that must complete first (e.g. ["1", "2"])
 - "assignee" must be "claude-code" or "codex"
-- "model" is optional. For claude-code: "opus", "sonnet", "haiku". For codex: "gpt-5.5", "gpt-5.3-codex", "gpt-5.3-codex-spark"
+- "model" is optional. For claude-code: "fable", "opus", "sonnet", "haiku". For codex: "gpt-5.5", "gpt-5.3-codex", "gpt-5.3-codex-spark"
 - Keep tasks focused — each should take a single agent session
 - Minimize dependencies to maximize parallelism
 - 2-8 tasks is typical for most goals
