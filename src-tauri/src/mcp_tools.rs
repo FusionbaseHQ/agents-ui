@@ -10,6 +10,9 @@ use tokio::sync::{Mutex, Notify};
 pub struct OutputBuffer {
     pub chunks: Vec<String>,
     pub total_bytes: usize,
+    /// True if eviction dropped output since the last read — surfaced to the
+    /// reader so truncation is never silent.
+    pub overflowed: bool,
 }
 
 const MAX_BUFFER_BYTES: usize = 200 * 1024; // 200KB per session
@@ -19,6 +22,7 @@ impl OutputBuffer {
         Self {
             chunks: Vec::new(),
             total_bytes: 0,
+            overflowed: false,
         }
     }
 
@@ -30,16 +34,19 @@ impl OutputBuffer {
         while self.total_bytes > MAX_BUFFER_BYTES && !self.chunks.is_empty() {
             let removed = self.chunks.remove(0);
             self.total_bytes -= removed.len();
+            self.overflowed = true;
         }
     }
 
     pub fn read_and_clear(&mut self, raw: bool) -> String {
         let text: String = self.chunks.drain(..).collect();
         self.total_bytes = 0;
-        if raw {
-            text
+        let overflowed = std::mem::take(&mut self.overflowed);
+        let text = if raw { text } else { strip_ansi(&text) };
+        if overflowed {
+            format!("[note: output buffer overflowed; oldest output was dropped]\n{text}")
         } else {
-            strip_ansi(&text)
+            text
         }
     }
 

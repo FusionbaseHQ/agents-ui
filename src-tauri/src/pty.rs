@@ -1801,7 +1801,12 @@ pub fn create_session(
     let id_for_emitter: Arc<str> = Arc::from(id.as_str());
     let state_for_emitter = state.inner().clone();
     let app_for_emitter = app.clone();
-    let (tx, rx) = mpsc::channel::<String>();
+    // Bounded channel so a flooding child can't grow the queue without limit:
+    // when the emitter falls behind, send() blocks the reader, the kernel PTY
+    // buffer fills, and the child throttles on write — the same backpressure a
+    // real terminal applies. No output is ever dropped. 256 slots × ≤64 KiB
+    // reads gives ample burst absorption before that kicks in.
+    let (tx, rx) = mpsc::sync_channel::<String>(256);
 
     // Reader thread: reads from PTY, decodes UTF-8, sends strings to channel.
     // Blocking reader.read() is isolated here so the emitter can flush on timeout.
@@ -2175,9 +2180,30 @@ pub fn close_session(state: State<'_, AppState>, id: String) -> Result<(), Strin
     if session.closing {
         return Ok(());
     }
+    // Flush any buffered recording tail now rather than relying on BufWriter's
+    // silent Drop flush when the emitter thread removes the session.
+    if let Some(rec) = session.recording.as_mut() {
+        let _ = rec.writer.flush();
+    }
     session.closing = true;
     let _ = session.child.kill();
     Ok(())
+}
+
+/// Best-effort cleanup at app exit: process exit does not run destructors for
+/// managed state, so buffered recording tails would be lost and children would
+/// only learn of the exit via PTY EOF. Flush every recording and kill children.
+pub fn shutdown_flush_all(state: &AppState) {
+    let Ok(mut sessions) = state.inner.sessions.lock() else {
+        return;
+    };
+    for session in sessions.values_mut() {
+        if let Some(rec) = session.recording.as_mut() {
+            let _ = rec.writer.flush();
+        }
+        session.closing = true;
+        let _ = session.child.kill();
+    }
 }
 
 #[tauri::command]

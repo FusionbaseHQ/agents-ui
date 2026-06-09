@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::files::{probe_from_sample, FileProbe, FsEntry, MAX_RANGE_READ_BYTES, PROBE_BYTES};
 
@@ -304,6 +304,38 @@ fn is_transient_ssh_error(stderr: &str) -> bool {
         || s.contains("operation timed out")
 }
 
+/// How long a successful master check stays valid before we re-verify with a
+/// fresh `ssh -O check`. The master is kept alive by ControlPersist=300s +
+/// ServerAliveInterval, so within this window the check is almost always
+/// redundant — and if the master does die anyway, run_ssh's transient-error
+/// retry path (close_master → ensure_master) rebuilds it transparently.
+const MASTER_CHECK_TTL: Duration = Duration::from_secs(30);
+
+fn master_verified_cache() -> &'static Mutex<HashMap<String, Instant>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn master_recently_verified(target: &str) -> bool {
+    master_verified_cache()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(target).map(|t| t.elapsed() < MASTER_CHECK_TTL))
+        .unwrap_or(false)
+}
+
+fn mark_master_verified(target: &str) {
+    if let Ok(mut map) = master_verified_cache().lock() {
+        map.insert(target.to_string(), Instant::now());
+    }
+}
+
+fn invalidate_master_verified(target: &str) {
+    if let Ok(mut map) = master_verified_cache().lock() {
+        map.remove(target);
+    }
+}
+
 /// Whether a multiplexing master process is currently registered for `target`.
 fn master_is_alive(target: &str) -> bool {
     let (Ok(ssh), Ok(common)) = (program_path("ssh"), ssh_common_args()) else {
@@ -324,6 +356,7 @@ fn master_is_alive(target: &str) -> bool {
 /// Tear down the master for `target` (best effort) — used when it looks stale
 /// (process alive but its underlying connection dead).
 fn close_master(target: &str) {
+    invalidate_master_verified(target);
     let (Ok(ssh), Ok(common)) = (program_path("ssh"), ssh_common_args()) else {
         return;
     };
@@ -346,7 +379,15 @@ fn ensure_master(target: &str) -> Result<(), String> {
     let lock = ssh_master_lock(target);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
 
+    // Skip the `ssh -O check` process spawn when the master was verified
+    // recently — per-op this check used to dominate burst latency (probe +
+    // N chunk reads = N+1 spawns).
+    if master_recently_verified(target) {
+        return Ok(());
+    }
+
     if master_is_alive(target) {
+        mark_master_verified(target);
         return Ok(());
     }
 
@@ -357,6 +398,7 @@ fn ensure_master(target: &str) -> Result<(), String> {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(250 * attempt as u64));
             if master_is_alive(target) {
+                mark_master_verified(target);
                 return Ok(());
             }
         }
@@ -372,6 +414,7 @@ fn ensure_master(target: &str) -> Result<(), String> {
             .output()
             .map_err(|e| format!("spawn ssh failed: {e}"))?;
         if output.status.success() {
+            mark_master_verified(target);
             return Ok(());
         }
         last_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -728,16 +771,23 @@ fn ssh_search_pass(
         return Ok(());
     }
 
+    // `awk` exits at `limit` matches (find then dies on SIGPIPE), and the
+    // optional `timeout` runner bounds the walk on huge trees with few matches
+    // — partial results beat a multi-minute stall. The probe (`timeout 1 true`)
+    // confirms coreutils-style syntax before relying on it.
     let script = r#"root=$1
 query=$2
 limit=$3
 include_hidden=$4
 q=$(printf '%s' "$query" | tr '[:upper:]' '[:lower:]')
+runner=""
+if timeout 1 true >/dev/null 2>&1; then runner="timeout 15"; fi
 if [ "$include_hidden" = "1" ]; then
-  find "$root" -mindepth 1 \( -type d \( -name .git -o -name .hg -o -name .svn -o -name node_modules -o -name target -o -name dist -o -name build -o -name .next -o -name .nuxt -o -name .cache -o -name .turbo -o -name .venv -o -name venv -o -name __pycache__ -o -name .npm -o -name .pnpm-store -o -name .yarn \) -prune \) -o -type f -print 2>/dev/null
+  $runner find "$root" -mindepth 1 \( -type d \( -name .git -o -name .hg -o -name .svn -o -name node_modules -o -name target -o -name dist -o -name build -o -name .next -o -name .nuxt -o -name .cache -o -name .turbo -o -name .venv -o -name venv -o -name __pycache__ -o -name .npm -o -name .pnpm-store -o -name .yarn \) -prune \) -o -type f -print 2>/dev/null
 else
-  find "$root" -mindepth 1 \( -type d \( -name .git -o -name .hg -o -name .svn -o -name node_modules -o -name target -o -name dist -o -name build -o -name .next -o -name .nuxt -o -name .cache -o -name .turbo -o -name .venv -o -name venv -o -name __pycache__ -o -name .npm -o -name .pnpm-store -o -name .yarn -o -name '.*' \) -prune \) -o -type f -print 2>/dev/null
+  $runner find "$root" -mindepth 1 \( -type d \( -name .git -o -name .hg -o -name .svn -o -name node_modules -o -name target -o -name dist -o -name build -o -name .next -o -name .nuxt -o -name .cache -o -name .turbo -o -name .venv -o -name venv -o -name __pycache__ -o -name .npm -o -name .pnpm-store -o -name .yarn -o -name '.*' \) -prune \) -o -type f -print 2>/dev/null
 fi | awk -v q="$q" -v limit="$limit" 'BEGIN { count = 0 } { low = tolower($0); if (index(low, q) > 0) { print; count++; if (count >= limit) exit } }'
+exit 0
 "#;
 
     let args = vec![
@@ -951,7 +1001,10 @@ fn ssh_write_text_file_sync(target: String, root: String, path: String, content:
     ensure_not_root(&root, &path, "write")?;
 
     // Note: The editor uses a separate "dirty" flag, so avoid appending extra newlines here.
-    let script = r#"set -e; file="$1"; [ -f "$file" ] || { echo "not a file" >&2; exit 1; }; dir="$(dirname "$file")"; tmp=""; if command -v mktemp >/dev/null 2>&1; then tmp="$(mktemp "$dir/.agents-ui-tmp.XXXXXXXX" 2>/dev/null || true)"; fi; if [ -z "$tmp" ]; then tmp="$dir/.agents-ui-tmp.$$"; rm -f "$tmp"; fi; cat > "$tmp"; mv "$tmp" "$file""#;
+    // The EXIT trap removes the temp file on any failure (after a successful mv
+    // it no longer exists, so the rm is a no-op). Permissions are copied from
+    // the original before the rename, since mktemp creates 0600.
+    let script = r#"set -e; file="$1"; [ -f "$file" ] || { echo "not a file" >&2; exit 1; }; dir="$(dirname "$file")"; tmp=""; if command -v mktemp >/dev/null 2>&1; then tmp="$(mktemp "$dir/.agents-ui-tmp.XXXXXXXX" 2>/dev/null || true)"; fi; if [ -z "$tmp" ]; then tmp="$dir/.agents-ui-tmp.$$"; rm -f "$tmp"; fi; trap 'rm -f "$tmp"' EXIT; cat > "$tmp"; perms="$(stat -c %a "$file" 2>/dev/null || stat -f %Lp "$file" 2>/dev/null || echo '')"; if [ -n "$perms" ]; then chmod "$perms" "$tmp" 2>/dev/null || true; fi; mv "$tmp" "$file""#;
 
     let command = build_sh_c_command(script, Some("--"), &[path]);
     let args = vec![command];
@@ -1080,6 +1133,23 @@ fn ssh_delete_fs_entry_sync(target: String, root: String, path: String) -> Resul
     Ok(())
 }
 
+/// Escape a remote path for scp. In legacy scp mode the path is interpreted by
+/// the remote shell; in sftp mode (OpenSSH ≥ 9 default) it goes through the
+/// client-side glob parser. Backslash-escaping is honored by both, so spaces,
+/// quotes and glob metacharacters reach the server literally.
+fn scp_escape_remote_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for ch in path.chars() {
+        let safe = ch.is_ascii_alphanumeric()
+            || matches!(ch, '/' | '-' | '_' | '.' | '+' | ',' | '@' | ':' | '=' | '%');
+        if !safe {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn run_scp(scp_flags: &[&str], ssh_args: Vec<String>, paths: &[String]) -> Result<Output, String> {
     let mut cmd = Command::new(program_path("scp")?);
     // scp flags first (like -r)
@@ -1127,8 +1197,9 @@ fn ssh_download_file_sync(
 
     // Use scp -r for recursive copy (works for files and directories)
     // Format: scp -r user@host:/remote/path /local/path
-    // Note: No shell escaping needed - scp handles paths directly
-    let source = format!("{}:{}", target, remote_path);
+    // Remote path must be escaped (remote shell in legacy mode, client-side
+    // glob in sftp mode); the local path is passed verbatim.
+    let source = format!("{}:{}", target, scp_escape_remote_path(&remote_path));
     let paths = vec![source, local.to_string()];
     let output = run_scp(&["-r"], ssh_common_args()?, &paths)?;
     if !output.status.success() {
@@ -1173,8 +1244,9 @@ fn ssh_upload_file_sync(
 
     // Use scp -r for recursive copy (works for files and directories)
     // Format: scp -r /local/path user@host:/remote/path
-    // Note: No shell escaping needed - scp handles paths directly
-    let dest = format!("{}:{}", target, remote_path);
+    // Remote path must be escaped (remote shell in legacy mode, client-side
+    // glob in sftp mode); the local path is passed verbatim.
+    let dest = format!("{}:{}", target, scp_escape_remote_path(&remote_path));
     let paths = vec![local.to_string(), dest];
     let output = run_scp(&["-r"], ssh_common_args()?, &paths)?;
     if !output.status.success() {
@@ -1230,9 +1302,8 @@ fn ssh_download_to_temp_sync(
     let local_path = unique_dir.join(file_name);
     let local_path_str = local_path.to_string_lossy().to_string();
 
-    // Download using scp
-    // Note: No shell escaping needed - scp handles paths directly
-    let source = format!("{}:{}", target, remote_path);
+    // Download using scp (remote path escaped for both scp protocol modes)
+    let source = format!("{}:{}", target, scp_escape_remote_path(&remote_path));
     let paths = vec![source, local_path_str.clone()];
     let output = run_scp(&["-r"], ssh_common_args()?, &paths)?;
     if !output.status.success() {

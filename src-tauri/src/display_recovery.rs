@@ -100,7 +100,13 @@ mod imp {
             if let Ok(sz) = win.inner_size() {
                 let w = sz.width.max(2);
                 let h = sz.height.max(2);
-                *cell1.lock().unwrap() = Some((w, h));
+                // These closures run on the main thread — never panic here, a
+                // poisoned lock just skips the kick (the JS recovery still ran).
+                let Ok(mut guard) = cell1.lock() else {
+                    return;
+                };
+                *guard = Some((w, h));
+                drop(guard);
                 let _ = win.set_size(tauri::PhysicalSize::new(w - 1, h));
             }
         });
@@ -111,7 +117,7 @@ mod imp {
         let app2 = app.clone();
         let cell2 = size_cell;
         let _ = app.run_on_main_thread(move || {
-            let Some((w, h)) = *cell2.lock().unwrap() else {
+            let Some((w, h)) = cell2.lock().ok().and_then(|guard| *guard) else {
                 return;
             };
             if let Some(win) = app2.get_window("main") {

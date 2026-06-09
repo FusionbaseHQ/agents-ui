@@ -240,15 +240,22 @@ pub fn save_persisted_state(app: AppHandle, state: PersistedStateV1) -> Result<(
 
     let json = serde_json::to_string(&state).map_err(|e| format!("serialize failed: {e}"))?;
 
-    let mut file = fs::File::create(&tmp).map_err(|e| format!("write temp failed: {e}"))?;
-    file.write_all(json.as_bytes())
-        .map_err(|e| format!("write temp failed: {e}"))?;
-    file.write_all(b"\n")
-        .map_err(|e| format!("write temp failed: {e}"))?;
-    file.sync_all().ok();
-    drop(file);
+    let write_result = (|| -> Result<(), String> {
+        let mut file = fs::File::create(&tmp).map_err(|e| format!("write temp failed: {e}"))?;
+        file.write_all(json.as_bytes())
+            .map_err(|e| format!("write temp failed: {e}"))?;
+        file.write_all(b"\n")
+            .map_err(|e| format!("write temp failed: {e}"))?;
+        file.sync_all().ok();
+        drop(file);
 
-    fs::rename(&tmp, &path).map_err(|e| format!("rename failed: {e}"))?;
+        fs::rename(&tmp, &path).map_err(|e| format!("rename failed: {e}"))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_result?;
 
     // Best-effort: ensure the directory entry for the rename is durable.
     let _ = fs::File::open(dir).and_then(|dir_handle| dir_handle.sync_all());

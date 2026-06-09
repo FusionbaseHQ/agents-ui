@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::{
     collections::VecDeque,
     fs::{self, File},
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -480,7 +480,39 @@ pub fn write_text_file(root: String, path: String, content: String) -> Result<()
     if !file.is_file() {
         return Err("not a file".to_string());
     }
-    fs::write(&file, content.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
+
+    // Write to a sibling temp file and rename over the original so a crash or
+    // full disk mid-write can never leave the file truncated. The rename also
+    // means the watcher/editor sees either the old or the new content, never a
+    // partial state.
+    let original_perms = fs::metadata(&file).ok().map(|m| m.permissions());
+    let dir = file.parent().ok_or("invalid file path")?;
+    let file_name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("invalid file name")?;
+    let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
+
+    let write_result = (|| -> Result<(), String> {
+        let mut out = File::create(&tmp).map_err(|e| format!("write failed: {e}"))?;
+        out.write_all(content.as_bytes())
+            .map_err(|e| format!("write failed: {e}"))?;
+        out.sync_all().map_err(|e| format!("sync failed: {e}"))?;
+        drop(out);
+        if let Some(perms) = original_perms {
+            let _ = fs::set_permissions(&tmp, perms);
+        }
+        fs::rename(&tmp, &file).map_err(|e| format!("rename failed: {e}"))?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_result?;
+
+    // Best-effort: make the directory entry for the rename durable.
+    let _ = File::open(dir).and_then(|d| d.sync_all());
     Ok(())
 }
 

@@ -10,6 +10,8 @@ pub struct DiscoveryFile {
     pub token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_token: Option<String>,
 }
 
 fn agents_ui_dir() -> Result<PathBuf, String> {
@@ -53,6 +55,7 @@ pub fn write_discovery_file(token: &str) -> Result<PathBuf, String> {
         pid: std::process::id(),
         token: token.to_string(),
         mcp_url: None,
+        mcp_token: None,
     };
 
     let json = serde_json::to_string_pretty(&file)
@@ -69,13 +72,14 @@ pub fn write_discovery_file(token: &str) -> Result<PathBuf, String> {
     Ok(disc)
 }
 
-pub fn update_mcp_url(port: u16) -> Result<(), String> {
+pub fn update_mcp_url(port: u16, mcp_token: &str) -> Result<(), String> {
     let disc = discovery_path()?;
     let content = fs::read_to_string(&disc)
         .map_err(|e| format!("read discovery file failed: {e}"))?;
     let mut file: DiscoveryFile = serde_json::from_str(&content)
         .map_err(|e| format!("parse discovery file failed: {e}"))?;
     file.mcp_url = Some(format!("http://127.0.0.1:{port}/mcp"));
+    file.mcp_token = Some(mcp_token.to_string());
     let json = serde_json::to_string_pretty(&file)
         .map_err(|e| format!("serialize failed: {e}"))?;
     fs::write(&disc, &json).map_err(|e| format!("write failed: {e}"))?;

@@ -15,6 +15,22 @@ use tokio::sync::watch;
 
 const MCP_PORT: u16 = 45557;
 
+/// Auth token of the currently running MCP server, if any. Used by the
+/// re-registration command so CLI registrations always carry the live token.
+static CURRENT_TOKEN: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+fn token_cell() -> &'static std::sync::Mutex<Option<String>> {
+    CURRENT_TOKEN.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+pub fn current_auth_token() -> Option<String> {
+    token_cell()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
 struct McpState {
     ctx: Arc<HandlerContext>,
     output_buffers: OutputBuffers,
@@ -25,6 +41,7 @@ struct McpState {
     idle_waiters: SessionNotifications,
     session_id: String,
     app_version: String,
+    auth_token: String,
 }
 
 #[allow(dead_code)]
@@ -65,6 +82,15 @@ async fn start_mcp_server_inner(
     OsRng.fill_bytes(&mut bytes);
     let session_id = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
 
+    // Bearer token required on every /mcp request. The MCP tools can spawn
+    // shells and run commands, so the TCP port must not be drivable by
+    // arbitrary local processes or DNS-rebound web pages. The token is shared
+    // with clients via the discovery file and CLI registration below.
+    let auth_token = crate::api_discovery::generate_token();
+    if let Ok(mut guard) = token_cell().lock() {
+        *guard = Some(auth_token.clone());
+    }
+
     let state = Arc::new(McpState {
         ctx,
         output_buffers: output_buffers.clone(),
@@ -75,6 +101,7 @@ async fn start_mcp_server_inner(
         idle_waiters: idle_waiters.clone(),
         session_id,
         app_version,
+        auth_token: auth_token.clone(),
     });
 
     // Spawn output buffer background task
@@ -136,7 +163,7 @@ async fn start_mcp_server_inner(
 
     // Update discovery file with MCP URL (retry — api_server may not have written it yet)
     for i in 0..20 {
-        match crate::api_discovery::update_mcp_url(port) {
+        match crate::api_discovery::update_mcp_url(port, &auth_token) {
             Ok(()) => {
                 eprintln!("[mcp] wrote mcp_url to discovery file");
                 break;
@@ -155,8 +182,9 @@ async fn start_mcp_server_inner(
 
     // Register MCP server with agent CLIs (non-blocking)
     let reg_port = port;
+    let reg_token = auth_token.clone();
     tokio::task::spawn_blocking(move || {
-        let result = crate::agent::do_register_mcp_with_agents(reg_port);
+        let result = crate::agent::do_register_mcp_with_agents(reg_port, &reg_token);
         if result.claude_code.success {
             eprintln!("[mcp-reg] Claude Code: registered");
         } else if let Some(ref e) = result.claude_code.error {
@@ -206,12 +234,17 @@ async fn start_mcp_server_inner(
         sc.mcp_running.store(false, Ordering::Relaxed);
     }
 
+    if let Ok(mut guard) = token_cell().lock() {
+        *guard = None;
+    }
+
     // Remove mcp_url from discovery file
     if let Ok(disc_path) = crate::api_discovery::discovery_path() {
         if disc_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&disc_path) {
                 if let Ok(mut file) = serde_json::from_str::<crate::api_discovery::DiscoveryFile>(&content) {
                     file.mcp_url = None;
+                    file.mcp_token = None;
                     if let Ok(json) = serde_json::to_string_pretty(&file) {
                         let _ = std::fs::write(&disc_path, &json);
                     }
@@ -288,12 +321,43 @@ async fn handle_event_notification(
     }
 }
 
+/// Compare tokens without early exit, so timing doesn't leak prefix matches.
+fn constant_time_token_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 async fn handle_mcp_request(
     State(state): State<Arc<McpState>>,
+    request_headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
     let mut headers = HeaderMap::new();
     headers.insert("content-type", "application/json".parse().unwrap());
+
+    let authorized = request_headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| constant_time_token_eq(t, &state.auth_token))
+        .unwrap_or(false);
+    if !authorized {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": { "code": -32001, "message": "Unauthorized: missing or invalid bearer token" }
+        })
+        .to_string();
+        return (StatusCode::UNAUTHORIZED, headers, body);
+    }
 
     // Try parsing as a single JSON-RPC message
     let parsed: Value = match serde_json::from_str(&body) {

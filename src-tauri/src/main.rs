@@ -225,6 +225,12 @@ fn main() {
         .run(|app, event| {
             match event {
                 tauri::RunEvent::Exit => {
+                    // Flush recording buffers and kill PTY children before the
+                    // process exits — destructors won't run for managed state.
+                    {
+                        use tauri::Manager;
+                        pty::shutdown_flush_all(&app.state::<pty::AppState>());
+                    }
                     api_discovery::cleanup();
                 }
                 tauri::RunEvent::Resumed { .. } => {
