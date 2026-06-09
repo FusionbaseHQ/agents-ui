@@ -12,6 +12,116 @@ import { useChunkCache } from "../fileViewer/useChunkCache";
 import { registerCodeEditorThemes, type CodeEditorThemeId } from "../monaco/editorThemes";
 
 type MonacoType = typeof import("monaco-editor");
+type MonacoTypeScriptDefaults = {
+  addExtraLib: (content: string, filePath?: string) => { dispose: () => void };
+  getCompilerOptions: () => Record<string, unknown>;
+  getDiagnosticsOptions: () => Record<string, unknown>;
+  setCompilerOptions: (options: Record<string, unknown>) => void;
+  setDiagnosticsOptions: (options: Record<string, unknown>) => void;
+};
+type MonacoTypeScriptApi = {
+  typescriptDefaults: MonacoTypeScriptDefaults;
+  javascriptDefaults: MonacoTypeScriptDefaults;
+  JsxEmit: { ReactJSX: unknown };
+};
+
+const REACT_JSX_EXTRA_LIB = `
+declare namespace JSX {
+  interface Element {}
+  interface ElementClass {
+    render?: any;
+  }
+  interface ElementAttributesProperty {
+    props: {};
+  }
+  interface ElementChildrenAttribute {
+    children: {};
+  }
+  interface IntrinsicAttributes {
+    key?: any;
+  }
+  interface IntrinsicClassAttributes<T> {
+    ref?: any;
+  }
+  interface IntrinsicElements {
+    [elemName: string]: any;
+  }
+}
+
+declare namespace React {
+  type ReactNode = any;
+  type ReactElement = JSX.Element;
+  type ComponentType<P = any> = (props: P) => ReactNode;
+  type FC<P = {}> = ComponentType<P>;
+  type PropsWithChildren<P = unknown> = P & { children?: ReactNode };
+  type CSSProperties = Record<string, string | number>;
+  type Ref<T = any> = any;
+  type RefObject<T = any> = { current: T | null };
+  type MutableRefObject<T = any> = { current: T };
+  type Dispatch<A> = (value: A) => void;
+  type SetStateAction<S> = S | ((prevState: S) => S);
+  interface SyntheticEvent<T = Element> {
+    currentTarget: T;
+    target: EventTarget;
+    preventDefault(): void;
+    stopPropagation(): void;
+  }
+  interface MouseEvent<T = Element> extends SyntheticEvent<T> {
+    clientX: number;
+    clientY: number;
+    button: number;
+  }
+  interface KeyboardEvent<T = Element> extends SyntheticEvent<T> {
+    key: string;
+  }
+  function createElement(type: any, props?: any, ...children: ReactNode[]): ReactElement;
+  function useCallback<T extends (...args: any[]) => any>(callback: T, deps: readonly unknown[]): T;
+  function useEffect(effect: () => void | (() => void), deps?: readonly unknown[]): void;
+  function useLayoutEffect(effect: () => void | (() => void), deps?: readonly unknown[]): void;
+  function useMemo<T>(factory: () => T, deps: readonly unknown[]): T;
+  function useRef<T>(initialValue: T): MutableRefObject<T>;
+  function useState<S>(initialState: S | (() => S)): [S, Dispatch<SetStateAction<S>>];
+  function forwardRef<T, P = {}>(render: (props: P, ref: Ref<T>) => ReactNode): ComponentType<P>;
+  function memo<T extends ComponentType<any>>(component: T): T;
+  function lazy<T extends ComponentType<any>>(loader: () => Promise<{ default: T }>): T;
+  const Fragment: any;
+}
+
+declare module "react" {
+  export = React;
+}
+
+declare module "react/jsx-runtime" {
+  export namespace JSX {
+    interface Element {}
+    interface ElementClass {
+      render?: any;
+    }
+    interface ElementAttributesProperty {
+      props: {};
+    }
+    interface ElementChildrenAttribute {
+      children: {};
+    }
+    interface IntrinsicAttributes {
+      key?: any;
+    }
+    interface IntrinsicClassAttributes<T> {
+      ref?: any;
+    }
+    interface IntrinsicElements {
+      [elemName: string]: any;
+    }
+  }
+  export const Fragment: any;
+  export function jsx(type: any, props: any, key?: any): JSX.Element;
+  export function jsxs(type: any, props: any, key?: any): JSX.Element;
+}
+
+declare module "react/jsx-dev-runtime" {
+  export * from "react/jsx-runtime";
+}
+`;
 
 export type CodeEditorOpenFileRequest = { path: string; nonce: number; mode?: CodeEditorOpenMode };
 
@@ -501,8 +611,7 @@ function inferLanguageId(path: string): string {
   const lowerName = name.toLowerCase();
   const dot = name.lastIndexOf(".");
   const ext = dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
-  // Curated preferred mappings first (e.g. tsx -> typescript, not the registry's
-  // "typescriptreact" if that ever ships), then fall back to Monaco's registry.
+  // Curated preferred mappings first, then fall back to Monaco's registry.
   const preferred = preferredLanguageId(ext);
   if (preferred) return preferred;
   if (!monacoLangByExt || !monacoLangByFilename) buildMonacoLangIndex();
@@ -511,6 +620,45 @@ function inferLanguageId(path: string): string {
     (ext ? monacoLangByExt!.get(ext) : undefined) ??
     "plaintext"
   );
+}
+
+let didConfigureTypeScriptDefaults = false;
+function configureTypeScriptDefaults(monaco: MonacoType): void {
+  if (didConfigureTypeScriptDefaults) return;
+
+  const ts = (monaco.languages as unknown as { typescript?: MonacoTypeScriptApi }).typescript;
+  if (!ts?.typescriptDefaults || !ts.javascriptDefaults || !ts.JsxEmit?.ReactJSX) return;
+
+  didConfigureTypeScriptDefaults = true;
+  ts.typescriptDefaults.addExtraLib(REACT_JSX_EXTRA_LIB, "file:///node_modules/@types/react/index.d.ts");
+  ts.javascriptDefaults.addExtraLib(REACT_JSX_EXTRA_LIB, "file:///node_modules/@types/react/index.d.ts");
+  ts.typescriptDefaults.setDiagnosticsOptions({
+    ...ts.typescriptDefaults.getDiagnosticsOptions(),
+    noSemanticValidation: true,
+    noSuggestionDiagnostics: true,
+  });
+  ts.javascriptDefaults.setDiagnosticsOptions({
+    ...ts.javascriptDefaults.getDiagnosticsOptions(),
+    noSemanticValidation: true,
+    noSuggestionDiagnostics: true,
+  });
+  ts.typescriptDefaults.setCompilerOptions({
+    ...ts.typescriptDefaults.getCompilerOptions(),
+    allowNonTsExtensions: true,
+    allowSyntheticDefaultImports: true,
+    esModuleInterop: true,
+    jsx: ts.JsxEmit.ReactJSX,
+    skipLibCheck: true,
+  });
+  ts.javascriptDefaults.setCompilerOptions({
+    ...ts.javascriptDefaults.getCompilerOptions(),
+    allowJs: true,
+    allowNonTsExtensions: true,
+    allowSyntheticDefaultImports: true,
+    esModuleInterop: true,
+    jsx: ts.JsxEmit.ReactJSX,
+    skipLibCheck: true,
+  });
 }
 
 function preferredLanguageId(ext: string): string | null {
@@ -822,6 +970,45 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       return false;
     }
   }, []);
+
+  const selectAllActiveModel = React.useCallback((): boolean => {
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model) return false;
+    try {
+      editor.setSelection(model.getFullModelRange(), "keyboard");
+      editor.focus();
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  React.useEffect(() => {
+    const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== "a") return;
+      if (event.altKey || event.shiftKey) return;
+      if (isMac ? !event.metaKey : !event.ctrlKey) return;
+
+      const editor = editorRef.current;
+      if (!editor?.getModel()) return;
+      const target = event.target;
+      const inMonaco = target instanceof Element && Boolean(target.closest(".codeEditorMonaco .monaco-editor"));
+      if (!inMonaco && !editor.hasTextFocus()) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      selectAllActiveModel();
+      requestAnimationFrame(() => {
+        selectAllActiveModel();
+      });
+    };
+
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [selectAllActiveModel]);
 
   const onPersistStateRef = React.useRef(onPersistState);
   React.useEffect(() => {
@@ -1800,6 +1987,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   }, [onCloseEditor]);
 
   const beforeMount = React.useCallback((monaco: MonacoType) => {
+    configureTypeScriptDefaults(monaco);
     registerCodeEditorThemes(monaco);
   }, []);
 
@@ -1807,6 +1995,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     (editor: import("monaco-editor").editor.IStandaloneCodeEditor, monaco: MonacoType) => {
       editorRef.current = editor;
       monacoRef.current = monaco;
+      configureTypeScriptDefaults(monaco);
       registerCodeEditorThemes(monaco);
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
         void saveActive();
@@ -1815,6 +2004,18 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
         const path = activePathRef.current;
         if (!path) return;
         requestCloseTab(path);
+      });
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyA, () => {
+        selectAllActiveModel();
+      });
+      editor.onKeyDown((event) => {
+        if (!event.equals(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyA)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        selectAllActiveModel();
+        requestAnimationFrame(() => {
+          selectAllActiveModel();
+        });
       });
       // Format Document (Shift+Alt+F, as in VS Code). A no-op for languages
       // without a registered formatter (only TS/JS/JSON/CSS/HTML ship one).
@@ -1831,7 +2032,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       pendingContentRef.current.clear();
       if (activePathRef.current) setEditorModel(activePathRef.current);
     },
-    [ensureModel, requestCloseTab, saveActive, setEditorModel],
+    [ensureModel, requestCloseTab, saveActive, selectAllActiveModel, setEditorModel],
   );
 
   const lastFsEventNonceRef = React.useRef<number | null>(null);

@@ -5,6 +5,7 @@ import type { ReadRangeFn } from "../fileViewer/useChunkCache";
 import type { PDFDocumentProxy, RenderTask } from "pdfjs-dist";
 
 const RANGE_CALL_MAX = 1024 * 1024; // backend caps a single range read at 1 MiB
+const MAX_CONCURRENT_RANGE_REQUESTS = 4; // avoid stampeding SSH/server-backed range reads
 // Granularity of PDF.js range requests. Smaller chunks reduce the wasted
 // over-read when PDF.js indexes each page's (tiny) dict on open — which for a
 // non-linearized PDF is one request per page — at the cost of more requests
@@ -16,6 +17,10 @@ const RENDER_AHEAD_PX = 800; // rasterize pages within this margin of the viewpo
 const MAX_RENDERED_PAGES = 14; // hard ceiling on simultaneously rasterized pages (memory bound)
 const MAX_CONCURRENT_RENDERS = 3; // cap in-flight PDF.js render tasks so fast scrolling can't stampede
 const MAX_CANVAS_DPR = 2; // cap backing-store scale on HiDPI to bound canvas memory
+const MAX_CANVAS_PIXELS = 24_000_000; // WebKit can crash on very large canvas allocations
+const MAX_CANVAS_SIDE = 16_384;
+const MAX_PAGE_CSS_PIXELS = 64_000_000;
+const MAX_PAGE_CSS_SIDE = 32_000;
 const MIN_SCALE = 0.2;
 const MAX_SCALE = 8;
 const ZOOM_STEP = 1.2;
@@ -26,6 +31,26 @@ function clampScale(value: number): number {
   return Math.min(MAX_SCALE, Math.max(MIN_SCALE, value));
 }
 
+function safeDisplayScale(width: number, height: number): number {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return 1;
+  const sideScale = Math.min(1, MAX_PAGE_CSS_SIDE / Math.max(width, height));
+  const area = width * height;
+  const areaScale = area > MAX_PAGE_CSS_PIXELS ? Math.sqrt(MAX_PAGE_CSS_PIXELS / area) : 1;
+  return Math.max(0.001, Math.min(sideScale, areaScale));
+}
+
+function pageDisplaySize(size: PageSize, scale: number, rotation: number): { width: number; height: number; scaleFactor: number } {
+  const swap = rotation % 180 !== 0;
+  const rawWidth = (swap ? size.h : size.w) * scale;
+  const rawHeight = (swap ? size.w : size.h) * scale;
+  const scaleFactor = safeDisplayScale(rawWidth, rawHeight);
+  return {
+    width: Math.max(1, Math.round(rawWidth * scaleFactor)),
+    height: Math.max(1, Math.round(rawHeight * scaleFactor)),
+    scaleFactor,
+  };
+}
+
 // Feeds PDF.js the bytes it asks for, on demand, by translating its range
 // requests into the app's chunked `read_file_range` IPC. Because the backend
 // caps a read at 1 MiB, larger requests are split and reassembled. Nothing
@@ -33,23 +58,49 @@ function clampScale(value: number): number {
 // pages it actually parses.
 class TauriRangeTransport extends pdfjsLib.PDFDataRangeTransport {
   private aborted = false;
+  private activeRequests = 0;
+  private readonly queue: Array<{ begin: number; end: number }> = [];
+  private readonly totalLength: number;
   private readonly path: string;
   private readonly readRange: ReadRangeFn;
   private readonly onError: (message: string) => void;
 
   constructor(length: number, path: string, readRange: ReadRangeFn, onError: (message: string) => void) {
     super(length, null);
+    this.totalLength = length;
     this.path = path;
     this.readRange = readRange;
     this.onError = onError;
   }
 
   override requestDataRange(begin: number, end: number): void {
-    void this.fulfill(begin, end);
+    if (this.aborted) return;
+    const rawBegin = Number.isFinite(begin) ? Math.floor(begin) : 0;
+    const rawEnd = Number.isFinite(end) ? Math.floor(end) : rawBegin;
+    const safeBegin = Math.max(0, Math.min(this.totalLength, rawBegin));
+    const safeEnd = Math.max(safeBegin, Math.min(this.totalLength, rawEnd));
+    if (safeBegin === safeEnd) {
+      this.onDataRange(safeBegin, new Uint8Array());
+      return;
+    }
+    this.queue.push({ begin: safeBegin, end: safeEnd });
+    this.pump();
   }
 
   override abort(): void {
     this.aborted = true;
+    this.queue.length = 0;
+  }
+
+  private pump(): void {
+    while (!this.aborted && this.activeRequests < MAX_CONCURRENT_RANGE_REQUESTS && this.queue.length > 0) {
+      const request = this.queue.shift()!;
+      this.activeRequests += 1;
+      void this.fulfill(request.begin, request.end).finally(() => {
+        this.activeRequests -= 1;
+        this.pump();
+      });
+    }
   }
 
   private async fulfill(begin: number, end: number): Promise<void> {
@@ -234,10 +285,12 @@ export default function PdfViewer({
       if (renderingRef.current.has(n)) return;
       renderingRef.current.add(n);
       const seq = renderSeqRef.current;
+      let page: Awaited<ReturnType<PDFDocumentProxy["getPage"]>> | null = null;
       try {
-        const page = await pdf.getPage(n);
+        page = await pdf.getPage(n);
         if (seq !== renderSeqRef.current) {
           page.cleanup();
+          page = null;
           return;
         }
         const unscaled = page.getViewport({ scale: 1 });
@@ -249,14 +302,30 @@ export default function PdfViewer({
           !shown || Math.abs(shown.w - unscaled.width) > 0.5 || Math.abs(shown.h - unscaled.height) > 0.5;
         pageSizeRef.current.set(n, { w: unscaled.width, h: unscaled.height });
         if (sizeChanged) setLayoutVersion((v) => v + 1);
-        const viewport = page.getViewport({ scale: targetScale, rotation: (page.rotate + rotationRef.current) % 360 });
-        const dpr = Math.min(window.devicePixelRatio || 1, MAX_CANVAS_DPR);
+        const rotation = (page.rotate + rotationRef.current) % 360;
+        const display = pageDisplaySize({ w: unscaled.width, h: unscaled.height }, targetScale, rotation);
+        const viewport = page.getViewport({ scale: targetScale * display.scaleFactor, rotation });
+        const cssWidth = Math.max(1, Math.floor(viewport.width));
+        const cssHeight = Math.max(1, Math.floor(viewport.height));
+        if (!Number.isFinite(cssWidth) || !Number.isFinite(cssHeight) || cssWidth <= 0 || cssHeight <= 0) {
+          throw new Error("PDF page has invalid dimensions.");
+        }
+        const requestedDpr = Math.min(window.devicePixelRatio || 1, MAX_CANVAS_DPR);
+        const pixelScaleLimit = Math.min(
+          MAX_CANVAS_SIDE / cssWidth,
+          MAX_CANVAS_SIDE / cssHeight,
+          Math.sqrt(MAX_CANVAS_PIXELS / (cssWidth * cssHeight)),
+        );
+        if (!Number.isFinite(pixelScaleLimit) || pixelScaleLimit <= 0) {
+          throw new Error("PDF page is too large to render safely.");
+        }
+        const dpr = Math.max(0.05, Math.min(requestedDpr, pixelScaleLimit));
         const canvas = document.createElement("canvas");
         canvas.className = "pdfPageCanvas";
-        canvas.width = Math.max(1, Math.floor(viewport.width * dpr));
-        canvas.height = Math.max(1, Math.floor(viewport.height * dpr));
-        canvas.style.width = `${Math.floor(viewport.width)}px`;
-        canvas.style.height = `${Math.floor(viewport.height)}px`;
+        canvas.width = Math.max(1, Math.floor(cssWidth * dpr));
+        canvas.height = Math.max(1, Math.floor(cssHeight * dpr));
+        canvas.style.width = `${cssWidth}px`;
+        canvas.style.height = `${cssHeight}px`;
         const task = page.render({
           canvas,
           viewport,
@@ -273,7 +342,7 @@ export default function PdfViewer({
         try {
           const textLayerDiv = document.createElement("div");
           textLayerDiv.className = "pdfTextLayer";
-          textLayerDiv.style.setProperty("--scale-factor", String(targetScale));
+          textLayerDiv.style.setProperty("--scale-factor", String(targetScale * display.scaleFactor));
           textLayerDiv.style.width = `${Math.floor(viewport.width)}px`;
           textLayerDiv.style.height = `${Math.floor(viewport.height)}px`;
           const textLayer = new pdfjsLib.TextLayer({
@@ -290,6 +359,7 @@ export default function PdfViewer({
           /* text layer unavailable — canvas still renders */
         }
         page.cleanup();
+        page = null;
         if (seq !== renderSeqRef.current) {
           const current = renderedRef.current.get(n);
           if (current === entry) {
@@ -298,6 +368,11 @@ export default function PdfViewer({
           }
         }
       } catch (err) {
+        try {
+          page?.cleanup();
+        } catch {
+          /* best-effort cleanup */
+        }
         if (!isCancelled(err)) {
           // A single page failing to render shouldn't take down the viewer
           // (leave the placeholder), but surface it so blank pages aren't silent.
@@ -757,13 +832,13 @@ export default function PdfViewer({
           {Array.from({ length: numPages }, (_, i) => {
             const n = i + 1;
             const sz = pageSizeRef.current.get(n) ?? defaultSize;
-            const swap = rotation % 180 !== 0;
+            const display = pageDisplaySize(sz, scale, rotation);
             return (
               <PageSlot
                 key={n}
                 pageNumber={n}
-                width={Math.round((swap ? sz.h : sz.w) * scale)}
-                height={Math.round((swap ? sz.w : sz.h) * scale)}
+                width={display.width}
+                height={display.height}
                 register={registerSlot}
                 unregister={unregisterSlot}
               />
