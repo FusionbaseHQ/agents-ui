@@ -238,6 +238,57 @@ const MAX_AGENT_PANEL_WIDTH = 700;
 const AUTO_RENAME_LOG_ENTRY_LIMIT = 6;
 const AGENTS_UI_MCP_PREFIX = "mcp__agents-ui__";
 
+function selectEditableElement(element: Element | null): boolean {
+  const editable = element?.closest("input, textarea, [contenteditable]") ?? null;
+  if (!editable) return false;
+
+  if (editable instanceof HTMLInputElement || editable instanceof HTMLTextAreaElement) {
+    if (editable.disabled) return false;
+    try {
+      editable.select();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  if (editable instanceof HTMLElement && editable.isContentEditable) {
+    const selection = window.getSelection();
+    if (!selection) return false;
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(editable);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
+}
+
+function selectDocumentContents(): void {
+  try {
+    if (document.execCommand("selectAll")) return;
+  } catch {
+    /* fall through to Selection API */
+  }
+
+  const selection = window.getSelection();
+  const body = document.body;
+  if (!selection || !body) return;
+  try {
+    const range = document.createRange();
+    range.selectNodeContents(body);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  } catch {
+    /* ignore */
+  }
+}
+
 type AutoRenameLogTone = "info" | "success" | "error";
 type AutoRenameActivity = {
   projectId: string;
@@ -7542,6 +7593,25 @@ export default function App() {
         if (event.payload.id === "help-check-updates") {
           setUpdatesOpen(true);
           void checkForUpdates();
+          return;
+        }
+        if (event.payload.id === "edit-select-all") {
+          const activeEl = document.activeElement;
+          const activeElement = activeEl instanceof Element ? activeEl : null;
+          const inCodeEditor = activeElement ? Boolean(activeElement.closest(".codeEditorPanel")) : false;
+          if (inCodeEditor && codeEditorPanelRef.current?.selectAll()) return;
+
+          const terminalElement = activeElement?.closest(".xterm") ?? null;
+          const terminalId = terminalElement?.closest<HTMLElement>("[data-session-id]")?.dataset.sessionId ?? null;
+          const terminalEntry = terminalId ? registry.current.get(terminalId) ?? null : null;
+          if (terminalEntry) {
+            terminalEntry.term.selectAll();
+            terminalEntry.term.focus();
+            return;
+          }
+
+          if (selectEditableElement(activeElement)) return;
+          selectDocumentContents();
           return;
         }
         if (event.payload.id === "window-toggle-terminal-search") {

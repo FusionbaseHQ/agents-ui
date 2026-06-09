@@ -129,6 +129,7 @@ loader.config({ monaco: bundledMonaco });
 
 export type CodeEditorPanelHandle = {
   openFind: () => boolean;
+  selectAll: () => boolean;
   workspaceSnapshot: () => CodeEditorWorkspaceSnapshot;
   openWorkspaceTab: (input: CodeEditorOpenWorkspaceTabInput) => Promise<CodeEditorWorkspaceTab>;
   focusWorkspaceTab: (input: { tabId?: string | null; path?: string | null }) => CodeEditorWorkspaceTab;
@@ -975,6 +976,10 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     const editor = editorRef.current;
     const model = editor?.getModel();
     if (!editor || !model) return false;
+    const active = activePathRef.current;
+    const tab = active ? tabsRef.current.find((it) => it.path === active) : null;
+    if (tab?.viewerKind !== "text") return false;
+    if (!editor.hasTextFocus()) return false;
     try {
       editor.setSelection(model.getFullModelRange(), "keyboard");
       editor.focus();
@@ -983,32 +988,6 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       return false;
     }
   }, []);
-
-  React.useEffect(() => {
-    const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key.toLowerCase() !== "a") return;
-      if (event.altKey || event.shiftKey) return;
-      if (isMac ? !event.metaKey : !event.ctrlKey) return;
-
-      const editor = editorRef.current;
-      if (!editor?.getModel()) return;
-      const target = event.target;
-      const inMonaco = target instanceof Element && Boolean(target.closest(".codeEditorMonaco .monaco-editor"));
-      if (!inMonaco && !editor.hasTextFocus()) return;
-
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation();
-      selectAllActiveModel();
-      requestAnimationFrame(() => {
-        selectAllActiveModel();
-      });
-    };
-
-    window.addEventListener("keydown", handleKeyDown, true);
-    return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [selectAllActiveModel]);
 
   const onPersistStateRef = React.useRef(onPersistState);
   React.useEffect(() => {
@@ -2290,6 +2269,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     ref,
     () => ({
       openFind,
+      selectAll: selectAllActiveModel,
       workspaceSnapshot,
       openWorkspaceTab,
       focusWorkspaceTab,
@@ -2310,6 +2290,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       focusWorkspaceTab,
       openFind,
       openWorkspaceTab,
+      selectAllActiveModel,
       workspaceSnapshot,
     ],
   );
