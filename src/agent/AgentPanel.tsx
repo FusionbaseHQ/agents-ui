@@ -43,10 +43,14 @@ type McpRegistrationResult = {
 
 const CLAUDE_MODELS = [
   { value: "", label: "Default" },
+  { value: "fable", label: "Fable 5" },
   { value: "opus", label: "Opus 4.8" },
   { value: "sonnet", label: "Sonnet 4.7" },
   { value: "haiku", label: "Haiku 4.5" },
 ];
+
+// Alias values the claude CLI accepts via --model (everything except "Default").
+const CLAUDE_MODEL_ALIASES = CLAUDE_MODELS.map((m) => m.value).filter(Boolean);
 
 const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const CODEX_MODELS = [
@@ -588,22 +592,23 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
                 className="agentSettingsSelect"
                 value={
                   settings.model === undefined || settings.model === "" ? ""
-                  : ["opus", "sonnet", "haiku"].includes(settings.model) ? settings.model
+                  : CLAUDE_MODEL_ALIASES.includes(settings.model) ? settings.model
                   : "custom"
                 }
                 onChange={(e) => {
                   const v = e.target.value;
                   if (v === "custom") {
-                    setSettings((s) => ({ ...s, model: s.model && !["opus", "sonnet", "haiku"].includes(s.model) ? s.model : "" }));
+                    setSettings((s) => ({ ...s, model: s.model && !CLAUDE_MODEL_ALIASES.includes(s.model) ? s.model : "" }));
                   } else {
                     setSettings((s) => ({ ...s, model: v || undefined }));
                   }
                 }}
               >
-                <option value="">Default</option>
-                <option value="opus">Opus 4.8</option>
-                <option value="sonnet">Sonnet 4.7</option>
-                <option value="haiku">Haiku 4.5</option>
+                {CLAUDE_MODELS.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                  </option>
+                ))}
                 <option value="custom">Custom...</option>
               </select>
             </label>
@@ -611,7 +616,7 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
           {settings.provider === "claude-code" &&
             settings.model !== undefined &&
             settings.model !== "" &&
-            !["opus", "sonnet", "haiku"].includes(settings.model) && (
+            !CLAUDE_MODEL_ALIASES.includes(settings.model) && (
             <label className="agentSettingsLabel">
               Custom Model ID
               <input

@@ -31,6 +31,7 @@ function convTitle(conv: AgentConversation): string {
 }
 
 const MODEL_LABELS: Record<string, string> = {
+  fable: "Fable",
   opus: "Opus",
   sonnet: "Sonnet",
   haiku: "Haiku",
