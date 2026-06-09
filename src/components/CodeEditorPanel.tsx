@@ -1,5 +1,6 @@
 import "../monaco/monacoEnv";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import Editor, { loader } from "@monaco-editor/react";
 import * as bundledMonaco from "monaco-editor";
 import React from "react";
@@ -141,7 +142,7 @@ export type CodeEditorPanelHandle = {
   captureScreenshot: (input?: CodeEditorCaptureScreenshotInput) => Promise<CodeEditorCaptureScreenshotResult>;
 };
 
-export type CodeEditorOpenMode = "auto" | "text" | "image" | "bytes" | "markdown" | "json" | "csv" | "xlsx";
+export type CodeEditorOpenMode = "auto" | "text" | "stream" | "image" | "bytes" | "markdown" | "json" | "csv" | "xlsx";
 type ViewerKind = "text" | "largeText" | "image" | "bytes" | "pdf" | "markdown" | "json" | "csv" | "xlsx" | "browser";
 
 export type CodeEditorOpenWorkspaceTabInput = {
@@ -286,6 +287,7 @@ const FRAME_FALLBACK_MS = 80;
 const VIEW_MODE_OPTIONS: Array<{ value: CodeEditorOpenMode; label: string; detail: string }> = [
   { value: "auto", label: "Auto", detail: "Pick the best viewer" },
   { value: "text", label: "Text", detail: "Editable source" },
+  { value: "stream", label: "Stream", detail: "Large text and follow" },
   { value: "markdown", label: "Markdown", detail: "Rendered preview" },
   { value: "json", label: "JSON tree", detail: "Structured tree" },
   { value: "csv", label: "CSV table", detail: "Rows and columns" },
@@ -380,8 +382,20 @@ function autoStructuredKind(path: string): ViewerKind | null {
   return null;
 }
 
+function isLogLikePath(path: string): boolean {
+  const name = basename(path).toLowerCase();
+  return (
+    name.endsWith(".log") ||
+    name.includes(".log.") ||
+    name.endsWith(".out") ||
+    name.endsWith(".err") ||
+    name.endsWith(".trace")
+  );
+}
+
 function chooseViewerKind(probe: FileProbe, mode: CodeEditorOpenMode, path: string): ViewerKind {
   if (mode === "bytes") return "bytes";
+  if (mode === "stream") return probe.kind === "text" && probe.validUtf8 && !probe.hasNul ? "largeText" : "bytes";
   if (mode === "markdown") return "markdown";
   if (mode === "json") return "json";
   if (mode === "csv") return "csv";
@@ -397,6 +411,7 @@ function chooseViewerKind(probe: FileProbe, mode: CodeEditorOpenMode, path: stri
       const structured = autoStructuredKind(path);
       if (structured) return structured;
     }
+    if (mode === "auto" && isLogLikePath(path)) return "largeText";
     return probe.size <= EDITABLE_TEXT_MAX_BYTES ? "text" : "largeText";
   }
   return "bytes";
@@ -1590,7 +1605,16 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       path: it.path,
       title: basename(it.path),
       viewerKind: it.dirty && it.content != null ? "text" : null,
-      requestedMode: it.viewerKind === "bytes" ? "bytes" : it.viewerKind === "image" ? "image" : it.viewerKind === "xlsx" ? "xlsx" : "auto",
+      requestedMode:
+        it.viewerKind === "bytes"
+          ? "bytes"
+          : it.viewerKind === "image"
+            ? "image"
+            : it.viewerKind === "xlsx"
+              ? "xlsx"
+              : it.viewerKind === "largeText"
+                ? "stream"
+                : "auto",
       dirty: it.dirty && it.content != null,
       loading: it.content == null,
       error: null,
@@ -2640,6 +2664,8 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
             key={`large-text:${activeTab.path}:${activeTab.size ?? 0}`}
             path={activeTab.path}
             size={activeTab.size ?? 0}
+            provider={provider}
+            probeFile={probeFile}
             readRange={readFileRange}
             onOpenBytes={() => void openFile(activeTab.path, "bytes")}
           />
@@ -3366,20 +3392,34 @@ function parseByteNeedle(value: string, mode: "hex" | "text"): Uint8Array | null
   return out;
 }
 
+const LIVE_FILE_WATCH_DEBOUNCE_MS = 350;
+const SSH_FOLLOW_POLL_MS = 1_500;
+const FOLLOW_BOTTOM_EPSILON_PX = 48;
+
 function LargeTextViewer({
   path,
   size,
+  provider,
+  probeFile,
   readRange,
   onOpenBytes,
 }: {
   path: string;
   size: number;
+  provider: "local" | "ssh";
+  probeFile: (path: string) => Promise<FileProbe>;
   readRange: ReadRangeFn;
   onOpenBytes: () => void;
 }) {
   const listRef = React.useRef<HTMLDivElement | null>(null);
   const readChunk = useChunkCache();
   const checkpointsRef = React.useRef<LineCheckpoint[]>([{ line: 0, offset: 0 }]);
+  const indexedOffsetRef = React.useRef(0);
+  const indexedLineRef = React.useRef(0);
+  const lastIndexedByteRef = React.useRef<number | null>(null);
+  const liveSizeRef = React.useRef(size);
+  const [liveSize, setLiveSize] = React.useState(size);
+  const [cacheGeneration, setCacheGeneration] = React.useState(0);
   const [indexState, setIndexState] = React.useState({ offset: 0, lines: 0, done: size === 0, totalLines: size === 0 ? 1 : 0 });
   const [scrollTop, setScrollTop] = React.useState(0);
   const [listHeight, setListHeight] = React.useState(0);
@@ -3391,14 +3431,79 @@ function LargeTextViewer({
   const lastMatchLineRef = React.useRef(-1);
   const [error, setError] = React.useState<string | null>(null);
   const [windowLines, setWindowLines] = React.useState<{ baseLine: number; lines: string[]; partial: boolean } | null>(null);
+  const [followEnabled, setFollowEnabled] = React.useState(false);
+  const [followPaused, setFollowPaused] = React.useState(false);
+  const [followStatus, setFollowStatus] = React.useState<string | null>(null);
+  const stickToBottomRef = React.useRef(false);
+  const followAtBottomRef = React.useRef(true);
   const rowHeight = 20;
-  const indexedRatio = size > 0 ? indexState.offset / size : 1;
+  const indexedRatio = liveSize > 0 ? indexState.offset / liveSize : 1;
   const estimatedRows = indexState.done
     ? Math.max(1, indexState.totalLines)
-    : Math.max(indexState.lines + 2048, Math.ceil(size / Math.max(48, indexState.offset / Math.max(1, indexState.lines || 1))));
+    : Math.max(indexState.lines + 2048, Math.ceil(liveSize / Math.max(48, indexState.offset / Math.max(1, indexState.lines || 1))));
   const totalRows = Math.max(1, estimatedRows);
   const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - 16);
   const endIndex = Math.min(totalRows, Math.ceil((scrollTop + listHeight) / rowHeight) + 16);
+
+  const resetIndexToSize = React.useCallback((nextSize: number) => {
+    const safeSize = Math.max(0, Math.floor(nextSize));
+    liveSizeRef.current = safeSize;
+    indexedOffsetRef.current = 0;
+    indexedLineRef.current = 0;
+    lastIndexedByteRef.current = null;
+    checkpointsRef.current = [{ line: 0, offset: 0 }];
+    setLiveSize(safeSize);
+    setCacheGeneration((value) => value + 1);
+    setWindowLines(null);
+    setError(null);
+    setIndexState({
+      offset: 0,
+      lines: 0,
+      done: safeSize === 0,
+      totalLines: safeSize === 0 ? 1 : 0,
+    });
+  }, []);
+
+  const applyLiveSize = React.useCallback(
+    (nextSize: number) => {
+      const safeSize = Math.max(0, Math.floor(nextSize));
+      const previousSize = liveSizeRef.current;
+      if (safeSize === previousSize) return;
+
+      if (safeSize < previousSize) {
+        resetIndexToSize(safeSize);
+        setFollowStatus("File reset");
+        if (followEnabled) stickToBottomRef.current = true;
+        return;
+      }
+
+      liveSizeRef.current = safeSize;
+      setLiveSize(safeSize);
+      setCacheGeneration((value) => value + 1);
+      setIndexState((prev) => (prev.offset >= safeSize ? prev : { ...prev, done: false, totalLines: 0 }));
+      setFollowStatus(`+${formatBytes(safeSize - previousSize)}`);
+      if (followEnabled) {
+        if (followAtBottomRef.current) stickToBottomRef.current = true;
+        else setFollowPaused(true);
+      }
+    },
+    [followEnabled, resetIndexToSize],
+  );
+
+  React.useEffect(() => {
+    resetIndexToSize(size);
+    setFollowPaused(false);
+    setFollowStatus(null);
+  }, [path, resetIndexToSize]);
+
+  const probeForUpdates = React.useCallback(async () => {
+    try {
+      const probe = await probeFile(path);
+      applyLiveSize(probe.size);
+    } catch (err) {
+      setFollowStatus(err instanceof Error ? err.message : String(err));
+    }
+  }, [applyLiveSize, path, probeFile]);
 
   React.useEffect(() => {
     const el = listRef.current;
@@ -3408,6 +3513,9 @@ function LargeTextViewer({
       raf = null;
       const nextScrollTop = el.scrollTop;
       const nextListHeight = el.clientHeight;
+      const atBottom = nextScrollTop + nextListHeight >= el.scrollHeight - FOLLOW_BOTTOM_EPSILON_PX;
+      followAtBottomRef.current = atBottom;
+      if (atBottom) setFollowPaused(false);
       setScrollTop((prev) => (prev === nextScrollTop ? prev : nextScrollTop));
       setListHeight((prev) => (prev === nextListHeight ? prev : nextListHeight));
     };
@@ -3426,25 +3534,130 @@ function LargeTextViewer({
     };
   }, []);
 
+  React.useLayoutEffect(() => {
+    if (!followEnabled || !stickToBottomRef.current) return;
+    const el = listRef.current;
+    if (!el) return;
+    const raf = window.requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+      followAtBottomRef.current = true;
+      stickToBottomRef.current = false;
+      setFollowPaused(false);
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, [followEnabled, indexState.lines, indexState.totalLines, liveSize, totalRows]);
+
+  React.useEffect(() => {
+    if (!followEnabled || provider !== "local") return;
+
+    const watcherId = `live-file-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const watchRoot = dirname(path);
+    let stopped = false;
+    let debounceTimer: number | null = null;
+    let unlisten: (() => void) | null = null;
+
+    const scheduleProbe = () => {
+      if (document.hidden || stopped) return;
+      if (debounceTimer !== null) window.clearTimeout(debounceTimer);
+      debounceTimer = window.setTimeout(() => {
+        debounceTimer = null;
+        void probeForUpdates();
+      }, LIVE_FILE_WATCH_DEBOUNCE_MS);
+    };
+
+    const setup = async () => {
+      try {
+        await invoke("start_fs_watcher", { watcherId, root: watchRoot });
+        if (stopped) return;
+        const stopListening = await listen<{ path: string; watcherId: string }>("fs-changed", (event) => {
+          if (event.payload.watcherId !== watcherId) return;
+          scheduleProbe();
+        });
+        if (stopped) {
+          stopListening();
+          return;
+        }
+        unlisten = stopListening;
+        void probeForUpdates();
+      } catch (err) {
+        if (!stopped) setFollowStatus(err instanceof Error ? err.message : String(err));
+      }
+    };
+
+    const handleVisibility = () => {
+      if (!document.hidden) void probeForUpdates();
+    };
+
+    document.addEventListener("visibilitychange", handleVisibility);
+    void setup();
+
+    return () => {
+      stopped = true;
+      document.removeEventListener("visibilitychange", handleVisibility);
+      if (debounceTimer !== null) window.clearTimeout(debounceTimer);
+      if (unlisten) unlisten();
+      invoke("stop_fs_watcher", { watcherId }).catch(() => {});
+    };
+  }, [followEnabled, path, probeForUpdates, provider]);
+
+  React.useEffect(() => {
+    if (!followEnabled || provider !== "ssh") return;
+
+    let stopped = false;
+    let interval: number | null = null;
+
+    const tick = () => {
+      if (stopped || document.hidden) return;
+      void probeForUpdates();
+    };
+
+    const start = () => {
+      if (interval !== null || document.hidden) return;
+      tick();
+      interval = window.setInterval(tick, SSH_FOLLOW_POLL_MS);
+    };
+
+    const stop = () => {
+      if (interval === null) return;
+      window.clearInterval(interval);
+      interval = null;
+    };
+
+    const handleVisibility = () => {
+      if (document.hidden) stop();
+      else start();
+    };
+
+    document.addEventListener("visibilitychange", handleVisibility);
+    start();
+
+    return () => {
+      stopped = true;
+      document.removeEventListener("visibilitychange", handleVisibility);
+      stop();
+    };
+  }, [followEnabled, probeForUpdates, provider]);
+
   React.useEffect(() => {
     let cancelled = false;
-    const checkpoints: LineCheckpoint[] = [{ line: 0, offset: 0 }];
-    checkpointsRef.current = checkpoints;
 
     const run = async () => {
-      let offset = 0;
-      let line = 0;
-      let lastByte: number | null = null;
+      let offset = indexedOffsetRef.current;
+      let line = indexedLineRef.current;
+      let lastByte = lastIndexedByteRef.current;
+      let checkpoints = checkpointsRef.current;
+      if (checkpoints.length === 0) {
+        checkpoints = [{ line: 0, offset: 0 }];
+        checkpointsRef.current = checkpoints;
+      }
       let lastPublish = 0;
-      const decoder = new TextDecoder("utf-8", { fatal: true });
       try {
-        while (offset < size && !cancelled) {
-          const reqLen = Math.min(RANGE_CHUNK_BYTES, size - offset);
+        while (offset < liveSizeRef.current && !cancelled) {
+          const targetSize = liveSizeRef.current;
+          const reqLen = Math.min(RANGE_CHUNK_BYTES, targetSize - offset);
           const bytes = await readRange(path, offset, reqLen);
           if (cancelled) return;
           const eof = bytes.length < reqLen;
-          // Validate UTF-8 as a stream so multibyte characters split across ranges are accepted.
-          decoder.decode(bytes, { stream: !(eof || offset + bytes.length >= size) });
           for (let i = 0; i < bytes.length; i++) {
             if (bytes[i] === 10) {
               line += 1;
@@ -3453,6 +3666,9 @@ function LargeTextViewer({
           }
           if (bytes.length > 0) lastByte = bytes[bytes.length - 1];
           offset = offset + bytes.length;
+          indexedOffsetRef.current = offset;
+          indexedLineRef.current = line;
+          lastIndexedByteRef.current = lastByte;
           const now = Date.now();
           if (now - lastPublish > 120 || eof) {
             lastPublish = now;
@@ -3460,13 +3676,21 @@ function LargeTextViewer({
             setIndexState({
               offset,
               lines: line,
-              done: eof || offset >= size,
-              totalLines: eof || offset >= size ? Math.max(1, line + (lastByte === 10 ? 0 : 1)) : 0,
+              done: eof || offset >= liveSizeRef.current,
+              totalLines: eof || offset >= liveSizeRef.current ? Math.max(1, line + (lastByte === 10 ? 0 : 1)) : 0,
             });
           }
           if (bytes.length === 0 || eof) break;
         }
-        decoder.decode();
+        if (!cancelled && offset >= liveSizeRef.current) {
+          checkpointsRef.current = checkpoints.slice();
+          setIndexState({
+            offset,
+            lines: line,
+            done: true,
+            totalLines: Math.max(1, line + (lastByte === 10 ? 0 : 1)),
+          });
+        }
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
       }
@@ -3476,7 +3700,7 @@ function LargeTextViewer({
     return () => {
       cancelled = true;
     };
-  }, [path, readRange, size]);
+  }, [liveSize, path, readRange]);
 
   const findCheckpoint = React.useCallback((line: number): LineCheckpoint => {
     const checkpoints = checkpointsRef.current;
@@ -3500,7 +3724,8 @@ function LargeTextViewer({
     const load = async () => {
       const checkpoint = findCheckpoint(startIndex);
       try {
-        const result = await readChunk(readRange, path, checkpoint.offset, Math.min(MAX_RANGE_BYTES, size - checkpoint.offset));
+        const length = Math.max(0, Math.min(MAX_RANGE_BYTES, liveSize - checkpoint.offset));
+        const result = await readChunk(readRange, path, checkpoint.offset, length, cacheGeneration);
         if (cancelled) return;
         const bytes = result.bytes;
         const decoded = new TextDecoder("utf-8").decode(bytes);
@@ -3509,7 +3734,7 @@ function LargeTextViewer({
         setWindowLines({
           baseLine: checkpoint.line + skip,
           lines: rawLines.slice(skip, skip + Math.max(32, endIndex - startIndex + 32)),
-          partial: !result.eof && checkpoint.offset + bytes.length < size,
+          partial: !result.eof && checkpoint.offset + bytes.length < liveSize,
         });
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
@@ -3519,7 +3744,7 @@ function LargeTextViewer({
     return () => {
       cancelled = true;
     };
-  }, [endIndex, error, findCheckpoint, indexState.done, indexState.lines, path, readChunk, readRange, size, startIndex]);
+  }, [cacheGeneration, endIndex, error, findCheckpoint, indexState.done, indexState.lines, liveSize, path, readChunk, readRange, startIndex]);
 
   const scrollToLine = React.useCallback((line: number) => {
     const target = Math.max(0, Math.min(totalRows - 1, line));
@@ -3543,8 +3768,8 @@ function LargeTextViewer({
         let offset = start.offset;
         let line = start.line;
         let overlap = new Uint8Array(0);
-        while (offset < size) {
-          const reqLen = Math.min(RANGE_CHUNK_BYTES, size - offset);
+        while (offset < liveSize) {
+          const reqLen = Math.min(RANGE_CHUNK_BYTES, liveSize - offset);
           const bytes = await readRange(path, offset, reqLen);
           const combined = overlap.length ? concatBytes([overlap, bytes]) : bytes;
           const baseLine = line - countNewlines(overlap);
@@ -3574,7 +3799,7 @@ function LargeTextViewer({
         setSearchBusy(false);
       }
     },
-    [caseInsensitive, findCheckpoint, path, query, readRange, scrollToLine, size],
+    [caseInsensitive, findCheckpoint, liveSize, path, query, readRange, scrollToLine],
   );
 
   const rows: React.ReactNode[] = [];
@@ -3608,7 +3833,7 @@ function LargeTextViewer({
   return (
     <div className="largeTextViewer">
       <div className="fileViewerToolbar">
-        <span>{formatBytes(size)}</span>
+        <span>{formatBytes(liveSize)}</span>
         <span>{indexState.done ? `${indexState.totalLines} lines` : `Indexed ${Math.round(indexedRatio * 100)}%`}</span>
         <input
           className="fileViewerInput"
@@ -3622,9 +3847,55 @@ function LargeTextViewer({
         <button type="button" className="btnSmall" onClick={submitLineJump}>
           Go
         </button>
-        <button type="button" className="btnSmall" onClick={() => scrollToLine(totalRows - 1)}>
+        <button
+          type="button"
+          className="btnSmall"
+          onClick={() => {
+            stickToBottomRef.current = true;
+            setFollowPaused(false);
+            scrollToLine(totalRows - 1);
+          }}
+        >
           Tail
         </button>
+        <button
+          type="button"
+          className={`btnSmall ${followEnabled ? "pdfViewerFitActive" : ""}`}
+          onClick={() => {
+            setFollowEnabled((prev) => {
+              const next = !prev;
+              if (next) {
+                stickToBottomRef.current = true;
+                setFollowPaused(false);
+                setFollowStatus("Watching");
+                void probeForUpdates();
+              } else {
+                stickToBottomRef.current = false;
+                setFollowPaused(false);
+                setFollowStatus(null);
+              }
+              return next;
+            });
+          }}
+        >
+          {followEnabled ? "Following" : "Follow"}
+        </button>
+        {followEnabled && followPaused ? (
+          <button
+            type="button"
+            className="btnSmall"
+            onClick={() => {
+              stickToBottomRef.current = true;
+              setFollowPaused(false);
+              scrollToLine(totalRows - 1);
+            }}
+          >
+            Resume
+          </button>
+        ) : null}
+        {followEnabled && (followPaused || followStatus) ? (
+          <span className="fileViewerMuted">{followPaused ? "New data" : followStatus}</span>
+        ) : null}
         <input
           className="fileViewerInput fileViewerSearchInput"
           value={query}
