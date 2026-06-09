@@ -1542,6 +1542,12 @@ pub fn create_session(
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // MCP bearer token: CLIs registered with --bearer-token-env-var (Codex)
+    // read it from the session environment to authenticate against /mcp.
+    cmd.env(
+        crate::mcp_server::MCP_TOKEN_ENV_VAR,
+        crate::mcp_server::get_or_init_auth_token(),
+    );
     #[cfg(target_family = "unix")]
     if cmd.get_env("SHELL").is_none() {
         cmd.env("SHELL", shell.clone());

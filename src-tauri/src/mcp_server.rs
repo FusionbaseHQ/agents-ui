@@ -15,20 +15,21 @@ use tokio::sync::watch;
 
 const MCP_PORT: u16 = 45557;
 
-/// Auth token of the currently running MCP server, if any. Used by the
-/// re-registration command so CLI registrations always carry the live token.
-static CURRENT_TOKEN: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
-    std::sync::OnceLock::new();
+/// Name of the environment variable carrying the MCP bearer token. Injected
+/// into PTY sessions and agent processes the app spawns, so CLIs registered
+/// with `--bearer-token-env-var` (Codex) authenticate transparently.
+pub const MCP_TOKEN_ENV_VAR: &str = "AGENTS_UI_MCP_TOKEN";
 
-fn token_cell() -> &'static std::sync::Mutex<Option<String>> {
-    CURRENT_TOKEN.get_or_init(|| std::sync::Mutex::new(None))
-}
+/// Process-lifetime MCP auth token, created lazily on first use so PTY
+/// sessions spawned before the MCP server starts still carry the right value.
+/// Stable across MCP server restarts within one app run, so CLI registrations
+/// stay valid when the server is toggled off/on.
+static CURRENT_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-pub fn current_auth_token() -> Option<String> {
-    token_cell()
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
+pub fn get_or_init_auth_token() -> String {
+    CURRENT_TOKEN
+        .get_or_init(crate::api_discovery::generate_token)
+        .clone()
 }
 
 struct McpState {
@@ -86,10 +87,7 @@ async fn start_mcp_server_inner(
     // shells and run commands, so the TCP port must not be drivable by
     // arbitrary local processes or DNS-rebound web pages. The token is shared
     // with clients via the discovery file and CLI registration below.
-    let auth_token = crate::api_discovery::generate_token();
-    if let Ok(mut guard) = token_cell().lock() {
-        *guard = Some(auth_token.clone());
-    }
+    let auth_token = get_or_init_auth_token();
 
     let state = Arc::new(McpState {
         ctx,
@@ -234,15 +232,15 @@ async fn start_mcp_server_inner(
         sc.mcp_running.store(false, Ordering::Relaxed);
     }
 
-    if let Ok(mut guard) = token_cell().lock() {
-        *guard = None;
-    }
-
     // Remove mcp_url from discovery file
     if let Ok(disc_path) = crate::api_discovery::discovery_path() {
         if disc_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&disc_path) {
                 if let Ok(mut file) = serde_json::from_str::<crate::api_discovery::DiscoveryFile>(&content) {
+                    // Don't clobber a discovery file another instance owns.
+                    if file.pid != std::process::id() {
+                        return;
+                    }
                     file.mcp_url = None;
                     file.mcp_token = None;
                     if let Ok(json) = serde_json::to_string_pretty(&file) {

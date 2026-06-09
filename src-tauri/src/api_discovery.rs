@@ -78,6 +78,14 @@ pub fn update_mcp_url(port: u16, mcp_token: &str) -> Result<(), String> {
         .map_err(|e| format!("read discovery file failed: {e}"))?;
     let mut file: DiscoveryFile = serde_json::from_str(&content)
         .map_err(|e| format!("parse discovery file failed: {e}"))?;
+    // Only update a discovery file THIS process wrote. At startup the file on
+    // disk is often a previous instance's — updating it both publishes a URL
+    // into a file whose socket/token are stale AND loses the update when our
+    // own api_server rewrites the file moments later. The caller's retry loop
+    // keeps trying until our api_server has written it.
+    if file.pid != std::process::id() {
+        return Err("discovery file belongs to another instance (not written yet)".to_string());
+    }
     file.mcp_url = Some(format!("http://127.0.0.1:{port}/mcp"));
     file.mcp_token = Some(mcp_token.to_string());
     let json = serde_json::to_string_pretty(&file)

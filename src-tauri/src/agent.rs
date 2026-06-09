@@ -77,8 +77,7 @@ impl Default for AgentLaunchSettings {
 #[tauri::command]
 pub async fn write_agent_mcp_config(mcp_port: Option<u16>) -> Result<String, String> {
     let port = mcp_port.unwrap_or(45557);
-    let token = crate::mcp_server::current_auth_token()
-        .ok_or_else(|| "MCP server is not running; no auth token available".to_string())?;
+    let token = crate::mcp_server::get_or_init_auth_token();
     let dir = agents_ui_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("create dir: {e}"))?;
     let path = dir.join("mcp-config.json");
@@ -260,6 +259,10 @@ pub async fn start_agent_prompt(
     let mut child = Command::new(&shell)
         .arg("-lc")
         .arg(&shell_command)
+        .env(
+            crate::mcp_server::MCP_TOKEN_ENV_VAR,
+            crate::mcp_server::get_or_init_auth_token(),
+        )
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -557,10 +560,14 @@ fn register_codex(
     // Remove first, ignore errors
     let _ = run_with_timeout(shell, "codex mcp remove agents-ui", timeout);
 
+    // Codex reads the bearer token from an env var at connect time. The app
+    // injects MCP_TOKEN_ENV_VAR into its PTY sessions and agent processes, so
+    // codex launched from inside the app authenticates transparently.
+    let _ = token;
     let add_cmd = format!(
-        "codex mcp add agents-ui --url {} --bearer-token {}",
+        "codex mcp add agents-ui --url {} --bearer-token-env-var {}",
         shell_escape(url),
-        shell_escape(token)
+        shell_escape(crate::mcp_server::MCP_TOKEN_ENV_VAR)
     );
 
     match run_with_timeout(shell, &add_cmd, timeout) {
@@ -572,7 +579,7 @@ fn register_codex(
                     return RegistrationStatus {
                         success: false,
                         error: Some(
-                            "codex CLI does not support --bearer-token; upgrade codex to use the authenticated MCP server".into(),
+                            "codex CLI does not support --bearer-token-env-var; upgrade codex to use the authenticated MCP server".into(),
                         ),
                     };
                 }
@@ -789,8 +796,7 @@ pub async fn orchestrate_read_file(path: String) -> Result<String, String> {
 #[tauri::command]
 pub async fn register_mcp_with_agents(port: Option<u16>) -> Result<McpRegistrationResult, String> {
     let port = port.unwrap_or(45557);
-    let token = crate::mcp_server::current_auth_token()
-        .ok_or_else(|| "MCP server is not running; cannot register an auth token".to_string())?;
+    let token = crate::mcp_server::get_or_init_auth_token();
     let result = tokio::task::spawn_blocking(move || do_register_mcp_with_agents(port, &token))
         .await
         .map_err(|e| format!("join error: {e}"))?;

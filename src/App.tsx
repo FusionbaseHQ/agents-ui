@@ -14,6 +14,7 @@ import {
 } from "./processEffects";
 import { shortenPathSmart } from "./pathDisplay";
 import { SlidePanel } from "./SlidePanel";
+import { PanelErrorBoundary } from "./ErrorBoundary";
 import { CommandPalette } from "./CommandPalette";
 import { ProjectsSection } from "./components/ProjectsSection";
 import { QuickPromptsSection } from "./components/QuickPromptsSection";
@@ -202,6 +203,12 @@ const MAX_SSH_HISTORY = 10;
 const MAX_PENDING_SESSIONS = 32;
 const MAX_PENDING_CHUNKS_PER_SESSION = 200;
 const MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION = 64;
+// Byte cap for output deferred for a hidden session. The terminal keeps 5000
+// lines of scrollback (~1.25 MB of typical text), so anything beyond the
+// newest few MiB could never survive switch-in anyway — dropping the oldest
+// overflow bounds memory during background floods (`yes`, runaway logs) and
+// keeps switch-in fast, with no reachable scrollback lost.
+const MAX_DEFERRED_OUTPUT_BYTES_PER_SESSION = 4 * 1024 * 1024;
 const SSH_RECONNECT_BASE_MS = 1000;
 const SSH_RECONNECT_MAX_MS = 30_000;
 const SSH_RECONNECT_MAX_ATTEMPTS = 6;
@@ -902,6 +909,99 @@ function buildSystemHealthDisplay(stats: SystemHealthStats | null): SystemHealth
 
   return items;
 }
+
+// Self-contained so the 5s poll re-renders only this span, not the whole App
+// (setSystemHealthStats used to live at App's top level, re-running every memo
+// in the 11k-line component on each tick).
+const SystemHealthIndicator = React.memo(function SystemHealthIndicator(props: {
+  hydrated: boolean;
+  sessionId: string | null;
+  isSsh: boolean;
+  sshTarget: string | null;
+  connectionState: string;
+}) {
+  const { hydrated, sessionId, isSsh, sshTarget, connectionState } = props;
+  const [stats, setStats] = useState<SystemHealthStats | null>(null);
+
+  useEffect(() => {
+    if (!hydrated || !sessionId) {
+      setStats(null);
+      return;
+    }
+
+    const target = sshTarget?.trim() ?? "";
+    if (isSsh && (!target || connectionState !== "connected")) {
+      setStats(null);
+      return;
+    }
+
+    let cancelled = false;
+    let inFlight = false;
+    let interval: number | null = null;
+
+    const refresh = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        const next = isSsh
+          ? await invoke<SystemHealthStats | null>("ssh_system_health_stats", { target })
+          : await invoke<SystemHealthStats | null>("system_health_stats");
+        if (!cancelled) {
+          const normalized = hasSystemHealthStats(next) ? next : null;
+          setStats((prev) => (sameHealthStats(prev, normalized) ? prev : normalized));
+        }
+      } catch {
+        if (!cancelled) setStats(null);
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    // Only poll while the window is visible: a backgrounded window issuing a
+    // backend IPC (and, for SSH, a remote command that wakes the radio + host)
+    // every few seconds defeats App Nap. On returning to visible we refresh
+    // immediately, so the status-bar snapshot is at most one tick stale.
+    const startPolling = () => {
+      if (interval !== null) return;
+      void refresh();
+      interval = window.setInterval(() => {
+        void refresh();
+      }, SYSTEM_HEALTH_REFRESH_MS);
+    };
+    const stopPolling = () => {
+      if (interval !== null) {
+        window.clearInterval(interval);
+        interval = null;
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") startPolling();
+      else stopPolling();
+    };
+
+    if (document.visibilityState === "visible") startPolling();
+    document.addEventListener("visibilitychange", onVisibility);
+
+    return () => {
+      cancelled = true;
+      stopPolling();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [connectionState, sessionId, isSsh, sshTarget, hydrated]);
+
+  const items = useMemo(() => buildSystemHealthDisplay(stats), [stats]);
+  if (items.length === 0) return null;
+  return (
+    <span className="systemHealthStats" aria-label="System health">
+      {items.map((item) => (
+        <span key={item.key} className="systemHealthItem" title={item.title}>
+          <span className="systemHealthLabel">{item.label}</span>
+          <span className="systemHealthValue">{item.value}</span>
+        </span>
+      ))}
+    </span>
+  );
+});
 
 type SessionActivityState = {
   effect: ProcessEffect | null;
@@ -2429,8 +2529,16 @@ export default function App() {
 
   const pushPendingData = useCallback((id: string, text: string) => {
     if (!pendingData.current.has(id) && pendingData.current.size >= MAX_PENDING_SESSIONS) {
-      const oldest = pendingData.current.keys().next().value as string | undefined;
-      if (oldest) pendingData.current.delete(oldest);
+      // Evict the oldest buffer, but never the active session's — dropping the
+      // visible terminal's pre-mount output would be user-visible data loss.
+      let victim: string | undefined;
+      for (const key of pendingData.current.keys()) {
+        if (key !== activeIdRef.current) {
+          victim = key;
+          break;
+        }
+      }
+      if (victim !== undefined) pendingData.current.delete(victim);
     }
     const buffer = pendingData.current.get(id) || [];
     buffer.push(text);
@@ -2455,7 +2563,20 @@ export default function App() {
     const requeueDeferredChunks = (id: string, chunks: string[]) => {
       if (!chunks.length) return;
       const existing = outputQueueRef.current.get(id) ?? [];
-      const merged = chunks.concat(existing);
+      let merged = chunks.concat(existing);
+
+      // Bound deferred bytes by dropping the OLDEST chunks (ordering here is
+      // oldest → newest). Without this, the count cap below still allows one
+      // ever-growing merged tail string during a background flood.
+      let totalBytes = 0;
+      for (const chunk of merged) totalBytes += chunk.length;
+      let start = 0;
+      while (totalBytes > MAX_DEFERRED_OUTPUT_BYTES_PER_SESSION && start < merged.length - 1) {
+        totalBytes -= merged[start].length;
+        start += 1;
+      }
+      if (start > 0) merged = merged.slice(start);
+
       if (merged.length <= MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION) {
         outputQueueRef.current.set(id, merged);
         return;
@@ -2732,79 +2853,8 @@ export default function App() {
     return sshTargetFromCommandLine(active.launchCommand ?? active.restoreCommand ?? null);
   }, [active]);
 
-  const [systemHealthStats, setSystemHealthStats] = useState<SystemHealthStats | null>(null);
-  const systemHealthItems = useMemo(
-    () => buildSystemHealthDisplay(systemHealthStats),
-    [systemHealthStats],
-  );
   const activeHealthSessionId = active?.id ?? null;
   const activeHealthConnectionState = active?.connectionState ?? "connected";
-
-  useEffect(() => {
-    if (!hydrated || !activeHealthSessionId) {
-      setSystemHealthStats(null);
-      return;
-    }
-
-    const target = activeSshTarget?.trim() ?? "";
-    if (activeIsSsh && (!target || activeHealthConnectionState !== "connected")) {
-      setSystemHealthStats(null);
-      return;
-    }
-
-    let cancelled = false;
-    let inFlight = false;
-    let interval: number | null = null;
-
-    const refresh = async () => {
-      if (cancelled || inFlight) return;
-      inFlight = true;
-      try {
-        const next = activeIsSsh
-          ? await invoke<SystemHealthStats | null>("ssh_system_health_stats", { target })
-          : await invoke<SystemHealthStats | null>("system_health_stats");
-        if (!cancelled) {
-          const normalized = hasSystemHealthStats(next) ? next : null;
-          setSystemHealthStats((prev) => (sameHealthStats(prev, normalized) ? prev : normalized));
-        }
-      } catch {
-        if (!cancelled) setSystemHealthStats(null);
-      } finally {
-        inFlight = false;
-      }
-    };
-
-    // Only poll while the window is visible: a backgrounded window issuing a
-    // backend IPC (and, for SSH, a remote command that wakes the radio + host)
-    // every few seconds defeats App Nap. On returning to visible we refresh
-    // immediately, so the status-bar snapshot is at most one tick stale.
-    const startPolling = () => {
-      if (interval !== null) return;
-      void refresh();
-      interval = window.setInterval(() => {
-        void refresh();
-      }, SYSTEM_HEALTH_REFRESH_MS);
-    };
-    const stopPolling = () => {
-      if (interval !== null) {
-        window.clearInterval(interval);
-        interval = null;
-      }
-    };
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") startPolling();
-      else stopPolling();
-    };
-
-    if (document.visibilityState === "visible") startPolling();
-    document.addEventListener("visibilitychange", onVisibility);
-
-    return () => {
-      cancelled = true;
-      stopPolling();
-      document.removeEventListener("visibilitychange", onVisibility);
-    };
-  }, [activeHealthConnectionState, activeHealthSessionId, activeIsSsh, activeSshTarget, hydrated]);
 
   const sshRootResolveInFlightRef = useRef<Set<string>>(new Set());
   useEffect(() => {
@@ -9581,16 +9631,13 @@ export default function App() {
             <span className="chipLabel">ssh</span>
           </span>
         ) : null}
-        {systemHealthItems.length > 0 ? (
-          <span className="systemHealthStats" aria-label="System health">
-            {systemHealthItems.map((item) => (
-              <span key={item.key} className="systemHealthItem" title={item.title}>
-                <span className="systemHealthLabel">{item.label}</span>
-                <span className="systemHealthValue">{item.value}</span>
-              </span>
-            ))}
-          </span>
-        ) : null}
+        <SystemHealthIndicator
+          hydrated={hydrated}
+          sessionId={activeHealthSessionId}
+          isSsh={activeIsSsh}
+          sshTarget={activeSshTarget}
+          connectionState={activeHealthConnectionState}
+        />
       </div>
       <div className="topbarRight">
         <ActivityCenter
@@ -9796,7 +9843,7 @@ export default function App() {
       </div>
     </div>
   ), [
-    active, activeProject, activeIsSsh, activeSshTarget, activeWorkspaceView, systemHealthItems,
+    active, activeProject, activeIsSsh, activeSshTarget, activeWorkspaceView, hydrated,
     activityCenterOpen, activityItems, slidePanelOpen, agentPanelOpen, appSettingsOpen,
     uiTheme,
     handleToggleActivityCenter, handleToggleAppSettings, reportError,
@@ -9846,6 +9893,7 @@ export default function App() {
               onMouseDown={beginWorkspaceResize("editor")}
               aria-hidden="true"
             />
+            <PanelErrorBoundary label="File viewer">
             <React.Suspense
               fallback={
                 <section className="codeEditorPanel" aria-label="Editor">
@@ -9897,6 +9945,7 @@ export default function App() {
                 onCloseEditor={closeCodeEditor}
               />
             </React.Suspense>
+            </PanelErrorBoundary>
           </>
         ) : null}
 
@@ -9912,6 +9961,7 @@ export default function App() {
               onMouseDown={beginWorkspaceResize("tree")}
               aria-hidden="true"
             />
+            <PanelErrorBoundary label="File tree">
             <FileExplorerPanel
               key={`file-tree:${activeWorkspaceKey}`}
               isOpen
@@ -9944,6 +9994,7 @@ export default function App() {
                 }))
               }
             />
+            </PanelErrorBoundary>
           </>
         ) : activeWorkspaceView.fileExplorerOpen && activeIsSsh ? (
           <>
@@ -9990,6 +10041,7 @@ export default function App() {
               onMouseDown={beginWorkspaceResize("agent")}
               aria-hidden="true"
             />
+            <PanelErrorBoundary label="Agent panel">
             <React.Suspense
               fallback={
                 <section className="agentPanel">
@@ -10034,6 +10086,7 @@ export default function App() {
                 }}
               />
             </React.Suspense>
+            </PanelErrorBoundary>
           </>
         )}
       </div>

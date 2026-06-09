@@ -119,6 +119,7 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
   const activeConvIdRef = useRef(activeConvId);
   const latestConversationsRef = useRef<AgentConversation[]>(initialConversations);
   const conversationSaveTimerRef = useRef<number | null>(null);
+  const saveImmediatelyRef = useRef(false);
   const messagesScrollRafRef = useRef<number | null>(null);
 
   const doMcpRegistration = useCallback(async () => {
@@ -145,11 +146,19 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
     saveAgentSettings(settings);
   }, [settings]);
 
-  // Persist conversations
+  // Persist conversations. Debounced while streaming; a completed run saves
+  // immediately (saveImmediatelyRef) so quitting the app right after a
+  // response can't lose it to the debounce window.
   useEffect(() => {
     latestConversationsRef.current = conversations;
     if (conversationSaveTimerRef.current !== null) {
       window.clearTimeout(conversationSaveTimerRef.current);
+      conversationSaveTimerRef.current = null;
+    }
+    if (saveImmediatelyRef.current) {
+      saveImmediatelyRef.current = false;
+      saveConversations(conversations);
+      return;
     }
     conversationSaveTimerRef.current = window.setTimeout(() => {
       conversationSaveTimerRef.current = null;
@@ -325,6 +334,7 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
       runIdRef.current = null;
       stderrRef.current = [];
       setRunning(false);
+      saveImmediatelyRef.current = true;
       setConversations((prev) => {
         const convId = activeConvIdRef.current;
         const idx = prev.findIndex((c) => c.id === convId);
