@@ -9,7 +9,7 @@ export type ActivityCenterItem = {
   running?: boolean;
   details?: string[];
   actionLabel?: string;
-  onAction?: () => void;
+  onAction?: () => void | Promise<void>;
   actionDisabled?: boolean;
   onDismiss?: () => void;
 };
@@ -19,6 +19,7 @@ type Props = {
   open: boolean;
   items: ActivityCenterItem[];
   onToggle: () => void;
+  onActionError?: (item: ActivityCenterItem, err: unknown) => void;
 };
 
 export const ActivityCenter = React.memo(function ActivityCenter({
@@ -26,6 +27,7 @@ export const ActivityCenter = React.memo(function ActivityCenter({
   open,
   items,
   onToggle,
+  onActionError,
 }: Props) {
   const runningCount = items.filter((item) => item.running).length;
   const badgeCount = runningCount;
@@ -33,6 +35,20 @@ export const ActivityCenter = React.memo(function ActivityCenter({
     runningCount > 0
       ? `${runningCount} active task${runningCount === 1 ? "" : "s"}`
       : "Activity center";
+  const runAction = React.useCallback(
+    (item: ActivityCenterItem) => {
+      if (!item.onAction) return;
+      try {
+        const result = item.onAction();
+        if (result) {
+          void Promise.resolve(result).catch((err) => onActionError?.(item, err));
+        }
+      } catch (err) {
+        onActionError?.(item, err);
+      }
+    },
+    [onActionError],
+  );
 
   return (
     <div className="topbarSettingsMenu sidebarActionMenu activityCenterMenu" ref={menuRef}>
@@ -115,7 +131,7 @@ export const ActivityCenter = React.memo(function ActivityCenter({
                       <button
                         type="button"
                         className="btnSmall"
-                        onClick={item.onAction}
+                        onClick={() => runAction(item)}
                         disabled={item.actionDisabled}
                       >
                         {item.actionLabel}

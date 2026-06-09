@@ -9406,7 +9406,7 @@ export default function App() {
         summary: persistenceDisabledReason,
         tone: "warning",
         actionLabel: isKeychainIssue ? (secureStorageRetrying ? "Retrying…" : "Retry") : undefined,
-        onAction: isKeychainIssue ? () => void retrySecureStorage() : undefined,
+        onAction: isKeychainIssue ? () => retrySecureStorage() : undefined,
         actionDisabled: secureStorageRetrying,
         onDismiss: () => setPersistenceDisabledReason(null),
       });
@@ -9423,7 +9423,7 @@ export default function App() {
           "Enable Agents UI, or the terminal/editor that launched the dev app, then restart the app.",
         ],
         actionLabel: "Open Settings",
-        onAction: () => void openScreenRecordingSettings(),
+        onAction: () => openScreenRecordingSettings(),
         onDismiss: () => setScreenCapturePermissionIssue(null),
       });
     }
@@ -9598,6 +9598,7 @@ export default function App() {
           open={activityCenterOpen}
           items={activityItems}
           onToggle={handleToggleActivityCenter}
+          onActionError={(item, err) => reportError(`Activity action failed: ${item.title}`, err)}
         />
         <div className="topbarSettingsMenu sidebarActionMenu" ref={appSettingsMenuRef}>
           <button

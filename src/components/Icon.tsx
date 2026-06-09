@@ -266,9 +266,11 @@ export const Icon = React.memo(function Icon({ name, size = 16, className }: Ico
     case "activity":
       return (
         <svg {...common}>
-          <path d="M3 12h4l2.2-4.5L13 17l2.4-5H21" />
-          <path d="M6 19h12" opacity="0.35" />
-          <path d="M6 5h12" opacity="0.35" />
+          <circle cx="12" cy="12" r="2.6" fill="currentColor" stroke="none" />
+          <path d="M12 4.5a7.5 7.5 0 0 1 7.5 7.5" />
+          <path d="M12 19.5A7.5 7.5 0 0 1 4.5 12" />
+          <path d="M5.4 6.2 7.6 8.4" />
+          <path d="M16.4 15.6l2.2 2.2" />
         </svg>
       );
     case "pin":
