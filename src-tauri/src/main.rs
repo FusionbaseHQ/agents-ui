@@ -15,6 +15,7 @@ mod file_manager;
 mod fs_watcher;
 mod mcp_server;
 mod mcp_tools;
+mod power_assertion;
 mod pty;
 mod persist;
 mod recording;
@@ -108,6 +109,12 @@ fn main() {
             // wedge that otherwise leaves the window permanently blank (macOS).
             display_recovery::start(app.handle().clone());
 
+            // Auto-caffeinate: keep the Mac awake while SSH sessions are
+            // active so idle sleep doesn't drop the connections and kill
+            // remote processes (macOS).
+            let pty_state = app.state::<AppState>().inner().clone();
+            power_assertion::start(app.handle().clone(), pty_state);
+
             // Server control: create shutdown channels and read persisted settings
             let settings = server_control::load_settings();
             let (sc, api_rx, mcp_rx) = ServerControl::new();
@@ -146,6 +153,7 @@ fn main() {
             kill_persistent_session,
             start_session_recording,
             stop_session_recording,
+            power_assertion::set_auto_caffeinate,
             get_startup_flags,
             load_persisted_state,
             load_persisted_state_meta,
