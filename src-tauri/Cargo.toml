@@ -1,6 +1,6 @@
 [package]
 name = "agents-ui"
-version = "0.8.6"
+version = "0.8.7"
 description = "Agents UI desktop app"
 authors = ["you"]
 edition = "2021"
@@ -31,6 +31,7 @@ objc2-web-kit = { version = "0.3.2", features = ["WKWebView", "WKSnapshotConfigu
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs" }
+libc = "0.2"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

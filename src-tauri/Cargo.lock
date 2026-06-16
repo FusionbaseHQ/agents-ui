@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "agents-ui"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -39,6 +39,7 @@ dependencies = [
  "chacha20poly1305",
  "fix-path-env",
  "keyring",
+ "libc",
  "notify",
  "objc2",
  "objc2-app-kit",
