@@ -197,7 +197,11 @@ const STORAGE_SSH_HISTORY_KEY = "agents-ui-ssh-history-v1";
 const STORAGE_SPLIT_VIEWS_KEY = "agents-ui-split-views-v1";
 const STORAGE_AGENT_PANEL_WIDTH_KEY = "agents-ui-agent-panel-width-v1";
 const STORAGE_UI_THEME_KEY = "agents-ui-ui-theme-v1";
+const STORAGE_AUTO_CAFFEINATE_KEY = "agents-ui-auto-caffeinate-v1";
 const DEFAULT_UI_THEME: UiTheme = "midnight";
+// Long enough to outlast the pauses inside one agent run (output gaps of a
+// few seconds happen constantly; thinking pauses can reach ~10s).
+const SHORTCUT_HINT_REAPPEAR_DELAY_MS = 15_000;
 const MAX_SSH_HISTORY = 10;
 
 const MAX_PENDING_SESSIONS = 32;
@@ -413,6 +417,17 @@ function readStoredUiTheme(): UiTheme {
     return DEFAULT_UI_THEME;
   }
 }
+
+function readStoredAutoCaffeinate(): boolean {
+  try {
+    // Default on: only an explicit "off" disables it.
+    return localStorage.getItem(STORAGE_AUTO_CAFFEINATE_KEY) !== "off";
+  } catch {
+    return true;
+  }
+}
+
+const INITIAL_AUTO_CAFFEINATE: boolean = readStoredAutoCaffeinate();
 
 const INITIAL_UI_THEME: UiTheme = readStoredUiTheme();
 if (typeof document !== "undefined") {
@@ -1865,6 +1880,9 @@ export default function App() {
   const [uiTheme, setUiTheme] = useState<UiTheme>(INITIAL_UI_THEME);
   const uiThemeRef = useRef<UiTheme>(INITIAL_UI_THEME);
   uiThemeRef.current = uiTheme;
+  const [autoCaffeinate, setAutoCaffeinate] = useState<boolean>(INITIAL_AUTO_CAFFEINATE);
+  // True while the backend holds the keep-awake power assertion.
+  const [keepAwakeActive, setKeepAwakeActive] = useState(false);
 
   const [sessions, setSessions] = useState<Session[]>([]);
   const [agentWorkingIds, setAgentWorkingIds] = useState<ReadonlySet<string>>(EMPTY_STRING_SET);
@@ -1923,6 +1941,32 @@ export default function App() {
       // Best-effort: localStorage may be unavailable in some contexts.
     }
   }, [uiTheme]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_AUTO_CAFFEINATE_KEY, autoCaffeinate ? "on" : "off");
+    } catch {
+      // Best-effort: localStorage may be unavailable in some contexts.
+    }
+    // Runs on mount too, syncing the backend (which defaults to enabled) with
+    // a persisted "off" before any SSH session can engage the assertion.
+    invoke("set_auto_caffeinate", { enabled: autoCaffeinate }).catch(() => {});
+  }, [autoCaffeinate]);
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    listen<boolean>("power-assertion-changed", (event) => {
+      setKeepAwakeActive(Boolean(event.payload));
+    })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
   useEffect(() => {
     if (!appSettingsOpen) return;
     const handlePointerDown = (event: MouseEvent) => {
@@ -9521,6 +9565,24 @@ export default function App() {
     () => activityItems.some((item) => item.running),
     [activityItems],
   );
+  // The running signal is inherently bursty: an agent session counts as
+  // "working" while output flows and drops out after ~2s of silence, so it
+  // toggles every few seconds during a normal agent run. Rendering the ⌘K
+  // hint straight off it made the hint blink in and out of the topbar.
+  // Hysteresis instead: hide as soon as activity starts, but only bring the
+  // hint back once things have stayed quiet for a sustained stretch.
+  const [showShortcutHint, setShowShortcutHint] = useState(true);
+  useEffect(() => {
+    if (hasRunningActivityItems) {
+      setShowShortcutHint(false);
+      return;
+    }
+    const timer = window.setTimeout(
+      () => setShowShortcutHint(true),
+      SHORTCUT_HINT_REAPPEAR_DELAY_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [hasRunningActivityItems]);
 
   const sidebarJsx = useMemo(() => (
     <aside
@@ -9690,11 +9752,26 @@ export default function App() {
                   {label}
                 </button>
               ))}
+              <div className="topbarSettingsLabel">Power</div>
+              <button
+                type="button"
+                className={`sidebarActionMenuItem topbarSettingsItem ${autoCaffeinate ? "topbarSettingsItemActive" : ""}`}
+                onClick={() => setAutoCaffeinate((prev) => !prev)}
+                role="menuitemcheckbox"
+                aria-checked={autoCaffeinate}
+                title="Keep the Mac awake while SSH sessions are active so connections (and remote processes) survive idle periods"
+              >
+                <span className={`topbarSettingsDot ${autoCaffeinate ? "active" : ""}`} aria-hidden="true" />
+                Auto-Caffeinate
+              </button>
+              {autoCaffeinate && keepAwakeActive ? (
+                <div className="topbarSettingsHint">Keeping Mac awake — SSH session active</div>
+              ) : null}
             </div>
           ) : null}
         </div>
 
-        {!hasRunningActivityItems && (
+        {showShortcutHint && (
           <div className="shortcutHint">
             <kbd>{"\u2318"}K</kbd> Quick Access
           </div>
@@ -9845,7 +9922,7 @@ export default function App() {
   ), [
     active, activeProject, activeIsSsh, activeSshTarget, activeWorkspaceView, hydrated,
     activityCenterOpen, activityItems, slidePanelOpen, agentPanelOpen, appSettingsOpen,
-    uiTheme,
+    uiTheme, autoCaffeinate, keepAwakeActive, showShortcutHint,
     handleToggleActivityCenter, handleToggleAppSettings, reportError,
     updateActiveWorkspaceView, refreshRecordings,
   ]);

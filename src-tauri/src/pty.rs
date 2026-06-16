@@ -11,7 +11,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-const AGENTS_UI_ZELLIJ_PREFIX: &str = "agents-ui-";
+pub(crate) const AGENTS_UI_ZELLIJ_PREFIX: &str = "agents-ui-";
 #[cfg(target_family = "unix")]
 const AGENTS_UI_ZELLIJ_LEGACY_SOCKET_BASE: &str = "/tmp/agents-ui-zellij";
 
@@ -34,6 +34,21 @@ struct AppStateInner {
 #[derive(Clone, Default)]
 pub struct AppState {
     inner: Arc<AppStateInner>,
+}
+
+impl AppState {
+    /// (launch command, child pid) for every live session. The auto-caffeinate
+    /// watcher derives SSH activity from this PTY-table ground truth rather
+    /// than trusting frontend session state.
+    pub fn ssh_activity_snapshot(&self) -> Vec<(String, Option<u32>)> {
+        match self.inner.sessions.lock() {
+            Ok(sessions) => sessions
+                .values()
+                .map(|s| (s.command.clone(), s.child.process_id()))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 struct PtySession {
@@ -1802,6 +1817,11 @@ pub fn create_session(
         },
     );
     drop(sessions);
+
+    // Re-evaluate promptly so the sleep assertion engages as soon as an SSH
+    // session opens. Deliberately no poke on exit/close: release goes through
+    // the watcher's grace period so a reconnect dip can't let the Mac sleep.
+    crate::power_assertion::poke();
 
     let id_for_reader = id.clone();
     let id_for_emitter: Arc<str> = Arc::from(id.as_str());

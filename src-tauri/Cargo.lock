@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "agents-ui"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "axum",
  "base64 0.22.1",
