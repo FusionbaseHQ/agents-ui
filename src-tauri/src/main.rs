@@ -57,7 +57,57 @@ use tray::{build_status_tray, set_tray_agent_count, set_tray_recent_sessions, se
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
+/// Raise the open-file-descriptor soft limit on Unix. The macOS default is only
+/// 256, which a terminal multiplexer exhausts fast: each PTY session holds ~3
+/// descriptors (master + cloned reader + writer), so a few dozen restored
+/// sessions plus SSH control sockets blow past it. Once over the limit, *any*
+/// new FD allocation fails with EMFILE ("Too many open files") — including
+/// reading ~/.ssh/config or spawning ssh/sftp for the remote file tree, which
+/// is how this surfaces. We only ever raise the soft limit, never lower it, and
+/// cap it at the hard limit (65536 is well under macOS's kern.maxfilesperproc).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn raise_fd_limit() {
+    const DESIRED_SOFT: libc::rlim_t = 65_536;
+    // SAFETY: getrlimit/setrlimit are simple syscalls writing into a local
+    // rlimit we fully own; no aliasing or lifetime concerns.
+    unsafe {
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            eprintln!(
+                "[fd-limit] getrlimit failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        // Target DESIRED_SOFT, but never exceed the hard cap (unless it reports
+        // unlimited, in which case DESIRED_SOFT is the ceiling we want).
+        let target = if lim.rlim_max == libc::RLIM_INFINITY {
+            DESIRED_SOFT
+        } else {
+            DESIRED_SOFT.min(lim.rlim_max)
+        };
+
+        if lim.rlim_cur >= target {
+            return; // already high enough
+        }
+
+        let new = libc::rlimit { rlim_cur: target, rlim_max: lim.rlim_max };
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &new) != 0 {
+            eprintln!(
+                "[fd-limit] setrlimit to {target} failed (current soft {}): {}",
+                lim.rlim_cur,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 fn main() {
+    // Must run before anything opens file descriptors (PTYs, sockets, watchers).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    raise_fd_limit();
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         // Pre-seed PATH with common directories so shell init scripts can run properly.
