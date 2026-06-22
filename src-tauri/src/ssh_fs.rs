@@ -1150,18 +1150,53 @@ fn scp_escape_remote_path(path: &str) -> String {
     out
 }
 
-fn run_scp(scp_flags: &[&str], ssh_args: Vec<String>, paths: &[String]) -> Result<Output, String> {
+fn run_scp_once(scp_flags: &[&str], paths: &[String]) -> Result<Output, String> {
     let mut cmd = Command::new(program_path("scp")?);
     // scp flags first (like -r)
     cmd.args(scp_flags);
-    // SSH options next
-    cmd.args(ssh_args);
+    // SSH options next (shared multiplexing master, timeouts, host-key policy)
+    cmd.args(ssh_common_args()?);
     // Source and destination paths last
     cmd.args(paths);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.output().map_err(|e| format!("run scp failed: {e}"))
+}
+
+/// Run scp over the shared multiplexing master with the same ensure_master +
+/// transient-retry handling as `run_ssh` / `run_sftp_batch`. Without this, scp
+/// is the one SSH op that surfaces a transient mux failure raw to the user:
+/// when a burst of concurrent channels is already open on the master, the server
+/// refuses scp's new session ("mux_client_request_session ... Session open
+/// refused by peer"), which is exactly the class of error the other paths absorb.
+/// `target` is the bare ssh destination (e.g. `user@host`) used to verify and,
+/// on failure, tear down the master; `paths` already embed `target:remote_path`.
+fn run_scp(target: &str, scp_flags: &[&str], paths: &[String]) -> Result<Output, String> {
+    let mut last_output: Option<Output> = None;
+    for attempt in 0..SSH_OP_ATTEMPTS {
+        if attempt > 0 {
+            // The previous attempt hit a transient transport error. The shared
+            // master may be stale or saturated; drop it so ensure_master rebuilds
+            // a fresh one, then back off.
+            close_master(target);
+            std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+        }
+        // Reuse the shared master rather than racing to open a fresh connection,
+        // and make sure it is up before scp tries to open its session channel.
+        ensure_master(target)?;
+        let output = run_scp_once(scp_flags, paths)?;
+        if output.status.success() {
+            return Ok(output);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !is_transient_ssh_error(&stderr) {
+            // Genuine failure (permission denied, no such file) — surface it.
+            return Ok(output);
+        }
+        last_output = Some(output);
+    }
+    Ok(last_output.expect("scp retry loop runs at least once"))
 }
 
 #[tauri::command]
@@ -1201,7 +1236,7 @@ fn ssh_download_file_sync(
     // glob in sftp mode); the local path is passed verbatim.
     let source = format!("{}:{}", target, scp_escape_remote_path(&remote_path));
     let paths = vec![source, local.to_string()];
-    let output = run_scp(&["-r"], ssh_common_args()?, &paths)?;
+    let output = run_scp(target, &["-r"], &paths)?;
     if !output.status.success() {
         return Err(output_to_error("scp download failed", &output));
     }
@@ -1248,7 +1283,7 @@ fn ssh_upload_file_sync(
     // glob in sftp mode); the local path is passed verbatim.
     let dest = format!("{}:{}", target, scp_escape_remote_path(&remote_path));
     let paths = vec![local.to_string(), dest];
-    let output = run_scp(&["-r"], ssh_common_args()?, &paths)?;
+    let output = run_scp(target, &["-r"], &paths)?;
     if !output.status.success() {
         return Err(output_to_error("scp upload failed", &output));
     }
@@ -1305,7 +1340,7 @@ fn ssh_download_to_temp_sync(
     // Download using scp (remote path escaped for both scp protocol modes)
     let source = format!("{}:{}", target, scp_escape_remote_path(&remote_path));
     let paths = vec![source, local_path_str.clone()];
-    let output = run_scp(&["-r"], ssh_common_args()?, &paths)?;
+    let output = run_scp(target, &["-r"], &paths)?;
     if !output.status.success() {
         return Err(output_to_error("scp download failed", &output));
     }
