@@ -21,7 +21,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-AGPL%203.0-blue.svg" alt="License">
   <img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-0.8.7-green.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.9.0-green.svg" alt="Version">
   <img src="https://img.shields.io/badge/tauri-v2-orange.svg" alt="Tauri">
 </p>
 
@@ -36,8 +36,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/FusionbaseHQ/agents-ui/releases/tag/v0.8.7">
-    <img src="https://img.shields.io/badge/Download-v0.8.7%20(macOS)-brightgreen" alt="Download v0.8.7 for macOS">
+  <a href="https://github.com/FusionbaseHQ/agents-ui/releases/tag/v0.9.0">
+    <img src="https://img.shields.io/badge/Download-v0.9.0%20(macOS)-brightgreen" alt="Download v0.9.0 for macOS">
   </a>
 </p>
 
