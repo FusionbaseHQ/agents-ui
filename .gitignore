@@ -28,3 +28,6 @@ src-tauri/.tauri/
 .claude/
 
 AGENTS.md
+
+# Secrets / signing credentials (see .env.example)
+.env
