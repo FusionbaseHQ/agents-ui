@@ -21,7 +21,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-AGPL%203.0-blue.svg" alt="License">
   <img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-0.9.0-green.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.10.0-green.svg" alt="Version">
   <img src="https://img.shields.io/badge/tauri-v2-orange.svg" alt="Tauri">
 </p>
 
@@ -36,8 +36,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/FusionbaseHQ/agents-ui/releases/tag/v0.9.0">
-    <img src="https://img.shields.io/badge/Download-v0.9.0%20(macOS)-brightgreen" alt="Download v0.9.0 for macOS">
+  <a href="https://github.com/FusionbaseHQ/agents-ui/releases/tag/v0.10.0">
+    <img src="https://img.shields.io/badge/Download-v0.10.0%20(macOS)-brightgreen" alt="Download v0.10.0 for macOS">
   </a>
 </p>
 
@@ -52,7 +52,8 @@
 - Split views (saved terminal layouts)
 - SSH host picker (and port forwards)
 - SSH-based projects with remote session creation
-- Projects, prompts & assets
+- **Workspaces → Projects → Sessions** organization with a keyboard quick-switch sidebar
+- Prompts & assets
 - Recording & replay
 - Local + SSH file explorer + Monaco editor
 - Rich file viewers (PDF, images, CSV, JSON, Markdown, hex) + embedded browser tabs
@@ -83,10 +84,14 @@
 - Built-in MCP server **and JSON-RPC API** for full programmatic control: terminal sessions & I/O, projects, prompts, files (local + SSH), the embedded browser & file viewer, screenshots, themes (`get_theme`/`set_theme`), and live shell state (screen, scrollback, command history via OSC 133)
 - [Python SDK](https://github.com/FusionbaseHQ/agents-ui-python-sdk) for steering the entire application programmatically (async + sync clients across all API namespaces)
 
-### Projects & Workspace
-- Project-based organization (sessions, base paths, and environment sets)
-- Resizable workspace layout (terminals + file tree + editor + slide panels)
-- Per-project environments (env vars), optionally encrypted at rest on macOS
+### Workspaces, Projects & Sessions
+- Three-level organization — **Workspaces → Projects → Sessions** — in a clean sidebar tree. Group related projects into a workspace and switch workspaces from the sidebar header (with an optional custom workspace icon).
+- Every project in the active workspace shows as a collapsible group with its sessions nested inline; projects carry a base path (local or SSH) and an environment set.
+- Keyboard quick-switch: type in the sidebar search, then `↑`/`↓`/`Enter` to jump to any project or session.
+- Per-project **+** menu to start a Terminal, agent (Claude/Codex), or SSH session in that project — on an SSH project, agents start on the remote host in the project's root directory.
+- Drag to reorder, per-session colors/symbols, pinning, and `Collapse/Expand all`.
+- Per-project environments (env vars), optionally encrypted at rest on macOS.
+- Resizable editor layout (terminals + file tree + editor + slide panels).
 
 ### Files Workspace (Local + SSH)
 - File explorer with a fast, scrollable tree view
@@ -170,22 +175,29 @@ The built application will be in `src-tauri/target/release/bundle/`.
 
 ## Usage
 
+### Workspaces & Projects
+
+- Use **+ New** in the sidebar's `PROJECTS` header to create a project (local base path or an SSH target).
+- Switch or create workspaces from the sidebar header; the `⋯` menu has `Collapse/Expand all` and workspace management.
+- Type in the search box and use `↑`/`↓`/`Enter` to jump to any project or session.
+
 ### Creating Sessions
 
-1. Click **New** in the sidebar or press `Cmd+T` / `Ctrl+Shift+T`
-2. Enter a session name
-3. Optionally specify a command (leave blank for shell)
-4. Choose a working directory
-5. Click **Create**
+1. Click the **+** on a project in the sidebar to open its new-session menu
+2. Choose **Terminal**, an agent (**Claude** / **Codex**), or **SSH / remote**
+3. For a Terminal you can optionally set a name, command, and working directory
+
+The session opens in that project's base path (or, for SSH projects, on the remote host in the project's root directory).
 
 ### Quick Agent Sessions
 
-Use the quick-start buttons in the sidebar to instantly launch agent sessions:
-- **claude** - Start a Claude Code session
-- **codex** - Start an OpenAI Codex session
-- **gemini** - Start a Google Gemini session
+From a project's **+** menu, pick an agent to instantly launch a session:
+- **Claude** - Start a Claude Code session
+- **Codex** - Start an OpenAI Codex session
 
-> **Note:** Agent CLI tools must be installed and available on your PATH.
+On an SSH project, the agent runs on the remote host in the project's root directory.
+
+> **Note:** Agent CLI tools must be installed and available on your PATH (locally or on the remote host).
 
 ### Files & Editor
 

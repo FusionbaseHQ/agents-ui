@@ -8,6 +8,16 @@ This project aims to follow Semantic Versioning.
 
 - No unreleased changes yet.
 
+## 0.10.0
+
+- Introduce **Workspaces** as a top-level tier: organization is now **Workspaces → Projects → Sessions**. Group projects into a workspace and switch workspaces from the sidebar header, with optional custom workspace icons.
+- Overhaul the sidebar into a single tree: every project in the active workspace shows as a collapsible group with its sessions nested inline (replacing the one-project-at-a-time view).
+- Add keyboard quick-switch: type in the sidebar search, then `↑`/`↓`/`Enter` to jump to any project or session.
+- Add a per-project **+** menu to start a Terminal, agent (Claude/Codex), or SSH session in that project. On SSH projects, Claude/Codex now start **on the remote host** in the project's root directory instead of locally.
+- Distinguish SSH sessions from local ones with a dedicated remote icon; fix per-session colors so they show in every state; restore pinned and disconnected indicators.
+- Clean up the sidebar typography and layout (calmer weights, no boxes/dividers, stable-width search), add a `Collapse/Expand all` action, and add a per-workspace delete flow that lets you move or remove the workspace's projects.
+- Allow `data:`/`blob:` images in the CSP (workspace icons; also unblocks existing data-URL images for production builds).
+
 ## 0.5.0
 
 - Add split views (saved 2-pane terminal layouts) with sidebar grouping and full-layout switching.
