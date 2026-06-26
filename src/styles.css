@@ -573,15 +573,68 @@ body::after {
 }
 
 .sidebar {
-  width: 260px;
-  background: rgba(var(--paper-panel-rgb), 0.9);
+  width: 270px;
+  background: rgba(var(--paper-panel-rgb), 0.92);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   border-right: 1px solid rgba(var(--ink-rgb), 0.06);
   display: flex;
   flex-direction: column;
-  padding: 10px;
-  gap: 8px;
+  padding: 8px;
+  gap: 5px;
+  min-width: 0;
+}
+
+.sidebarTreeGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.quickPromptsTreeGroup {
+  flex: 0 0 auto;
+}
+
+.sidebarProjectTree {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.sidebarSessionsGroup {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.sidebarTreeItemChevron {
+  color: rgba(var(--ink-rgb), 0.48);
+  flex: 0 0 auto;
+}
+
+.sidebarTreeList {
+  position: relative;
+  margin-left: 7px;
+  padding-left: 9px;
+  border-left: 1px solid rgba(var(--ink-rgb), 0.08);
+}
+
+.sidebarTreeItem {
+  position: relative;
+}
+
+.sidebarTreeItem::before {
+  content: "";
+  position: absolute;
+  left: -10px;
+  top: 50%;
+  width: 8px;
+  height: 1px;
+  background: rgba(var(--ink-rgb), 0.08);
+  pointer-events: none;
+}
+
+.projectRootList .sidebarTreeItem::before {
+  display: none;
 }
 
 .sidebarHeader {
@@ -849,16 +902,23 @@ body::after {
 .projectList {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  height: var(--projectsListMaxHeight, 290px);
+  gap: 3px;
+  height: auto;
+  max-height: 160px;
   overflow: auto;
   padding-right: 2px;
+}
+
+.projectRootList {
+  gap: 2px;
+  max-height: none;
+  overflow: visible;
 }
 
 .projectItem {
   position: relative;
   border: 1px solid transparent;
-  background: rgba(var(--ink-rgb), 0.02);
+  background: rgba(var(--ink-rgb), 0.018);
   color: var(--text);
   border-radius: var(--radius-sm);
   display: flex;
@@ -867,17 +927,23 @@ body::after {
   transition: background 0.15s ease, border-color 0.15s ease, opacity 0.1s ease;
 }
 
+.projectRootItem {
+  min-height: 34px;
+  border-color: rgba(var(--accent-rgb), 0.42);
+  background: rgba(var(--accent-rgb), 0.10);
+}
+
 .projectItemMain {
   flex: 1;
   min-width: 0;
   border: none;
   background: transparent;
   color: inherit;
-  padding: 8px 11px 8px 2px;
+  padding: 8px 10px 8px 2px;
   cursor: pointer;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   text-align: left;
 }
 
@@ -915,6 +981,10 @@ body::after {
   pointer-events: none;
 }
 
+.projectRootItem .projectDragHandle {
+  opacity: 0;
+}
+
 .projectItemDragging {
   opacity: 0.6;
 }
@@ -948,7 +1018,12 @@ body::after {
 
 .projectItemActive {
   border-color: rgba(var(--accent-rgb), 0.5);
-  background: rgba(var(--accent-rgb), 0.09);
+  background: rgba(var(--accent-rgb), 0.11);
+}
+
+.projectRootItem.projectItemActive {
+  border-color: rgba(var(--accent-rgb), 0.46);
+  background: rgba(var(--accent-rgb), 0.12);
 }
 
 .projectTitle {
@@ -958,6 +1033,7 @@ body::after {
   overflow: hidden;
   text-overflow: ellipsis;
   font-size: 12px;
+  font-weight: 560;
 }
 
 .projectSshBadge {
@@ -976,6 +1052,103 @@ body::after {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+.projectRootActions {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding-right: 4px;
+}
+
+.projectRootActionBtn {
+  width: 24px;
+  height: 24px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(var(--ink-rgb), 0.58);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  cursor: pointer;
+}
+
+.projectRootActionBtn:hover:not(:disabled),
+.projectRootActionBtn:focus-visible {
+  border-color: rgba(var(--ink-rgb), 0.10);
+  background: rgba(var(--ink-rgb), 0.055);
+  color: rgba(var(--ink-rgb), 0.88);
+}
+
+.projectRootActionDanger:hover:not(:disabled),
+.projectRootActionDanger:focus-visible {
+  border-color: rgba(var(--danger-rgb), 0.20);
+  background: rgba(var(--danger-rgb), 0.10);
+  color: rgba(var(--danger-rgb), 0.95);
+}
+
+.projectRootActionBtn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.projectPickerMenu {
+  position: fixed;
+  min-width: 245px;
+  max-width: min(360px, calc(100vw - 16px));
+  max-height: min(420px, calc(100vh - 16px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 5px;
+  border: 1px solid rgba(var(--ink-rgb), 0.08);
+  background: rgba(var(--paper-panel-rgb), 0.94);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(var(--shadow-rgb), 0.55), 0 2px 8px rgba(var(--shadow-rgb), 0.32), inset 0 0.5px 0 rgba(var(--ink-rgb), 0.06);
+  z-index: 390;
+}
+
+.projectPickerItem {
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(var(--ink-rgb), 0.82);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 7px;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+}
+
+.projectPickerItem:hover,
+.projectPickerItem:focus-visible {
+  border-color: rgba(var(--ink-rgb), 0.10);
+  background: rgba(var(--ink-rgb), 0.055);
+  outline: none;
+}
+
+.projectPickerItemActive {
+  border-color: rgba(var(--accent-rgb), 0.32);
+  background: rgba(var(--accent-rgb), 0.10);
+}
+
+.projectPickerTitle {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  font-weight: 560;
 }
 
 .projectAgentsBadge {
@@ -1009,101 +1182,86 @@ body::after {
   white-space: nowrap;
 }
 
-.agentShortcutRow {
+.sessionLaunchPanel {
   display: flex;
-  gap: 4px;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
   overflow-x: auto;
-  padding: 0 0 2px;
-  margin-top: -2px;
   scrollbar-width: none;
+  padding: 1px 0 3px 25px;
+  margin-top: -1px;
 }
 
-.agentShortcutRow::-webkit-scrollbar {
+.sessionLaunchPanel::-webkit-scrollbar {
   display: none;
 }
 
-.agentShortcutBtn {
-  border: 1px solid var(--border);
-  background: rgba(var(--ink-rgb), 0.03);
-  color: var(--text);
-  padding: 4px 7px;
-  border-radius: var(--radius-sm);
+.sessionLaunchAction {
+  flex: 0 0 auto;
+  min-width: 0;
+  width: 28px;
+  height: 28px;
+  border: 1px solid rgba(var(--ink-rgb), 0.09);
+  background: rgba(var(--paper-panel-rgb), 0.54);
+  color: rgba(var(--ink-rgb), 0.82);
+  border-radius: 6px;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
   justify-content: center;
+  padding: 0;
+  line-height: 1;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.sessionLaunchLabel {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
   white-space: nowrap;
-  font-size: 12px;
-  flex: 1;
-  min-width: 0;
-  transition: background 0.12s ease, border-color 0.12s ease;
+  border: 0;
 }
 
-.agentShortcutBtn:hover {
-  background: rgba(var(--ink-rgb), 0.06);
-  border-color: rgba(var(--ink-rgb), 0.14);
+.sessionLaunchAction svg,
+.sessionLaunchIcon {
+  flex: 0 0 auto;
 }
 
-.agentShortcutIcon {
-  width: 13px;
-  height: 13px;
-  flex-shrink: 0;
+.sessionLaunchIcon {
+  width: 14px;
+  height: 14px;
   display: block;
 }
 
-.agentShortcutIconFallback {
-  width: 13px;
-  height: 13px;
-  flex-shrink: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--muted);
-  font-size: 10px;
+.sessionLaunchAction:hover:not(:disabled) {
+  border-color: rgba(var(--ink-rgb), 0.16);
+  background: rgba(var(--ink-rgb), 0.055);
+  color: rgba(var(--ink-rgb), 0.94);
 }
 
-.agentShortcutLabel {
-  line-height: 1;
-  font-size: 11px;
+.sessionLaunchPrimary {
+  border-color: rgba(var(--accent-rgb), 0.28);
+  background: rgba(var(--accent-rgb), 0.095);
 }
 
-.sidebarResizeHandle {
-  height: 12px;
-  margin: 2px 0;
-  position: relative;
-  cursor: row-resize;
-  border-radius: var(--radius-control);
-  touch-action: none;
-  transition: background 0.15s ease;
+.sessionLaunchAgentAction {
+  border-color: rgba(var(--accent-2-rgb), 0.24);
+  background: rgba(var(--accent-2-rgb), 0.07);
 }
 
-.sidebarResizeHandle::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 50%;
-  height: 1px;
-  background: rgba(var(--ink-rgb), 0.06);
-  transform: translateY(-0.5px);
-  transition: background 0.15s ease, height 0.15s ease;
+.sessionLaunchActionActive {
+  border-color: rgba(var(--accent-rgb), 0.4);
+  background: rgba(var(--accent-rgb), 0.12);
 }
 
-.sidebarResizeHandle:hover {
-  background: rgba(var(--ink-rgb), 0.02);
-}
-
-.sidebarResizeHandle:hover::before,
-.sidebarResizeHandle:focus-visible::before {
-  background: rgba(var(--accent-rgb), 0.35);
-  height: 2px;
-  transform: translateY(-1px);
-}
-
-.sidebarResizeHandle:focus-visible {
-  outline: 2px solid rgba(var(--accent-rgb), 0.35);
-  outline-offset: 2px;
+.sessionLaunchAction:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 .divider {
@@ -1165,7 +1323,7 @@ body::after {
 .sessionList {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
   overflow: auto;
   padding-right: 2px;
   flex: 1 1 auto;
@@ -1452,7 +1610,7 @@ body::after {
 .btn:focus-visible,
 .btnSmall:focus-visible,
 .sidebarActionMenuItem:focus-visible,
-.agentShortcutBtn:focus-visible,
+.sessionLaunchAction:focus-visible,
 .projectItemMain:focus-visible,
 .projectDragHandle:focus-visible,
 .sessionDragHandle:focus-visible,
@@ -1473,11 +1631,11 @@ body::after {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 8px;
+  padding: 7px 8px;
   border-radius: var(--radius-sm);
   border: 1px solid transparent;
   cursor: pointer;
-  background: rgba(var(--ink-rgb), 0.02);
+  background: rgba(var(--ink-rgb), 0.018);
   transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.2s ease, opacity 0.1s ease;
 }
 
@@ -1649,6 +1807,7 @@ body::after {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  font-weight: 560;
 }
 
 .sessionSymbol {
@@ -5336,10 +5495,14 @@ select.input {
 
 /* Quick Prompts Sidebar */
 .quickPromptsSection {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
   margin-bottom: 4px;
 }
 
 .quickPromptItem {
+  width: 100%;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -7626,4 +7789,1075 @@ select.input {
 
 .osc133-context-menu-item-disabled:hover {
   background: transparent;
+}
+
+/* ==========================================================================
+   Workspace sidebar (Workspace → Project → Session)
+   ========================================================================== */
+
+.sidebar.sidebarCollapsed {
+  width: 52px;
+  padding: 8px 6px;
+  gap: 8px;
+  align-items: center;
+}
+
+.wsSidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* Collapsed rail */
+.wsRail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.wsRailBtn {
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(var(--ink-rgb), 0.1);
+  background: rgba(var(--ink-rgb), 0.03);
+  color: var(--text-secondary);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.wsRailBtn:hover {
+  background: rgba(var(--ink-rgb), 0.07);
+  border-color: rgba(var(--ink-rgb), 0.18);
+  color: var(--text);
+}
+
+/* ---- Workspace header ---- */
+.wsHeader {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 0 0 auto;
+}
+.wsHeaderMain {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.wsHeaderMain:hover {
+  background: rgba(var(--ink-rgb), 0.05);
+  border-color: rgba(var(--ink-rgb), 0.08);
+}
+.wsHeaderIcon {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: linear-gradient(140deg, rgba(var(--accent-rgb), 0.95), rgba(var(--accent-rgb), 0.7));
+  color: #fff;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+}
+.wsHeaderIcon.wsHeaderIconColored {
+  background: linear-gradient(140deg, rgba(var(--tab-color), 0.95), rgba(var(--tab-color), 0.7));
+}
+.wsHeaderIcon img,
+.wsMenuIcon img {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+/* Custom workspace image fills the whole tile (overrides the 16px symbol size). */
+.wsHeaderIconImage {
+  background: none;
+  padding: 0;
+  overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgba(var(--ink-rgb), 0.2);
+}
+.wsHeaderIcon .wsIconImg,
+.wsMenuIcon .wsIconImg {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  border-radius: inherit;
+}
+.wsHeaderText {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+.wsHeaderEyebrow {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  font-weight: 500;
+  color: var(--muted);
+  text-transform: uppercase;
+  line-height: 1;
+}
+.wsHeaderName {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1.15;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wsHeaderChevron {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+.wsHeaderCollapse {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.wsHeaderCollapse:hover {
+  background: rgba(var(--ink-rgb), 0.07);
+  color: var(--text);
+}
+.wsHeaderRenaming {
+  border: 1px solid rgba(var(--accent-rgb), 0.5);
+  background: rgba(var(--ink-rgb), 0.04);
+}
+.wsHeaderRenameInput {
+  font-size: 13.5px;
+  font-weight: 500;
+  padding: 4px 8px;
+}
+
+/* ---- Search ---- */
+.wsSearch {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  height: 32px;
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  border: 1px solid rgba(var(--ink-rgb), 0.1);
+  background: rgba(var(--ink-rgb), 0.03);
+  border-radius: var(--radius-control);
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.wsSearch:focus-within {
+  border-color: rgba(var(--accent-rgb), 0.5);
+  background: rgba(var(--ink-rgb), 0.045);
+}
+.wsSearchIcon {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+.wsSearchInput {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  outline: none;
+  color: var(--text);
+  font-size: 12px;
+}
+.wsSearchInput::placeholder {
+  color: var(--muted);
+}
+.wsSearchClear {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.wsSearchClear:hover {
+  background: rgba(var(--ink-rgb), 0.08);
+  color: var(--text);
+}
+/* Clear button stays in layout flow even when empty (just hidden) so the
+   search input never resizes between empty and typing states. */
+.wsSearchClearHidden {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* Keyboard quick-switch cursor (distinct from the active selection) */
+.wsNavHighlight {
+  background: rgba(var(--accent-rgb), 0.12);
+  box-shadow: inset 0 0 0 1.5px rgba(var(--accent-rgb), 0.6);
+}
+.wsProjectHeader.wsNavHighlight {
+  border-radius: var(--radius-sm);
+}
+
+/* ---- Section header ---- */
+.wsSectionHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 2px 0 4px;
+  flex: 0 0 auto;
+}
+.wsSectionTitle {
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  font-weight: 500;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.wsSectionActions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.wsSectionBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px 3px 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.wsSectionBtn:hover {
+  background: rgba(var(--accent-rgb), 0.12);
+  border-color: rgba(var(--accent-rgb), 0.25);
+  color: var(--text);
+}
+.wsSectionIconBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 24px;
+  color: var(--muted);
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.wsSectionIconBtn:hover {
+  background: rgba(var(--ink-rgb), 0.07);
+  color: var(--text);
+}
+
+/* ---- Tree ---- */
+.wsTree {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding-right: 2px;
+  margin: 0 -2px;
+}
+.wsEmpty {
+  padding: 14px 8px;
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+
+/* ---- Project group ---- */
+.wsProjectGroup {
+  position: relative;
+  border-radius: var(--radius-control);
+  padding: 1px 0 4px;
+}
+.wsProjectGroup:not(:last-child) {
+  margin-bottom: 8px;
+}
+.wsProjectGroupActive {
+  background: transparent;
+}
+.wsProjectGroupDragging {
+  opacity: 0.55;
+}
+.wsProjectDropBefore::before,
+.wsProjectDropAfter::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  height: 2px;
+  border-radius: 2px;
+  background: rgba(var(--accent-rgb), 0.8);
+}
+.wsProjectDropBefore::before { top: -1px; }
+.wsProjectDropAfter::after { bottom: -1px; }
+
+.wsProjectHeaderRow {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 4px 2px 0;
+  min-width: 0;
+}
+.wsProjectDrag {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: grab;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.wsProjectGroup:hover .wsProjectDrag { opacity: 0.6; }
+.wsProjectDrag:hover { opacity: 1 !important; }
+
+.wsProjectHeader {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 4px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  text-align: left;
+}
+.wsProjectHeader:hover { background: rgba(var(--ink-rgb), 0.04); }
+.wsProjectChevronBtn {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color 0.12s ease;
+}
+.wsProjectChevronBtn:hover { color: var(--text); }
+.wsProjectChevronBtn:disabled { opacity: 0.35; cursor: default; }
+.wsProjectChevron {
+  flex: 0 0 auto;
+  color: inherit;
+}
+.wsProjectStatus {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(var(--ink-rgb), 0.28);
+  background: transparent;
+}
+.wsProjectStatus.wsProjectStatusActive {
+  border-color: transparent;
+  background: rgb(var(--success-rgb));
+  box-shadow: 0 0 6px rgba(var(--success-rgb), 0.55);
+}
+.wsProjectName {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The active project is the one bold "you are here" anchor in the list. */
+.wsProjectGroupActive .wsProjectName {
+  font-weight: 700;
+  color: var(--text);
+}
+.wsProjectColored .wsProjectName { color: rgb(var(--tab-color)); }
+.wsProjectSshBadge {
+  flex: 0 0 auto;
+  font-size: 8.5px;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  padding: 1px 4px;
+  border-radius: 3px;
+  color: rgb(var(--ssh-rgb));
+  background: rgba(var(--ssh-rgb), 0.14);
+}
+.wsProjectActions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+.wsProjectWorking {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--warning, rgb(var(--warning-rgb)));
+  padding: 0 4px;
+}
+.wsProjectActionBtn {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+.wsProjectGroup:hover .wsProjectActionBtn,
+.wsProjectGroupActive .wsProjectActionBtn { opacity: 1; }
+.wsProjectActionBtn:hover {
+  background: rgba(var(--ink-rgb), 0.09);
+  color: var(--text);
+}
+
+.wsProjectSub {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px 1px 40px;
+  font-size: 10.5px;
+  color: var(--muted);
+  opacity: 0.85;
+  min-width: 0;
+}
+.wsProjectSubIcon { flex: 0 0 auto; opacity: 0.8; }
+.wsProjectBranch {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.wsProjectSubDot { flex: 0 0 auto; opacity: 0.6; }
+.wsProjectPath {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- Session list (nested) ---- */
+.wsSessionList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 3px;
+  margin-left: 19px;
+  padding-left: 10px;
+  border-left: 1px solid rgba(var(--ink-rgb), 0.09);
+}
+/* The active project's sessions get an accent rail tying them to it. */
+.wsSessionListActive {
+  border-left-color: rgba(var(--accent-rgb), 0.45);
+}
+
+.wsSessionEmpty {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 7px;
+  font-size: 11.5px;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.wsSessionEmpty:hover {
+  color: var(--text);
+  background: rgba(var(--ink-rgb), 0.05);
+}
+
+.wsSessionItem {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 6px 5px 7px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  min-width: 0;
+  border: 1px solid transparent;
+  transition: background 0.1s ease, border-color 0.1s ease;
+}
+.wsSessionItem:hover { background: rgba(var(--ink-rgb), 0.05); }
+.wsSessionItemActive {
+  background: rgba(var(--accent-rgb), 0.12);
+  border-color: transparent;
+}
+.wsSessionItemActive::before {
+  content: "";
+  position: absolute;
+  left: -11px;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  border-radius: 2px;
+  background: rgb(var(--accent-rgb));
+}
+/* Colored sessions: show the tab color in EVERY state via a left bar + tint
+   (previously only the active session reflected its color). */
+.wsSessionItemColored::before {
+  content: "";
+  position: absolute;
+  left: -11px;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  border-radius: 2px;
+  background: rgb(var(--tab-color));
+}
+.wsSessionItemColored:not(.wsSessionItemActive) {
+  background: rgba(var(--tab-color), 0.08);
+}
+.wsSessionItemColored:not(.wsSessionItemActive):hover {
+  background: rgba(var(--tab-color), 0.14);
+}
+.wsSessionItemColored.wsSessionItemActive {
+  background: rgba(var(--tab-color), 0.2);
+  border-color: transparent;
+}
+.wsSessionItemExited { opacity: 0.55; }
+.wsSessionItemDragging { opacity: 0.55; }
+.wsSessionItemDropBefore::after,
+.wsSessionItemDropAfter::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  height: 2px;
+  border-radius: 2px;
+  background: rgba(var(--accent-rgb), 0.85);
+}
+.wsSessionItemDropBefore::after { top: -1px; }
+.wsSessionItemDropAfter::after { bottom: -1px; }
+
+.wsSessionDrag {
+  position: absolute;
+  left: -13px;
+  width: 13px;
+  height: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: grab;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.wsSessionItem:hover .wsSessionDrag { opacity: 0.55; }
+.wsSessionDrag:hover { opacity: 1 !important; }
+
+.wsSessionIcon {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.wsSessionIcon img { width: 15px; height: 15px; display: block; }
+/* Lean: type glyphs are tinted, not boxed. Agent icons (Claude/Codex) keep
+   their own artwork. */
+.wsSessionIconTerminal {
+  background: transparent;
+  color: var(--muted);
+}
+.wsSessionIconSsh {
+  background: transparent;
+  color: rgb(var(--ssh-rgb));
+}
+.wsSessionIconPersistent {
+  background: transparent;
+  color: rgb(var(--accent-persistent-rgb));
+}
+.wsSessionIconAgent {
+  background: transparent;
+}
+
+.wsSessionName {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wsSessionItem:hover .wsSessionName { color: var(--text); }
+.wsSessionItemActive .wsSessionName { font-weight: 500; color: var(--text); }
+.wsSessionMeta {
+  flex: 0 0 auto;
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.wsSessionEnd {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+}
+
+/* Status dots */
+.wsStatusDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+.wsStatusDot-idle {
+  border: 1.5px solid rgba(var(--ink-rgb), 0.26);
+  background: transparent;
+}
+.wsStatusDot-running {
+  background: rgb(var(--success-rgb));
+  box-shadow: 0 0 6px rgba(var(--success-rgb), 0.5);
+}
+.wsStatusDot-working {
+  background: rgb(var(--warning-rgb));
+  box-shadow: 0 0 6px rgba(var(--warning-rgb), 0.55);
+  animation: wsDotPulse 1.2s ease-in-out infinite;
+}
+.wsStatusDot-reconnecting {
+  background: rgb(var(--warning-rgb));
+  animation: wsDotPulse 1s ease-in-out infinite;
+}
+.wsStatusDot-recording {
+  background: rgb(var(--danger-rgb));
+  box-shadow: 0 0 6px rgba(var(--danger-rgb), 0.5);
+  animation: wsDotPulse 1.2s ease-in-out infinite;
+}
+.wsStatusDot-exited {
+  background: rgba(var(--ink-rgb), 0.22);
+}
+.wsStatusDot-disconnected {
+  background: transparent;
+  border: 1.5px solid rgb(var(--danger-rgb));
+}
+.wsSessionPin {
+  flex: 0 0 auto;
+  color: var(--muted);
+  opacity: 0.7;
+  transform: rotate(40deg);
+}
+@keyframes wsDotPulse {
+  0%, 100% { opacity: 0.55; transform: scale(0.82); }
+  50% { opacity: 1; transform: scale(1.08); }
+}
+
+.wsSessionReconnect,
+.wsSessionClose {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.wsSessionReconnect:hover { color: rgb(var(--accent-rgb)); background: rgba(var(--accent-rgb), 0.12); }
+.wsSessionClose {
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.wsSessionItem:hover .wsSessionClose { opacity: 1; }
+.wsSessionClose:hover { color: var(--text); background: rgba(var(--ink-rgb), 0.1); }
+
+/* Inline rename input (project + session) */
+.wsRenameInput {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  font-family: inherit;
+  color: var(--text);
+  background: rgba(var(--ink-rgb), 0.08);
+  border: 1px solid rgba(var(--accent-rgb), 0.55);
+  border-radius: 4px;
+  padding: 2px 6px;
+  outline: none;
+}
+
+/* ---- Split views block ---- */
+.wsSplitSection {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(var(--ink-rgb), 0.08);
+}
+.wsSplitLabel {
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 0 4px;
+}
+.wsSplitGroup {
+  border: 1px solid rgba(var(--ink-rgb), 0.1);
+  border-radius: var(--radius-sm);
+  padding: 5px 6px;
+  cursor: pointer;
+}
+.wsSplitGroupActive {
+  border-color: rgba(var(--accent-rgb), 0.4);
+  background: rgba(var(--accent-rgb), 0.08);
+}
+.wsSplitHeader {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+}
+.wsSplitTitle { font-size: 11px; font-weight: 500; }
+.wsSplitMeta { font-size: 10px; color: var(--muted); }
+.wsSplitRemove {
+  margin-left: auto;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.wsSplitRemove:hover { color: rgb(var(--danger-rgb)); background: rgba(var(--danger-rgb), 0.12); }
+.wsSplitMembers { display: flex; gap: 4px; margin-top: 5px; }
+.wsSplitMember {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px;
+  border: 1px solid rgba(var(--ink-rgb), 0.1);
+  background: rgba(var(--ink-rgb), 0.03);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.wsSplitMemberActive { border-color: rgba(var(--accent-rgb), 0.5); background: rgba(var(--accent-rgb), 0.12); }
+.wsSplitTag {
+  flex: 0 0 auto;
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--muted);
+}
+.wsSplitMemberName {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- Floating menus (workspace switcher, new-session, context) ---- */
+.wsMenu {
+  position: fixed;
+  z-index: 400;
+  min-width: 200px;
+  max-width: min(320px, calc(100vw - 16px));
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 5px;
+  background: rgba(var(--paper-panel-rgb), 0.98);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border: 1px solid rgba(var(--ink-rgb), 0.14);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 14px 40px rgba(var(--shadow-rgb, 0, 0, 0), 0.3);
+}
+.wsMenuLabel {
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 5px 8px 4px;
+}
+.wsMenuItem {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 9px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 12px;
+  text-align: left;
+  width: 100%;
+}
+.wsMenuItem:hover { background: rgba(var(--ink-rgb), 0.08); }
+.wsMenuItem:disabled { opacity: 0.5; cursor: default; }
+.wsMenuItem:disabled:hover { background: transparent; }
+.wsMenuItemActive { background: rgba(var(--accent-rgb), 0.1); }
+.wsMenuItemName {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wsMenuItemDanger { color: rgb(var(--danger-rgb)); }
+.wsMenuItemDanger:hover { background: rgba(var(--danger-rgb), 0.12); }
+.wsMenuSep {
+  height: 1px;
+  margin: 4px 6px;
+  background: rgba(var(--ink-rgb), 0.1);
+}
+.wsMenuIcon {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  background: rgba(var(--ink-rgb), 0.05);
+}
+.wsMenuIcon.wsSessionIconTerminal { color: rgb(var(--accent-rgb)); background: rgba(var(--accent-rgb), 0.14); }
+.wsMenuIcon.wsSessionIconSsh { color: rgb(var(--ssh-rgb)); background: rgba(var(--ssh-rgb), 0.14); }
+.wsMenuIcon.wsHeaderIconColored {
+  color: #fff;
+  background: linear-gradient(140deg, rgba(var(--tab-color), 0.95), rgba(var(--tab-color), 0.7));
+}
+
+/* Symbol / color pickers reuse existing token language */
+.wsSymbolPicker,
+.wsColorPicker {
+  position: fixed;
+  z-index: 400;
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  background: rgba(var(--paper-panel-rgb), 0.98);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border: 1px solid rgba(var(--ink-rgb), 0.14);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 14px 40px rgba(var(--shadow-rgb, 0, 0, 0), 0.3);
+}
+.wsSymbolPicker { grid-template-columns: repeat(5, 1fr); }
+.wsColorPicker { grid-template-columns: repeat(4, 1fr); }
+.wsSymbolPicker button,
+.wsColorPicker button {
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(var(--ink-rgb), 0.1);
+  background: rgba(var(--ink-rgb), 0.03);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.wsSymbolPicker button:hover,
+.wsColorPicker button:hover { border-color: rgba(var(--accent-rgb), 0.5); }
+.wsColorPicker button { border-color: rgba(255, 255, 255, 0.18); }
+
+/* ---- Delete-workspace confirmation modal ---- */
+.wsConfirmBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 500;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.42);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+}
+.wsConfirmModal {
+  width: min(420px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px;
+  background: rgba(var(--paper-panel-rgb), 0.99);
+  border: 1px solid rgba(var(--ink-rgb), 0.16);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 24px 60px rgba(var(--shadow-rgb, 0, 0, 0), 0.4);
+}
+.wsConfirmTitle {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+.wsConfirmText {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+.wsConfirmOptions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.wsConfirmOption {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 12px;
+  text-align: left;
+  border: 1px solid rgba(var(--ink-rgb), 0.12);
+  background: rgba(var(--ink-rgb), 0.02);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.wsConfirmOption:hover { border-color: rgba(var(--ink-rgb), 0.22); }
+.wsConfirmOptionActive {
+  border-color: rgba(var(--accent-rgb), 0.55);
+  background: rgba(var(--accent-rgb), 0.08);
+}
+.wsConfirmOptionActive.wsConfirmOptionDanger {
+  border-color: rgba(var(--danger-rgb), 0.55);
+  background: rgba(var(--danger-rgb), 0.09);
+}
+.wsConfirmRadio {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(var(--ink-rgb), 0.32);
+  position: relative;
+}
+.wsConfirmOptionActive .wsConfirmRadio {
+  border-color: rgb(var(--accent-rgb));
+}
+.wsConfirmOptionActive .wsConfirmRadio::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: rgb(var(--accent-rgb));
+}
+.wsConfirmOptionActive.wsConfirmOptionDanger .wsConfirmRadio { border-color: rgb(var(--danger-rgb)); }
+.wsConfirmOptionActive.wsConfirmOptionDanger .wsConfirmRadio::after { background: rgb(var(--danger-rgb)); }
+.wsConfirmOptionBody {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.wsConfirmOptionLabel {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text);
+}
+.wsConfirmOptionHint {
+  font-size: 11px;
+  color: var(--muted);
+}
+.wsConfirmSelect {
+  margin-top: 6px;
+  max-width: 100%;
+  padding: 5px 8px;
+  font-size: 12px;
+  font-family: inherit;
+  color: var(--text);
+  background: rgba(var(--ink-rgb), 0.05);
+  border: 1px solid rgba(var(--ink-rgb), 0.18);
+  border-radius: var(--radius-sm);
+  outline: none;
+}
+.wsConfirmActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
+}
+.wsConfirmBtn {
+  padding: 7px 14px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  border: 1px solid rgba(var(--ink-rgb), 0.16);
+  background: rgba(var(--ink-rgb), 0.04);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.wsConfirmBtn:hover { background: rgba(var(--ink-rgb), 0.08); }
+.wsConfirmBtnDanger {
+  color: #fff;
+  border-color: transparent;
+  background: rgb(var(--danger-rgb));
+}
+.wsConfirmBtnDanger:hover { background: rgba(var(--danger-rgb), 0.86); }
+.wsConfirmBtnDanger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }

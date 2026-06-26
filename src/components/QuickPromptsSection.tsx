@@ -37,18 +37,22 @@ export const QuickPromptsSection = React.memo(function QuickPromptsSection({
   if (pinnedPrompts.length === 0) return null;
 
   return (
-    <>
-      <div className="sidebarHeader">
-        <div className="title">Quick Prompts</div>
-        <button className="btn" onClick={onOpenPromptsPanel} title="Manage prompts">
-          <Icon name="panel" />
+    <section className="quickPromptsTreeGroup" aria-label="Quick prompts">
+      <div className="quickPromptsSection sidebarTreeList">
+        <button
+          type="button"
+          className="quickPromptItem quickPromptManageItem sidebarTreeItem"
+          onClick={onOpenPromptsPanel}
+          title="Manage prompts"
+        >
+          <Icon name="panel" size={13} />
+          <span className="quickPromptTitle">Prompts</span>
+          <span className="quickPromptShortcut">{pinnedPrompts.length}</span>
         </button>
-      </div>
-      <div className="quickPromptsSection">
         {pinnedPrompts.map((p, idx) => (
           <button
             key={p.id}
-            className="quickPromptItem"
+            className="quickPromptItem sidebarTreeItem"
             onClick={() => onSendPrompt(p)}
             onDoubleClick={() => onEditPrompt(p)}
             disabled={!activeSessionId}
@@ -63,6 +67,6 @@ export const QuickPromptsSection = React.memo(function QuickPromptsSection({
           </button>
         ))}
       </div>
-    </>
+    </section>
   );
 });

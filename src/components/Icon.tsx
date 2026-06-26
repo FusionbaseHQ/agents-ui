@@ -29,6 +29,10 @@ export type IconName =
   | "history"
   | "activity"
   | "globe"
+  | "terminal"
+  | "git-branch"
+  | "more"
+  | "sidebar"
   | "pin";
 
 type IconProps = {
@@ -204,10 +208,14 @@ export const Icon = React.memo(function Icon({ name, size = 16, className }: Ico
         </svg>
       );
     case "ssh":
+      // Globe/network glyph for remote (SSH) sessions — a solid, instantly
+      // recognizable "remote" shape that reads clearly at 12px and is obviously
+      // distinct from the local terminal ">_" prompt.
       return (
         <svg {...common}>
-          <path d="M7 8l5 4-5 4" />
-          <path d="M15 16h5" />
+          <circle cx="12" cy="12" r="8" />
+          <path d="M4 12h16" />
+          <path d="M12 4a12 12 0 0 1 0 16 12 12 0 0 1 0-16" />
         </svg>
       );
     case "grip":
@@ -279,6 +287,40 @@ export const Icon = React.memo(function Icon({ name, size = 16, className }: Ico
           <path d="M9 4h6" />
           <path d="M10 4v5l-3 3v1h10v-1l-3-3V4" />
           <path d="M12 13v7" />
+        </svg>
+      );
+    case "terminal":
+      return (
+        <svg {...common}>
+          <path d="M5 8l4 4-4 4" />
+          <path d="M13 16h6" />
+        </svg>
+      );
+    case "git-branch":
+      return (
+        <svg {...common}>
+          <circle cx="6" cy="6" r="2.4" />
+          <circle cx="6" cy="18" r="2.4" />
+          <circle cx="18" cy="8" r="2.4" />
+          <path d="M6 8.4v7.2" />
+          <path d="M18 10.4a6 6 0 0 1-6 6H6" />
+        </svg>
+      );
+    case "more":
+      return (
+        <svg {...common}>
+          <circle cx="5" cy="12" r="1.4" fill="currentColor" stroke="none" />
+          <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none" />
+          <circle cx="19" cy="12" r="1.4" fill="currentColor" stroke="none" />
+        </svg>
+      );
+    case "sidebar":
+      return (
+        <svg {...common}>
+          <rect x="3.5" y="5" width="17" height="14" rx="2.2" />
+          <path d="M10 5v14" />
+          <path d="M6 9h1.5" />
+          <path d="M6 12h1.5" />
         </svg>
       );
     default:
