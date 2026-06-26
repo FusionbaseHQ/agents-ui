@@ -16,9 +16,13 @@ import { shortenPathSmart } from "./pathDisplay";
 import { SlidePanel } from "./SlidePanel";
 import { PanelErrorBoundary } from "./ErrorBoundary";
 import { CommandPalette } from "./CommandPalette";
-import { ProjectsSection } from "./components/ProjectsSection";
 import { QuickPromptsSection } from "./components/QuickPromptsSection";
-import { SessionsSection } from "./components/SessionsSection";
+import {
+  WorkspaceSidebar,
+  type SidebarProject,
+  type SidebarSession,
+  type WorkspaceDeleteOptions,
+} from "./components/WorkspaceSidebar";
 import { TerminalPane, type TerminalPaneSession } from "./components/TerminalPane";
 import { Icon } from "./components/Icon";
 import { ActivityCenter, type ActivityCenterItem } from "./components/ActivityCenter";
@@ -73,6 +77,25 @@ type Project = {
   color?: string | null;
   sshTarget?: string | null;
   sshRemotePath?: string | null;
+};
+
+// A Workspace groups projects (Workspace → Project → Session). Workspaces are a
+// frontend-only tier persisted separately (see STORAGE_WORKSPACES_KEY); the Rust
+// PersistedStateV1 blob drops unknown fields, so workspace membership is kept in
+// its own localStorage record rather than on the Project rows.
+type Workspace = {
+  id: string;
+  name: string;
+  symbol?: string | null;
+  color?: string | null;
+  iconImage?: string | null; // data URL of a custom workspace icon
+};
+
+type PersistedWorkspacesV1 = {
+  schemaVersion: 1;
+  workspaces: Workspace[];
+  activeWorkspaceId: string;
+  projectWorkspace: Record<string, string>;
 };
 
 type SessionInfo = {
@@ -188,7 +211,6 @@ const STORAGE_PROJECTS_KEY = "agents-ui-projects";
 const STORAGE_ACTIVE_PROJECT_KEY = "agents-ui-active-project-id";
 const STORAGE_SESSIONS_KEY = "agents-ui-sessions-v1";
 const STORAGE_ACTIVE_SESSION_BY_PROJECT_KEY = "agents-ui-active-session-by-project-v1";
-const STORAGE_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT_KEY = "agents-ui-sidebar-projects-list-max-height-v1";
 const STORAGE_WORKSPACE_EDITOR_WIDTH_KEY = "agents-ui-workspace-editor-width-v1";
 const STORAGE_WORKSPACE_FILE_TREE_WIDTH_KEY = "agents-ui-workspace-file-tree-width-v1";
 const STORAGE_WORKSPACE_VIEW_BY_KEY = "agents-ui-workspace-view-by-key-v1";
@@ -198,6 +220,8 @@ const STORAGE_SPLIT_VIEWS_KEY = "agents-ui-split-views-v1";
 const STORAGE_AGENT_PANEL_WIDTH_KEY = "agents-ui-agent-panel-width-v1";
 const STORAGE_UI_THEME_KEY = "agents-ui-ui-theme-v1";
 const STORAGE_AUTO_CAFFEINATE_KEY = "agents-ui-auto-caffeinate-v1";
+const STORAGE_WORKSPACES_KEY = "agents-ui-workspaces-v1";
+const STORAGE_SIDEBAR_COLLAPSED_KEY = "agents-ui-sidebar-collapsed-v1";
 const DEFAULT_UI_THEME: UiTheme = "midnight";
 // Long enough to outlast the pauses inside one agent run (output gaps of a
 // few seconds happen constantly; thinking pauses can reach ~10s).
@@ -233,11 +257,6 @@ const CPR_RESPONSE_RE_GLOBAL = /\x1b\[\d{1,4};\d{1,4}R/g;
 const COMMAND_ACTIVITY_IDLE_MS = 3_000;
 
 const DEFAULT_AGENT_SHORTCUT_IDS = ["codex", "claude"];
-const DEFAULT_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT = 290;
-const MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT = 0;
-const MAX_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT = 1200;
-const SIDEBAR_RESIZE_BOTTOM_MIN_PX = 200;
-const SIDEBAR_PROJECTS_LIST_AUTO_MAX_VISIBLE = 6;
 const DEFAULT_WORKSPACE_EDITOR_WIDTH = 520;
 const DEFAULT_WORKSPACE_FILE_TREE_WIDTH = 320;
 const DEFAULT_AGENT_PANEL_WIDTH = 420;
@@ -731,6 +750,36 @@ function buildSshCommandAtRemoteDir(input: {
   return ensureSshKeepAliveOptions([program, ...options, "-t", target, remoteCommandArg].join(" ")) ?? "ssh";
 }
 
+// Build an SSH command that opens the project's remote host, cd's into the
+// project's remote root dir, runs an agent (claude/codex/…) in the user's
+// interactive shell (so PATH from the shell rc is available), and drops back to
+// an interactive shell when the agent exits — i.e. the SSH equivalent of the
+// local "quick start an agent" flow.
+function buildSshAgentCommandAtRemoteDir(input: {
+  target: string;
+  remoteDir: string;
+  agentCommand: string;
+}): string {
+  const target = input.target.trim();
+  const remoteDir = input.remoteDir.trim();
+  const agentCommand = input.agentCommand.trim();
+  // Literal text for the remote shell to expand (NOT interpolated locally).
+  const SH = "${SHELL:-sh}";
+  const cdPart = remoteDir
+    ? `cd -- ${shellEscapePosix(remoteDir)} 2>/dev/null || echo ${shellEscapePosix(
+        `cd failed: ${remoteDir}`,
+      )} >&2; `
+    : "";
+  // Runs inside the remote interactive shell ($SHELL -ic): cd, run agent, fall
+  // back to an interactive shell when it exits.
+  const innerScript = `${cdPart}${agentCommand}; exec "${SH}"`;
+  const remoteCommand = `"${SH}" -ic ${shellEscapePosix(innerScript)}`;
+  return (
+    ensureSshKeepAliveOptions(`ssh -t ${target} ${shellEscapePosix(remoteCommand)}`) ??
+    `ssh ${target}`
+  );
+}
+
 function isSshCommandLine(commandLine: string | null | undefined): boolean {
   const trimmed = commandLine?.trim() ?? "";
   if (!trimmed) return false;
@@ -1151,6 +1200,45 @@ function defaultProjectState(): { projects: Project[]; activeProjectId: string }
     projects: [{ id, title: "Default", basePath: null, environmentId: null, assetsEnabled: true }],
     activeProjectId: id,
   };
+}
+
+function defaultWorkspaceState(): PersistedWorkspacesV1 {
+  const id = makeId();
+  return {
+    schemaVersion: 1,
+    workspaces: [{ id, name: "Workspace" }],
+    activeWorkspaceId: id,
+    projectWorkspace: {},
+  };
+}
+
+function loadWorkspaceState(): PersistedWorkspacesV1 {
+  try {
+    const raw = localStorage.getItem(STORAGE_WORKSPACES_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<PersistedWorkspacesV1>;
+      const workspaces = Array.isArray(parsed.workspaces)
+        ? parsed.workspaces.filter(
+            (w): w is Workspace => Boolean(w) && typeof w.id === "string" && typeof w.name === "string",
+          )
+        : [];
+      if (workspaces.length) {
+        const activeWorkspaceId =
+          typeof parsed.activeWorkspaceId === "string" &&
+          workspaces.some((w) => w.id === parsed.activeWorkspaceId)
+            ? parsed.activeWorkspaceId
+            : workspaces[0].id;
+        const projectWorkspace =
+          parsed.projectWorkspace && typeof parsed.projectWorkspace === "object"
+            ? (parsed.projectWorkspace as Record<string, string>)
+            : {};
+        return { schemaVersion: 1, workspaces, activeWorkspaceId, projectWorkspace };
+      }
+    }
+  } catch {
+    // ignore — fall through to default
+  }
+  return defaultWorkspaceState();
 }
 
 type PersistedSession = {
@@ -1877,6 +1965,27 @@ export default function App() {
   const [projects, setProjects] = useState<Project[]>(initialProjectState.projects);
   const [activeProjectId, setActiveProjectId] = useState<string>(initialProjectState.activeProjectId);
   const [activeSessionByProject, setActiveSessionByProject] = useState<Record<string, string>>({});
+  const [initialWorkspaceState] = useState(() => loadWorkspaceState());
+  const [workspaces, setWorkspaces] = useState<Workspace[]>(initialWorkspaceState.workspaces);
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState<string>(initialWorkspaceState.activeWorkspaceId);
+  const [projectWorkspace, setProjectWorkspace] = useState<Record<string, string>>(
+    initialWorkspaceState.projectWorkspace,
+  );
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(STORAGE_SIDEBAR_COLLAPSED_KEY) === "on";
+    } catch {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_SIDEBAR_COLLAPSED_KEY, sidebarCollapsed ? "on" : "off");
+    } catch {
+      // Best-effort.
+    }
+  }, [sidebarCollapsed]);
   const [uiTheme, setUiTheme] = useState<UiTheme>(INITIAL_UI_THEME);
   const uiThemeRef = useRef<UiTheme>(INITIAL_UI_THEME);
   uiThemeRef.current = uiTheme;
@@ -1899,32 +2008,6 @@ export default function App() {
   const activityCenterMenuRef = useRef<HTMLDivElement | null>(null);
   const [appSettingsOpen, setAppSettingsOpen] = useState(false);
   const appSettingsMenuRef = useRef<HTMLDivElement | null>(null);
-  const sidebarRef = useRef<HTMLElement | null>(null);
-  const [projectsListHeightMode, setProjectsListHeightMode] = useState<"auto" | "manual">(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT_KEY);
-      const parsed = raw != null ? Number(raw) : NaN;
-      return Number.isFinite(parsed) ? "manual" : "auto";
-    } catch {
-      // Best-effort: localStorage may be unavailable in some contexts.
-      return "auto";
-    }
-  });
-  const [projectsListMaxHeight, setProjectsListMaxHeight] = useState<number>(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT_KEY);
-      const parsed = raw != null ? Number(raw) : NaN;
-      if (Number.isFinite(parsed)) {
-        return Math.min(
-          MAX_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT,
-          Math.max(MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT, parsed),
-        );
-      }
-    } catch {
-      // Best-effort: localStorage may be unavailable in some contexts.
-    }
-    return DEFAULT_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT;
-  });
   const [activeId, setActiveId] = useState<string | null>(null);
   const [sessionHistory, setSessionHistory] = useState<string[]>([]);
   const [splitViews, setSplitViews] = useState<SplitView[]>(() => loadPersistedSplitViews());
@@ -2020,6 +2103,63 @@ export default function App() {
     splitPaneRef.current = splitPane;
   }, [splitPane]);
   const [hydrated, setHydrated] = useState(false);
+
+  // Persist the workspace tier (separate from the Rust state blob). Gated on
+  // `hydrated` so we never overwrite the saved record with the pre-hydration
+  // placeholder state (initial `projects` is a synthetic Default project).
+  useEffect(() => {
+    if (!hydrated) return;
+    try {
+      const payload: PersistedWorkspacesV1 = {
+        schemaVersion: 1,
+        workspaces,
+        activeWorkspaceId,
+        projectWorkspace,
+      };
+      localStorage.setItem(STORAGE_WORKSPACES_KEY, JSON.stringify(payload));
+    } catch {
+      // Best-effort.
+    }
+  }, [hydrated, workspaces, activeWorkspaceId, projectWorkspace]);
+
+  // Self-heal workspace membership: assign any project lacking a workspace to the
+  // active workspace, drop stale mappings, and keep activeWorkspaceId valid. This
+  // also migrates pre-workspace installs (all existing projects join the default
+  // workspace) and absorbs newly created projects into the current workspace.
+  // Gated on `hydrated`: before real projects load, `projects` only holds the
+  // synthetic Default project, so running this early would strip every saved
+  // mapping.
+  useEffect(() => {
+    if (!hydrated) return;
+    if (!workspaces.length) return;
+    const validWorkspaceIds = new Set(workspaces.map((w) => w.id));
+    const fallbackWorkspaceId = validWorkspaceIds.has(activeWorkspaceId)
+      ? activeWorkspaceId
+      : workspaces[0].id;
+    if (!validWorkspaceIds.has(activeWorkspaceId)) {
+      setActiveWorkspaceId(fallbackWorkspaceId);
+    }
+    setProjectWorkspace((prev) => {
+      const next: Record<string, string> = {};
+      let changed = false;
+      const projectIds = new Set(projects.map((p) => p.id));
+      for (const p of projects) {
+        const current = prev[p.id];
+        if (current && validWorkspaceIds.has(current)) {
+          next[p.id] = current;
+        } else {
+          next[p.id] = fallbackWorkspaceId;
+          changed = true;
+        }
+      }
+      // Drop mappings for deleted projects.
+      for (const key of Object.keys(prev)) {
+        if (!projectIds.has(key)) changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [hydrated, projects, workspaces, activeWorkspaceId]);
+
   const [sessionRestoreProgress, setSessionRestoreProgress] = useState<SessionRestoreProgress | null>(
     null,
   );
@@ -2381,6 +2521,12 @@ export default function App() {
   const environmentsRef = useRef<EnvironmentConfig[]>(environments);
   const projectByIdRef = useRef<Map<string, Project>>(new Map());
   const activeProjectIdRef = useRef<string>(activeProjectId);
+  const projectWorkspaceRef = useRef<Record<string, string>>(projectWorkspace);
+  projectWorkspaceRef.current = projectWorkspace;
+  const activeWorkspaceIdRef = useRef<string>(activeWorkspaceId);
+  activeWorkspaceIdRef.current = activeWorkspaceId;
+  const workspacesRef = useRef<Workspace[]>(workspaces);
+  workspacesRef.current = workspaces;
   const reconnectTimersRef = useRef<Map<string, number>>(new Map());
   const reconnectInFlightRef = useRef<Set<string>>(new Set());
   const healthCheckInFlightRef = useRef(false);
@@ -3176,18 +3322,34 @@ export default function App() {
     [sessions, activeProjectId],
   );
 
-  const { sessionCountByProject, workingAgentCountByProject } = useMemo(() => {
-    const sessionCounts = new Map<string, number>();
-    const workingCounts = new Map<string, number>();
-    for (const s of sessions) {
-      sessionCounts.set(s.projectId, (sessionCounts.get(s.projectId) ?? 0) + 1);
-      const activity = getSessionActivityState(s, agentWorkingIds);
-      if (activity.isActive) {
-        workingCounts.set(s.projectId, (workingCounts.get(s.projectId) ?? 0) + 1);
-      }
+  // Projects belonging to the active workspace, in their existing order.
+  // Unmapped projects fall back to the active workspace so nothing vanishes
+  // before the self-heal effect runs.
+  const workspaceProjects = useMemo<SidebarProject[]>(
+    () =>
+      projects
+        .filter((p) => (projectWorkspace[p.id] ?? activeWorkspaceId) === activeWorkspaceId)
+        .map((p) => ({
+          id: p.id,
+          title: p.title,
+          basePath: p.basePath,
+          symbol: p.symbol ?? null,
+          color: p.color ?? null,
+          sshTarget: p.sshTarget ?? null,
+          sshRemotePath: p.sshRemotePath ?? null,
+          branch: null,
+        })),
+    [projects, projectWorkspace, activeWorkspaceId],
+  );
+
+  // Sorted sessions per project for the active workspace's tree.
+  const sessionsByProject = useMemo(() => {
+    const map = new Map<string, SidebarSession[]>();
+    for (const p of workspaceProjects) {
+      map.set(p.id, sortProjectSessionsForSidebar(sessions, p.id));
     }
-    return { sessionCountByProject: sessionCounts, workingAgentCountByProject: workingCounts };
-  }, [sessions, agentWorkingIds]);
+    return map;
+  }, [sessions, workspaceProjects]);
 
   const persistentSessionItems = useMemo<PersistentSessionsModalItem[]>(() => {
     if (!persistentSessions.length) return [];
@@ -3394,6 +3556,10 @@ export default function App() {
               sshRootDir: previous.sshRootDir ?? created.sshRootDir,
               lastRecordingId: previous.lastRecordingId ?? created.lastRecordingId,
               symbol: previous.symbol,
+              // Keep an explicit agent classification (e.g. an SSH-wrapped
+              // claude/codex session whose effect can't be re-detected from the
+              // `ssh …` launch command).
+              effectId: previous.effectId ?? created.effectId,
               recordingActive: false,
               exited: false,
               closing: false,
@@ -7407,12 +7573,6 @@ export default function App() {
     void refreshSshHosts();
   }, []);
 
-  const openRenameProject = useCallback(() => {
-    const curProject = projectByIdRef.current.get(activeProjectIdRef.current ?? "") ?? null;
-    if (!curProject) return;
-    openProjectSettings(curProject.id);
-  }, [openProjectSettings]);
-
   async function createSshSessionForProject(project: Project, allProjects?: Project[]) {
     const target = project.sshTarget!.trim();
     const remoteDir = project.sshRemotePath?.trim() || "";
@@ -7432,6 +7592,31 @@ export default function App() {
     });
     const s = applyPendingExit(createdRaw);
     addSessionWithProjectSafeActivation(s);
+  }
+
+  async function createSshAgentSessionForProject(project: Project, effect: ProcessEffect) {
+    const target = project.sshTarget!.trim();
+    const remoteDir = project.sshRemotePath?.trim() || "";
+    const agentCommand = effect.matchCommands[0] ?? effect.label;
+    const launchCommand = buildSshAgentCommandAtRemoteDir({ target, remoteDir, agentCommand });
+    const localCwd = project.basePath ?? homeDirRef.current ?? "";
+    const validatedCwd = await invoke<string | null>("validate_directory", { path: localCwd }).catch(
+      () => localCwd,
+    );
+    const createdRaw = await createSession({
+      projectId: project.id,
+      name: effect.label,
+      launchCommand,
+      sshTarget: target,
+      sshRootDir: remoteDir || null,
+      cwd: validatedCwd,
+      envVars: envVarsForProjectId(project.id, projects, environments),
+    });
+    const s = applyPendingExit(createdRaw);
+    // The agent runs inside an ssh invocation, so effect detection on the launch
+    // command can miss it — tag the session explicitly so it shows the agent
+    // icon and is tracked for activity.
+    addSessionWithProjectSafeActivation({ ...s, effectId: effect.id });
   }
 
   async function onProjectSubmit(data: ProjectSubmitData) {
@@ -8630,16 +8815,21 @@ export default function App() {
     });
   }
 
-  async function quickStart(preset: { id: string; title: string; command: string | null }) {
+  async function quickStart(
+    preset: { id: string; title: string; command: string | null },
+    projectIdArg?: string,
+  ) {
     try {
-      const cwd = activeProject?.basePath ?? homeDirRef.current ?? null;
-      if (cwd) await ensureAutoAssets(cwd, activeProjectId);
+      const targetProjectId = projectIdArg ?? activeProjectId;
+      const targetProject = projects.find((p) => p.id === targetProjectId) ?? activeProject ?? null;
+      const cwd = targetProject?.basePath ?? homeDirRef.current ?? null;
+      if (cwd) await ensureAutoAssets(cwd, targetProjectId);
       const createdRaw = await createSession({
-        projectId: activeProjectId,
+        projectId: targetProjectId,
         name: preset.title,
         launchCommand: null,
         cwd,
-        envVars: envVarsForProjectId(activeProjectId, projects, environments),
+        envVars: envVarsForProjectId(targetProjectId, projects, environments),
       });
       const created = applyPendingExit(createdRaw);
       const next = created;
@@ -8669,235 +8859,6 @@ export default function App() {
   const pendingDeleteAsset = confirmDeleteAssetId
     ? assets.find((a) => a.id === confirmDeleteAssetId) ?? null
     : null;
-
-  const persistProjectsListMaxHeight = useCallback((value: number) => {
-    setProjectsListHeightMode("manual");
-    try {
-      localStorage.setItem(
-        STORAGE_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT_KEY,
-        String(Math.round(value)),
-      );
-    } catch {
-      // Best-effort: localStorage may be unavailable in some contexts.
-    }
-  }, [setProjectsListHeightMode]);
-
-  const clearPersistedProjectsListMaxHeight = useCallback(() => {
-    try {
-      localStorage.removeItem(STORAGE_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT_KEY);
-    } catch {
-      // Best-effort: localStorage may be unavailable in some contexts.
-    }
-  }, []);
-
-  const computeProjectsListMaxHeightLimit = useCallback(() => {
-    const sidebar = sidebarRef.current;
-    const projectList = sidebar?.querySelector<HTMLElement>(".projectList");
-    if (!sidebar || !projectList) return MAX_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT;
-    const sidebarRect = sidebar.getBoundingClientRect();
-    const listRect = projectList.getBoundingClientRect();
-    const available = sidebarRect.bottom - listRect.top - SIDEBAR_RESIZE_BOTTOM_MIN_PX;
-    return Math.min(
-      MAX_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT,
-      Math.max(MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT, Math.floor(available)),
-    );
-  }, []);
-
-  const projectsListResizingRef = useRef(false);
-  const projectsListSyncRafRef = useRef<number | null>(null);
-
-  const computeProjectsListAutoHeight = useCallback((): number => {
-    const sidebar = sidebarRef.current;
-    const projectList = sidebar?.querySelector<HTMLElement>(".projectList");
-    if (!sidebar || !projectList) return DEFAULT_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT;
-
-    const items = Array.from(projectList.querySelectorAll<HTMLElement>(".projectItem"));
-    const visibleCount = Math.min(items.length, SIDEBAR_PROJECTS_LIST_AUTO_MAX_VISIBLE);
-    if (!visibleCount) return 0;
-
-    const style = getComputedStyle(projectList);
-    const gap = Number.parseFloat(style.rowGap || style.gap || "0") || 0;
-
-    let height = 0;
-    for (let i = 0; i < visibleCount; i++) {
-      height += items[i].getBoundingClientRect().height;
-    }
-    height += gap * Math.max(0, visibleCount - 1);
-    return height;
-  }, []);
-
-  const syncProjectsListHeight = useCallback(
-    (modeOverride?: "auto" | "manual") => {
-      if (projectsListResizingRef.current) return;
-
-      const max = computeProjectsListMaxHeightLimit();
-      const clamp = (value: number) =>
-        Math.min(max, Math.max(MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT, value));
-
-      const mode = modeOverride ?? projectsListHeightMode;
-      if (mode === "auto") {
-        setProjectsListMaxHeight(clamp(computeProjectsListAutoHeight()));
-        return;
-      }
-
-      setProjectsListMaxHeight((prev) => {
-        const clamped = clamp(prev);
-        if (clamped !== prev) persistProjectsListMaxHeight(clamped);
-        return clamped;
-      });
-    },
-    [
-      computeProjectsListAutoHeight,
-      computeProjectsListMaxHeightLimit,
-      persistProjectsListMaxHeight,
-      projectsListHeightMode,
-    ],
-  );
-
-  const scheduleProjectsListHeightSync = useCallback(
-    (modeOverride?: "auto" | "manual") => {
-      if (projectsListSyncRafRef.current != null) {
-        cancelAnimationFrame(projectsListSyncRafRef.current);
-      }
-
-      projectsListSyncRafRef.current = requestAnimationFrame(() => {
-        projectsListSyncRafRef.current = null;
-        syncProjectsListHeight(modeOverride);
-      });
-    },
-    [syncProjectsListHeight],
-  );
-
-  useLayoutEffect(() => {
-    syncProjectsListHeight();
-  }, [projects.length, projectsListHeightMode, syncProjectsListHeight]);
-
-  const handleWindowResize = useCallback(() => {
-    scheduleProjectsListHeightSync();
-  }, [scheduleProjectsListHeightSync]);
-
-  useEffect(() => {
-    window.addEventListener("resize", handleWindowResize);
-    return () => window.removeEventListener("resize", handleWindowResize);
-  }, [handleWindowResize]);
-
-  useEffect(() => {
-    return () => {
-      if (projectsListSyncRafRef.current != null) {
-        cancelAnimationFrame(projectsListSyncRafRef.current);
-      }
-    };
-  }, []);
-
-  const resetProjectsListMaxHeight = useCallback(() => {
-    setProjectsListHeightMode("auto");
-    clearPersistedProjectsListMaxHeight();
-    scheduleProjectsListHeightSync("auto");
-  }, [clearPersistedProjectsListMaxHeight, scheduleProjectsListHeightSync, setProjectsListHeightMode]);
-
-  const handleProjectsDividerKeyDown = useCallback(
-    (event: React.KeyboardEvent<HTMLDivElement>) => {
-      const step = event.shiftKey ? 60 : 20;
-      const max = computeProjectsListMaxHeightLimit();
-      const clamp = (value: number) =>
-        Math.min(max, Math.max(MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT, value));
-
-      if (event.key === "ArrowDown") {
-        event.preventDefault();
-        setProjectsListMaxHeight((prev) => {
-          const next = clamp(prev + step);
-          persistProjectsListMaxHeight(next);
-          return next;
-        });
-        return;
-      }
-
-      if (event.key === "ArrowUp") {
-        event.preventDefault();
-        setProjectsListMaxHeight((prev) => {
-          const next = clamp(prev - step);
-          persistProjectsListMaxHeight(next);
-          return next;
-        });
-        return;
-      }
-
-      if (event.key === "Home") {
-        event.preventDefault();
-        setProjectsListMaxHeight(MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT);
-        persistProjectsListMaxHeight(MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT);
-        return;
-      }
-
-      if (event.key === "End") {
-        event.preventDefault();
-        setProjectsListMaxHeight(max);
-        persistProjectsListMaxHeight(max);
-      }
-    },
-    [computeProjectsListMaxHeightLimit, persistProjectsListMaxHeight],
-  );
-
-	  const handleProjectsDividerPointerDown = useCallback(
-	    (event: React.PointerEvent<HTMLDivElement>) => {
-	      if (event.button !== 0) return;
-	      event.preventDefault();
-
-	      projectsListResizingRef.current = true;
-	      if (projectsListSyncRafRef.current != null) {
-	        cancelAnimationFrame(projectsListSyncRafRef.current);
-	        projectsListSyncRafRef.current = null;
-	      }
-
-	      const pointerId = event.pointerId;
-	      const target = event.currentTarget;
-	      const startY = event.clientY;
-	      const startHeight = projectsListMaxHeight;
-      const maxHeight = computeProjectsListMaxHeightLimit();
-
-      const clamp = (value: number) =>
-        Math.min(maxHeight, Math.max(MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT, value));
-
-      let current = startHeight;
-      const prevCursor = document.body.style.cursor;
-      const prevUserSelect = document.body.style.userSelect;
-      document.body.style.cursor = "row-resize";
-      document.body.style.userSelect = "none";
-
-      try {
-        target.setPointerCapture(pointerId);
-      } catch {
-        // ignore
-      }
-
-      const handlePointerMove = (e: PointerEvent) => {
-        if (e.pointerId !== pointerId) return;
-        current = clamp(startHeight + (e.clientY - startY));
-        setProjectsListMaxHeight(current);
-      };
-
-	      const handlePointerUp = (e: PointerEvent) => {
-	        if (e.pointerId !== pointerId) return;
-	        document.removeEventListener("pointermove", handlePointerMove);
-	        document.removeEventListener("pointerup", handlePointerUp);
-	        document.removeEventListener("pointercancel", handlePointerUp);
-	        projectsListResizingRef.current = false;
-	        document.body.style.cursor = prevCursor;
-	        document.body.style.userSelect = prevUserSelect;
-	        persistProjectsListMaxHeight(current);
-	        try {
-	          target.releasePointerCapture(pointerId);
-        } catch {
-          // ignore
-        }
-      };
-
-	      document.addEventListener("pointermove", handlePointerMove);
-	      document.addEventListener("pointerup", handlePointerUp);
-	      document.addEventListener("pointercancel", handlePointerUp);
-	    },
-	    [computeProjectsListMaxHeightLimit, persistProjectsListMaxHeight, projectsListMaxHeight],
-	  );
 
   // -- Stable callback props for memoized sidebar sections --
 
@@ -9296,15 +9257,6 @@ export default function App() {
     });
   }, []);
 
-  const handleQuickStartFromSidebar = useCallback(
-    (effect: ProcessEffect) =>
-      void quickStart({
-        id: effect.id,
-        title: effect.label,
-        command: effect.matchCommands[0] ?? effect.label,
-      }),
-    [quickStart],
-  );
 
   const handleOpenNewSession = useCallback(() => {
     const project = projectByIdRef.current.get(activeProjectIdRef.current ?? "");
@@ -9332,6 +9284,202 @@ export default function App() {
 
   const handleDeleteProject = useCallback(() => setConfirmDeleteProjectOpen(true), []);
 
+  // --- Project-targeted session creation (per-project "+" popover) ---
+
+  const handleNewTerminalForProject = useCallback(
+    (projectId: string) => {
+      selectProject(projectId);
+      const project = projectByIdRef.current.get(projectId);
+      if (isProjectSsh(project)) {
+        void createSshSessionForProject(project!);
+        return;
+      }
+      setProjectOpen(false);
+      setNewOpen(true);
+    },
+    [selectProject],
+  );
+
+  const handleNewSshForProject = useCallback(
+    (projectId: string) => {
+      selectProject(projectId);
+      const project = projectByIdRef.current.get(projectId);
+      if (project?.sshTarget) {
+        void createSshSessionForProject(project);
+        return;
+      }
+      setProjectOpen(false);
+      setNewOpen(false);
+      setSshManagerOpen(true);
+    },
+    [selectProject],
+  );
+
+  const handleQuickStartForProject = useCallback(
+    (projectId: string, effect: ProcessEffect) => {
+      selectProject(projectId);
+      const project = projectByIdRef.current.get(projectId);
+      // On an SSH project, run the agent ON the remote in the project's root dir
+      // (the same place a new terminal session opens) instead of locally.
+      if (isProjectSsh(project)) {
+        void createSshAgentSessionForProject(project!, effect);
+        return;
+      }
+      void quickStart(
+        {
+          id: effect.id,
+          title: effect.label,
+          command: effect.matchCommands[0] ?? effect.label,
+        },
+        projectId,
+      );
+    },
+    [selectProject, quickStart],
+  );
+
+  const handleRequestDeleteProject = useCallback(
+    (projectId: string) => {
+      selectProject(projectId);
+      setConfirmDeleteProjectOpen(true);
+    },
+    [selectProject],
+  );
+
+  const handleToggleSidebarCollapsed = useCallback(() => setSidebarCollapsed((prev) => !prev), []);
+
+  // Selecting a session from the tree exits any in-pane split and focuses it
+  // (switching the active project if the session lives in another project).
+  const handleSelectSessionFromTree = useCallback(
+    (sessionId: string) => {
+      handleUnsplit();
+      selectSessionById(sessionId);
+    },
+    [handleUnsplit, selectSessionById],
+  );
+
+  // --- Workspace tier handlers ---
+
+  const handleSelectWorkspace = useCallback((workspaceId: string) => {
+    setActiveWorkspaceId(workspaceId);
+    // Keep the active project inside the chosen workspace.
+    const map = projectWorkspaceRef.current;
+    const currentActive = activeProjectIdRef.current;
+    const inWorkspace = (id: string) => (map[id] ?? workspaceId) === workspaceId;
+    if (!inWorkspace(currentActive)) {
+      const first = projectsRef.current.find((p) => inWorkspace(p.id));
+      if (first) selectProject(first.id);
+    }
+  }, [selectProject]);
+
+  const handleCreateWorkspace = useCallback(() => {
+    // window.prompt() is a no-op in Tauri's WKWebView, so create immediately
+    // with an auto-incremented name; the sidebar drops it into inline rename.
+    const id = makeId();
+    setWorkspaces((prev) => {
+      const names = new Set(prev.map((w) => w.name));
+      let n = prev.length + 1;
+      let name = `Workspace ${n}`;
+      while (names.has(name)) {
+        n += 1;
+        name = `Workspace ${n}`;
+      }
+      return [...prev, { id, name }];
+    });
+    setActiveWorkspaceId(id);
+  }, []);
+
+  const handleRenameWorkspace = useCallback((workspaceId: string, name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setWorkspaces((prev) => prev.map((w) => (w.id === workspaceId ? { ...w, name: trimmed } : w)));
+  }, []);
+
+  const handleSetWorkspaceImage = useCallback((workspaceId: string, image: string | null) => {
+    setWorkspaces((prev) => prev.map((w) => (w.id === workspaceId ? { ...w, iconImage: image } : w)));
+  }, []);
+
+  const handleDeleteWorkspace = useCallback(
+    (workspaceId: string, options: WorkspaceDeleteOptions) => {
+      const remaining = workspacesRef.current.filter((w) => w.id !== workspaceId);
+      if (remaining.length === 0) return; // never delete the last workspace
+
+      const map = projectWorkspaceRef.current;
+      const wsProjectIds = projectsRef.current
+        .filter((p) => (map[p.id] ?? activeWorkspaceIdRef.current) === workspaceId)
+        .map((p) => p.id);
+      const wsProjectIdSet = new Set(wsProjectIds);
+
+      // Where does the active workspace land after deletion?
+      const moveTarget =
+        options.mode === "move" &&
+        options.targetWorkspaceId &&
+        remaining.some((w) => w.id === options.targetWorkspaceId)
+          ? options.targetWorkspaceId
+          : remaining[0].id;
+      const nextActiveWorkspaceId = moveTarget;
+
+      if (options.mode === "remove" && wsProjectIds.length > 0) {
+        // Delete the projects entirely: drop their sessions + close the PTYs.
+        const sessionIdsToClose = sessionsRef.current
+          .filter((s) => wsProjectIdSet.has(s.projectId))
+          .map((s) => s.id);
+        for (const sid of sessionIdsToClose) removeSessionFromState(sid);
+        for (const pid of wsProjectIds) lastActiveByProject.current.delete(pid);
+        setActiveSessionByProject((prev) => {
+          let changed = false;
+          const next = { ...prev };
+          for (const pid of wsProjectIds) {
+            if (pid in next) {
+              delete next[pid];
+              changed = true;
+            }
+          }
+          return changed ? next : prev;
+        });
+        void Promise.all(sessionIdsToClose.map((id) => closeSession(id).catch(() => {})));
+
+        setProjectWorkspace((m) => {
+          const next = { ...m };
+          for (const pid of wsProjectIds) delete next[pid];
+          return next;
+        });
+
+        let nextProjects = projectsRef.current.filter((p) => !wsProjectIdSet.has(p.id));
+        if (nextProjects.length === 0) {
+          const fallback: Project = {
+            id: makeId(),
+            title: "Default",
+            basePath: homeDirRef.current,
+            environmentId: null,
+            assetsEnabled: true,
+          };
+          nextProjects = [fallback];
+          setProjects(nextProjects);
+          setActiveProjectId(fallback.id);
+          setActiveId(null);
+        } else {
+          setProjects(nextProjects);
+          if (wsProjectIdSet.has(activeProjectIdRef.current)) {
+            const np = nextProjects[0].id;
+            setActiveProjectId(np);
+            setActiveId(pickActiveSessionId(np));
+          }
+        }
+      } else {
+        // Move mode: reassign this workspace's projects to the target.
+        setProjectWorkspace((m) => {
+          const next = { ...m };
+          for (const pid of wsProjectIds) next[pid] = moveTarget;
+          return next;
+        });
+      }
+
+      setWorkspaces(remaining);
+      setActiveWorkspaceId((curr) => (curr === workspaceId ? nextActiveWorkspaceId : curr));
+    },
+    [],
+  );
+
   const handleSendPromptToActive = useCallback(
     (prompt: Prompt) => void sendPromptToActive(prompt, "send"),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -9343,21 +9491,7 @@ export default function App() {
     setSlidePanelOpen(true);
   }, []);
 
-  // -- Ref-stable projectSessions for SessionsSection --
-
-  const projectSessionsRef = useRef<Session[]>([]);
-  const stableProjectSessions = useMemo(() => {
-    const next = projectSessions;
-    const prev = projectSessionsRef.current;
-    if (
-      prev.length === next.length &&
-      prev.every((p, i) => p === next[i])
-    ) {
-      return prev;
-    }
-    projectSessionsRef.current = next;
-    return next;
-  }, [projectSessions]);
+  // -- Ref-stable split views for the active project (sidebar tree) --
 
   const projectSplitViewsRef = useRef<SplitView[]>([]);
   const stableProjectSplitViews = useMemo(() => {
@@ -9369,38 +9503,6 @@ export default function App() {
     projectSplitViewsRef.current = next;
     return next;
   }, [activeProjectId, splitViews]);
-
-  // -- Ref-stable Maps for ProjectsSection --
-
-  const sessionCountByProjectRef = useRef<Map<string, number>>(new Map());
-  const stableSessionCountByProject = useMemo(() => {
-    const next = sessionCountByProject;
-    const prev = sessionCountByProjectRef.current;
-    if (prev.size === next.size) {
-      let same = true;
-      for (const [k, v] of next) {
-        if (prev.get(k) !== v) { same = false; break; }
-      }
-      if (same) return prev;
-    }
-    sessionCountByProjectRef.current = next;
-    return next;
-  }, [sessionCountByProject]);
-
-  const workingAgentCountByProjectRef = useRef<Map<string, number>>(new Map());
-  const stableWorkingAgentCountByProject = useMemo(() => {
-    const next = workingAgentCountByProject;
-    const prev = workingAgentCountByProjectRef.current;
-    if (prev.size === next.size) {
-      let same = true;
-      for (const [k, v] of next) {
-        if (prev.get(k) !== v) { same = false; break; }
-      }
-      if (same) return prev;
-    }
-    workingAgentCountByProjectRef.current = next;
-    return next;
-  }, [workingAgentCountByProject]);
 
   const handleToggleActivityCenter = useCallback(() => {
     setAppSettingsOpen(false);
@@ -9585,100 +9687,83 @@ export default function App() {
   }, [hasRunningActivityItems]);
 
   const sidebarJsx = useMemo(() => (
-    <aside
-      className="sidebar"
-      ref={sidebarRef}
-      style={
-        { ["--projectsListMaxHeight" as any]: `${projectsListMaxHeight}px` } as React.CSSProperties
-      }
-    >
-      <ProjectsSection
-        projects={projects}
+    <div className={`sidebar${sidebarCollapsed ? " sidebarCollapsed" : ""}`}>
+      <WorkspaceSidebar
+        workspaces={workspaces}
+        activeWorkspaceId={activeWorkspaceId}
+        onSelectWorkspace={handleSelectWorkspace}
+        onCreateWorkspace={handleCreateWorkspace}
+        onRenameWorkspace={handleRenameWorkspace}
+        onSetWorkspaceImage={handleSetWorkspaceImage}
+        onDeleteWorkspace={handleDeleteWorkspace}
+        projects={workspaceProjects}
         activeProjectId={activeProjectId}
-        activeProject={activeProject}
-        environments={environments}
-        sessionCountByProject={stableSessionCountByProject}
-        workingAgentCountByProject={stableWorkingAgentCountByProject}
-        onNewProject={openNewProject}
-        onProjectSettings={openRenameProject}
-        onDeleteProject={handleDeleteProject}
+        activeSessionId={activeId}
+        sessionsByProject={sessionsByProject}
+        workingSessionIds={agentWorkingIds}
+        agentShortcuts={agentShortcuts}
         onSelectProject={selectProject}
+        onNewProject={openNewProject}
         onOpenProjectSettings={openProjectSettings}
-        onMoveProject={moveProject}
+        onRequestDeleteProject={handleRequestDeleteProject}
         onRenameProjectInline={handleRenameProjectInline}
+        onMoveProject={moveProject}
         onSetProjectSymbol={handleSetProjectSymbol}
         onSetProjectColor={handleSetProjectColor}
-      />
-
-      <QuickPromptsSection
-        prompts={prompts}
-        activeSessionId={activeId}
-        onSendPrompt={handleSendPromptToActive}
-        onEditPrompt={openPromptEditor}
-        onOpenPromptsPanel={handleOpenPromptsPanel}
-      />
-
-      <div
-        className="sidebarResizeHandle"
-        role="separator"
-        aria-label="Resize Projects and Sessions"
-        aria-orientation="horizontal"
-        aria-valuemin={MIN_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT}
-        aria-valuemax={MAX_SIDEBAR_PROJECTS_LIST_MAX_HEIGHT}
-        aria-valuenow={Math.round(projectsListMaxHeight)}
-        tabIndex={0}
-        onDoubleClick={resetProjectsListMaxHeight}
-        onKeyDown={handleProjectsDividerKeyDown}
-        onPointerDown={handleProjectsDividerPointerDown}
-        title="Drag to resize • Double-click to auto-fit"
-      />
-
-      <SessionsSection
-        agentShortcuts={agentShortcuts}
-        sessions={stableProjectSessions}
-        agentWorkingIds={agentWorkingIds}
-        activeSessionId={activeId}
-        splitViews={stableProjectSplitViews}
-        activeSplitViewId={activeSplitViewId}
-        splitPane={splitPane}
-        onSplitSession={handleSplitSession}
-        onUnsplit={handleUnsplit}
-        onActivateSplitView={handleActivateSplitView}
-        onRemoveSplitView={handleRemoveSplitView}
-        onSelectSession={setActiveId}
+        onSelectSession={handleSelectSessionFromTree}
         onCloseSession={handleCloseSession}
-        onToggleSessionPin={handleToggleSessionPin}
-        onReorderSession={handleReorderSession}
         onReconnectSession={handleReconnectSession}
+        onReorderSession={handleReorderSession}
+        onToggleSessionPin={handleToggleSessionPin}
         onRenameSession={handleRenameSession}
         onSetSessionSymbol={handleSetSessionSymbol}
         onSetSessionColor={handleSetSessionColor}
-        onQuickStart={handleQuickStartFromSidebar}
-        onOpenNewSession={handleOpenNewSession}
+        onNewTerminalForProject={handleNewTerminalForProject}
+        onNewSshForProject={handleNewSshForProject}
+        onQuickStartForProject={handleQuickStartForProject}
+        onOpenPersistentSessions={handleOpenPersistentSessions}
+        onOpenAgentShortcuts={handleOpenAgentShortcuts}
+        onOpenSshManager={handleOpenSshManager}
         onAgentInstruction={handleAgentInstruction}
         agentInstructionRunning={
           autoRenamingSessions || autoRenameActivity?.status === "running"
         }
-        onOpenPersistentSessions={handleOpenPersistentSessions}
-        onOpenSshManager={handleOpenSshManager}
-        onOpenAgentShortcuts={handleOpenAgentShortcuts}
+        splitViews={stableProjectSplitViews}
+        activeSplitViewId={activeSplitViewId}
+        splitPane={splitPane}
+        onActivateSplitView={handleActivateSplitView}
+        onRemoveSplitView={handleRemoveSplitView}
+        onUnsplit={handleUnsplit}
+        onSplitSession={handleSplitSession}
+        collapsed={sidebarCollapsed}
+        onToggleCollapsed={handleToggleSidebarCollapsed}
       />
-    </aside>
+
+      {!sidebarCollapsed && (
+        <QuickPromptsSection
+          prompts={prompts}
+          activeSessionId={activeId}
+          onSendPrompt={handleSendPromptToActive}
+          onEditPrompt={openPromptEditor}
+          onOpenPromptsPanel={handleOpenPromptsPanel}
+        />
+      )}
+    </div>
   ), [
-    projects, activeProjectId, activeProject, environments,
-    stableSessionCountByProject, stableWorkingAgentCountByProject,
-    prompts, agentShortcuts, stableProjectSessions, stableProjectSplitViews, agentWorkingIds,
-    activeId, splitPane, activeSplitViewId, projectsListMaxHeight, autoRenamingSessions, autoRenameActivity,
-    selectProject, moveProject, openNewProject, openRenameProject,
-    openProjectSettings, handleDeleteProject, handleRenameProjectInline, handleSetProjectSymbol, handleSetProjectColor,
+    sidebarCollapsed, workspaces, activeWorkspaceId, workspaceProjects, sessionsByProject,
+    activeProjectId, activeId, agentWorkingIds, agentShortcuts,
+    prompts, stableProjectSplitViews, splitPane, activeSplitViewId,
+    autoRenamingSessions, autoRenameActivity,
+    handleSelectWorkspace, handleCreateWorkspace, handleRenameWorkspace, handleSetWorkspaceImage, handleDeleteWorkspace,
+    selectProject, openNewProject, openProjectSettings, handleRequestDeleteProject,
+    handleRenameProjectInline, moveProject, handleSetProjectSymbol, handleSetProjectColor,
+    handleSelectSessionFromTree, handleCloseSession, handleReconnectSession, handleReorderSession,
+    handleToggleSessionPin, handleRenameSession, handleSetSessionSymbol, handleSetSessionColor,
+    handleNewTerminalForProject, handleNewSshForProject, handleQuickStartForProject,
+    handleOpenPersistentSessions, handleOpenAgentShortcuts, handleOpenSshManager,
+    handleAgentInstruction, handleActivateSplitView, handleRemoveSplitView, handleUnsplit,
+    handleSplitSession, handleToggleSidebarCollapsed,
     handleSendPromptToActive, openPromptEditor, handleOpenPromptsPanel,
-    handleCloseSession, handleToggleSessionPin, handleReorderSession, handleReconnectSession,
-    handleRenameSession, handleSetSessionSymbol, handleSetSessionColor,
-    handleSplitSession, handleUnsplit, handleActivateSplitView, handleRemoveSplitView, handleQuickStartFromSidebar,
-    handleOpenNewSession, handleAgentInstruction, handleOpenPersistentSessions,
-    handleOpenSshManager, handleOpenAgentShortcuts,
-    resetProjectsListMaxHeight, handleProjectsDividerKeyDown,
-    handleProjectsDividerPointerDown,
   ]);
 
   const topbarJsx = useMemo(() => (
