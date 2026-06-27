@@ -24,19 +24,18 @@ type Row = { info: ShellInfo; group: "recommended" | "other" };
  * "Which shell?" prompt for opening an individual terminal. The fast path (the
  * plain "Terminal" button) skips this and uses the project default; this is the
  * explicit per-terminal override. The project default and the OS login shell are
- * surfaced under "Recommended"; everything else sits under "Other shells".
+ * surfaced under "Recommended"; everything else under "Other". Uses the shared
+ * modal chrome (.modal / .modalTitle / .modalActions / .btn) for consistency.
  */
 export function ShellPickerModal(props: ShellPickerModalProps) {
   const { projectTitle, shells, loading, projectDefault, onRescan, onClose, onPick } = props;
   const defaultChoice = projectDefault ?? BUNDLED_NU;
 
-  const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
-  const filterRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
-  // Full ordered list: bundled + login shell first (Recommended), then the rest.
-  const ordered = useMemo<Row[]>(() => {
+  // Ordered list: bundled + login shell first (Recommended), then the rest.
+  const rows = useMemo<Row[]>(() => {
     const synthetic: ShellInfo = {
       id: "bundled-nu",
       kind: "bundled-nu",
@@ -69,30 +68,18 @@ export function ShellPickerModal(props: ShellPickerModalProps) {
     ];
   }, [shells, defaultChoice]);
 
-  const visible = useMemo<Row[]>(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return ordered;
-    return ordered.filter(
-      ({ info }) =>
-        info.displayName.toLowerCase().includes(q) ||
-        info.family.toLowerCase().includes(q) ||
-        info.path.toLowerCase().includes(q),
-    );
-  }, [ordered, query]);
-
-  // Keep selection on the default (or first) as the filtered set changes.
+  // Start on the project default.
   useEffect(() => {
-    const idx = visible.findIndex(({ info }) => choiceMatchesInfo(defaultChoice, info));
+    const idx = rows.findIndex(({ info }) => choiceMatchesInfo(defaultChoice, info));
     setSelected(idx >= 0 ? idx : 0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible.length]);
+  }, [rows.length]);
 
   useEffect(() => {
-    const t = window.setTimeout(() => filterRef.current?.focus(), 0);
+    const t = window.setTimeout(() => listRef.current?.focus(), 0);
     return () => window.clearTimeout(t);
   }, []);
 
-  // Keep the selected row in view when navigating by keyboard (no-op if visible).
   useEffect(() => {
     listRef.current
       ?.querySelector<HTMLElement>(`[data-idx="${selected}"]`)
@@ -100,12 +87,12 @@ export function ShellPickerModal(props: ShellPickerModalProps) {
   }, [selected]);
 
   const confirm = (idx = selected) => {
-    const row = visible[idx];
+    const row = rows[idx];
     if (row) onPick(shellInfoToChoice(row.info));
   };
 
   const move = (delta: number) =>
-    setSelected((prev) => (visible.length ? (prev + delta + visible.length) % visible.length : 0));
+    setSelected((prev) => (rows.length ? (prev + delta + rows.length) % rows.length : 0));
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "ArrowDown") {
@@ -123,7 +110,7 @@ export function ShellPickerModal(props: ShellPickerModalProps) {
     }
   };
 
-  const selectedInfo = visible[selected]?.info;
+  const selectedInfo = rows[selected]?.info;
   const openLabel = selectedInfo
     ? selectedInfo.kind === "bundled-nu"
       ? "Nushell"
@@ -131,116 +118,73 @@ export function ShellPickerModal(props: ShellPickerModalProps) {
     : "shell";
 
   return (
-    <div className="modalBackdrop" onClick={onClose} onKeyDown={onKeyDown}>
-      <div className="modal shellPickerModal" onClick={(e) => e.stopPropagation()}>
-        <div className="shellPickerHead">
-          <div className="shellPickerCrumb">
-            <span>AGENTS-UI</span>
-            <span className="shellPickerCrumbSep">/</span>
-            <span className="shellPickerCrumbAccent">NEW TERMINAL</span>
-            <span className="shellPickerCaret" aria-hidden="true" />
-          </div>
-          <button type="button" className="shellPickerClose" onClick={onClose} aria-label="Close">
-            ✕
-          </button>
-        </div>
+    <div className="modalBackdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} onKeyDown={onKeyDown}>
+        <h3 className="modalTitle">Open terminal{projectTitle ? ` — ${projectTitle}` : ""}</h3>
 
-        <h3 className="shellPickerTitle">
-          Choose a shell to launch{projectTitle ? ` — ${projectTitle}` : ""}
-        </h3>
-
-        <div className="shellPickerFilter">
-          <span className="shellPickerFilterIcon" aria-hidden="true">
-            ›
-          </span>
-          <input
-            ref={filterRef}
-            className="shellPickerFilterInput"
-            placeholder="Filter shells…"
-            value={query}
-            spellCheck={false}
-            autoComplete="off"
-            onChange={(e) => setQuery(e.target.value)}
-          />
-          <span className="shellPickerCount">
-            {visible.length}/{ordered.length}
-          </span>
-        </div>
-
-        <div className="shellPickerScroll" ref={listRef} role="listbox" aria-label="Available shells">
-          {visible.map((row, i) => {
-            const { info, group } = row;
-            const prev = visible[i - 1];
-            const showHeader = !prev || prev.group !== group;
-            const isDefault = choiceMatchesInfo(defaultChoice, info);
-            const sub = info.kind === "bundled-nu" ? "bundled · cross-platform" : info.path;
-            return (
-              <React.Fragment key={info.id}>
-                {showHeader ? (
-                  <div className="shellPickerSection">
-                    {group === "recommended" ? "Recommended" : "Other shells"}
-                  </div>
-                ) : null}
-                <button
-                  type="button"
-                  role="option"
-                  data-idx={i}
-                  aria-selected={i === selected}
-                  className={`shellPickerItem${i === selected ? " selected" : ""}`}
-                  onMouseEnter={() => setSelected(i)}
-                  onClick={() => confirm(i)}
-                >
-                  <span className="shellPickerIcon">{info.family}</span>
-                  <span className="shellPickerBody">
-                    <span className="shellPickerNameRow">
-                      <span className="shellPickerName">{info.displayName}</span>
-                      {isDefault ? <span className="shellPickerBadge">Default</span> : null}
-                      {info.isLoginDefault ? (
-                        <span className="shellPickerBadge alt">Login shell</span>
-                      ) : null}
-                    </span>
-                    <span className="shellPickerSub">{sub}</span>
-                  </span>
-                  {i === selected ? (
-                    <span className="shellPickerEnter" aria-hidden="true">
-                      ↵
-                    </span>
+        <div className="formRow">
+          <div className="label">Shell</div>
+          <div className="shellList" role="listbox" aria-label="Available shells" tabIndex={0} ref={listRef}>
+            {rows.map((row, i) => {
+              const { info, group } = row;
+              const prev = rows[i - 1];
+              const showHeader = !prev || prev.group !== group;
+              const isDefault = choiceMatchesInfo(defaultChoice, info);
+              const sub = info.kind === "bundled-nu" ? "bundled · cross-platform" : info.path;
+              return (
+                <React.Fragment key={info.id}>
+                  {showHeader ? (
+                    <div className="shellGroupLabel">
+                      {group === "recommended" ? "Recommended" : "Other"}
+                    </div>
                   ) : null}
-                </button>
-              </React.Fragment>
-            );
-          })}
-          {loading && ordered.length <= 1 ? (
-            <div className="shellPickerLoading">Detecting shells…</div>
-          ) : null}
-          {!visible.length ? (
-            <div className="shellPickerLoading">No shells match “{query.trim()}”.</div>
-          ) : null}
+                  <div
+                    role="option"
+                    data-idx={i}
+                    aria-selected={i === selected}
+                    className={`shellOption${i === selected ? " active" : ""}`}
+                    onMouseEnter={() => setSelected(i)}
+                    onClick={() => confirm(i)}
+                  >
+                    <span className="shellOptionIcon">{info.family}</span>
+                    <span className="shellOptionMain">
+                      <span className="shellOptionName">
+                        {info.displayName}
+                        {isDefault ? <span className="shellTag">Default</span> : null}
+                        {info.isLoginDefault ? <span className="shellTag login">Login shell</span> : null}
+                      </span>
+                      <span className="shellOptionPath">{sub}</span>
+                    </span>
+                    <span className="shellOptionCheck" aria-hidden="true">
+                      ✓
+                    </span>
+                  </div>
+                </React.Fragment>
+              );
+            })}
+            {loading && rows.length <= 1 ? (
+              <div className="shellListEmpty">Detecting shells…</div>
+            ) : null}
+          </div>
+          <div className="hint">
+            The plain “Terminal” button always opens this project’s default shell.
+          </div>
         </div>
 
-        <div className="shellPickerFootHint">
-          Opens a one-off terminal with the selected shell. The plain <code>Terminal</code> button
-          always uses this project’s default shell.
-        </div>
-
-        <div className="shellPickerActions">
-          <button type="button" className="shellPickerBtn" onClick={onRescan} disabled={loading}>
-            ⟳ Rescan
+        <div className="modalActions">
+          <button type="button" className="btn shellRescanBtn" onClick={onRescan} disabled={loading}>
+            Rescan
           </button>
-          <span className="shellPickerMoveHint">
-            <kbd>↑↓</kbd> move
-          </span>
-          <span className="shellPickerSpacer" />
-          <button type="button" className="shellPickerBtn" onClick={onClose}>
-            Cancel <kbd>esc</kbd>
+          <button type="button" className="btn" onClick={onClose}>
+            Cancel
           </button>
           <button
             type="button"
-            className="shellPickerBtn shellPickerBtnPrimary"
+            className="btn btnPrimary"
             onClick={() => confirm()}
             disabled={!selectedInfo}
           >
-            Open {openLabel} <kbd>↵</kbd>
+            Open {openLabel}
           </button>
         </div>
       </div>

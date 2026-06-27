@@ -4840,203 +4840,90 @@ select.input {
   margin-top: 4px;
 }
 
-/* Shell picker (bring-your-own-shell) */
-.shellPickerModal {
-  width: min(560px, calc(100% - 24px));
-  padding: 18px 20px 16px;
-}
-
-.shellPickerHead {
+/* Shell picker (bring-your-own-shell) — uses shared .modal chrome */
+.shellList {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.shellPickerCrumb {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  font-weight: 600;
-  color: var(--muted);
-}
-
-.shellPickerCrumbSep {
-  opacity: 0.5;
-}
-
-.shellPickerCrumbAccent {
-  color: var(--accent);
-}
-
-.shellPickerCaret {
-  width: 6px;
-  height: 12px;
-  background: var(--accent);
-  border-radius: 1px;
-  animation: shellCaretBlink 1.1s steps(1) infinite;
-}
-
-@keyframes shellCaretBlink {
-  0%, 49% { opacity: 1; }
-  50%, 100% { opacity: 0; }
-}
-
-.shellPickerClose {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
-  border-radius: var(--radius-sm);
-  border: 1px solid rgba(var(--ink-rgb), 0.08);
-  background: rgba(var(--ink-rgb), 0.03);
-  color: var(--muted);
-  font-size: 12px;
-  cursor: pointer;
-  transition: all 0.12s ease;
-}
-
-.shellPickerClose:hover {
-  color: var(--text);
-  background: rgba(var(--ink-rgb), 0.08);
-  border-color: rgba(var(--ink-rgb), 0.16);
-}
-
-.shellPickerTitle {
-  font-size: 17px;
-  font-weight: 600;
-  color: var(--text-bright);
-  margin: 12px 0 14px;
-}
-
-.shellPickerFilter {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 9px 12px;
-  border-radius: var(--radius-control);
-  border: 1px solid rgba(var(--ink-rgb), 0.1);
-  background: var(--input-bg);
-}
-
-.shellPickerFilterIcon {
-  color: var(--accent);
-  font-size: 13px;
-  font-weight: 700;
-}
-
-.shellPickerFilterInput {
-  flex: 1;
-  min-width: 0;
-  border: 0;
-  background: transparent;
-  color: var(--text);
-  font-size: 13px;
-  font-family: inherit;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 300px;
+  overflow-y: auto;
+  margin-top: 6px;
+  padding: 2px;
   outline: none;
 }
 
-.shellPickerFilterInput::placeholder {
-  color: var(--muted);
-}
-
-.shellPickerCount {
-  font-size: 11px;
-  color: var(--muted);
-  border: 1px solid rgba(var(--ink-rgb), 0.1);
-  background: rgba(var(--ink-rgb), 0.03);
-  border-radius: var(--radius-sm);
-  padding: 1px 6px;
-  white-space: nowrap;
-}
-
-.shellPickerScroll {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  max-height: 268px;
-  overflow: auto;
-  margin: 12px -4px 0;
-  padding: 0 4px 2px;
-}
-
-.shellPickerSection {
+.shellGroupLabel {
   font-size: 10px;
   text-transform: uppercase;
-  letter-spacing: 0.14em;
+  letter-spacing: 0.1em;
   color: var(--muted);
   font-weight: 600;
-  padding: 8px 2px 2px;
+  padding: 9px 4px 3px;
 }
 
-.shellPickerItem {
+.shellGroupLabel:first-child {
+  padding-top: 2px;
+}
+
+.shellOption {
   display: flex;
   align-items: center;
-  gap: 12px;
-  width: 100%;
-  text-align: left;
-  cursor: pointer;
-  padding: 10px 12px;
+  gap: 11px;
+  padding: 9px 11px;
   border-radius: var(--radius-control);
   border: 1px solid transparent;
-  background: rgba(var(--ink-rgb), 0.02);
-  color: var(--text);
-  transition: background 0.1s ease, border-color 0.1s ease, box-shadow 0.1s ease;
+  background: rgba(var(--ink-rgb), 0.03);
+  cursor: pointer;
+  transition: background 0.1s ease, border-color 0.1s ease;
 }
 
-.shellPickerItem.selected {
-  border-color: rgba(var(--accent-rgb), 0.55);
-  background: rgba(var(--accent-rgb), 0.1);
-  box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0.18), 0 6px 18px rgba(var(--shadow-rgb), 0.3);
+.shellOption:hover {
+  background: rgba(var(--ink-rgb), 0.06);
 }
 
-.shellPickerIcon {
+.shellOption.active {
+  border-color: rgba(var(--accent-rgb), 0.45);
+  background: rgba(var(--accent-rgb), 0.08);
+}
+
+.shellOptionIcon {
   flex-shrink: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  height: 34px;
+  width: 30px;
+  height: 30px;
   border-radius: var(--radius-sm);
   border: 1px solid rgba(var(--ink-rgb), 0.1);
-  background: rgba(var(--ink-rgb), 0.05);
-  color: var(--text-bright);
+  background: rgba(var(--ink-rgb), 0.04);
+  color: var(--muted);
   font-family: ui-monospace, monospace;
-  font-size: 11px;
-  letter-spacing: 0.02em;
+  font-size: 10.5px;
 }
 
-.shellPickerItem.selected .shellPickerIcon {
-  border-color: rgba(var(--accent-rgb), 0.4);
-  background: rgba(var(--accent-rgb), 0.16);
+.shellOption.active .shellOptionIcon {
+  border-color: rgba(var(--accent-rgb), 0.35);
   color: var(--accent);
 }
 
-.shellPickerBody {
+.shellOptionMain {
   flex: 1;
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
 }
 
-.shellPickerNameRow {
+.shellOptionName {
   display: flex;
   align-items: center;
-  gap: 8px;
-}
-
-.shellPickerName {
-  font-size: 14px;
+  gap: 7px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-bright);
 }
 
-.shellPickerSub {
+.shellOptionPath {
   font-size: 11px;
   color: var(--muted);
   font-family: ui-monospace, monospace;
@@ -5045,132 +4932,40 @@ select.input {
   text-overflow: ellipsis;
 }
 
-.shellPickerBadge {
-  font-size: 9px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: #fff;
-  background: var(--accent);
-  border: 1px solid var(--accent);
-  border-radius: var(--radius-sm);
-  padding: 2px 6px;
-}
-
-.shellPickerBadge.alt {
-  color: var(--accent);
-  background: transparent;
-  border-color: rgba(var(--accent-rgb), 0.45);
-}
-
-.shellPickerEnter {
-  flex-shrink: 0;
-  margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
-  border-radius: var(--radius-sm);
-  background: rgba(var(--accent-rgb), 0.16);
-  color: var(--accent);
-  font-size: 13px;
-}
-
-.shellPickerLoading {
-  font-size: 12px;
-  color: var(--muted);
-  padding: 10px 4px;
-}
-
-.shellPickerFootHint {
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--muted);
-  margin-top: 14px;
-}
-
-.shellPickerFootHint code {
-  font-family: ui-monospace, monospace;
-  font-size: 11px;
-  color: var(--text);
-  background: rgba(var(--ink-rgb), 0.07);
-  border-radius: var(--radius-sm);
-  padding: 1px 5px;
-}
-
-.shellPickerActions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 16px -20px -16px;
-  padding: 14px 20px;
-  border-top: 1px solid rgba(var(--ink-rgb), 0.07);
-}
-
-.shellPickerSpacer {
-  flex: 1;
-}
-
-.shellPickerMoveHint {
-  font-size: 11px;
-  color: var(--muted);
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.shellPickerBtn {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  border: 1px solid var(--border);
-  background: rgba(var(--ink-rgb), 0.05);
-  color: var(--text);
-  padding: 7px 12px;
-  border-radius: var(--radius-control);
-  font-size: 13px;
-  cursor: pointer;
-  transition: all 0.12s ease;
-}
-
-.shellPickerBtn:hover:not(:disabled) {
-  background: rgba(var(--ink-rgb), 0.09);
-  border-color: rgba(var(--ink-rgb), 0.16);
-}
-
-.shellPickerBtn:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-
-.shellPickerBtnPrimary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
+.shellTag {
+  font-size: 9.5px;
   font-weight: 600;
-}
-
-.shellPickerBtnPrimary:hover:not(:disabled) {
-  filter: brightness(1.08);
-  border-color: var(--accent);
-}
-
-.shellPickerActions kbd,
-.shellPickerMoveHint kbd {
-  font-family: ui-monospace, monospace;
-  font-size: 11px;
-  line-height: 1;
-  padding: 3px 5px;
+  letter-spacing: 0.02em;
+  padding: 1px 6px;
   border-radius: var(--radius-sm);
-  background: rgba(var(--ink-rgb), 0.1);
-  border: 1px solid rgba(var(--ink-rgb), 0.12);
-  color: inherit;
+  color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.13);
 }
 
-.shellPickerBtnPrimary kbd {
-  background: rgba(255, 255, 255, 0.2);
-  border-color: rgba(255, 255, 255, 0.25);
+.shellTag.login {
+  color: var(--muted);
+  background: rgba(var(--ink-rgb), 0.07);
+}
+
+.shellOptionCheck {
+  flex-shrink: 0;
+  color: var(--accent);
+  font-size: 12px;
+  opacity: 0;
+}
+
+.shellOption.active .shellOptionCheck {
+  opacity: 1;
+}
+
+.shellListEmpty {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 12px 4px;
+}
+
+.shellRescanBtn {
+  margin-right: auto;
 }
 
 /* Slide Panel */
