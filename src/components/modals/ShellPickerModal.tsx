@@ -26,10 +26,10 @@ type ShellPickerModalProps = {
 export function ShellPickerModal(props: ShellPickerModalProps) {
   const { projectTitle, shells, loading, projectDefault, onRescan, onClose, onPick } = props;
 
-  // Always offer the bundled shell, even if detection hasn't returned it yet.
-  const items = useMemo<ShellInfo[]>(() => {
-    const hasBundled = shells.some((s) => s.kind === "bundled-nu");
-    const bundled: ShellInfo = {
+  // Order so the two shells a user almost always wants — the bundled default
+  // and their login shell — sit at the top, above an "Other shells" group.
+  const { items, otherStart } = useMemo(() => {
+    const synthetic: ShellInfo = {
       id: "bundled-nu",
       kind: "bundled-nu",
       family: "nu",
@@ -40,7 +40,12 @@ export function ShellPickerModal(props: ShellPickerModalProps) {
       isLoginDefault: false,
       supportsIntegration: true,
     };
-    return hasBundled ? shells : [bundled, ...shells];
+    const bundled = shells.find((s) => s.kind === "bundled-nu") ?? synthetic;
+    const systems = shells.filter((s) => s.kind === "system");
+    const login = systems.filter((s) => s.isLoginDefault);
+    const others = systems.filter((s) => !s.isLoginDefault);
+    const primary = [bundled, ...login];
+    return { items: [...primary, ...others], otherStart: primary.length };
   }, [shells]);
 
   const defaultChoice = projectDefault ?? BUNDLED_NU;
@@ -69,28 +74,28 @@ export function ShellPickerModal(props: ShellPickerModalProps) {
           <div className="shellPickerList" role="listbox" aria-label="Available shells">
             {items.map((s, i) => {
               const isDefault = choiceMatchesInfo(defaultChoice, s);
+              const showDivider = i === otherStart && otherStart > 0 && otherStart < items.length;
               return (
-                <button
-                  key={s.id}
-                  type="button"
-                  role="option"
-                  aria-selected={i === selected}
-                  className={`shellPickerItem${i === selected ? " selected" : ""}`}
-                  onClick={() => setSelected(i)}
-                  onDoubleClick={confirm}
-                >
-                  <span className="shellPickerName">
-                    {s.displayName}
-                    {isDefault ? <span className="shellPickerBadge">default</span> : null}
-                    {s.isLoginDefault ? <span className="shellPickerBadge">login</span> : null}
-                    {!s.verified && s.kind === "system" ? (
-                      <span className="shellPickerBadge muted" title="Couldn't confirm this shell runs; will try anyway">
-                        unverified
-                      </span>
-                    ) : null}
-                  </span>
-                  {s.path ? <span className="shellPickerPath">{s.path}</span> : null}
-                </button>
+                <React.Fragment key={s.id}>
+                  {showDivider ? <div className="shellPickerDivider">Other shells</div> : null}
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={i === selected}
+                    className={`shellPickerItem${i === selected ? " selected" : ""}${
+                      i < otherStart ? " primary" : ""
+                    }`}
+                    onClick={() => setSelected(i)}
+                    onDoubleClick={confirm}
+                  >
+                    <span className="shellPickerName">
+                      {s.displayName}
+                      {isDefault ? <span className="shellPickerBadge">default</span> : null}
+                      {s.isLoginDefault ? <span className="shellPickerBadge">login shell</span> : null}
+                    </span>
+                    {s.path ? <span className="shellPickerPath">{s.path}</span> : null}
+                  </button>
+                </React.Fragment>
               );
             })}
             {loading && items.length <= 1 ? (

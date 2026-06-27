@@ -4900,9 +4900,20 @@ select.input {
   padding: 1px 5px;
 }
 
-.shellPickerBadge.muted {
+.shellPickerItem.primary {
+  border-color: rgba(var(--accent-rgb), 0.22);
+  background: rgba(var(--accent-rgb), 0.04);
+}
+
+.shellPickerDivider {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
   color: var(--muted);
-  border-color: rgba(var(--ink-rgb), 0.15);
+  font-weight: 500;
+  margin: 8px 2px 2px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(var(--ink-rgb), 0.08);
 }
 
 .shellPickerHint {

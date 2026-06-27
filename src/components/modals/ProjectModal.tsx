@@ -128,7 +128,10 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
     // Shells offered in the dropdown: the bundled default, the detected system
     // shells, plus the currently-selected one if detection hasn't found it.
     const shellOptions = useMemo(() => {
-      const systemShells = shells.filter((s) => s.kind === "system");
+      // Surface the login shell first; it's the most likely pick after the default.
+      const systemShells = shells
+        .filter((s) => s.kind === "system")
+        .sort((a, b) => Number(b.isLoginDefault) - Number(a.isLoginDefault));
       const opts = systemShells.map((s) => ({
         key: s.path,
         label: s.isLoginDefault ? `${s.displayName} (login default)` : s.displayName,
