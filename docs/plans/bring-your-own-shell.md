@@ -1,8 +1,35 @@
 # Bring Your Own Shell — Design Plan
 
-**Status:** Proposed (no implementation yet)
+**Status:** Implemented (macOS/Unix) — 2026-06-27
 **Branch:** `feature/bring-your-own-shell`
 **Author:** design pass, 2026-06-27
+
+## As built (differs slightly from the original UX in §7.3)
+
+The per-session override is a **dedicated second button** rather than a dropdown
+inside `NewSessionModal`, matching the requested "fast default + explicit choice"
+split:
+
+- **"Terminal"** (existing menu item) — fast path; opens a session with the
+  project's default shell. Unchanged flow.
+- **"Terminal with shell…"** (new menu item) — opens a lightweight
+  `ShellPickerModal` listing detected shells (project default highlighted);
+  picking one opens a one-off terminal with that shell.
+- **Project default** — a "Default shell" `<select>` in `ProjectModal`
+  (local projects only), default = Bundled Nushell.
+- Agent quick-starts (claude/codex) and the prompt/agent-panel launchers inherit
+  the project default silently.
+
+App-global default (§7.1) was **not** built — precedence is
+`per-session pick > project default > bundled nu`. Per-session shell memory on
+restore/reconnect (§ follow-ups) is also deferred; those paths use bundled nu.
+
+Key files: backend `detect_shells` + `ShellChoice`/`resolve_shell` in
+`src-tauri/src/pty.rs`, `default_shell` on `PersistedProjectV1`
+(`persist.rs`); frontend `src/shells.ts`, `ShellPickerModal.tsx`, wiring in
+`App.tsx` / `WorkspaceSidebar.tsx` / `ProjectModal.tsx`.
+
+---
 
 ---
 

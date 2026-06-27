@@ -6,7 +6,7 @@ This project aims to follow Semantic Versioning.
 
 ## Unreleased
 
-- No unreleased changes yet.
+- **Bring your own shell**: terminals can now launch with one of your own installed shells (zsh, bash, fish, …) instead of the bundled Nushell. Set a per-project **Default shell** in Project settings (default stays Bundled Nushell), and use the new **Terminal with shell…** menu item to open a one-off terminal with any detected shell. Shell detection is multi-source (`/etc/shells`, `$SHELL`, `PATH`, well-known locations) and never blocks a launch — if a chosen shell goes missing the session falls back to the default with a toast.
 
 ## 0.10.0
 

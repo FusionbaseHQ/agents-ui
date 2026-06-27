@@ -16,12 +16,25 @@ pub enum SecureStorageModeV1 {
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct PersistedShellChoiceV1 {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct PersistedProjectV1 {
     pub id: String,
     pub title: String,
     pub base_path: Option<String>,
     pub environment_id: Option<String>,
     pub assets_enabled: Option<bool>,
+    /// Per-project default shell. Absent ⇒ bundled Nushell (the app default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_shell: Option<PersistedShellChoiceV1>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

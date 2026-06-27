@@ -44,6 +44,14 @@ import { parseStreamLine, type ParsedUpdate } from "./agent/agentStreamParser";
 import { loadAgentSettings } from "./agent/agentStorage";
 import type { AgentLaunchSettings } from "./agent/agentTypes";
 import { NewSessionModal, type NewSessionModalHandle, type NewSessionSubmitData } from "./components/modals/NewSessionModal";
+import { ShellPickerModal } from "./components/modals/ShellPickerModal";
+import {
+  type ShellChoice,
+  type ShellInfo,
+  detectShells,
+  shellChoiceToPayload,
+  shellChoiceShortName,
+} from "./shells";
 import {
   PersistentSessionsModal,
   type PersistentSessionsModalItem,
@@ -77,6 +85,8 @@ type Project = {
   color?: string | null;
   sshTarget?: string | null;
   sshRemotePath?: string | null;
+  // Per-project default shell. Absent ⇒ bundled Nushell (the app default).
+  defaultShell?: ShellChoice | null;
 };
 
 // A Workspace groups projects (Workspace → Project → Session). Workspaces are a
@@ -1788,6 +1798,7 @@ async function createSession(input: {
   createdAt?: number;
   pinned?: boolean;
   sidebarOrder?: number | null;
+  shellChoice?: ShellChoice | null;
 }): Promise<Session> {
   const persistent = input.persistent ?? false;
   const persistId = input.persistId ?? makeId();
@@ -1827,6 +1838,7 @@ async function createSession(input: {
     envVars: input.envVars ?? null,
     persistent,
     persistId,
+    shellChoice: shellChoiceToPayload(input.shellChoice),
   });
   return {
     ...info,
@@ -2164,6 +2176,10 @@ export default function App() {
     null,
   );
   const [newOpen, setNewOpen] = useState(false);
+  // Bring-your-own-shell: detected shells (lazy-loaded) + the per-terminal picker.
+  const [detectedShells, setDetectedShells] = useState<ShellInfo[]>([]);
+  const [shellsLoading, setShellsLoading] = useState(false);
+  const [shellPicker, setShellPicker] = useState<{ projectId: string } | null>(null);
   const [sshManagerOpen, setSshManagerOpen] = useState(false);
   const [sshHosts, setSshHosts] = useState<SshHostEntry[]>([]);
   const [sshHostsLoading, setSshHostsLoading] = useState(false);
@@ -2534,7 +2550,7 @@ export default function App() {
   const lastActiveByProject = useRef<Map<string, string>>(new Map());
   const newSessionModalRef = useRef<NewSessionModalHandle>(null);
   const projectModalRef = useRef<ProjectModalHandle>(null);
-  const projectModalInitialRef = useRef({ mode: "new" as "new" | "rename", title: "", basePath: "", environmentId: "", assetsEnabled: true, sshTarget: "", sshRemotePath: "" });
+  const projectModalInitialRef = useRef({ mode: "new" as "new" | "rename", title: "", basePath: "", environmentId: "", assetsEnabled: true, sshTarget: "", sshRemotePath: "", defaultShell: null as ShellChoice | null });
   const pathPickerInitialPathRef = useRef<string | null>(null);
   const sshPathPickerTargetRef = useRef<string | null>(null);
   const recordNameRef = useRef<HTMLInputElement | null>(null);
@@ -6197,6 +6213,36 @@ export default function App() {
     }, timeoutMs);
   }, []);
 
+  // Lazily detect installed shells for the picker / project settings. Cached in
+  // the backend; pass `refresh` for the "Rescan" affordance.
+  const loadShells = useCallback(async (refresh = false): Promise<ShellInfo[]> => {
+    setShellsLoading(true);
+    try {
+      const list = await detectShells(refresh);
+      setDetectedShells(list);
+      return list;
+    } finally {
+      setShellsLoading(false);
+    }
+  }, []);
+
+  // The backend emits this when a session's requested shell couldn't be launched
+  // and it fell back to the default — surface it as a non-fatal toast.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    void listen<{ sessionId: string; message: string }>("shell-fallback", (e) => {
+      showNotice(e.payload.message);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [showNotice]);
+
   const runBackgroundAgentPrompt = useCallback(
     async (
       prompt: string,
@@ -6954,6 +7000,7 @@ export default function App() {
         launchCommand: effect.matchCommands[0] ?? effect.label,
         cwd,
         envVars: envVarsForProjectId(projectId, projects, environments),
+        shellChoice: projects.find((p) => p.id === projectId)?.defaultShell ?? null,
       });
       const s = applyPendingExit(createdRaw);
       addSessionWithProjectSafeActivation(s);
@@ -7550,6 +7597,7 @@ export default function App() {
       assetsEnabled: curProject?.assetsEnabled ?? true,
       sshTarget: "",
       sshRemotePath: "",
+      defaultShell: null,
     };
     setProjectOpen(true);
     void refreshSshHosts();
@@ -7568,6 +7616,7 @@ export default function App() {
       assetsEnabled: project.assetsEnabled ?? true,
       sshTarget: project.sshTarget ?? "",
       sshRemotePath: project.sshRemotePath ?? "",
+      defaultShell: project.defaultShell ?? null,
     };
     setProjectOpen(true);
     void refreshSshHosts();
@@ -7651,6 +7700,7 @@ export default function App() {
                 assetsEnabled: data.assetsEnabled,
                 sshTarget: isSshProject ? data.sshTarget.trim() : null,
                 sshRemotePath: isSshProject ? data.sshRemotePath.trim() || null : null,
+                defaultShell: isSshProject ? null : data.defaultShell,
               }
             : p,
         ),
@@ -7668,6 +7718,7 @@ export default function App() {
       assetsEnabled: data.assetsEnabled,
       sshTarget: isSshProject ? data.sshTarget.trim() : null,
       sshRemotePath: isSshProject ? data.sshRemotePath.trim() || null : null,
+      defaultShell: isSshProject ? null : data.defaultShell,
     };
     setProjects((prev) => [...prev, project]);
     setProjectOpen(false);
@@ -7683,6 +7734,7 @@ export default function App() {
           projectId: id,
           cwd: validatedBasePath!,
           envVars: envVarsForProjectId(id, [...projects, project], environments),
+          shellChoice: project.defaultShell ?? null,
         });
         const s = applyPendingExit(createdRaw);
         addSessionWithProjectSafeActivation(s);
@@ -8544,10 +8596,36 @@ export default function App() {
         persistent: usePersistent,
         cwd: validatedCwd,
         envVars: envVarsForProjectId(activeProjectId, projects, environments),
+        // Fast default flow: inherit the project's default shell.
+        shellChoice: activeProject?.defaultShell ?? null,
       });
       const s = applyPendingExit(createdRaw);
       addSessionWithProjectSafeActivation(s);
       setNewOpen(false);
+    } catch (err) {
+      reportError("Failed to create session", err);
+    }
+  }
+
+  // Second flow: open an individual terminal with an explicitly chosen shell.
+  async function createTerminalWithShell(projectId: string, choice: ShellChoice) {
+    try {
+      const project = projects.find((p) => p.id === projectId) ?? null;
+      const desiredCwd = project?.basePath || homeDirRef.current || "";
+      const validatedCwd = desiredCwd
+        ? await invoke<string | null>("validate_directory", { path: desiredCwd }).catch(() => null)
+        : null;
+      if (validatedCwd) await ensureAutoAssets(validatedCwd, projectId);
+      const createdRaw = await createSession({
+        projectId,
+        name: shellChoiceShortName(choice),
+        launchCommand: null,
+        cwd: validatedCwd,
+        envVars: envVarsForProjectId(projectId, projects, environments),
+        shellChoice: choice,
+      });
+      const s = applyPendingExit(createdRaw);
+      addSessionWithProjectSafeActivation(s);
     } catch (err) {
       reportError("Failed to create session", err);
     }
@@ -8830,6 +8908,8 @@ export default function App() {
         launchCommand: null,
         cwd,
         envVars: envVarsForProjectId(targetProjectId, projects, environments),
+        // Agent quick-starts run under the project's default shell.
+        shellChoice: targetProject?.defaultShell ?? null,
       });
       const created = applyPendingExit(createdRaw);
       const next = created;
@@ -9300,6 +9380,23 @@ export default function App() {
     [selectProject],
   );
 
+  // Second button: prompt for which shell to open this terminal with.
+  const handleNewTerminalWithShellForProject = useCallback(
+    (projectId: string) => {
+      selectProject(projectId);
+      const project = projectByIdRef.current.get(projectId);
+      // Shell choice doesn't apply to remote sessions; fall back to the normal flow.
+      if (isProjectSsh(project)) {
+        void createSshSessionForProject(project!);
+        return;
+      }
+      setProjectOpen(false);
+      void loadShells();
+      setShellPicker({ projectId });
+    },
+    [selectProject, loadShells],
+  );
+
   const handleNewSshForProject = useCallback(
     (projectId: string) => {
       selectProject(projectId);
@@ -9719,6 +9816,7 @@ export default function App() {
         onSetSessionSymbol={handleSetSessionSymbol}
         onSetSessionColor={handleSetSessionColor}
         onNewTerminalForProject={handleNewTerminalForProject}
+        onNewTerminalWithShellForProject={handleNewTerminalWithShellForProject}
         onNewSshForProject={handleNewSshForProject}
         onQuickStartForProject={handleQuickStartForProject}
         onOpenPersistentSessions={handleOpenPersistentSessions}
@@ -10223,6 +10321,7 @@ export default function App() {
                       launchCommand: command,
                       cwd,
                       envVars: envVarsForProjectId(activeProjectId, projects, environments),
+                      shellChoice: activeProject?.defaultShell ?? null,
                     });
                     const s = applyPendingExit(createdRaw);
                     addSessionWithProjectSafeActivation(s);
@@ -10238,6 +10337,7 @@ export default function App() {
                     launchCommand: command,
                     cwd,
                     envVars: envVarsForProjectId(activeProjectId, projects, environments),
+                    shellChoice: activeProject?.defaultShell ?? null,
                   });
                   const s = applyPendingExit(createdRaw);
                   addSessionWithProjectSafeActivation(s);
@@ -10351,6 +10451,26 @@ export default function App() {
             onSubmit={onNewSubmit}
           />}
 
+          {shellPicker && (
+            <ShellPickerModal
+              projectTitle={
+                projects.find((p) => p.id === shellPicker.projectId)?.title ?? null
+              }
+              shells={detectedShells}
+              loading={shellsLoading}
+              projectDefault={
+                projects.find((p) => p.id === shellPicker.projectId)?.defaultShell ?? null
+              }
+              onRescan={() => void loadShells(true)}
+              onClose={() => setShellPicker(null)}
+              onPick={(choice) => {
+                const pid = shellPicker.projectId;
+                setShellPicker(null);
+                void createTerminalWithShell(pid, choice);
+              }}
+            />
+          )}
+
           {sshManagerOpen && <SshManagerModal
             hosts={sshHosts}
             hostsLoading={sshHostsLoading}
@@ -10422,6 +10542,10 @@ export default function App() {
             initialAssetsEnabled={projectModalInitialRef.current.assetsEnabled}
             initialSshTarget={projectModalInitialRef.current.sshTarget}
             initialSshRemotePath={projectModalInitialRef.current.sshRemotePath}
+            initialDefaultShell={projectModalInitialRef.current.defaultShell}
+            shells={detectedShells}
+            shellsLoading={shellsLoading}
+            onLoadShells={() => void loadShells()}
             sshHosts={sshHosts}
             sshHostsLoading={sshHostsLoading}
             onBrowseBasePath={(currentBasePath) =>

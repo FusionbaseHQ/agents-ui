@@ -1,7 +1,27 @@
 import React, { useState, useRef, useEffect, useMemo, useImperativeHandle, forwardRef } from "react";
+import type { ShellChoice, ShellInfo } from "../../shells";
 
 function normalizeSmartQuotes(input: string): string {
   return input.replace(/[""„‟«»]/g, '"').replace(/[''‚‛‹›]/g, "'");
+}
+
+// The <select> uses string keys: "bundled-nu" for the default, else the shell path.
+function choiceToKey(choice: ShellChoice | null | undefined): string {
+  if (!choice || choice.kind === "bundled-nu") return "bundled-nu";
+  return choice.path;
+}
+
+function keyToChoice(
+  key: string,
+  shells: ShellInfo[],
+  fallback: ShellChoice | null,
+): ShellChoice | null {
+  if (key === "bundled-nu") return null; // null ⇒ bundled default
+  const match = shells.find((s) => s.kind === "system" && s.path === key);
+  if (match) return { kind: "system", path: match.path, family: match.family };
+  // Preserve a previously-selected shell even if detection hasn't (re)found it.
+  if (fallback && fallback.kind === "system" && fallback.path === key) return fallback;
+  return null;
 }
 
 type EnvironmentConfig = {
@@ -23,6 +43,7 @@ export type ProjectSubmitData = {
   assetsEnabled: boolean;
   sshTarget: string;
   sshRemotePath: string;
+  defaultShell: ShellChoice | null;
 };
 
 export type ProjectModalHandle = {
@@ -39,6 +60,10 @@ type ProjectModalProps = {
   initialAssetsEnabled: boolean;
   initialSshTarget: string;
   initialSshRemotePath: string;
+  initialDefaultShell: ShellChoice | null;
+  shells: ShellInfo[];
+  shellsLoading: boolean;
+  onLoadShells: () => void;
   sshHosts: SshHostEntry[];
   sshHostsLoading: boolean;
   canUseCurrentTab: boolean;
@@ -71,6 +96,7 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
       mode, initialTitle, initialBasePath, basePathPlaceholder,
       initialEnvironmentId, initialAssetsEnabled,
       initialSshTarget, initialSshRemotePath,
+      initialDefaultShell, shells, shellsLoading, onLoadShells,
       sshHosts, sshHostsLoading,
       canUseCurrentTab, currentTabCwd, canUseHome, homeDir,
       environments, onOpenEnvironments, onBrowseBasePath, onBrowseRemotePath, onClose, onSubmit,
@@ -83,6 +109,7 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
     const [projectType, setProjectType] = useState<"local" | "ssh">(initialSshTarget ? "ssh" : "local");
     const [sshTarget, setSshTarget] = useState(initialSshTarget);
     const [sshRemotePath, setSshRemotePath] = useState(initialSshRemotePath);
+    const [defaultShellKey, setDefaultShellKey] = useState(choiceToKey(initialDefaultShell));
     const titleRef = useRef<HTMLInputElement>(null);
 
     useImperativeHandle(ref, () => ({ setBasePath, setSshRemotePath }));
@@ -91,6 +118,34 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
       const t = window.setTimeout(() => titleRef.current?.focus(), 0);
       return () => clearTimeout(t);
     }, []);
+
+    // Detect installed shells when the modal opens so the picker is populated.
+    useEffect(() => {
+      onLoadShells();
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    // Shells offered in the dropdown: the bundled default, the detected system
+    // shells, plus the currently-selected one if detection hasn't found it.
+    const shellOptions = useMemo(() => {
+      const systemShells = shells.filter((s) => s.kind === "system");
+      const opts = systemShells.map((s) => ({
+        key: s.path,
+        label: s.isLoginDefault ? `${s.displayName} (login default)` : s.displayName,
+        detail: s.path,
+      }));
+      if (
+        initialDefaultShell?.kind === "system" &&
+        !systemShells.some((s) => s.path === initialDefaultShell.path)
+      ) {
+        opts.unshift({
+          key: initialDefaultShell.path,
+          label: `${initialDefaultShell.family || "Custom"} (not found)`,
+          detail: initialDefaultShell.path,
+        });
+      }
+      return opts;
+    }, [shells, initialDefaultShell]);
 
     const isSsh = projectType === "ssh";
 
@@ -132,6 +187,8 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
         assetsEnabled,
         sshTarget: isSsh ? sshTarget : "",
         sshRemotePath: isSsh ? sshRemotePath : "",
+        // Shell choice applies to local projects only.
+        defaultShell: isSsh ? null : keyToChoice(defaultShellKey, shells, initialDefaultShell),
       });
     };
 
@@ -305,6 +362,28 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
               </div>
               <div className="hint">Applied to new sessions in this project.</div>
             </div>
+            {!isSsh && (
+              <div className="formRow">
+                <div className="label">Default shell</div>
+                <select
+                  className="input"
+                  value={defaultShellKey}
+                  onChange={(e) => setDefaultShellKey(e.target.value)}
+                >
+                  <option value="bundled-nu">Bundled Nushell (default)</option>
+                  {shellOptions.map((o) => (
+                    <option key={o.key} value={o.key}>
+                      {o.label} — {o.detail}
+                    </option>
+                  ))}
+                </select>
+                <div className="hint">
+                  {shellsLoading
+                    ? "Detecting installed shells…"
+                    : "New terminals in this project start with this shell. Use the “Terminal with shell…” menu to override per terminal."}
+                </div>
+              </div>
+            )}
             <div className="formRow">
               <div className="label">Assets</div>
               <label className="checkRow">

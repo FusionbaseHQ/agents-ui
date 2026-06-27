@@ -1,5 +1,5 @@
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufWriter, Read, Write};
@@ -29,6 +29,8 @@ struct AppStateInner {
     sessions: Mutex<HashMap<String, PtySession>>,
     #[cfg(target_os = "macos")]
     login_path_cache: Mutex<LoginPathCache>,
+    #[cfg(target_family = "unix")]
+    shells_cache: Mutex<Option<Vec<ShellInfo>>>,
 }
 
 #[derive(Clone, Default)]
@@ -90,6 +92,15 @@ struct PtyOutput {
 struct PtyExit {
     id: String,
     exit_code: Option<u32>,
+}
+
+/// Emitted when a session's requested shell couldn't be launched and we fell
+/// back to the default. The UI surfaces `message` as a non-fatal toast.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ShellFallbackEvent {
+    session_id: String,
+    message: String,
 }
 
 fn now_epoch_ms() -> u64 {
@@ -1121,6 +1132,353 @@ fn find_bundled_nu() -> Option<PathBuf> {
     None
 }
 
+// ───────────────────────── Bring-your-own-shell ─────────────────────────
+//
+// The app bundles Nushell and uses it as the default interactive shell. This
+// block lets a user instead launch one of their own installed shells (zsh /
+// bash / fish / …) per project or per session, while keeping bundled Nushell
+// the default. Detection is advisory and never blocks a launch: if a chosen
+// shell is missing at spawn time `resolve_shell` falls back to the default.
+
+/// A shell selection passed from the frontend to `create_session`.
+/// `kind == "bundled-nu"` (or `None`) keeps the default bundled Nushell;
+/// `kind == "system"` launches `path` (an installed shell binary).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellChoice {
+    pub kind: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    // The frontend also sends `family` (for its own display); we re-derive the
+    // family from the path at spawn time, so any extra fields are ignored here.
+}
+
+/// One detected shell offered in the picker.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellInfo {
+    /// Stable key: canonical path, or "bundled-nu" for the built-in.
+    pub id: String,
+    /// "bundled-nu" | "system"
+    pub kind: String,
+    /// "nu" | "zsh" | "bash" | "fish" | "sh" | "dash" | "ksh" | …
+    pub family: String,
+    pub display_name: String,
+    /// Absolute launch path; empty for the bundled shell (resolved at spawn).
+    pub path: String,
+    pub version: Option<String>,
+    /// Liveness probe succeeded (we got a version string).
+    pub verified: bool,
+    /// This is the user's login shell ($SHELL / passwd).
+    pub is_login_default: bool,
+    /// We provide PATH-import + OSC shell-integration for this family.
+    pub supports_integration: bool,
+}
+
+fn shell_family_from_name(name: &str) -> &'static str {
+    let n = name.trim().to_ascii_lowercase();
+    if n == "nu" || n == "nushell" {
+        "nu"
+    } else if n.contains("pwsh") || n.contains("powershell") {
+        "pwsh"
+    } else if n.contains("fish") {
+        "fish"
+    } else if n.contains("zsh") {
+        "zsh"
+    } else if n.contains("bash") {
+        "bash"
+    } else if n.contains("xonsh") {
+        "xonsh"
+    } else if n.contains("elvish") {
+        "elvish"
+    } else if n.contains("tcsh") {
+        "tcsh"
+    } else if n.contains("dash") {
+        "dash"
+    } else if n.contains("ksh") {
+        "ksh"
+    } else if n.contains("csh") {
+        "csh"
+    } else if n == "sh" {
+        "sh"
+    } else {
+        "other"
+    }
+}
+
+fn shell_display_name(family: &str, file_name: &str) -> String {
+    match family {
+        "nu" => "Nushell".to_string(),
+        "zsh" => "Zsh".to_string(),
+        "bash" => "Bash".to_string(),
+        "fish" => "Fish".to_string(),
+        "sh" => "sh".to_string(),
+        "dash" => "Dash".to_string(),
+        "ksh" => "Ksh".to_string(),
+        "tcsh" => "Tcsh".to_string(),
+        "csh" => "Csh".to_string(),
+        "pwsh" => "PowerShell".to_string(),
+        "xonsh" => "Xonsh".to_string(),
+        "elvish" => "Elvish".to_string(),
+        _ => file_name.to_string(),
+    }
+}
+
+fn file_name_of(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn shell_supports_integration(family: &str) -> bool {
+    matches!(family, "nu" | "zsh" | "bash" | "fish")
+}
+
+#[cfg(target_family = "unix")]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match fs::metadata(path) {
+        // `fs::metadata` follows symlinks, so /usr/local/bin/zsh → /bin/zsh works.
+        Ok(m) => m.is_file() && (m.permissions().mode() & 0o111 != 0),
+        Err(_) => false,
+    }
+}
+
+/// Best-effort version string. Only shells known to accept `--version` and exit
+/// promptly are probed; everything is timeout- and stdin-guarded so a hostile or
+/// hanging binary can never wedge detection.
+#[cfg(target_family = "unix")]
+fn probe_shell_version(path: &str, family: &str) -> Option<String> {
+    if !matches!(family, "nu" | "zsh" | "bash" | "fish" | "pwsh") {
+        return None;
+    }
+    let mut cmd = Command::new(path);
+    cmd.arg("--version");
+    cmd.stdin(Stdio::null());
+    cmd.env("TERM", "dumb");
+    let out = run_command_output_with_timeout(
+        cmd,
+        Duration::from_millis(1500),
+        "shell version probe",
+    )
+    .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|l| !l.trim().is_empty())?.trim();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line.chars().take(120).collect())
+    }
+}
+
+/// Union of candidate shell paths from several independent sources, so one
+/// failing source can never blank the list.
+#[cfg(target_family = "unix")]
+fn shell_candidate_paths() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let push = |p: &str, out: &mut Vec<String>| {
+        let t = p.trim().to_string();
+        if !t.is_empty() && !out.iter().any(|e| e == &t) {
+            out.push(t);
+        }
+    };
+
+    // 1. /etc/shells — canonical login-approved shells on macOS.
+    if let Ok(contents) = fs::read_to_string("/etc/shells") {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            push(line, &mut out);
+        }
+    }
+
+    // 2. $SHELL — the user's configured login shell.
+    if let Ok(s) = std::env::var("SHELL") {
+        push(&s, &mut out);
+    }
+
+    // 3. passwd entry.
+    if let Some(s) = shell_from_passwd() {
+        push(&s, &mut out);
+    }
+
+    // 4. Well-known absolute paths.
+    const NAMES: [&str; 10] = [
+        "zsh", "bash", "fish", "nu", "pwsh", "dash", "ksh", "tcsh", "elvish", "xonsh",
+    ];
+    const DIRS: [&str; 5] = [
+        "/bin",
+        "/usr/bin",
+        "/usr/local/bin",
+        "/opt/homebrew/bin",
+        "/run/current-system/sw/bin",
+    ];
+    for d in DIRS {
+        for n in NAMES {
+            let p = format!("{d}/{n}");
+            if Path::new(&p).exists() {
+                push(&p, &mut out);
+            }
+        }
+    }
+
+    // 5. PATH lookup — catches nonstandard prefixes (nix, asdf, custom).
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(':') {
+            if dir.trim().is_empty() {
+                continue;
+            }
+            for n in NAMES {
+                let p = format!("{dir}/{n}");
+                if Path::new(&p).exists() {
+                    push(&p, &mut out);
+                }
+            }
+        }
+    }
+
+    out
+}
+
+#[cfg(target_family = "unix")]
+fn detect_shells_uncached() -> Vec<ShellInfo> {
+    let login_default = default_user_shell();
+    let login_default_canon = fs::canonicalize(&login_default)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| login_default.clone());
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut shells: Vec<ShellInfo> = Vec::new();
+
+    // Bundled Nushell is always first and always available.
+    if find_bundled_nu().is_some() {
+        shells.push(ShellInfo {
+            id: "bundled-nu".to_string(),
+            kind: "bundled-nu".to_string(),
+            family: "nu".to_string(),
+            display_name: "Bundled Nushell".to_string(),
+            path: String::new(),
+            version: None,
+            verified: true,
+            is_login_default: false,
+            supports_integration: true,
+        });
+    }
+
+    for cand in shell_candidate_paths() {
+        if !is_executable_file(Path::new(&cand)) {
+            continue;
+        }
+        // Dedupe by canonical (symlink-resolved) path.
+        let canon = fs::canonicalize(&cand)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| cand.clone());
+        if seen.iter().any(|s| s == &canon) {
+            continue;
+        }
+        seen.push(canon.clone());
+
+        let fname = file_name_of(&cand);
+        let family = shell_family_from_name(&fname).to_string();
+        let version = probe_shell_version(&cand, &family);
+        let is_login_default = canon == login_default_canon;
+        shells.push(ShellInfo {
+            id: canon,
+            kind: "system".to_string(),
+            display_name: shell_display_name(&family, &fname),
+            supports_integration: shell_supports_integration(&family),
+            family,
+            path: cand,
+            verified: version.is_some(),
+            version,
+            is_login_default,
+        });
+    }
+
+    shells
+}
+
+/// Enumerate installed shells for the picker. Cached; pass `refresh = true`
+/// (the "Rescan" affordance) to force a re-detect. Never errors on Unix and
+/// always includes the bundled shell, so the picker is never empty.
+#[tauri::command]
+pub fn detect_shells(
+    state: State<'_, AppState>,
+    refresh: Option<bool>,
+) -> Result<Vec<ShellInfo>, String> {
+    #[cfg(not(target_family = "unix"))]
+    {
+        let _ = (state, refresh);
+        Ok(Vec::new())
+    }
+    #[cfg(target_family = "unix")]
+    {
+        let refresh = refresh.unwrap_or(false);
+        if !refresh {
+            if let Ok(cache) = state.inner.shells_cache.lock() {
+                if let Some(cached) = cache.as_ref() {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+        let shells = detect_shells_uncached();
+        if let Ok(mut cache) = state.inner.shells_cache.lock() {
+            *cache = Some(shells.clone());
+        }
+        Ok(shells)
+    }
+}
+
+/// The interactive shell a session will actually launch.
+#[cfg(target_family = "unix")]
+enum ResolvedShell {
+    /// Bundled Nushell (the default). Carries the resolved `nu` binary path.
+    BundledNu(PathBuf),
+    /// A user-installed shell at this absolute path.
+    System(String),
+}
+
+/// Resolve a frontend `ShellChoice` into a concrete shell, falling back to the
+/// default (bundled nu, else `$SHELL`) when a chosen system shell is missing.
+/// Returns an optional warning describing any fallback.
+#[cfg(target_family = "unix")]
+fn resolve_shell(
+    choice: Option<&ShellChoice>,
+    default_shell: &str,
+) -> (ResolvedShell, Option<String>) {
+    let default_resolved = || match find_bundled_nu() {
+        Some(nu) => ResolvedShell::BundledNu(nu),
+        None => ResolvedShell::System(default_shell.to_string()),
+    };
+
+    match choice {
+        Some(c) if c.kind == "system" => match c.path.as_deref() {
+            Some(p) if is_executable_file(Path::new(p)) => (ResolvedShell::System(p.to_string()), None),
+            Some(p) => (
+                default_resolved(),
+                Some(format!(
+                    "Selected shell \"{p}\" was not found; started the default shell instead."
+                )),
+            ),
+            None => (default_resolved(), None),
+        },
+        _ => (default_resolved(), None),
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn interactive_login_args(path: &str) -> Vec<String> {
+    match shell_family_from_name(&file_name_of(path)) {
+        // fish only enters interactive mode reliably with an explicit -i.
+        "fish" => vec!["-l".to_string(), "-i".to_string()],
+        _ => vec!["-l".to_string()],
+    }
+}
+
 #[cfg(target_family = "unix")]
 fn ensure_nu_config(app: &AppHandle, env_keys: &[String]) -> Option<(String, String, String, String)> {
     let xdg = ensure_shell_xdg_paths(app)?;
@@ -1380,11 +1738,26 @@ pub fn create_session(
     env_vars: Option<HashMap<String, String>>,
     persistent: Option<bool>,
     persist_id: Option<String>,
+    shell_choice: Option<ShellChoice>,
 ) -> Result<SessionInfo, String> {
+    #[cfg(not(target_family = "unix"))]
+    let _ = &shell_choice;
+
     #[cfg(target_family = "unix")]
     let shell = default_user_shell();
     #[cfg(not(target_family = "unix"))]
     let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+
+    // Resolve the requested shell up front. `None`/`bundled-nu` keeps today's
+    // default (bundled Nushell); a `system` choice launches the user's own
+    // shell, with a graceful fallback if it has gone missing.
+    #[cfg(target_family = "unix")]
+    let (resolved_shell, shell_warning) = resolve_shell(shell_choice.as_ref(), &shell);
+    #[cfg(target_family = "unix")]
+    let effective_shell = match &resolved_shell {
+        ResolvedShell::System(p) => p.clone(),
+        ResolvedShell::BundledNu(_) => shell.clone(),
+    };
 
     let persistent = persistent.unwrap_or(false);
     let persist_id = persist_id
@@ -1436,11 +1809,9 @@ pub fn create_session(
         let zellij_config = ensure_zellij_config(&app).map(|p| p.to_string_lossy().to_string());
         let zellij_paths = ensure_zellij_paths(&app).ok_or("unable to determine app data dir".to_string())?;
 
-        let nu = find_bundled_nu();
-        let inner_shell = if let Some(nu) = &nu {
-            nu.to_string_lossy().to_string()
-        } else {
-            shell.clone()
+        let (inner_shell, inner_use_nu) = match &resolved_shell {
+            ResolvedShell::BundledNu(nu) => (nu.to_string_lossy().to_string(), true),
+            ResolvedShell::System(p) => (p.clone(), false),
         };
 
         let mut socket_dir = zellij_paths.socket_dir.clone();
@@ -1476,35 +1847,44 @@ pub fn create_session(
             zellij.to_string_lossy().to_string(),
             zellij_args,
             shown_command,
-            nu.is_some(),
+            inner_use_nu,
             inner_shell,
         )
     } else if is_shell {
-        if let Some(nu) = find_bundled_nu() {
-            (
+        match &resolved_shell {
+            ResolvedShell::BundledNu(nu) => (
                 nu.to_string_lossy().to_string(),
                 Vec::new(),
                 "nu".to_string(),
                 true,
                 shell.clone(),
-            )
-        } else {
-            (
-                shell.clone(),
-                vec!["-l".to_string()],
-                format!("{shell} -l"),
-                false,
-                shell.clone(),
-            )
+            ),
+            ResolvedShell::System(p) => {
+                let args = interactive_login_args(p);
+                let shown = format!("{p} {}", args.join(" "));
+                (p.clone(), args, shown, false, p.clone())
+            }
         }
     } else {
-        (
-            shell.clone(),
-            vec!["-lc".to_string(), command.clone()],
-            format!("{shell} -lc {command}"),
-            false,
-            shell.clone(),
-        )
+        // Run-a-command sessions (agent quick-starts like claude/codex). Nushell
+        // is not used as the command runner; the default path keeps `$SHELL -lc`,
+        // while an explicitly chosen system shell runs `<shell> -l -c <command>`.
+        match &resolved_shell {
+            ResolvedShell::System(p) => (
+                p.clone(),
+                vec!["-l".to_string(), "-c".to_string(), command.clone()],
+                format!("{p} -l -c {command}"),
+                false,
+                p.clone(),
+            ),
+            ResolvedShell::BundledNu(_) => (
+                shell.clone(),
+                vec!["-lc".to_string(), command.clone()],
+                format!("{shell} -lc {command}"),
+                false,
+                shell.clone(),
+            ),
+        }
     };
 
     #[cfg(not(target_family = "unix"))]
@@ -1565,7 +1945,7 @@ pub fn create_session(
     );
     #[cfg(target_family = "unix")]
     if cmd.get_env("SHELL").is_none() {
-        cmd.env("SHELL", shell.clone());
+        cmd.env("SHELL", effective_shell.clone());
     }
     #[cfg(target_family = "unix")]
     if persistent {
@@ -1652,18 +2032,21 @@ pub fn create_session(
             }
 
             let fallback_path = fallback_entries.join(":");
+            // Import PATH from the shell that will actually run, so a user whose
+            // PATH is configured in their chosen shell's profile gets it. The
+            // cache is keyed by that shell, so different shells don't collide.
             let imported_path = if let Ok(mut cache) = state.inner.login_path_cache.lock() {
-                if cache.initialized && cache.shell.as_deref() == Some(shell.as_str()) {
+                if cache.initialized && cache.shell.as_deref() == Some(effective_shell.as_str()) {
                     cache.path.clone()
                 } else {
-                    let computed = login_shell_path(&shell, &fallback_path);
+                    let computed = login_shell_path(&effective_shell, &fallback_path);
                     cache.initialized = true;
-                    cache.shell = Some(shell.clone());
+                    cache.shell = Some(effective_shell.clone());
                     cache.path = computed.clone();
                     computed
                 }
             } else {
-                login_shell_path(&shell, &fallback_path)
+                login_shell_path(&effective_shell, &fallback_path)
             };
 
             let mut path_entries: Vec<String> = Vec::new();
@@ -1822,6 +2205,19 @@ pub fn create_session(
     // session opens. Deliberately no poke on exit/close: release goes through
     // the watcher's grace period so a reconnect dip can't let the Mac sleep.
     crate::power_assertion::poke();
+
+    // Tell the UI if the requested shell couldn't be launched and we fell back.
+    #[cfg(target_family = "unix")]
+    if let Some(message) = shell_warning {
+        let _ = app.emit_to(
+            "main",
+            "shell-fallback",
+            ShellFallbackEvent {
+                session_id: id.clone(),
+                message,
+            },
+        );
+    }
 
     let id_for_reader = id.clone();
     let id_for_emitter: Arc<str> = Arc::from(id.as_str());

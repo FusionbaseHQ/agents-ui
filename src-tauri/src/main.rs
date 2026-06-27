@@ -32,9 +32,9 @@ use app_menu::{build_app_menu, handle_app_menu_event};
 use files::{copy_fs_entry, create_directory, create_file, delete_fs_entry, list_fs_entries, probe_file, read_file_range, read_text_file, rename_fs_entry, search_fs_entries, write_text_file};
 use file_manager::{open_path_in_file_manager, open_path_in_vscode};
 use pty::{
-    close_session, create_session, detach_session, kill_persistent_session, list_persistent_sessions,
-    list_sessions, rename_session, resize_session, start_session_recording, stop_session_recording,
-    write_to_session, AppState,
+    close_session, create_session, detach_session, detect_shells, kill_persistent_session,
+    list_persistent_sessions, list_sessions, rename_session, resize_session,
+    start_session_recording, stop_session_recording, write_to_session, AppState,
 };
 use persist::{list_directories, load_persisted_state, load_persisted_state_meta, save_persisted_state, validate_directory};
 use recording::{delete_recording, list_recordings, load_recording};
@@ -193,6 +193,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             create_session,
+            detect_shells,
             write_to_session,
             resize_session,
             close_session,

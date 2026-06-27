@@ -389,6 +389,7 @@ export type WorkspaceSidebarProps = {
   onSetSessionColor: (id: string, color: string | null) => void;
 
   onNewTerminalForProject: (projectId: string) => void;
+  onNewTerminalWithShellForProject: (projectId: string) => void;
   onNewSshForProject: (projectId: string) => void;
   onQuickStartForProject: (projectId: string, effect: ProcessEffect) => void;
 
@@ -442,6 +443,7 @@ export const WorkspaceSidebar = React.memo(function WorkspaceSidebar(props: Work
     onSetSessionSymbol,
     onSetSessionColor,
     onNewTerminalForProject,
+    onNewTerminalWithShellForProject,
     onNewSshForProject,
     onQuickStartForProject,
     onOpenPersistentSessions,
@@ -1529,6 +1531,22 @@ export const WorkspaceSidebar = React.memo(function WorkspaceSidebar(props: Work
                 <Icon name="terminal" size={13} />
               </span>
               <span className="wsMenuItemName">Terminal</span>
+            </button>
+            <button
+              type="button"
+              className="wsMenuItem"
+              role="menuitem"
+              onClick={() => {
+                const pid = newMenu.projectId;
+                setNewMenu(null);
+                onNewTerminalWithShellForProject(pid);
+              }}
+              title="Choose which shell to open this terminal with"
+            >
+              <span className="wsMenuIcon wsSessionIconTerminal">
+                <Icon name="terminal" size={13} />
+              </span>
+              <span className="wsMenuItemName">Terminal with shell…</span>
             </button>
             {agentShortcuts.map((effect) => (
               <button
