@@ -574,7 +574,7 @@ export function CommandPalette({
 
   return (
     <div className="commandPaletteBackdrop" onClick={onClose}>
-      <div className="commandPalette" onClick={e => e.stopPropagation()}>
+      <div className="commandPalette" role="dialog" aria-modal="true" aria-label="Command palette" onClick={e => e.stopPropagation()}>
         <div className="commandPaletteSearch">
           <span className="commandPaletteSearchIcon">&gt;</span>
           <input
@@ -585,9 +585,13 @@ export function CommandPalette({
             onChange={e => setQuery(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder="Search projects, sessions, terminal content..."
+            role="combobox"
+            aria-expanded="true"
+            aria-controls="commandPaletteList"
+            aria-autocomplete="list"
           />
         </div>
-        <div className="commandPaletteList" ref={listRef}>
+        <div className="commandPaletteList" id="commandPaletteList" role="listbox" ref={listRef}>
           {groupedItems.length === 0 && (
             <div className="commandPaletteEmpty">No results found</div>
           )}
@@ -601,6 +605,8 @@ export function CommandPalette({
                 return (
                   <div
                     key={item.id}
+                    role="option"
+                    aria-selected={isSelected}
                     className={`commandPaletteItem ${isSelected ? "commandPaletteItemSelected" : ""}`}
                     data-selected={isSelected}
                     onClick={() => executeItem(item)}
