@@ -60,6 +60,14 @@ import {
   shellChoiceForProject,
 } from "./stores/shells";
 import {
+  useDialogsStore,
+  openDialog,
+  closeDialog,
+  toggleDialog,
+  closeTopDialog,
+  anyDialogOpen,
+} from "./stores/dialogs";
+import {
   useUpdatesStore,
   fetchAppInfo,
   checkForUpdates,
@@ -1994,7 +2002,6 @@ export default function App() {
     null,
   );
   const activityCenterMenuRef = useRef<HTMLDivElement | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   // Shells domain lives in src/stores/shells.ts (App.tsx decomposition).
   const { detectedShells, shellsLoading, appDefaultShell } = useShellsStore();
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -2254,8 +2261,8 @@ export default function App() {
   const [slidePanelWidth, setSlidePanelWidth] = useState(360);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [workspaceFileSearchOpen, setWorkspaceFileSearchOpen] = useState(false);
-  const [shortcutsOpen, setShortcutsOpen] = useState(false);
-  const [newSessionFlowOpen, setNewSessionFlowOpen] = useState(false);
+  // Simple dialog open/closed state lives in src/stores/dialogs.ts.
+  const dialogs = useDialogsStore();
   const [promptSearch, setPromptSearch] = useState("");
   const [recordingSearch, setRecordingSearch] = useState("");
   const [assetSearch, setAssetSearch] = useState("");
@@ -2551,9 +2558,6 @@ export default function App() {
     environmentEditorOpen: false,
     assetEditorOpen: false,
     commandPaletteOpen: false,
-    shortcutsOpen: false,
-    settingsOpen: false,
-    newSessionFlowOpen: false,
     slidePanelOpen: false,
     slidePanelTab: "prompts" as string,
     prompts: [] as Prompt[],
@@ -5229,9 +5233,6 @@ export default function App() {
     s.environmentEditorOpen = environmentEditorOpen;
     s.assetEditorOpen = assetEditorOpen;
     s.commandPaletteOpen = commandPaletteOpen;
-    s.shortcutsOpen = shortcutsOpen;
-    s.settingsOpen = settingsOpen;
-    s.newSessionFlowOpen = newSessionFlowOpen;
     s.slidePanelOpen = slidePanelOpen;
     s.slidePanelTab = slidePanelTab;
     s.prompts = prompts;
@@ -5621,14 +5622,11 @@ export default function App() {
         applyAssetRequest, replayOpen, recordPromptOpen, recordingsOpen,
         secureStorageSettingsOpen, promptsOpen, promptEditorOpen,
         environmentsOpen, environmentEditorOpen, assetEditorOpen,
-        commandPaletteOpen, shortcutsOpen, settingsOpen, newSessionFlowOpen,
-        slidePanelOpen, slidePanelTab, prompts,
+        commandPaletteOpen, slidePanelOpen, slidePanelTab, prompts,
         applyAssetApplying,
       } = ks;
       const modalOpen =
-        shortcutsOpen ||
-        settingsOpen ||
-        newSessionFlowOpen ||
+        anyDialogOpen() ||
         newOpen ||
         sshManagerOpen ||
         agentShortcutsOpen ||
@@ -5730,7 +5728,7 @@ export default function App() {
       if (binding === "shortcuts.show" && !commandPaletteOpen) {
         e.preventDefault();
         e.stopPropagation();
-        setShortcutsOpen((prev) => !prev);
+        toggleDialog("shortcuts");
         return;
       }
 
@@ -5792,18 +5790,7 @@ export default function App() {
 
       if (e.key === "Escape" && modalOpen) {
         e.preventDefault();
-        if (shortcutsOpen) {
-          setShortcutsOpen(false);
-          return;
-        }
-        if (settingsOpen) {
-          setSettingsOpen(false);
-          return;
-        }
-        if (newSessionFlowOpen) {
-          setNewSessionFlowOpen(false);
-          return;
-        }
+        if (closeTopDialog()) return;
         if (applyAssetRequest) {
           if (applyAssetApplying) return;
           closeApplyAssetModal();
@@ -9134,7 +9121,7 @@ export default function App() {
   const handleOpenNewSessionFlow = useCallback(() => {
     setProjectOpen(false);
     setNewOpen(false);
-    setNewSessionFlowOpen(true);
+    openDialog("newSessionFlow");
   }, []);
 
   const handleOpenPersistentSessions = useCallback(() => {
@@ -9398,7 +9385,7 @@ export default function App() {
   const handleOpenSettings = useCallback(() => {
     setActivityCenterOpen(false);
     setActivityCenterAutoOpenSource(null);
-    setSettingsOpen(true);
+    openDialog("settings");
   }, []);
 
   const activityItems = useMemo<ActivityCenterItem[]>(() => {
@@ -9670,7 +9657,7 @@ export default function App() {
         />
         <button
           type="button"
-          className={`iconBtn ${settingsOpen ? "iconBtnActive" : ""}`}
+          className={`iconBtn ${dialogs.settings ? "iconBtnActive" : ""}`}
           onClick={handleOpenSettings}
           title="Settings"
           aria-label="Settings"
@@ -9820,7 +9807,7 @@ export default function App() {
     </div>
   ), [
     active, activeProject, activeIsSsh, activeSshTarget, activeWorkspaceView, hydrated,
-    activityCenterOpen, activityItems, slidePanelOpen, agentPanelOpen, settingsOpen,
+    activityCenterOpen, activityItems, slidePanelOpen, agentPanelOpen, dialogs.settings,
     uiTheme, autoCaffeinate, keepAwakeActive, showShortcutHint,
     handleToggleActivityCenter, handleOpenSettings, reportError,
     updateActiveWorkspaceView, refreshRecordings,
@@ -10104,7 +10091,7 @@ export default function App() {
                 if (effect) handleQuickStartForProject(activeProjectId, effect);
               }}
               onConnectSsh={() => handleNewSshForProject(activeProjectId)}
-              onShowShortcuts={() => setShortcutsOpen(true)}
+              onShowShortcuts={() => openDialog("shortcuts")}
             />
           )}
 
@@ -10200,9 +10187,9 @@ export default function App() {
             onSubmit={onNewSubmit}
           />}
 
-          {shortcutsOpen && <ShortcutsModal onClose={() => setShortcutsOpen(false)} />}
+          {dialogs.shortcuts && <ShortcutsModal onClose={() => closeDialog("shortcuts")} />}
 
-          {newSessionFlowOpen && (() => {
+          {dialogs.newSessionFlow && (() => {
             const pid = activeProjectId;
             const isSshProj = isProjectSsh(activeProject);
             const items: NewSessionFlowItem[] = [];
@@ -10273,12 +10260,12 @@ export default function App() {
               <NewSessionFlow
                 projectTitle={activeProject?.title ?? null}
                 items={items}
-                onClose={() => setNewSessionFlowOpen(false)}
+                onClose={() => closeDialog("newSessionFlow")}
               />
             );
           })()}
 
-          {settingsOpen && (
+          {dialogs.settings && (
             <SettingsModal
               themes={[
                 { id: "dawn", label: "Dawn" },
@@ -10304,14 +10291,14 @@ export default function App() {
               shellsLoading={shellsLoading}
               onLoadShells={() => void loadShells()}
               onOpenSecureStorage={() => {
-                setSettingsOpen(false);
+                closeDialog("settings");
                 openSecureStorageSettings();
               }}
               onOpenUpdates={() => {
-                setSettingsOpen(false);
+                closeDialog("settings");
                 setUpdatesOpen(true);
               }}
-              onClose={() => setSettingsOpen(false)}
+              onClose={() => closeDialog("settings")}
             />
           )}
 
@@ -11733,7 +11720,7 @@ export default function App() {
             id: "shortcuts",
             title: "Keyboard Shortcuts",
             shortcut: "/",
-            run: () => setShortcutsOpen(true),
+            run: () => openDialog("shortcuts"),
           },
           {
             id: "terminal-with-shell",
