@@ -51,7 +51,9 @@ import {
   detectShells,
   shellChoiceToPayload,
   shellChoiceShortName,
+  shellChoiceLabel,
 } from "./shells";
+import { StatusBar } from "./components/StatusBar";
 import {
   PersistentSessionsModal,
   type PersistentSessionsModalItem,
@@ -142,6 +144,8 @@ type Session = SessionInfo & {
   exited?: boolean;
   closing?: boolean;
   exitCode?: number | null;
+  /** Shell this session was launched with (null/absent ⇒ the default). Not restored across app restarts. */
+  shellChoice?: ShellChoice | null;
   connectionState?: "connected" | "reconnecting" | "disconnected";
   reconnectAttempt?: number;
   nextReconnectAt?: number | null;
@@ -1883,6 +1887,7 @@ async function createSession(input: {
     effectId: effect?.id ?? null,
     processTag,
     runningCommand: shouldTrackLaunchCommandAsRunning(launchCommand, persistent) ? launchCommand : null,
+    shellChoice: input.shellChoice ?? null,
     connectionState: "connected",
     reconnectAttempt: 0,
     nextReconnectAt: null,
@@ -9837,14 +9842,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Recording Timer */}
-        {active?.recordingActive && (
-          <div className="recordingTimer">
-            <span className="recordingTimerDot" />
-            <span>REC</span>
-          </div>
-        )}
-
         {active && (
           <>
             {!activeIsSsh ? (
@@ -11732,6 +11729,23 @@ export default function App() {
             )}
           </SlidePanel>}
         </div>
+
+        <StatusBar
+          shellLabel={
+            active && !active.launchCommand && !activeIsSsh && !active.exited
+              ? shellChoiceLabel(active.shellChoice ?? shellChoiceForProject(activeProject), detectedShells)
+              : null
+          }
+          onShellClick={() => handleNewTerminalWithShellForProject(activeProjectId)}
+          cwd={active?.cwd ? shortenPathSmart(active.cwd, 60) : null}
+          sshTarget={activeIsSsh ? activeSshTarget : null}
+          connectionState={active?.connectionState ?? null}
+          recordingActive={Boolean(active?.recordingActive)}
+          keepAwake={autoCaffeinate && keepAwakeActive}
+          updateAvailable={updateCheckState.status === "updateAvailable"}
+          onOpenUpdates={() => setUpdatesOpen(true)}
+          version={appInfo?.version ?? null}
+        />
       </main>
 
       {/* Command Palette */}

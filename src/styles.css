@@ -9362,3 +9362,63 @@ select.input {
   color: var(--text-bright);
   font-weight: 600;
 }
+
+/* Bottom status bar (StatusBar). */
+.statusBar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: 24px;
+  padding: 0 10px;
+  border-top: 1px solid rgba(var(--ink-rgb), 0.08);
+  background: rgba(var(--paper-panel-rgb), 0.6);
+  font-size: 11px;
+  color: var(--muted);
+  user-select: none;
+}
+
+.statusBarLeft,
+.statusBarRight {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.statusChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 7px;
+  border-radius: var(--radius-sm);
+  background: rgba(var(--ink-rgb), 0.06);
+  color: var(--muted);
+  white-space: nowrap;
+  border: none;
+  font-size: 10.5px;
+}
+
+.statusChipButton { cursor: pointer; }
+.statusChipButton:hover { background: rgba(var(--ink-rgb), 0.12); color: var(--text); }
+.statusChipButton.accent {
+  color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.12);
+}
+.statusChipButton.accent:hover { background: rgba(var(--accent-rgb), 0.2); }
+
+.statusChip.warn { color: rgb(var(--danger-rgb)); background: rgba(var(--danger-rgb), 0.1); }
+
+.statusChipRec { color: rgb(var(--danger-rgb)); background: rgba(var(--danger-rgb), 0.1); }
+
+.statusCwd {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, monospace;
+  font-size: 10.5px;
+}
+
+.statusVersion { opacity: 0.7; }
