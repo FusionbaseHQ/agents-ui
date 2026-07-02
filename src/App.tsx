@@ -10107,11 +10107,15 @@ export default function App() {
             <WelcomePane
               projectTitle={activeProject?.title ?? null}
               isSshProject={isProjectSsh(activeProject)}
-              agentLabel={quickStarts[0]?.title ?? null}
+              agents={agentShortcutIds
+                .map((id) => getProcessEffectById(id))
+                .filter((e): e is NonNullable<typeof e> => Boolean(e))
+                .slice(0, 4)
+                .map((e) => ({ id: e.id, label: e.label, iconSrc: e.iconSrc ?? null }))}
               onNewTerminal={() => handleNewTerminalForProject(activeProjectId)}
               onNewTerminalWithShell={() => handleNewTerminalWithShellForProject(activeProjectId)}
-              onStartAgent={() => {
-                const effect = quickStarts[0] ? getProcessEffectById(quickStarts[0].id) : null;
+              onStartAgent={(agentId) => {
+                const effect = getProcessEffectById(agentId);
                 if (effect) handleQuickStartForProject(activeProjectId, effect);
               }}
               onConnectSsh={() => handleNewSshForProject(activeProjectId)}

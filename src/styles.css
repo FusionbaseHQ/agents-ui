@@ -9231,10 +9231,10 @@ select.input {
 
 .welcomeCard {
   display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 3px;
-  padding: 13px 15px;
+  flex-direction: row;
+  align-items: center;
+  gap: 11px;
+  padding: 12px 14px;
   border-radius: var(--radius-lg);
   border: 1px solid rgba(var(--ink-rgb), 0.1);
   background: rgba(var(--ink-rgb), 0.03);
@@ -9248,11 +9248,43 @@ select.input {
   border-color: rgba(var(--accent-rgb), 0.35);
 }
 
+.welcomeCardBody {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  min-width: 0;
+}
+
 .welcomeCardTitle {
   font-size: 13px;
   font-weight: 600;
   color: var(--text-bright);
 }
+
+/* Card icon chips — same iconography as the sidebar rows. Zero-specificity
+   base (:where) so the shared per-agent chip tints (.chip-claude/.chip-codex)
+   win regardless of stylesheet order. */
+:where(.welcomeCardIcon) {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(var(--ink-rgb), 0.1);
+  background: rgba(var(--ink-rgb), 0.04);
+  color: var(--muted);
+}
+
+.welcomeCardIcon .agentIcon {
+  width: 16px;
+  height: 16px;
+}
+
+.welcomeCardIconTerminal { color: rgb(var(--accent-rgb)); background: rgba(var(--accent-rgb), 0.12); }
+.welcomeCardIconSsh { color: rgb(var(--ssh-rgb)); background: rgba(var(--ssh-rgb), 0.12); }
 
 .welcomeCardHint {
   font-size: 11px;
