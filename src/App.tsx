@@ -64,6 +64,8 @@ import { ConfirmActionModal } from "./components/modals/ConfirmActionModal";
 import { ShortcutsModal } from "./components/modals/ShortcutsModal";
 import { SettingsModal } from "./components/modals/SettingsModal";
 import { WelcomePane } from "./components/WelcomePane";
+import { SessionTimeline } from "./components/SessionTimeline";
+import { NewSessionFlow, type NewSessionFlowItem } from "./components/modals/NewSessionFlow";
 import { matchBinding } from "./keymap";
 import { ToastHost, showToast, EmptyState, Modal } from "./ui";
 import { PathPickerModal } from "./components/modals/PathPickerModal";
@@ -2316,11 +2318,12 @@ export default function App() {
 
   // New UI state for SlidePanel and CommandPalette
   const [slidePanelOpen, setSlidePanelOpen] = useState(false);
-  const [slidePanelTab, setSlidePanelTab] = useState<"prompts" | "recordings" | "assets">("prompts");
+  const [slidePanelTab, setSlidePanelTab] = useState<"prompts" | "recordings" | "assets" | "timeline">("prompts");
   const [slidePanelWidth, setSlidePanelWidth] = useState(360);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [workspaceFileSearchOpen, setWorkspaceFileSearchOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [newSessionFlowOpen, setNewSessionFlowOpen] = useState(false);
   const [promptSearch, setPromptSearch] = useState("");
   const [recordingSearch, setRecordingSearch] = useState("");
   const [assetSearch, setAssetSearch] = useState("");
@@ -2618,6 +2621,7 @@ export default function App() {
     commandPaletteOpen: false,
     shortcutsOpen: false,
     settingsOpen: false,
+    newSessionFlowOpen: false,
     slidePanelOpen: false,
     slidePanelTab: "prompts" as string,
     prompts: [] as Prompt[],
@@ -5300,6 +5304,7 @@ export default function App() {
     s.commandPaletteOpen = commandPaletteOpen;
     s.shortcutsOpen = shortcutsOpen;
     s.settingsOpen = settingsOpen;
+    s.newSessionFlowOpen = newSessionFlowOpen;
     s.slidePanelOpen = slidePanelOpen;
     s.slidePanelTab = slidePanelTab;
     s.prompts = prompts;
@@ -5689,12 +5694,14 @@ export default function App() {
         applyAssetRequest, replayOpen, recordPromptOpen, recordingsOpen,
         secureStorageSettingsOpen, promptsOpen, promptEditorOpen,
         environmentsOpen, environmentEditorOpen, assetEditorOpen,
-        commandPaletteOpen, shortcutsOpen, settingsOpen, slidePanelOpen, slidePanelTab, prompts,
+        commandPaletteOpen, shortcutsOpen, settingsOpen, newSessionFlowOpen,
+        slidePanelOpen, slidePanelTab, prompts,
         applyAssetApplying,
       } = ks;
       const modalOpen =
         shortcutsOpen ||
         settingsOpen ||
+        newSessionFlowOpen ||
         newOpen ||
         sshManagerOpen ||
         agentShortcutsOpen ||
@@ -5866,6 +5873,10 @@ export default function App() {
           setSettingsOpen(false);
           return;
         }
+        if (newSessionFlowOpen) {
+          setNewSessionFlowOpen(false);
+          return;
+        }
         if (applyAssetRequest) {
           if (applyAssetApplying) return;
           closeApplyAssetModal();
@@ -5958,7 +5969,7 @@ export default function App() {
       const sessions = sessionsRef.current.filter((s) => s.projectId === activeProjectId);
       const activeId = activeIdRef.current;
 
-      const toggleSlidePanel = (tab: "prompts" | "recordings" | "assets") => {
+      const toggleSlidePanel = (tab: "prompts" | "recordings" | "assets" | "timeline") => {
         setSlidePanelOpen((prev) => {
           if (!prev) {
             setSlidePanelTab(tab);
@@ -5980,7 +5991,7 @@ export default function App() {
       switch (binding) {
         case "session.new":
           e.preventDefault();
-          handleOpenNewSession();
+          handleOpenNewSessionFlow();
           return;
         case "session.close":
           if (!activeId) return;
@@ -6007,6 +6018,10 @@ export default function App() {
         case "panel.assets":
           e.preventDefault();
           toggleSlidePanel("assets");
+          return;
+        case "panel.timeline":
+          e.preventDefault();
+          toggleSlidePanel("timeline");
           return;
         case "panel.agent":
           e.preventDefault();
@@ -9273,6 +9288,14 @@ export default function App() {
     setNewOpen(true);
   }, []);
 
+  // ⌘T and the palette's "New Session" open the unified flow (terminal /
+  // shells / agents / SSH / custom command in one keyboard-first list).
+  const handleOpenNewSessionFlow = useCallback(() => {
+    setProjectOpen(false);
+    setNewOpen(false);
+    setNewSessionFlowOpen(true);
+  }, []);
+
   const handleOpenPersistentSessions = useCallback(() => {
     setPersistentSessionsOpen(true);
     void refreshPersistentSessions();
@@ -10337,6 +10360,82 @@ export default function App() {
           />}
 
           {shortcutsOpen && <ShortcutsModal onClose={() => setShortcutsOpen(false)} />}
+
+          {newSessionFlowOpen && (() => {
+            const pid = activeProjectId;
+            const isSshProj = isProjectSsh(activeProject);
+            const items: NewSessionFlowItem[] = [];
+            if (isSshProj) {
+              items.push({
+                id: "terminal",
+                group: "start",
+                title: `Terminal — ssh ${activeProject?.sshTarget ?? ""}`,
+                subtitle: "Connect to the project host",
+                glyph: "ssh",
+                onPick: () => handleNewTerminalForProject(pid),
+              });
+            } else {
+              items.push({
+                id: "terminal",
+                group: "start",
+                title: `Terminal — ${shellChoiceLabel(shellChoiceForProject(activeProject), detectedShells)}`,
+                subtitle: activeProject?.basePath ?? undefined,
+                glyph: "❯",
+                onPick: () =>
+                  void createTerminalWithShell(
+                    pid,
+                    shellChoiceForProject(activeProject) ?? { kind: "bundled-agsh" },
+                  ),
+              });
+              items.push({
+                id: "shell",
+                group: "start",
+                title: "Terminal with shell…",
+                subtitle: "Pick agsh, Nushell, or an installed shell",
+                glyph: "sh",
+                onPick: () => handleNewTerminalWithShellForProject(pid),
+              });
+            }
+            for (const preset of quickStarts.slice(0, 4)) {
+              items.push({
+                id: `agent-${preset.id}`,
+                group: "agents",
+                title: preset.title,
+                subtitle: preset.command ?? undefined,
+                iconSrc: preset.iconSrc,
+                glyph: "ai",
+                onPick: () => {
+                  const effect = getProcessEffectById(preset.id);
+                  if (effect) handleQuickStartForProject(pid, effect);
+                },
+              });
+            }
+            items.push({
+              id: "ssh",
+              group: "more",
+              title: "SSH connection…",
+              subtitle: "Connect to a host from ~/.ssh/config",
+              glyph: "ssh",
+              onPick: () => setSshManagerOpen(true),
+            });
+            if (!isSshProj) {
+              items.push({
+                id: "custom",
+                group: "more",
+                title: "Custom command…",
+                subtitle: "Run a specific command in a new session",
+                glyph: ">_",
+                onPick: handleOpenNewSession,
+              });
+            }
+            return (
+              <NewSessionFlow
+                projectTitle={activeProject?.title ?? null}
+                items={items}
+                onClose={() => setNewSessionFlowOpen(false)}
+              />
+            );
+          })()}
 
           {settingsOpen && (
             <SettingsModal
@@ -11577,6 +11676,18 @@ export default function App() {
                   </button>
                 </div>
               </>
+            ) : slidePanelTab === "timeline" ? (
+              <SessionTimeline
+                term={activeId ? registry.current.get(activeId)?.term ?? null : null}
+                shellInt={activeId ? registry.current.get(activeId)?.shellInt ?? null : null}
+                sessionName={active?.name ?? null}
+                onCopyOutput={(text) => {
+                  void navigator.clipboard
+                    .writeText(text)
+                    .then(() => showToast({ tone: "success", message: "Output copied." }))
+                    .catch(() => showToast({ tone: "error", message: "Could not copy output." }));
+                }}
+              />
             ) : (
               <>
                 {/* Assets Search */}
@@ -11749,7 +11860,7 @@ export default function App() {
           setActiveId(sessionId);
         }}
         onSelectProject={setActiveProjectId}
-        onNewSession={handleOpenNewSession}
+        onNewSession={handleOpenNewSessionFlow}
         getTerminalText={getTerminalText}
         onOpenSshManager={() => {
           setProjectOpen(false);
@@ -11820,6 +11931,17 @@ export default function App() {
             shortcut: "Shift+G",
             icon: "panel",
             run: () => setAgentPanelOpen((prev) => !prev),
+          },
+          {
+            id: "session-timeline",
+            title: "Session Timeline",
+            subtitle: "Commands run in the active terminal, with exit status and duration",
+            shortcut: "Shift+E",
+            icon: "panel",
+            run: () => {
+              setSlidePanelTab("timeline");
+              setSlidePanelOpen(true);
+            },
           },
         ]}
         onOpenAssetsPanel={() => {

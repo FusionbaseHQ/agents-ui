@@ -3,8 +3,8 @@ import React, { useState, useRef, useCallback, useEffect } from "react";
 type SlidePanelProps = {
   isOpen: boolean;
   onClose: () => void;
-  activeTab: "prompts" | "recordings" | "assets";
-  onTabChange: (tab: "prompts" | "recordings" | "assets") => void;
+  activeTab: "prompts" | "recordings" | "assets" | "timeline";
+  onTabChange: (tab: "prompts" | "recordings" | "assets" | "timeline") => void;
   width: number;
   onWidthChange: (width: number) => void;
   children: React.ReactNode;
@@ -82,6 +82,12 @@ export function SlidePanel({
             onClick={() => onTabChange("assets")}
           >
             Assets
+          </button>
+          <button
+            className={`slidePanelTab ${activeTab === "timeline" ? "slidePanelTabActive" : ""}`}
+            onClick={() => onTabChange("timeline")}
+          >
+            Timeline
           </button>
         </div>
         <button className="slidePanelClose" onClick={onClose} title="Close panel">

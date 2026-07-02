@@ -16,6 +16,7 @@ export type KeyBindingId =
   | "panel.prompts"
   | "panel.recordings"
   | "panel.assets"
+  | "panel.timeline"
   | "panel.agent"
   | "prompt.1"
   | "prompt.2"
@@ -52,6 +53,7 @@ export const KEY_BINDINGS: KeyBinding[] = [
   { id: "panel.prompts", title: "Toggle Prompts panel", section: "Panels", mac: "mod+shift+p", other: "mod+shift+p" },
   { id: "panel.recordings", title: "Toggle Recordings panel", section: "Panels", mac: "mod+shift+r", other: "mod+shift+r" },
   { id: "panel.assets", title: "Toggle Assets panel", section: "Panels", mac: "mod+shift+a", other: "mod+shift+a" },
+  { id: "panel.timeline", title: "Toggle Timeline panel", section: "Panels", mac: "mod+shift+e", other: "mod+shift+e" },
   { id: "panel.agent", title: "Toggle Agent panel", section: "Panels", mac: "mod+shift+g", other: "mod+shift+g" },
   quickPrompt(1),
   quickPrompt(2),

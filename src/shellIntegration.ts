@@ -19,6 +19,17 @@ export class SessionShellIntegration {
   private currentBlock: CommandBlock | null = null;
   private disposed = false;
   private onBlockEvicted: ((blockId: number) => void) | null = null;
+  private changeListeners = new Set<() => void>();
+
+  /** Subscribe to any block change (new prompt/command, finish, evict). Returns unsubscribe. */
+  onBlocksChanged(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => this.changeListeners.delete(listener);
+  }
+
+  private notifyChanged(): void {
+    for (const l of this.changeListeners) l();
+  }
   private static hasCommandLifecycle(block: CommandBlock): boolean {
     return Boolean(block.commandMarker || block.outputMarker || block.endMarker);
   }
@@ -65,6 +76,7 @@ export class SessionShellIntegration {
     this.currentBlock = block;
 
     marker.onDispose(() => this.evictBlock(block.id));
+    this.notifyChanged();
   }
 
   handleCommandStart(term: Terminal): void {
@@ -77,6 +89,7 @@ export class SessionShellIntegration {
     block.commandMarker = marker;
     // Capture cursor column — this is where user input begins (after the prompt)
     block.commandStartCol = term.buffer.active.cursorX;
+    this.notifyChanged();
   }
 
   handleOutputStart(term: Terminal): void {
@@ -89,6 +102,7 @@ export class SessionShellIntegration {
     if (!marker) return;
     block.outputMarker = marker;
     block.startedAt = Date.now();
+    this.notifyChanged();
   }
 
   handleCommandFinished(term: Terminal, exitCode: number): void {
@@ -108,6 +122,7 @@ export class SessionShellIntegration {
     block.finishedAt = Date.now();
     this.blocks.push(block);
     this.currentBlock = null;
+    this.notifyChanged();
   }
 
   getBlockAtRow(row: number): CommandBlock | null {
@@ -215,6 +230,7 @@ export class SessionShellIntegration {
       this.currentBlock = null;
     }
     this.onBlockEvicted?.(blockId);
+    this.notifyChanged();
   }
 
   setOnBlockEvicted(cb: ((blockId: number) => void) | null): void {
@@ -225,5 +241,6 @@ export class SessionShellIntegration {
     this.disposed = true;
     this.blocks = [];
     this.currentBlock = null;
+    this.changeListeners.clear();
   }
 }
