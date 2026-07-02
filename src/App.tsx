@@ -2263,6 +2263,8 @@ export default function App() {
   const [workspaceFileSearchOpen, setWorkspaceFileSearchOpen] = useState(false);
   // Simple dialog open/closed state lives in src/stores/dialogs.ts.
   const dialogs = useDialogsStore();
+  // Tab-strip drag-reorder indicator (drop target + side).
+  const [tabDrop, setTabDrop] = useState<{ id: string; position: "before" | "after" } | null>(null);
   const [promptSearch, setPromptSearch] = useState("");
   const [recordingSearch, setRecordingSearch] = useState("");
   const [assetSearch, setAssetSearch] = useState("");
@@ -10096,14 +10098,12 @@ export default function App() {
           )}
 
           {(() => {
-            // Session tab strip: the active project's sessions in stable
-            // (sidebar) order — a real tab strip, not a recency list.
-            const tabSessions = sessions
-              .filter((s) => s.projectId === activeProjectId && !s.closing)
-              .slice()
-              .sort(
-                (a, b) => (a.sidebarOrder ?? a.createdAt) - (b.sidebarOrder ?? b.createdAt),
-              );
+            // Session tab strip: the active project's sessions in the same
+            // order as the sidebar — a real tab strip, not a recency list.
+            // Tabs drag-reorder via the same handler the sidebar uses.
+            const tabSessions = sortProjectSessionsForSidebar(sessions, activeProjectId).filter(
+              (s) => !s.closing,
+            );
             if (tabSessions.length === 0) return null;
             return (
               <div className="historyBar" role="tablist" aria-label="Sessions">
@@ -10134,6 +10134,12 @@ export default function App() {
                         isDefaultType ? "sessionItemDefault" : ""
                       } ${s.color ? "sessionItemColored" : ""} ${
                         s.exited ? "sessionItemExited" : ""
+                      } ${
+                        tabDrop?.id === sid
+                          ? tabDrop.position === "before"
+                            ? "historyTabDropBefore"
+                            : "historyTabDropAfter"
+                          : ""
                       }`}
                       style={s.color ? { "--tab-color": s.color } as React.CSSProperties : undefined}
                       onClick={() => selectSessionById(sid)}
@@ -10143,6 +10149,32 @@ export default function App() {
                           void onClose(sid);
                         }
                       }}
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.setData("text/x-session-id", sid);
+                        e.dataTransfer.effectAllowed = "move";
+                      }}
+                      onDragOver={(e) => {
+                        if (!e.dataTransfer.types.includes("text/x-session-id")) return;
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = "move";
+                        const r = e.currentTarget.getBoundingClientRect();
+                        const position = e.clientX < r.left + r.width / 2 ? "before" : "after";
+                        setTabDrop((prev) =>
+                          prev?.id === sid && prev.position === position ? prev : { id: sid, position },
+                        );
+                      }}
+                      onDragLeave={() => setTabDrop((prev) => (prev?.id === sid ? null : prev))}
+                      onDrop={(e) => {
+                        const sourceId = e.dataTransfer.getData("text/x-session-id");
+                        setTabDrop(null);
+                        if (!sourceId || sourceId === sid) return;
+                        e.preventDefault();
+                        const r = e.currentTarget.getBoundingClientRect();
+                        const position = e.clientX < r.left + r.width / 2 ? "before" : "after";
+                        handleReorderSession(sourceId, sid, position);
+                      }}
+                      onDragEnd={() => setTabDrop(null)}
                       title={s.cwd ?? s.name}
                     >
                       {s.symbol ? (

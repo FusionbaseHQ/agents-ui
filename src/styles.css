@@ -9517,3 +9517,7 @@ select.input {
 
 .wsSessionItem:hover .wsSessionStyle { opacity: 1; }
 .wsSessionStyle:hover { color: var(--text-bright); background: rgba(var(--ink-rgb), 0.1); }
+
+/* Tab-strip drag-reorder drop indicator. */
+.historyTabDropBefore { box-shadow: inset 2px 0 0 rgba(var(--accent-rgb), 0.9); }
+.historyTabDropAfter { box-shadow: inset -2px 0 0 rgba(var(--accent-rgb), 0.9); }
