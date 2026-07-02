@@ -9137,3 +9137,51 @@ select.input {
   color: var(--muted);
   font-family: ui-monospace, monospace;
 }
+
+/* Keyboard shortcuts cheat sheet (ShortcutsModal). */
+.shortcutsModal { width: min(640px, calc(100% - 24px)); }
+
+.shortcutsGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 28px;
+  margin-bottom: 12px;
+}
+
+.shortcutsSection { min-width: 0; }
+
+.shortcutsSectionTitle {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  font-weight: 600;
+  padding: 10px 0 5px;
+}
+
+.shortcutsRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 0;
+}
+
+.shortcutsLabel {
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.shortcutsKeys {
+  flex-shrink: 0;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--text-bright);
+  background: rgba(var(--ink-rgb), 0.07);
+  border: 1px solid rgba(var(--ink-rgb), 0.12);
+  border-radius: var(--radius-sm);
+  padding: 1px 7px;
+}

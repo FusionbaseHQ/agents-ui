@@ -61,6 +61,8 @@ import { ConfirmDeleteProjectModal } from "./components/modals/ConfirmDeleteProj
 import { ConfirmDeleteRecordingModal } from "./components/modals/ConfirmDeleteRecordingModal";
 import { ApplyAssetModal } from "./components/modals/ApplyAssetModal";
 import { ConfirmActionModal } from "./components/modals/ConfirmActionModal";
+import { ShortcutsModal } from "./components/modals/ShortcutsModal";
+import { matchBinding } from "./keymap";
 import { PathPickerModal } from "./components/modals/PathPickerModal";
 import { UpdateModal, UpdateCheckState } from "./components/modals/UpdateModal";
 import {
@@ -2293,6 +2295,7 @@ export default function App() {
   const [slidePanelWidth, setSlidePanelWidth] = useState(360);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [workspaceFileSearchOpen, setWorkspaceFileSearchOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [promptSearch, setPromptSearch] = useState("");
   const [recordingSearch, setRecordingSearch] = useState("");
   const [assetSearch, setAssetSearch] = useState("");
@@ -2588,6 +2591,7 @@ export default function App() {
     environmentEditorOpen: false,
     assetEditorOpen: false,
     commandPaletteOpen: false,
+    shortcutsOpen: false,
     slidePanelOpen: false,
     slidePanelTab: "prompts" as string,
     prompts: [] as Prompt[],
@@ -5285,6 +5289,7 @@ export default function App() {
     s.environmentEditorOpen = environmentEditorOpen;
     s.assetEditorOpen = assetEditorOpen;
     s.commandPaletteOpen = commandPaletteOpen;
+    s.shortcutsOpen = shortcutsOpen;
     s.slidePanelOpen = slidePanelOpen;
     s.slidePanelTab = slidePanelTab;
     s.prompts = prompts;
@@ -5674,10 +5679,11 @@ export default function App() {
         applyAssetRequest, replayOpen, recordPromptOpen, recordingsOpen,
         secureStorageSettingsOpen, promptsOpen, promptEditorOpen,
         environmentsOpen, environmentEditorOpen, assetEditorOpen,
-        commandPaletteOpen, slidePanelOpen, slidePanelTab, prompts,
+        commandPaletteOpen, shortcutsOpen, slidePanelOpen, slidePanelTab, prompts,
         applyAssetApplying,
       } = ks;
       const modalOpen =
+        shortcutsOpen ||
         newOpen ||
         sshManagerOpen ||
         agentShortcutsOpen ||
@@ -5755,23 +5761,33 @@ export default function App() {
         });
       };
 
-        // Command palette takes priority - Cmd+K or Ctrl+K
-        const modKey = isMac ? e.metaKey : e.ctrlKey;
-        if (modKey && e.key.toLowerCase() === "k" && !commandPaletteOpen) {
-          e.preventDefault();
-          e.stopPropagation();
-          (document.activeElement as HTMLElement | null)?.blur?.();
-          setCommandPaletteOpen(true);
-          return;
-        }
+      // Match the declarative keymap once; dispatch on the binding id below.
+      const binding = matchBinding(e, isMac);
 
-        if (modKey && e.key.toLowerCase() === "p" && !workspaceFileSearchOpen && activeWorkspaceFileRoot) {
-          e.preventDefault();
-          e.stopPropagation();
-          (document.activeElement as HTMLElement | null)?.blur?.();
-          setWorkspaceFileSearchOpen(true);
-          return;
-        }
+      // Command palette takes priority - mod+K
+      if (binding === "palette.open" && !commandPaletteOpen) {
+        e.preventDefault();
+        e.stopPropagation();
+        (document.activeElement as HTMLElement | null)?.blur?.();
+        setCommandPaletteOpen(true);
+        return;
+      }
+
+      if (binding === "files.search" && !workspaceFileSearchOpen && activeWorkspaceFileRoot) {
+        e.preventDefault();
+        e.stopPropagation();
+        (document.activeElement as HTMLElement | null)?.blur?.();
+        setWorkspaceFileSearchOpen(true);
+        return;
+      }
+
+      // Shortcut cheat sheet - mod+/ (toggles; also closeable via Escape cascade)
+      if (binding === "shortcuts.show" && !commandPaletteOpen) {
+        e.preventDefault();
+        e.stopPropagation();
+        setShortcutsOpen((prev) => !prev);
+        return;
+      }
 
         // Close command palette with Escape
         if (e.key === "Escape" && commandPaletteOpen) {
@@ -5781,12 +5797,9 @@ export default function App() {
           return;
         }
 
-      const isFKey = e.key.toLowerCase() === "f";
-      const isMacCmdF = e.metaKey && !e.shiftKey && isFKey;
-      const isTerminalSearchHotkey = isMacCmdF || (e.ctrlKey && e.shiftKey && isFKey);
-      if (isTerminalSearchHotkey) {
+      if (binding === "terminal.search") {
         const activeEl = document.activeElement;
-        const inCodeEditor = isMacCmdF && activeEl instanceof Element && Boolean(activeEl.closest(".codeEditorPanel"));
+        const inCodeEditor = isMac && activeEl instanceof Element && Boolean(activeEl.closest(".codeEditorPanel"));
         if (inCodeEditor) {
           const now = Date.now();
           if (now - terminalSearchTriggerAtRef.current < 180) return;
@@ -5834,6 +5847,10 @@ export default function App() {
 
       if (e.key === "Escape" && modalOpen) {
         e.preventDefault();
+        if (shortcutsOpen) {
+          setShortcutsOpen(false);
+          return;
+        }
         if (applyAssetRequest) {
           if (applyAssetApplying) return;
           closeApplyAssetModal();
@@ -5920,174 +5937,83 @@ export default function App() {
 	      }
 
         if (commandPaletteOpen || modalOpen) return;
+        if (!binding) return;
 
       const activeProjectId = activeProjectIdRef.current;
       const sessions = sessionsRef.current.filter((s) => s.projectId === activeProjectId);
       const activeId = activeIdRef.current;
 
-	      if (isMac) {
-	        if (e.metaKey && e.key.toLowerCase() === "t") {
-	          e.preventDefault();
-	          handleOpenNewSession();
-	          return;
-	        }
-        if (e.metaKey && e.key.toLowerCase() === "w") {
-          if (!activeId) return;
-          e.preventDefault();
-          void onClose(activeId);
-          return;
-        }
-        // Cmd+Shift+P - Toggle Prompts Panel
-        if (e.metaKey && e.shiftKey && e.key.toLowerCase() === "p") {
-          e.preventDefault();
-          setSlidePanelOpen(prev => {
-            if (!prev) {
-              setSlidePanelTab("prompts");
-              return true;
-            }
-            if (slidePanelTab === "prompts") return false;
-            setSlidePanelTab("prompts");
+      const toggleSlidePanel = (tab: "prompts" | "recordings" | "assets") => {
+        setSlidePanelOpen((prev) => {
+          if (!prev) {
+            setSlidePanelTab(tab);
             return true;
-          });
-          return;
-        }
-        // Cmd+Shift+R - Toggle Recordings Panel
-        if (e.metaKey && e.shiftKey && e.key.toLowerCase() === "r") {
-          e.preventDefault();
-          void refreshRecordings();
-          setSlidePanelOpen(prev => {
-            if (!prev) {
-              setSlidePanelTab("recordings");
-              return true;
-            }
-            if (slidePanelTab === "recordings") return false;
-            setSlidePanelTab("recordings");
-            return true;
-          });
-          return;
-        }
-        // Cmd+Shift+A - Toggle Assets Panel
-        if (e.metaKey && e.shiftKey && e.key.toLowerCase() === "a") {
-          e.preventDefault();
-          setSlidePanelOpen(prev => {
-            if (!prev) {
-              setSlidePanelTab("assets");
-              return true;
-            }
-            if (slidePanelTab === "assets") return false;
-            setSlidePanelTab("assets");
-            return true;
-          });
-          return;
-        }
-        // Cmd+Shift+G - Toggle Agent Panel
-        if (e.metaKey && e.shiftKey && e.key.toLowerCase() === "g") {
-          e.preventDefault();
-          setAgentPanelOpen(prev => !prev);
-          return;
-        }
-        // Cmd+1 through Cmd+5 - Quick prompts
-        if (e.metaKey && /^[1-5]$/.test(e.key)) {
-          const idx = parseInt(e.key) - 1;
-          const pinnedPrompts = prompts
-            .filter(p => p.pinned)
-            .sort((a, b) => (a.pinOrder ?? 0) - (b.pinOrder ?? 0));
-          if (pinnedPrompts[idx] && activeId) {
-            e.preventDefault();
-            void sendPromptToActive(pinnedPrompts[idx], "send");
           }
-          return;
-        }
-	      } else {
-	        if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "t") {
-	          e.preventDefault();
-	          handleOpenNewSession();
-	          return;
-	        }
-        if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "w") {
-          if (!activeId) return;
-          e.preventDefault();
-          void onClose(activeId);
-          return;
-        }
-        // Ctrl+Shift+P - Toggle Prompts Panel
-        if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "p") {
-          e.preventDefault();
-          setSlidePanelOpen(prev => {
-            if (!prev) {
-              setSlidePanelTab("prompts");
-              return true;
-            }
-            if (slidePanelTab === "prompts") return false;
-            setSlidePanelTab("prompts");
-            return true;
-          });
-          return;
-        }
-        // Ctrl+Shift+R - Toggle Recordings Panel
-        if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "r") {
-          e.preventDefault();
-          void refreshRecordings();
-          setSlidePanelOpen(prev => {
-            if (!prev) {
-              setSlidePanelTab("recordings");
-              return true;
-            }
-            if (slidePanelTab === "recordings") return false;
-            setSlidePanelTab("recordings");
-            return true;
-          });
-          return;
-        }
-        // Ctrl+Shift+A - Toggle Assets Panel
-        if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "a") {
-          e.preventDefault();
-          setSlidePanelOpen(prev => {
-            if (!prev) {
-              setSlidePanelTab("assets");
-              return true;
-            }
-            if (slidePanelTab === "assets") return false;
-            setSlidePanelTab("assets");
-            return true;
-          });
-          return;
-        }
-        // Ctrl+Shift+G - Toggle Agent Panel
-        if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "g") {
-          e.preventDefault();
-          setAgentPanelOpen(prev => !prev);
-          return;
-        }
-        // Ctrl+1 through Ctrl+5 - Quick prompts
-        if (e.ctrlKey && /^[1-5]$/.test(e.key)) {
-          const idx = parseInt(e.key) - 1;
-          const pinnedPrompts = prompts
-            .filter(p => p.pinned)
-            .sort((a, b) => (a.pinOrder ?? 0) - (b.pinOrder ?? 0));
-          if (pinnedPrompts[idx] && activeId) {
-            e.preventDefault();
-            void sendPromptToActive(pinnedPrompts[idx], "send");
-          }
-          return;
-        }
-      }
+          if (slidePanelTab === tab) return false;
+          setSlidePanelTab(tab);
+          return true;
+        });
+      };
 
-      if (e.ctrlKey && e.shiftKey && e.key === "Tab") {
-        e.preventDefault();
+      const cycleSession = (delta: number) => {
         if (!sessions.length) return;
         const idx = sessions.findIndex((s) => s.id === activeId);
-        const next = sessions[(idx - 1 + sessions.length) % sessions.length];
+        const next = sessions[(idx + delta + sessions.length) % sessions.length];
         setActiveId(next.id);
-        return;
-      }
-      if (e.ctrlKey && e.key === "Tab") {
-        e.preventDefault();
-        if (!sessions.length) return;
-        const idx = sessions.findIndex((s) => s.id === activeId);
-        const next = sessions[(idx + 1 + sessions.length) % sessions.length];
-        setActiveId(next.id);
-        return;
+      };
+
+      switch (binding) {
+        case "session.new":
+          e.preventDefault();
+          handleOpenNewSession();
+          return;
+        case "session.close":
+          if (!activeId) return;
+          e.preventDefault();
+          void onClose(activeId);
+          return;
+        case "session.next":
+          e.preventDefault();
+          cycleSession(1);
+          return;
+        case "session.prev":
+          e.preventDefault();
+          cycleSession(-1);
+          return;
+        case "panel.prompts":
+          e.preventDefault();
+          toggleSlidePanel("prompts");
+          return;
+        case "panel.recordings":
+          e.preventDefault();
+          void refreshRecordings();
+          toggleSlidePanel("recordings");
+          return;
+        case "panel.assets":
+          e.preventDefault();
+          toggleSlidePanel("assets");
+          return;
+        case "panel.agent":
+          e.preventDefault();
+          setAgentPanelOpen((prev) => !prev);
+          return;
+        case "prompt.1":
+        case "prompt.2":
+        case "prompt.3":
+        case "prompt.4":
+        case "prompt.5": {
+          const idx = Number(binding.slice("prompt.".length)) - 1;
+          const pinnedPrompts = prompts
+            .filter((p) => p.pinned)
+            .sort((a, b) => (a.pinOrder ?? 0) - (b.pinOrder ?? 0));
+          if (pinnedPrompts[idx] && activeId) {
+            e.preventDefault();
+            void sendPromptToActive(pinnedPrompts[idx], "send");
+          }
+          return;
+        }
+        default:
+          return;
       }
     };
 
@@ -10450,6 +10376,8 @@ export default function App() {
             onClose={() => setNewOpen(false)}
             onSubmit={onNewSubmit}
           />}
+
+          {shortcutsOpen && <ShortcutsModal onClose={() => setShortcutsOpen(false)} />}
 
           {shellPicker && (
             <ShellPickerModal
