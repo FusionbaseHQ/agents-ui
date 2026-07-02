@@ -6,6 +6,16 @@ This project aims to follow Semantic Versioning.
 
 ## Unreleased
 
+- **UI/UX overhaul (phase 1)**:
+  - **Welcome pane**: projects with no sessions (including first run) now show action cards — New terminal, Terminal with shell…, first agent quick-start, Connect SSH — plus the key shortcuts, instead of a blank area. All empty states across the app gained hints and call-to-action buttons.
+  - **Unified Settings** (gear button): Appearance with a hover-to-preview theme grid, Terminal with a new **app-global default shell** (precedence: per-terminal pick > project default > app default > bundled agsh), Power, Keyboard cheat sheet, and Storage & updates.
+  - **Toasts**: transient events (shell fallback, recording start/stop, notices, errors) now appear as bottom-right toasts; the ActivityCenter remains the persistent log.
+  - **Session tab strip**: the bar under the terminal is now the active project's sessions in stable order, always visible; tabs close their session (× or middle-click).
+  - **Status bar**: new bottom bar with the session's shell (click to open a terminal with a different shell), cwd, SSH state, REC (moved from the topbar), keep-awake, update-available, and app version.
+  - **Keyboard**: one declarative keymap drives all shortcuts and a new cheat sheet on **⌘/**; modifier matching is now exact per combo.
+  - **⌘K**: palette now also reaches Settings, Keyboard Shortcuts, Terminal with Shell…, New Project, Persistent Terminals, Agent Shortcuts, Check for Updates, Toggle Agent Panel.
+  - **Consistency/internal**: new shared UI primitives (Modal/Menu/Toast/EmptyState/Badge); all 11 hand-rolled dialogs and the sidebar's four bespoke portal menus migrated onto them (keyboard navigation everywhere, −700 lines); the two one-off delete confirms consolidated into the shared confirm dialog.
+
 - **Bring your own shell**: terminals can now launch with one of your own installed shells (zsh, bash, fish, …) instead of the bundled Nushell. Set a per-project **Default shell** in Project settings (default stays Bundled Nushell), and use the new **Terminal with shell…** menu item to open a one-off terminal with any detected shell. Shell detection is multi-source (`/etc/shells`, `$SHELL`, `PATH`, well-known locations) and never blocks a launch — if a chosen shell goes missing the session falls back to the default with a toast.
 - **Bundled agsh, now the default shell**: the app ships [agsh](https://github.com/FusionbaseHQ/agsh) as a second bundled shell and makes it the default for new terminals (projects with no explicit default shell now open agsh; bundled Nushell remains available as an option). The picker recommends agsh, Nushell, and your login shell — with bundled shells marked by a **Bundled** badge — and lists all other installed shells below; the project **Default shell** select groups bundled and installed shells separately.
 

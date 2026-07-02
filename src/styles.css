@@ -9186,7 +9186,9 @@ select.input {
   padding: 1px 7px;
 }
 
-/* Welcome pane — terminal-area empty state / first-run screen (WelcomePane). */
+/* Welcome pane — terminal-area empty state / first-run screen (WelcomePane).
+   pointer-events pass through the backdrop so a file viewer open underneath
+   (project with no sessions) stays fully interactive. */
 .welcomePane {
   position: absolute;
   inset: 0;
@@ -9195,6 +9197,7 @@ select.input {
   align-items: center;
   justify-content: center;
   background: transparent;
+  pointer-events: none;
 }
 
 .welcomeInner {
@@ -9204,6 +9207,7 @@ select.input {
   gap: 10px;
   max-width: 560px;
   padding: 24px;
+  pointer-events: auto;
 }
 
 .welcomeTitle {
