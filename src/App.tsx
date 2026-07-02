@@ -48,12 +48,17 @@ import { ShellPickerModal } from "./components/modals/ShellPickerModal";
 import {
   type ShellChoice,
   type ShellInfo,
-  detectShells,
   shellChoiceToPayload,
   shellChoiceShortName,
   shellChoiceLabel,
 } from "./shells";
 import { StatusBar } from "./components/StatusBar";
+import {
+  useShellsStore,
+  loadShells,
+  setAppDefaultShell,
+  shellChoiceForProject,
+} from "./stores/shells";
 import {
   PersistentSessionsModal,
   type PersistentSessionsModalItem,
@@ -239,23 +244,6 @@ const STORAGE_SPLIT_VIEWS_KEY = "agents-ui-split-views-v1";
 const STORAGE_AGENT_PANEL_WIDTH_KEY = "agents-ui-agent-panel-width-v1";
 const STORAGE_UI_THEME_KEY = "agents-ui-ui-theme-v1";
 const STORAGE_AUTO_CAFFEINATE_KEY = "agents-ui-auto-caffeinate-v1";
-const STORAGE_APP_DEFAULT_SHELL_KEY = "agents-ui-app-default-shell-v1";
-
-// App-global default shell (Settings → Terminal). null ⇒ bundled agsh.
-function loadAppDefaultShell(): ShellChoice | null {
-  try {
-    const raw = localStorage.getItem(STORAGE_APP_DEFAULT_SHELL_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as ShellChoice;
-    if (parsed && parsed.kind === "bundled-nu") return { kind: "bundled-nu" };
-    if (parsed && parsed.kind === "system" && typeof parsed.path === "string" && parsed.path) {
-      return { kind: "system", path: parsed.path, family: parsed.family ?? "" };
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
 const STORAGE_WORKSPACES_KEY = "agents-ui-workspaces-v1";
 const STORAGE_SIDEBAR_COLLAPSED_KEY = "agents-ui-sidebar-collapsed-v1";
 const DEFAULT_UI_THEME: UiTheme = "midnight";
@@ -2046,23 +2034,8 @@ export default function App() {
   );
   const activityCenterMenuRef = useRef<HTMLDivElement | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [appDefaultShell, setAppDefaultShell] = useState<ShellChoice | null>(() => loadAppDefaultShell());
-  const appDefaultShellRef = useRef(appDefaultShell);
-  useEffect(() => {
-    appDefaultShellRef.current = appDefaultShell;
-    try {
-      if (appDefaultShell) localStorage.setItem(STORAGE_APP_DEFAULT_SHELL_KEY, JSON.stringify(appDefaultShell));
-      else localStorage.removeItem(STORAGE_APP_DEFAULT_SHELL_KEY);
-    } catch {
-      // Best-effort: localStorage may be unavailable in some contexts.
-    }
-  }, [appDefaultShell]);
-  // Shell for a new session: project default > app default (Settings) > bundled agsh.
-  const shellChoiceForProject = useCallback(
-    (project: { defaultShell?: ShellChoice | null } | null | undefined): ShellChoice | null =>
-      project?.defaultShell ?? appDefaultShellRef.current ?? null,
-    [],
-  );
+  // Shells domain lives in src/stores/shells.ts (App.tsx decomposition).
+  const { detectedShells, shellsLoading, appDefaultShell } = useShellsStore();
   const [activeId, setActiveId] = useState<string | null>(null);
   const [splitViews, setSplitViews] = useState<SplitView[]>(() => loadPersistedSplitViews());
   const splitViewsRef = useRef(splitViews);
@@ -2208,8 +2181,6 @@ export default function App() {
   );
   const [newOpen, setNewOpen] = useState(false);
   // Bring-your-own-shell: detected shells (lazy-loaded) + the per-terminal picker.
-  const [detectedShells, setDetectedShells] = useState<ShellInfo[]>([]);
-  const [shellsLoading, setShellsLoading] = useState(false);
   const [shellPicker, setShellPicker] = useState<{ projectId: string } | null>(null);
   const [sshManagerOpen, setSshManagerOpen] = useState(false);
   const [sshHosts, setSshHosts] = useState<SshHostEntry[]>([]);
@@ -6152,19 +6123,6 @@ export default function App() {
   // (bottom-right, auto-dismiss); persistent state lives in the ActivityCenter.
   const showNotice = useCallback((message: string, timeoutMs = 4500) => {
     showToast({ message, duration: timeoutMs });
-  }, []);
-
-  // Lazily detect installed shells for the picker / project settings. Cached in
-  // the backend; pass `refresh` for the "Rescan" affordance.
-  const loadShells = useCallback(async (refresh = false): Promise<ShellInfo[]> => {
-    setShellsLoading(true);
-    try {
-      const list = await detectShells(refresh);
-      setDetectedShells(list);
-      return list;
-    } finally {
-      setShellsLoading(false);
-    }
   }, []);
 
   // The backend emits this when a session's requested shell couldn't be launched
