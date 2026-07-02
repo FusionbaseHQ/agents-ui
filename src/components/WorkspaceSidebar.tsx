@@ -4,7 +4,7 @@ import { detectProcessEffect, getProcessEffectById, type ProcessEffect } from ".
 import { shortenPathSmart } from "../pathDisplay";
 import { useClampedMenuPosition } from "../hooks/useClampedMenuPosition";
 import { Icon } from "./Icon";
-import { EmptyState } from "../ui";
+import { EmptyState, Menu, type MenuEntry } from "../ui";
 import { TAB_SYMBOLS, TabSymbolIcon, normalizeTabSymbolValue } from "../tabSymbols";
 
 /* -------------------------------------------------------------------------- */
@@ -484,20 +484,19 @@ export const WorkspaceSidebar = React.memo(function WorkspaceSidebar(props: Work
   const wsMenuTriggerRef = React.useRef<HTMLButtonElement | null>(null);
   const [wsMenuOpen, setWsMenuOpen] = React.useState<{ x: number; y: number } | null>(null);
 
-  const projMenuRef = React.useRef<HTMLDivElement | null>(null);
   const [projMenu, setProjMenu] = React.useState<{ projectId: string; x: number; y: number } | null>(null);
 
-  const newMenuRef = React.useRef<HTMLDivElement | null>(null);
   const [newMenu, setNewMenu] = React.useState<{ projectId: string; x: number; y: number } | null>(null);
 
-  const sessMenuRef = React.useRef<HTMLDivElement | null>(null);
   const [sessMenu, setSessMenu] = React.useState<{ sessionId: string; x: number; y: number } | null>(null);
 
   const pickerRef = React.useRef<HTMLDivElement | null>(null);
   const [picker, setPicker] = React.useState<PickerTarget | null>(null);
 
-  const overflowRef = React.useRef<HTMLDivElement | null>(null);
-  const overflowTriggerRef = React.useRef<HTMLButtonElement | null>(null);
+  // Whether the overflow menu was open at mousedown on its trigger: the shared
+  // Menu closes itself on any outside mousedown, so without this the same
+  // click's onClick would immediately reopen it instead of toggling it closed.
+  const overflowWasOpenRef = React.useRef(false);
   const [overflowOpen, setOverflowOpen] = React.useState<{ x: number; y: number } | null>(null);
 
   const [renaming, setRenaming] = React.useState<RenameTarget | null>(null);
@@ -513,11 +512,7 @@ export const WorkspaceSidebar = React.memo(function WorkspaceSidebar(props: Work
   const [projectDrop, setProjectDrop] = React.useState<{ projectId: string; position: "before" | "after" } | null>(null);
 
   const wsMenuPos = useClampedMenuPosition(wsMenuRef, wsMenuOpen);
-  const projMenuPos = useClampedMenuPosition(projMenuRef, projMenu);
-  const newMenuPos = useClampedMenuPosition(newMenuRef, newMenu);
-  const sessMenuPos = useClampedMenuPosition(sessMenuRef, sessMenu);
   const pickerPos = useClampedMenuPosition(pickerRef, picker);
-  const overflowPos = useClampedMenuPosition(overflowRef, overflowOpen);
 
   // Persist collapsed projects
   React.useEffect(() => {
@@ -590,33 +585,23 @@ export const WorkspaceSidebar = React.memo(function WorkspaceSidebar(props: Work
       <Icon name="layers" size={fallbackSize} />
     );
 
-  // Dismiss-on-outside for all floating menus
+  // Dismiss-on-outside for the hand-rolled floating popovers (workspace
+  // switcher + symbol/color pickers). The action menus are shared <Menu>
+  // components that handle their own dismissal.
   React.useEffect(() => {
-    if (!wsMenuOpen && !projMenu && !newMenu && !sessMenu && !picker && !overflowOpen) return;
+    if (!wsMenuOpen && !picker) return;
     const onDown = (event: MouseEvent) => {
       const t = event.target;
       if (!(t instanceof Node)) return;
       if (wsMenuTriggerRef.current?.contains(t) || wsMenuRef.current?.contains(t)) return;
-      if (projMenuRef.current?.contains(t)) return;
-      if (newMenuRef.current?.contains(t)) return;
-      if (sessMenuRef.current?.contains(t)) return;
       if (pickerRef.current?.contains(t)) return;
-      if (overflowTriggerRef.current?.contains(t) || overflowRef.current?.contains(t)) return;
       setWsMenuOpen(null);
-      setProjMenu(null);
-      setNewMenu(null);
-      setSessMenu(null);
       setPicker(null);
-      setOverflowOpen(null);
     };
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       setWsMenuOpen(null);
-      setProjMenu(null);
-      setNewMenu(null);
-      setSessMenu(null);
       setPicker(null);
-      setOverflowOpen(null);
     };
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
@@ -624,7 +609,7 @@ export const WorkspaceSidebar = React.memo(function WorkspaceSidebar(props: Work
       document.removeEventListener("mousedown", onDown);
       document.removeEventListener("keydown", onKey);
     };
-  }, [wsMenuOpen, projMenu, newMenu, sessMenu, picker, overflowOpen]);
+  }, [wsMenuOpen, picker]);
 
   const startRename = React.useCallback((kind: "project" | "session", id: string, current: string) => {
     setRenaming({ kind, id });
@@ -1097,11 +1082,16 @@ export const WorkspaceSidebar = React.memo(function WorkspaceSidebar(props: Work
           </button>
           <button
             type="button"
-            ref={overflowTriggerRef}
             className="wsSectionIconBtn"
+            onMouseDown={() => {
+              overflowWasOpenRef.current = Boolean(overflowOpen);
+            }}
             onClick={(e) => {
+              const wasOpen = overflowWasOpenRef.current;
+              overflowWasOpenRef.current = false;
+              if (wasOpen) return;
               const r = e.currentTarget.getBoundingClientRect();
-              setOverflowOpen((prev) => (prev ? null : { x: r.right - 200, y: r.bottom + 6 }));
+              setOverflowOpen({ x: r.right - 200, y: r.bottom + 6 });
             }}
             title="More actions"
             aria-label="More actions"
@@ -1517,433 +1507,228 @@ export const WorkspaceSidebar = React.memo(function WorkspaceSidebar(props: Work
         )}
 
       {/* New-session popover */}
-      {newMenu &&
-        createPortal(
-          <div
-            ref={newMenuRef}
-            className="wsMenu wsNewMenu"
-            style={{ top: newMenuPos.top, left: newMenuPos.left }}
-            role="menu"
-            aria-label="New session"
-          >
-            <div className="wsMenuLabel">New session</div>
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => {
-                const pid = newMenu.projectId;
-                setNewMenu(null);
-                onNewTerminalForProject(pid);
-              }}
-            >
-              <span className="wsMenuIcon wsSessionIconTerminal">
-                <Icon name="terminal" size={13} />
-              </span>
-              <span className="wsMenuItemName">Terminal</span>
-            </button>
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => {
-                const pid = newMenu.projectId;
-                setNewMenu(null);
-                onNewTerminalWithShellForProject(pid);
-              }}
-              title="Choose which shell to open this terminal with"
-            >
-              <span className="wsMenuIcon wsSessionIconTerminal">
-                <Icon name="terminal" size={13} />
-              </span>
-              <span className="wsMenuItemName">Terminal with shell…</span>
-            </button>
-            {agentShortcuts.map((effect) => (
-              <button
-                key={effect.id}
-                type="button"
-                className="wsMenuItem"
-                role="menuitem"
-                onClick={() => {
-                  const pid = newMenu.projectId;
-                  setNewMenu(null);
-                  onQuickStartForProject(pid, effect);
-                }}
-              >
-                <span className={`wsMenuIcon wsSessionIconAgent chip-${effect.id}`}>
-                  {effect.iconSrc ? (
-                    <img src={effect.iconSrc} alt="" />
-                  ) : (
-                    <Icon name="play" size={13} />
-                  )}
+      {newMenu && (
+        <Menu
+          anchor={{ x: newMenu.x, y: newMenu.y }}
+          onClose={() => setNewMenu(null)}
+          label="New session"
+          items={[
+            { type: "label", label: "New session" },
+            {
+              label: "Terminal",
+              icon: (
+                <span className="wsMenuIcon wsSessionIconTerminal">
+                  <Icon name="terminal" size={13} />
                 </span>
-                <span className="wsMenuItemName">{formatShortcutLabel(effect.label)} session</span>
-              </button>
-            ))}
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => {
-                const pid = newMenu.projectId;
-                setNewMenu(null);
-                onNewSshForProject(pid);
-              }}
-            >
-              <span className="wsMenuIcon wsSessionIconSsh">
-                <Icon name="ssh" size={13} />
-              </span>
-              <span className="wsMenuItemName">SSH / remote</span>
-            </button>
-          </div>,
-          document.body,
-        )}
+              ),
+              onSelect: () => onNewTerminalForProject(newMenu.projectId),
+            },
+            {
+              label: (
+                <span title="Choose which shell to open this terminal with">Terminal with shell…</span>
+              ),
+              icon: (
+                <span className="wsMenuIcon wsSessionIconTerminal">
+                  <Icon name="terminal" size={13} />
+                </span>
+              ),
+              onSelect: () => onNewTerminalWithShellForProject(newMenu.projectId),
+            },
+            ...agentShortcuts.map(
+              (effect): MenuEntry => ({
+                label: `${formatShortcutLabel(effect.label)} session`,
+                icon: (
+                  <span className={`wsMenuIcon wsSessionIconAgent chip-${effect.id}`}>
+                    {effect.iconSrc ? (
+                      <img src={effect.iconSrc} alt="" />
+                    ) : (
+                      <Icon name="play" size={13} />
+                    )}
+                  </span>
+                ),
+                onSelect: () => onQuickStartForProject(newMenu.projectId, effect),
+              }),
+            ),
+            {
+              label: "SSH / remote",
+              icon: (
+                <span className="wsMenuIcon wsSessionIconSsh">
+                  <Icon name="ssh" size={13} />
+                </span>
+              ),
+              onSelect: () => onNewSshForProject(newMenu.projectId),
+            },
+          ]}
+        />
+      )}
 
       {/* Project context menu */}
-      {projMenu &&
-        contextProject &&
-        createPortal(
-          <div
-            ref={projMenuRef}
-            className="wsMenu"
-            style={{ top: projMenuPos.top, left: projMenuPos.left }}
-            role="menu"
-          >
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => startRename("project", contextProject.id, contextProject.title)}
-            >
-              <span className="wsMenuItemName">Rename</span>
-            </button>
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => {
-                setPicker({ kind: "project", id: contextProject.id, mode: "symbol", x: projMenu.x, y: projMenu.y });
-                setProjMenu(null);
-              }}
-            >
-              <span className="wsMenuItemName">Set symbol</span>
-            </button>
-            {contextProject.symbol ? (
-              <button
-                type="button"
-                className="wsMenuItem"
-                role="menuitem"
-                onClick={() => {
-                  onSetProjectSymbol(contextProject.id, null);
-                  setProjMenu(null);
-                }}
-              >
-                <span className="wsMenuItemName">Remove symbol</span>
-              </button>
-            ) : null}
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => {
-                setPicker({ kind: "project", id: contextProject.id, mode: "color", x: projMenu.x, y: projMenu.y });
-                setProjMenu(null);
-              }}
-            >
-              <span className="wsMenuItemName">Set color</span>
-            </button>
-            {contextProject.color ? (
-              <button
-                type="button"
-                className="wsMenuItem"
-                role="menuitem"
-                onClick={() => {
-                  onSetProjectColor(contextProject.id, null);
-                  setProjMenu(null);
-                }}
-              >
-                <span className="wsMenuItemName">Remove color</span>
-              </button>
-            ) : null}
-            <div className="wsMenuSep" />
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => {
-                const pid = contextProject.id;
-                setProjMenu(null);
-                onOpenProjectSettings(pid);
-              }}
-            >
-              <span className="wsMenuItemName">Project settings</span>
-            </button>
-            <button
-              type="button"
-              className="wsMenuItem wsMenuItemDanger"
-              role="menuitem"
-              onClick={() => {
-                const pid = contextProject.id;
-                setProjMenu(null);
-                onRequestDeleteProject(pid);
-              }}
-            >
-              <span className="wsMenuItemName">Delete project</span>
-            </button>
-          </div>,
-          document.body,
-        )}
+      {projMenu && contextProject && (
+        <Menu
+          anchor={{ x: projMenu.x, y: projMenu.y }}
+          onClose={() => setProjMenu(null)}
+          items={[
+            {
+              label: "Rename",
+              onSelect: () => startRename("project", contextProject.id, contextProject.title),
+            },
+            {
+              label: "Set symbol",
+              onSelect: () =>
+                setPicker({ kind: "project", id: contextProject.id, mode: "symbol", x: projMenu.x, y: projMenu.y }),
+            },
+            ...(contextProject.symbol
+              ? [
+                  {
+                    label: "Remove symbol",
+                    onSelect: () => onSetProjectSymbol(contextProject.id, null),
+                  },
+                ]
+              : []),
+            {
+              label: "Set color",
+              onSelect: () =>
+                setPicker({ kind: "project", id: contextProject.id, mode: "color", x: projMenu.x, y: projMenu.y }),
+            },
+            ...(contextProject.color
+              ? [
+                  {
+                    label: "Remove color",
+                    onSelect: () => onSetProjectColor(contextProject.id, null),
+                  },
+                ]
+              : []),
+            { type: "separator" },
+            {
+              label: "Project settings",
+              onSelect: () => onOpenProjectSettings(contextProject.id),
+            },
+            {
+              label: "Delete project",
+              danger: true,
+              onSelect: () => onRequestDeleteProject(contextProject.id),
+            },
+          ]}
+        />
+      )}
 
       {/* Session context menu */}
-      {sessMenu &&
-        contextSession &&
-        createPortal(
-          <div
-            ref={sessMenuRef}
-            className="wsMenu"
-            style={{ top: sessMenuPos.top, left: sessMenuPos.left }}
-            role="menu"
-          >
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => startRename("session", contextSession.id, contextSession.name)}
-            >
-              <span className="wsMenuItemName">Rename</span>
-            </button>
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => {
-                onToggleSessionPin(contextSession.id);
-                setSessMenu(null);
-              }}
-            >
-              <span className="wsMenuItemName">{contextSession.pinned ? "Unpin" : "Pin"}</span>
-            </button>
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => {
-                setPicker({ kind: "session", id: contextSession.id, mode: "symbol", x: sessMenu.x, y: sessMenu.y });
-                setSessMenu(null);
-              }}
-            >
-              <span className="wsMenuItemName">Set symbol</span>
-            </button>
-            {contextSession.symbol ? (
-              <button
-                type="button"
-                className="wsMenuItem"
-                role="menuitem"
-                onClick={() => {
-                  onSetSessionSymbol(contextSession.id, null);
-                  setSessMenu(null);
-                }}
-              >
-                <span className="wsMenuItemName">Remove symbol</span>
-              </button>
-            ) : null}
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => {
-                setPicker({ kind: "session", id: contextSession.id, mode: "color", x: sessMenu.x, y: sessMenu.y });
-                setSessMenu(null);
-              }}
-            >
-              <span className="wsMenuItemName">Set color</span>
-            </button>
-            {contextSession.color ? (
-              <button
-                type="button"
-                className="wsMenuItem"
-                role="menuitem"
-                onClick={() => {
-                  onSetSessionColor(contextSession.id, null);
-                  setSessMenu(null);
-                }}
-              >
-                <span className="wsMenuItemName">Remove color</span>
-              </button>
-            ) : null}
-            <div className="wsMenuSep" />
-            {!splitPane && contextSession.id !== activeSessionId ? (
-              <>
-                <button
-                  type="button"
-                  className="wsMenuItem"
-                  role="menuitem"
-                  onClick={() => {
-                    onSplitSession(contextSession.id, "vertical");
-                    setSessMenu(null);
-                  }}
-                >
-                  <span className="wsMenuItemName">Split right</span>
-                </button>
-                <button
-                  type="button"
-                  className="wsMenuItem"
-                  role="menuitem"
-                  onClick={() => {
-                    onSplitSession(contextSession.id, "horizontal");
-                    setSessMenu(null);
-                  }}
-                >
-                  <span className="wsMenuItemName">Split down</span>
-                </button>
-              </>
-            ) : null}
-            {splitPane &&
-            (contextSession.id === activeSessionId || contextSession.id === splitPane.secondaryId) ? (
-              <button
-                type="button"
-                className="wsMenuItem"
-                role="menuitem"
-                onClick={() => {
-                  onUnsplit();
-                  setSessMenu(null);
-                }}
-              >
-                <span className="wsMenuItemName">Unsplit</span>
-              </button>
-            ) : null}
-            <div className="wsMenuSep" />
-            <button
-              type="button"
-              className="wsMenuItem wsMenuItemDanger"
-              role="menuitem"
-              onClick={() => {
-                onCloseSession(contextSession.id);
-                setSessMenu(null);
-              }}
-            >
-              <span className="wsMenuItemName">Close session</span>
-            </button>
-          </div>,
-          document.body,
-        )}
+      {sessMenu && contextSession && (
+        <Menu
+          anchor={{ x: sessMenu.x, y: sessMenu.y }}
+          onClose={() => setSessMenu(null)}
+          items={[
+            {
+              label: "Rename",
+              onSelect: () => startRename("session", contextSession.id, contextSession.name),
+            },
+            {
+              label: contextSession.pinned ? "Unpin" : "Pin",
+              onSelect: () => onToggleSessionPin(contextSession.id),
+            },
+            {
+              label: "Set symbol",
+              onSelect: () =>
+                setPicker({ kind: "session", id: contextSession.id, mode: "symbol", x: sessMenu.x, y: sessMenu.y }),
+            },
+            ...(contextSession.symbol
+              ? [
+                  {
+                    label: "Remove symbol",
+                    onSelect: () => onSetSessionSymbol(contextSession.id, null),
+                  },
+                ]
+              : []),
+            {
+              label: "Set color",
+              onSelect: () =>
+                setPicker({ kind: "session", id: contextSession.id, mode: "color", x: sessMenu.x, y: sessMenu.y }),
+            },
+            ...(contextSession.color
+              ? [
+                  {
+                    label: "Remove color",
+                    onSelect: () => onSetSessionColor(contextSession.id, null),
+                  },
+                ]
+              : []),
+            { type: "separator" },
+            ...(!splitPane && contextSession.id !== activeSessionId
+              ? [
+                  {
+                    label: "Split right",
+                    onSelect: () => onSplitSession(contextSession.id, "vertical"),
+                  },
+                  {
+                    label: "Split down",
+                    onSelect: () => onSplitSession(contextSession.id, "horizontal"),
+                  },
+                ]
+              : []),
+            ...(splitPane &&
+            (contextSession.id === activeSessionId || contextSession.id === splitPane.secondaryId)
+              ? [{ label: "Unsplit", onSelect: () => onUnsplit() }]
+              : []),
+            { type: "separator" },
+            {
+              label: "Close session",
+              danger: true,
+              onSelect: () => onCloseSession(contextSession.id),
+            },
+          ]}
+        />
+      )}
 
       {/* Section overflow menu */}
-      {overflowOpen &&
-        createPortal(
-          <div
-            ref={overflowRef}
-            className="wsMenu"
-            style={{ top: overflowPos.top, left: overflowPos.left }}
-            role="menu"
-          >
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => {
-                setOverflowOpen(null);
-                onNewProject();
-              }}
-            >
-              <span className="wsMenuIcon">
-                <Icon name="plus" size={13} />
-              </span>
-              <span className="wsMenuItemName">New project</span>
-            </button>
-            <div className="wsMenuSep" />
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => {
-                setOverflowOpen(null);
-                collapseAllProjects();
-              }}
-            >
-              <span className="wsMenuIcon">
-                <Icon name="chevron-right" size={13} />
-              </span>
-              <span className="wsMenuItemName">Collapse all</span>
-            </button>
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => {
-                setOverflowOpen(null);
-                expandAllProjects();
-              }}
-            >
-              <span className="wsMenuIcon">
-                <Icon name="chevron-down" size={13} />
-              </span>
-              <span className="wsMenuItemName">Expand all</span>
-            </button>
-            <div className="wsMenuSep" />
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => {
-                setOverflowOpen(null);
-                onOpenSshManager();
-              }}
-            >
-              <span className="wsMenuIcon">
-                <Icon name="ssh" size={13} />
-              </span>
-              <span className="wsMenuItemName">SSH manager</span>
-            </button>
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => {
-                setOverflowOpen(null);
-                onOpenPersistentSessions();
-              }}
-            >
-              <span className="wsMenuIcon">
-                <Icon name="layers" size={13} />
-              </span>
-              <span className="wsMenuItemName">Persistent sessions</span>
-            </button>
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              onClick={() => {
-                setOverflowOpen(null);
-                onOpenAgentShortcuts();
-              }}
-            >
-              <span className="wsMenuIcon">
-                <Icon name="brain" size={13} />
-              </span>
-              <span className="wsMenuItemName">Agent shortcuts</span>
-            </button>
-            <button
-              type="button"
-              className="wsMenuItem"
-              role="menuitem"
-              disabled={agentInstructionRunning}
-              onClick={() => {
-                setOverflowOpen(null);
+      {overflowOpen && (
+        <Menu
+          anchor={{ x: overflowOpen.x, y: overflowOpen.y }}
+          onClose={() => setOverflowOpen(null)}
+          items={[
+            {
+              label: "New project",
+              icon: <Icon name="plus" size={13} />,
+              onSelect: onNewProject,
+            },
+            { type: "separator" },
+            {
+              label: "Collapse all",
+              icon: <Icon name="chevron-right" size={13} />,
+              onSelect: collapseAllProjects,
+            },
+            {
+              label: "Expand all",
+              icon: <Icon name="chevron-down" size={13} />,
+              onSelect: expandAllProjects,
+            },
+            { type: "separator" },
+            {
+              label: "SSH manager",
+              icon: <Icon name="ssh" size={13} />,
+              onSelect: onOpenSshManager,
+            },
+            {
+              label: "Persistent sessions",
+              icon: <Icon name="layers" size={13} />,
+              onSelect: onOpenPersistentSessions,
+            },
+            {
+              label: "Agent shortcuts",
+              icon: <Icon name="brain" size={13} />,
+              onSelect: onOpenAgentShortcuts,
+            },
+            {
+              label: agentInstructionRunning ? "Agent working…" : "Agent actions",
+              icon: <Icon name="wand" size={13} />,
+              disabled: agentInstructionRunning,
+              onSelect: () => {
                 setAgentCustomInstruction("");
                 setAgentModalOpen(true);
-              }}
-            >
-              <span className="wsMenuIcon">
-                <Icon name="wand" size={13} />
-              </span>
-              <span className="wsMenuItemName">
-                {agentInstructionRunning ? "Agent working…" : "Agent actions"}
-              </span>
-            </button>
-          </div>,
-          document.body,
-        )}
+              },
+            },
+          ]}
+        />
+      )}
 
       {/* Symbol / color picker */}
       {picker &&
