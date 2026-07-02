@@ -63,6 +63,7 @@ import { ApplyAssetModal } from "./components/modals/ApplyAssetModal";
 import { ConfirmActionModal } from "./components/modals/ConfirmActionModal";
 import { ShortcutsModal } from "./components/modals/ShortcutsModal";
 import { matchBinding } from "./keymap";
+import { ToastHost, showToast } from "./ui";
 import { PathPickerModal } from "./components/modals/PathPickerModal";
 import { UpdateModal, UpdateCheckState } from "./components/modals/UpdateModal";
 import {
@@ -2247,7 +2248,6 @@ export default function App() {
   const [secureStorageRetrying, setSecureStorageRetrying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [screenCapturePermissionIssue, setScreenCapturePermissionIssue] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [autoRenamingSessions, setAutoRenamingSessions] = useState(false);
   const [autoRenameActivity, setAutoRenameActivity] = useState<AutoRenameActivity | null>(null);
   useEffect(() => {
@@ -2256,7 +2256,6 @@ export default function App() {
     setActivityCenterOpen(false);
     setActivityCenterAutoOpenSource(null);
   }, [activityCenterAutoOpenSource, autoRenameActivity]);
-  const noticeTimerRef = useRef<number | null>(null);
   const secureStoragePromptedRef = useRef(false);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [updatesOpen, setUpdatesOpen] = useState(false);
@@ -4248,6 +4247,7 @@ export default function App() {
             : x,
         ),
       );
+      showToast({ tone: "success", message: `Recording started — “${name}”` });
       return { sessionId, recordingId: safeId };
     }
 
@@ -4263,6 +4263,7 @@ export default function App() {
           prev.map((x) => (x.id === sessionId ? { ...x, recordingActive: false } : x)),
         );
       }
+      showToast({ tone: "success", message: "Recording saved." });
       return { sessionId };
     }
 
@@ -6024,10 +6025,6 @@ export default function App() {
 
   useEffect(() => {
     return () => {
-      if (noticeTimerRef.current !== null) {
-        window.clearTimeout(noticeTimerRef.current);
-        noticeTimerRef.current = null;
-      }
       if (trayStatusTimerRef.current !== null) {
         window.clearTimeout(trayStatusTimerRef.current);
         trayStatusTimerRef.current = null;
@@ -6071,7 +6068,10 @@ export default function App() {
     return KNOWN_XTERM_RESIZE_RACE_SIGNATURES.some((signature) => message.includes(signature));
   }
   const reportError = useCallback((prefix: string, err: unknown) => {
-    setError(`${prefix}: ${formatError(err)}`);
+    const message = `${prefix}: ${formatError(err)}`;
+    // Persistent copy in the ActivityCenter; transient toast so it's noticed.
+    setError(message);
+    showToast({ tone: "error", message });
   }, []);
 
   const openScreenRecordingSettings = useCallback(async () => {
@@ -6120,23 +6120,10 @@ export default function App() {
     };
   }, []);
 
-  const dismissNotice = useCallback(() => {
-    setNotice(null);
-    if (noticeTimerRef.current !== null) {
-      window.clearTimeout(noticeTimerRef.current);
-      noticeTimerRef.current = null;
-    }
-  }, []);
-
+  // Transient tier of the two-tier notification model: notices are toasts
+  // (bottom-right, auto-dismiss); persistent state lives in the ActivityCenter.
   const showNotice = useCallback((message: string, timeoutMs = 4500) => {
-    setNotice(message);
-    if (noticeTimerRef.current !== null) {
-      window.clearTimeout(noticeTimerRef.current);
-    }
-    noticeTimerRef.current = window.setTimeout(() => {
-      noticeTimerRef.current = null;
-      setNotice(null);
-    }, timeoutMs);
+    showToast({ message, duration: timeoutMs });
   }, []);
 
   // Lazily detect installed shells for the picker / project settings. Cached in
@@ -6158,7 +6145,7 @@ export default function App() {
     let unlisten: (() => void) | null = null;
     let disposed = false;
     void listen<{ sessionId: string; message: string }>("shell-fallback", (e) => {
-      showNotice(e.payload.message);
+      showToast({ tone: "warning", title: "Shell fallback", message: e.payload.message });
     }).then((fn) => {
       if (disposed) fn();
       else unlisten = fn;
@@ -9657,27 +9644,15 @@ export default function App() {
       });
     }
 
-    if (notice) {
-      items.push({
-        id: "app-notice",
-        title: "Notice",
-        summary: notice,
-        tone: "info",
-        onDismiss: dismissNotice,
-      });
-    }
-
     return items;
   }, [
     autoRenameActivity,
     dismissAutoRenameActivity,
-    dismissNotice,
     error,
     screenCapturePermissionIssue,
     openScreenRecordingSettings,
     agentWorkingIds,
     handleReconnectSession,
-    notice,
     persistenceDisabledReason,
     projects,
     retrySecureStorage,
@@ -11763,6 +11738,7 @@ export default function App() {
         onOpenFile={(path) => handleSelectWorkspaceFile(path, "auto")}
         onClose={() => setWorkspaceFileSearchOpen(false)}
       />
+      <ToastHost />
     </div>
   );
 }
