@@ -9498,3 +9498,22 @@ select.input {
 }
 
 .timelineRow:hover .timelineCopy { opacity: 1; }
+
+/* Inline session-style affordance (color picker on row hover). */
+.wsSessionStyle {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  opacity: 0;
+}
+
+.wsSessionItem:hover .wsSessionStyle { opacity: 1; }
+.wsSessionStyle:hover { color: var(--text-bright); background: rgba(var(--ink-rgb), 0.1); }

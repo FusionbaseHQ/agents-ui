@@ -194,6 +194,8 @@ type SessionRowProps = {
   onClose: (id: string) => void;
   onReconnect: (id: string) => void;
   onContextMenu: (id: string, x: number, y: number) => void;
+  /** Opens the color/symbol picker at the given point (inline hover affordance). */
+  onStyle: (id: string, x: number, y: number) => void;
   onDragStart: (e: React.PointerEvent<HTMLButtonElement>, id: string) => void;
   onRenameChange: (v: string) => void;
   onRenameSubmit: () => void;
@@ -213,6 +215,7 @@ const SessionRow = React.memo(function SessionRow({
   onClose,
   onReconnect,
   onContextMenu,
+  onStyle,
   onDragStart,
   onRenameChange,
   onRenameSubmit,
@@ -332,6 +335,18 @@ const SessionRow = React.memo(function SessionRow({
         ) : (
           <span className={`wsStatusDot wsStatusDot-${status}`} aria-hidden="true" />
         )}
+        <button
+          className="wsSessionStyle"
+          onClick={(e) => {
+            e.stopPropagation();
+            const r = e.currentTarget.getBoundingClientRect();
+            onStyle(s.id, r.left, r.bottom + 4);
+          }}
+          title="Set color (right-click for symbol & more)"
+          aria-label="Set session color"
+        >
+          <Icon name="wand" size={12} />
+        </button>
         <button
           className="wsSessionClose"
           onClick={(e) => {
@@ -1297,6 +1312,7 @@ export const WorkspaceSidebar = React.memo(function WorkspaceSidebar(props: Work
                           onClose={onCloseSession}
                           onReconnect={onReconnectSession}
                           onContextMenu={(id, x, y) => setSessMenu({ sessionId: id, x, y })}
+                          onStyle={(id, x, y) => setPicker({ kind: "session", id, mode: "color", x, y })}
                           onDragStart={handleSessionDragStart}
                           onRenameChange={setRenameValue}
                           onRenameSubmit={submitRename}
