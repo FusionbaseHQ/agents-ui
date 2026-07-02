@@ -40,6 +40,28 @@ export function Modal(props: ModalProps) {
       e.preventDefault();
       e.stopPropagation();
       onClose();
+      return;
+    }
+    // Focus trap: keep Tab/Shift+Tab cycling inside the dialog.
+    if (e.key === "Tab") {
+      const panel = panelRef.current;
+      if (!panel) return;
+      const focusables = Array.from(
+        panel.querySelectorAll<HTMLElement>(
+          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((el) => !el.hasAttribute("disabled") && el.offsetParent !== null);
+      if (focusables.length === 0) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const current = document.activeElement;
+      if (e.shiftKey && (current === first || current === panel)) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && current === last) {
+        e.preventDefault();
+        first.focus();
+      }
     }
   };
 
