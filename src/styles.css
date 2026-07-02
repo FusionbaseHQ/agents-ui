@@ -2520,10 +2520,26 @@ body::after {
   left: 2.5px;
 }
 
-.terminalPane {
+.terminalPaneStack {
   position: relative;
   flex: 1;
   min-width: 240px;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+
+.terminalOverlays {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+}
+
+.terminalPane {
+  position: relative;
+  flex: 1;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
   contain: layout style;
@@ -9557,6 +9573,7 @@ select.input {
 /* In-pane session-state banner (disconnect/reconnect, over the terminal). */
 .sessionBanner {
   position: absolute;
+  pointer-events: auto;
   top: 8px;
   left: 50%;
   transform: translateX(-50%);

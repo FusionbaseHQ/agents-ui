@@ -1,3 +1,4 @@
+import { createPortal } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { homeDir } from "@tauri-apps/api/path";
@@ -2265,6 +2266,9 @@ export default function App() {
   const dialogs = useDialogsStore();
   // Tab-strip drag-reorder indicator (drop target + side).
   const [tabDrop, setTabDrop] = useState<{ id: string; position: "before" | "after" } | null>(null);
+  // Portal host inside the terminal pane for terminal-scoped overlays.
+  const [terminalOverlayHost, setTerminalOverlayHost] = useState<HTMLDivElement | null>(null);
+  const terminalOverlayRef = useCallback((el: HTMLDivElement | null) => setTerminalOverlayHost(el), []);
   const [promptSearch, setPromptSearch] = useState("");
   const [recordingSearch, setRecordingSearch] = useState("");
   const [assetSearch, setAssetSearch] = useState("");
@@ -9827,24 +9831,29 @@ export default function App() {
           } as React.CSSProperties
         }
       >
-        <TerminalPane
-          sessions={terminalPaneSessions}
-          activeId={activeId}
-          activeProjectId={activeProjectId}
-          uiTheme={uiTheme}
-          splitPane={splitPane}
-          onSplitRatioChange={handleSplitRatioChange}
-          onCloseSplitPane={handleCloseSplitPane}
-          onCwdChange={onCwdChange}
-          onCommandChange={onCommandChange}
-          onSessionResize={onSessionResize}
-          onSessionTransportError={onSessionTransportError}
-          registry={registry}
-          pendingData={pendingData}
-          onRegistryChanged={handleTerminalRegistryChanged}
-          searchOpenSessions={terminalSearchSessions}
-          onSearchClose={handleSearchClose}
-        />
+        <div className="terminalPaneStack">
+          <TerminalPane
+            sessions={terminalPaneSessions}
+            activeId={activeId}
+            activeProjectId={activeProjectId}
+            uiTheme={uiTheme}
+            splitPane={splitPane}
+            onSplitRatioChange={handleSplitRatioChange}
+            onCloseSplitPane={handleCloseSplitPane}
+            onCwdChange={onCwdChange}
+            onCommandChange={onCommandChange}
+            onSessionResize={onSessionResize}
+            onSessionTransportError={onSessionTransportError}
+            registry={registry}
+            pendingData={pendingData}
+            onRegistryChanged={handleTerminalRegistryChanged}
+            searchOpenSessions={terminalSearchSessions}
+            onSearchClose={handleSearchClose}
+          />
+          {/* Portal target for terminal-scoped overlays (welcome pane, session
+              banner) so they center over the terminal, not the whole row. */}
+          <div className="terminalOverlays" ref={terminalOverlayRef} />
+        </div>
 
         {activeWorkspaceView.codeEditorOpen &&
         (
@@ -10081,6 +10090,8 @@ export default function App() {
         <div className="terminalArea">
           {workspaceRowJsx}
 
+          {terminalOverlayHost && createPortal(
+            <>
           {active && (active.connectionState === "disconnected" || active.connectionState === "reconnecting") && !active.closing && (
             <div className={`sessionBanner${active.connectionState === "reconnecting" ? " reconnecting" : ""}`} role="status">
               <span className="sessionBannerText">
@@ -10121,6 +10132,9 @@ export default function App() {
               onConnectSsh={() => handleNewSshForProject(activeProjectId)}
               onShowShortcuts={() => openDialog("shortcuts")}
             />
+          )}
+            </>,
+            terminalOverlayHost,
           )}
 
           {(() => {
