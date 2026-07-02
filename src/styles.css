@@ -5420,7 +5420,8 @@ select.input {
   align-items: center;
   gap: 8px;
   padding: 7px 10px;
-  border-radius: var(--radius-control);
+  /* Left corners square so the selection accent stripe is a straight bar. */
+  border-radius: 0 var(--radius-control) var(--radius-control) 0;
   border-left: 3px solid transparent;
   cursor: pointer;
   transition: background 0.12s ease;
@@ -9032,7 +9033,8 @@ select.input {
   align-items: flex-start;
   gap: 10px;
   padding: 11px 12px;
-  border-radius: var(--radius-lg);
+  /* Left corners square so the tone accent stripe is a straight bar. */
+  border-radius: 0 var(--radius-lg) var(--radius-lg) 0;
   border: 1px solid rgba(var(--ink-rgb), 0.14);
   background: rgba(var(--paper-panel-rgb), 0.97);
   backdrop-filter: blur(18px);
