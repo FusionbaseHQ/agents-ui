@@ -10081,6 +10081,28 @@ export default function App() {
         <div className="terminalArea">
           {workspaceRowJsx}
 
+          {active && (active.connectionState === "disconnected" || active.connectionState === "reconnecting") && !active.closing && (
+            <div className={`sessionBanner${active.connectionState === "reconnecting" ? " reconnecting" : ""}`} role="status">
+              <span className="sessionBannerText">
+                {active.connectionState === "reconnecting"
+                  ? `Reconnecting${active.reconnectAttempt ? ` (attempt ${active.reconnectAttempt})` : ""}…`
+                  : active.disconnectReason?.trim() || "Session disconnected."}
+              </span>
+              {active.connectionState === "disconnected" && active.manualReconnectAvailable ? (
+                <button
+                  type="button"
+                  className="btnSmall sessionBannerBtn"
+                  onClick={() => handleReconnectSession(active.id)}
+                >
+                  Reconnect
+                </button>
+              ) : null}
+              <button type="button" className="btnSmall sessionBannerBtn" onClick={() => void onClose(active.id)}>
+                Close session
+              </button>
+            </div>
+          )}
+
           {hydrated && !sessions.some((s) => s.projectId === activeProjectId) && (
             <WelcomePane
               projectTitle={activeProject?.title ?? null}

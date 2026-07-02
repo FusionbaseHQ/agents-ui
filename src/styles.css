@@ -9521,3 +9521,35 @@ select.input {
 /* Tab-strip drag-reorder drop indicator. */
 .historyTabDropBefore { box-shadow: inset 2px 0 0 rgba(var(--accent-rgb), 0.9); }
 .historyTabDropAfter { box-shadow: inset -2px 0 0 rgba(var(--accent-rgb), 0.9); }
+
+/* In-pane session-state banner (disconnect/reconnect, over the terminal). */
+.sessionBanner {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(560px, calc(100% - 32px));
+  padding: 7px 12px;
+  border-radius: var(--radius-lg);
+  border: 1px solid rgba(var(--danger-rgb), 0.4);
+  background: rgba(var(--paper-panel-rgb), 0.97);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 10px 30px rgba(var(--shadow-rgb), 0.35);
+}
+
+.sessionBanner.reconnecting { border-color: rgba(var(--accent-rgb), 0.4); }
+
+.sessionBannerText {
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sessionBannerBtn { flex-shrink: 0; }
