@@ -11770,6 +11770,58 @@ export default function App() {
           setSlidePanelTab("recordings");
           setSlidePanelOpen(true);
         }}
+        extraActions={[
+          {
+            id: "settings",
+            title: "Open Settings",
+            subtitle: "Theme, default shell, power, keyboard, storage",
+            run: handleOpenSettings,
+          },
+          {
+            id: "shortcuts",
+            title: "Keyboard Shortcuts",
+            shortcut: "/",
+            run: () => setShortcutsOpen(true),
+          },
+          {
+            id: "terminal-with-shell",
+            title: "Terminal with Shell…",
+            subtitle: "Pick agsh, Nushell, or an installed shell for a one-off terminal",
+            icon: "plus",
+            run: () => handleNewTerminalWithShellForProject(activeProjectId),
+          },
+          {
+            id: "new-project",
+            title: "New Project",
+            icon: "plus",
+            run: openNewProject,
+          },
+          {
+            id: "persistent-terminals",
+            title: "Persistent Terminals",
+            run: handleOpenPersistentSessions,
+          },
+          {
+            id: "agent-shortcuts",
+            title: "Agent Shortcuts…",
+            run: () => setAgentShortcutsOpen(true),
+          },
+          {
+            id: "check-updates",
+            title: "Check for Updates",
+            run: () => {
+              setUpdatesOpen(true);
+              void checkForUpdates();
+            },
+          },
+          {
+            id: "toggle-agent-panel",
+            title: "Toggle Agent Panel",
+            shortcut: "Shift+G",
+            icon: "panel",
+            run: () => setAgentPanelOpen((prev) => !prev),
+          },
+        ]}
         onOpenAssetsPanel={() => {
           setSlidePanelTab("assets");
           setSlidePanelOpen(true);

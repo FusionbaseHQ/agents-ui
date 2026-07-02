@@ -92,6 +92,17 @@ type CommandPaletteProps = {
   onOpenAssetsPanel: () => void;
   /** Returns visible terminal text for a session, or empty string if unavailable */
   getTerminalText?: (sessionId: string) => string;
+  /** App-provided actions appended to the built-in list (settings, shell picker, …). */
+  extraActions?: ExtraPaletteAction[];
+};
+
+export type ExtraPaletteAction = {
+  id: string;
+  title: string;
+  subtitle?: string;
+  icon?: string;
+  shortcut?: string;
+  run: () => void;
 };
 
 function fuzzyMatch(text: string, query: string): { match: boolean; score: number } {
@@ -172,6 +183,7 @@ export function CommandPalette({
   onOpenRecordingsPanel,
   onOpenAssetsPanel,
   getTerminalText,
+  extraActions,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -329,8 +341,20 @@ export function CommandPalette({
       icon: "settings",
     });
 
+    (extraActions ?? []).forEach((a) => {
+      items.push({
+        id: `extra-${a.id}`,
+        type: "action",
+        title: a.title,
+        subtitle: a.subtitle,
+        icon: a.icon ?? "settings",
+        shortcut: a.shortcut,
+        data: a,
+      });
+    });
+
     return items;
-  }, [prompts, recordings, sessions, projects, activeSessionId, activeProjectId, isRecording, quickStarts]);
+  }, [prompts, recordings, sessions, projects, activeSessionId, activeProjectId, isRecording, quickStarts, extraActions]);
 
   // Filter and sort by query (including terminal content search for sessions)
   const filteredItems = useMemo(() => {
@@ -452,6 +476,10 @@ export function CommandPalette({
         break;
       }
       case "action": {
+        if (item.id.startsWith("extra-")) {
+          (item.data as ExtraPaletteAction | undefined)?.run();
+          break;
+        }
         switch (item.id) {
           case "action-new-session":
             onNewSession();
