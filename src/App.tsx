@@ -59,15 +59,13 @@ import {
   type PersistentSessionsModalItem,
 } from "./components/modals/PersistentSessionsModal";
 import { ProjectModal, type ProjectModalHandle, type ProjectSubmitData } from "./components/modals/ProjectModal";
-import { ConfirmDeleteProjectModal } from "./components/modals/ConfirmDeleteProjectModal";
-import { ConfirmDeleteRecordingModal } from "./components/modals/ConfirmDeleteRecordingModal";
 import { ApplyAssetModal } from "./components/modals/ApplyAssetModal";
 import { ConfirmActionModal } from "./components/modals/ConfirmActionModal";
 import { ShortcutsModal } from "./components/modals/ShortcutsModal";
 import { SettingsModal } from "./components/modals/SettingsModal";
 import { WelcomePane } from "./components/WelcomePane";
 import { matchBinding } from "./keymap";
-import { ToastHost, showToast, EmptyState } from "./ui";
+import { ToastHost, showToast, EmptyState, Modal } from "./ui";
 import { PathPickerModal } from "./components/modals/PathPickerModal";
 import { UpdateModal, UpdateCheckState } from "./components/modals/UpdateModal";
 import {
@@ -10491,26 +10489,30 @@ export default function App() {
             onSubmit={onProjectSubmit}
           />}
 
-          {confirmDeleteProjectOpen && activeProject && <ConfirmDeleteProjectModal
+          {confirmDeleteProjectOpen && activeProject && <ConfirmActionModal
             isOpen={confirmDeleteProjectOpen && Boolean(activeProject)}
-            projectTitle={activeProject?.title ?? ""}
+            title="Delete project"
+            message={`Delete "${activeProject?.title ?? ""}"? All sessions in this project will be closed.`}
+            confirmLabel="Delete"
+            confirmDanger
             onClose={() => setConfirmDeleteProjectOpen(false)}
-            onConfirmDelete={() => {
+            onConfirm={() => {
               setConfirmDeleteProjectOpen(false);
               void deleteActiveProject();
             }}
           />}
 
-          {confirmDeleteRecordingId && <ConfirmDeleteRecordingModal
+          {confirmDeleteRecordingId && <ConfirmActionModal
             isOpen={Boolean(confirmDeleteRecordingId)}
-            recordingLabel={
+            title="Delete recording"
+            message={`Delete "${
+              recordings.find((r) => r.recordingId === confirmDeleteRecordingId)?.meta?.name?.trim() ||
               confirmDeleteRecordingId
-                ? recordings.find((r) => r.recordingId === confirmDeleteRecordingId)?.meta?.name?.trim() ||
-                  confirmDeleteRecordingId
-                : ""
-            }
+            }"? This cannot be undone.`}
+            confirmLabel="Delete"
+            confirmDanger
             onClose={() => setConfirmDeleteRecordingId(null)}
-            onConfirmDelete={() => {
+            onConfirm={() => {
               const id = confirmDeleteRecordingId;
               setConfirmDeleteRecordingId(null);
               if (id) void deleteRecording(id);
@@ -10613,16 +10615,14 @@ export default function App() {
           />}
 
           {secureStorageSettingsOpen && (
-            <div
-              className="modalBackdrop modalBackdropTop"
-              onClick={() => {
+            <Modal
+              top
+              title="Secure storage"
+              onClose={() => {
                 if (secureStorageSettingsBusy) return;
                 closeSecureStorageSettings();
               }}
             >
-              <div className="modal" onClick={(e) => e.stopPropagation()}>
-                <h3 className="modalTitle">Secure storage</h3>
-
                 {secureStorageSettingsError && (
                   <div className="pathPickerError" role="alert">
                     {secureStorageSettingsError}
@@ -10689,14 +10689,11 @@ export default function App() {
                     {secureStorageSettingsBusy ? "Working…" : secureStorageMode === null ? "Continue" : "Apply"}
                   </button>
                 </div>
-              </div>
-            </div>
+            </Modal>
           )}
 
           {recordPromptOpen && (
-            <div className="modalBackdrop" onClick={closeRecordPrompt}>
-              <div className="modal" onClick={(e) => e.stopPropagation()}>
-                <h3 className="modalTitle">Start recording</h3>
+            <Modal title="Start recording" onClose={closeRecordPrompt}>
                 <form
                   onSubmit={(e) => {
                     e.preventDefault();
@@ -10738,15 +10735,11 @@ export default function App() {
                     </button>
                   </div>
                 </form>
-              </div>
-            </div>
+            </Modal>
           )}
 
           {recordingsOpen && (
-            <div className="modalBackdrop" onClick={() => setRecordingsOpen(false)}>
-              <div className="modal recordingsModal" onClick={(e) => e.stopPropagation()}>
-                <h3 className="modalTitle">Recordings</h3>
-
+            <Modal title="Recordings" onClose={() => setRecordingsOpen(false)} className="recordingsModal">
                 {recordingsError && (
                   <div className="pathPickerError" role="alert">
                     {recordingsError}
@@ -10844,15 +10837,11 @@ export default function App() {
                     Refresh
                   </button>
                 </div>
-              </div>
-            </div>
+            </Modal>
           )}
 
           {promptsOpen && (
-            <div className="modalBackdrop" onClick={() => setPromptsOpen(false)}>
-              <div className="modal recordingsModal" onClick={(e) => e.stopPropagation()}>
-                <h3 className="modalTitle">Prompts</h3>
-
+            <Modal title="Prompts" onClose={() => setPromptsOpen(false)} className="recordingsModal">
                 <div className="recordingsList">
                   {prompts.length === 0 ? (
                     <EmptyState
@@ -10928,14 +10917,15 @@ export default function App() {
                     New
                   </button>
                 </div>
-              </div>
-            </div>
+            </Modal>
           )}
 
           {promptEditorOpen && (
-            <div className="modalBackdrop" onClick={closePromptEditor}>
-              <div className="modal recordingsModal" onClick={(e) => e.stopPropagation()}>
-                <h3 className="modalTitle">{promptEditorId ? "Edit prompt" : "New prompt"}</h3>
+            <Modal
+              title={promptEditorId ? "Edit prompt" : "New prompt"}
+              onClose={closePromptEditor}
+              className="recordingsModal"
+            >
                 <form
                   onSubmit={(e) => {
                     e.preventDefault();
@@ -10976,15 +10966,11 @@ export default function App() {
                     </button>
                   </div>
                 </form>
-              </div>
-            </div>
+            </Modal>
           )}
 
           {environmentsOpen && (
-            <div className="modalBackdrop" onClick={() => setEnvironmentsOpen(false)}>
-              <div className="modal recordingsModal" onClick={(e) => e.stopPropagation()}>
-                <h3 className="modalTitle">Environments</h3>
-
+            <Modal title="Environments" onClose={() => setEnvironmentsOpen(false)} className="recordingsModal">
                 <div className="recordingsList">
                   {environments.length === 0 ? (
                     <EmptyState
@@ -11042,16 +11028,15 @@ export default function App() {
                     New
                   </button>
                 </div>
-              </div>
-            </div>
+            </Modal>
           )}
 
           {environmentEditorOpen && (
-            <div className="modalBackdrop" onClick={closeEnvironmentEditor}>
-              <div className="modal recordingsModal" onClick={(e) => e.stopPropagation()}>
-                <h3 className="modalTitle">
-                  {environmentEditorId ? "Edit environment" : "New environment"}
-                </h3>
+            <Modal
+              title={environmentEditorId ? "Edit environment" : "New environment"}
+              onClose={closeEnvironmentEditor}
+              className="recordingsModal"
+            >
                 <form
                   onSubmit={(e) => {
                     e.preventDefault();
@@ -11126,14 +11111,15 @@ export default function App() {
                     </button>
                   </div>
                 </form>
-              </div>
-            </div>
+            </Modal>
           )}
 
           {assetEditorOpen && (
-            <div className="modalBackdrop" onClick={closeAssetEditor}>
-              <div className="modal recordingsModal" onClick={(e) => e.stopPropagation()}>
-                <h3 className="modalTitle">{assetEditorId ? "Edit asset" : "New asset"}</h3>
+            <Modal
+              title={assetEditorId ? "Edit asset" : "New asset"}
+              onClose={closeAssetEditor}
+              className="recordingsModal"
+            >
                 <form
                   onSubmit={(e) => {
                     e.preventDefault();
@@ -11204,15 +11190,11 @@ export default function App() {
                     </button>
                   </div>
                 </form>
-              </div>
-            </div>
+            </Modal>
           )}
 
           {replayOpen && (
-            <div className="modalBackdrop" onClick={closeReplayModal}>
-              <div className="modal recordingsModal" onClick={(e) => e.stopPropagation()}>
-                <h3 className="modalTitle">Replay recording</h3>
-
+            <Modal title="Replay recording" onClose={closeReplayModal} className="recordingsModal">
                 {replayError && (
                   <div className="pathPickerError" role="alert">
                     {replayError}
@@ -11376,8 +11358,7 @@ export default function App() {
                     Send next
                   </button>
                 </div>
-              </div>
-            </div>
+            </Modal>
           )}
 
           {/* Slide Panel */}

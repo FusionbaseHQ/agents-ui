@@ -1,5 +1,5 @@
 import React from "react";
-import { EmptyState } from "../../ui";
+import { EmptyState, Modal } from "../../ui";
 
 export type PersistentSessionsModalItem = {
   persistId: string;
@@ -32,9 +32,7 @@ export function PersistentSessionsModal({
   if (!isOpen) return null;
 
   return (
-    <div className="modalBackdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h3 className="modalTitle">Persistent terminals</h3>
+    <Modal title="Persistent terminals" onClose={onClose}>
         <div className="hint" style={{ marginTop: 0 }}>
           Running bundled <code>zellij</code> sessions started by Agents UI. Kill them to stop background shells.
         </div>
@@ -103,7 +101,6 @@ export function PersistentSessionsModal({
             Done
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

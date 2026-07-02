@@ -1,4 +1,5 @@
 import React from "react";
+import { Modal } from "../../ui";
 
 type ConfirmActionModalProps = {
   isOpen: boolean;
@@ -12,6 +13,7 @@ type ConfirmActionModalProps = {
   onConfirm: () => void;
 };
 
+/** The one confirm dialog: title + message + cancel/confirm (optionally destructive). */
 export function ConfirmActionModal({
   isOpen,
   title,
@@ -26,19 +28,15 @@ export function ConfirmActionModal({
   if (!isOpen) return null;
 
   return (
-    <div
-      className="modalBackdrop modalBackdropTop"
-      onClick={() => {
+    <Modal
+      top
+      title={title}
+      onClose={() => {
         if (busy) return;
         onClose();
       }}
-    >
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h3 className="modalTitle">{title}</h3>
-        <div className="hint" style={{ marginTop: 0 }}>
-          {message}
-        </div>
-        <div className="modalActions">
+      actions={
+        <>
           <button type="button" className="btn" onClick={onClose} disabled={busy}>
             {cancelLabel}
           </button>
@@ -50,8 +48,12 @@ export function ConfirmActionModal({
           >
             {busy ? "Working…" : confirmLabel}
           </button>
-        </div>
+        </>
+      }
+    >
+      <div className="hint" style={{ marginTop: 0 }}>
+        {message}
       </div>
-    </div>
+    </Modal>
   );
 }

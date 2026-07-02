@@ -1,6 +1,6 @@
 import React from "react";
 import { PROCESS_EFFECTS, type ProcessEffect } from "../processEffects";
-import { EmptyState } from "../ui";
+import { EmptyState, Modal } from "../ui";
 
 type AgentShortcutsModalProps = {
   isOpen: boolean;
@@ -32,9 +32,7 @@ export function AgentShortcutsModal({
     .sort((a, b) => a.label.toLowerCase().localeCompare(b.label.toLowerCase()));
 
   return (
-    <div className="modalBackdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h3 className="modalTitle">Agent shortcuts</h3>
+    <Modal title="Agent shortcuts" onClose={onClose}>
         <div className="hint" style={{ marginTop: 0 }}>
           Used for quick starts (sidebar + Cmd+K).
         </div>
@@ -144,8 +142,7 @@ export function AgentShortcutsModal({
             Done
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
 
