@@ -1,5 +1,6 @@
 import React from "react";
 import { PROCESS_EFFECTS, type ProcessEffect } from "../processEffects";
+import { EmptyState } from "../ui";
 
 type AgentShortcutsModalProps = {
   isOpen: boolean;
@@ -41,7 +42,11 @@ export function AgentShortcutsModal({
         <div className="agentShortcutEditorSection">
           <div className="agentShortcutEditorTitle">Shortcuts</div>
           {agentShortcuts.length === 0 ? (
-            <div className="empty">No shortcuts configured.</div>
+            <EmptyState
+              compact
+              title="No shortcuts configured"
+              hint="Add an agent below to get one-click quick starts in the sidebar and ⌘K."
+            />
           ) : (
             <div className="agentShortcutEditorList">
               {agentShortcuts.map((effect, idx) => (

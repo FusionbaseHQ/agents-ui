@@ -9185,3 +9185,93 @@ select.input {
   border-radius: var(--radius-sm);
   padding: 1px 7px;
 }
+
+/* Welcome pane — terminal-area empty state / first-run screen (WelcomePane). */
+.welcomePane {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+}
+
+.welcomeInner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  max-width: 560px;
+  padding: 24px;
+}
+
+.welcomeTitle {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-bright);
+}
+
+.welcomeSubtitle {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.welcomeCards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(200px, 1fr));
+  gap: 10px;
+  width: 100%;
+}
+
+.welcomeCard {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  padding: 13px 15px;
+  border-radius: var(--radius-lg);
+  border: 1px solid rgba(var(--ink-rgb), 0.1);
+  background: rgba(var(--ink-rgb), 0.03);
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.1s ease, border-color 0.1s ease;
+}
+
+.welcomeCard:hover {
+  background: rgba(var(--accent-rgb), 0.07);
+  border-color: rgba(var(--accent-rgb), 0.35);
+}
+
+.welcomeCardTitle {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-bright);
+}
+
+.welcomeCardHint {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.welcomeShortcuts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin-top: 14px;
+}
+
+.welcomeShortcut {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: none;
+  background: transparent;
+  padding: 2px 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.welcomeShortcut:not(:disabled) { cursor: pointer; }
+.welcomeShortcut:not(:disabled):hover { color: var(--text); }

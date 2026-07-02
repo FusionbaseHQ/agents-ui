@@ -62,8 +62,9 @@ import { ConfirmDeleteRecordingModal } from "./components/modals/ConfirmDeleteRe
 import { ApplyAssetModal } from "./components/modals/ApplyAssetModal";
 import { ConfirmActionModal } from "./components/modals/ConfirmActionModal";
 import { ShortcutsModal } from "./components/modals/ShortcutsModal";
+import { WelcomePane } from "./components/WelcomePane";
 import { matchBinding } from "./keymap";
-import { ToastHost, showToast } from "./ui";
+import { ToastHost, showToast, EmptyState } from "./ui";
 import { PathPickerModal } from "./components/modals/PathPickerModal";
 import { UpdateModal, UpdateCheckState } from "./components/modals/UpdateModal";
 import {
@@ -10277,6 +10278,22 @@ export default function App() {
         <div className="terminalArea">
           {workspaceRowJsx}
 
+          {hydrated && !sessions.some((s) => s.projectId === activeProjectId) && (
+            <WelcomePane
+              projectTitle={activeProject?.title ?? null}
+              isSshProject={isProjectSsh(activeProject)}
+              agentLabel={quickStarts[0]?.title ?? null}
+              onNewTerminal={() => handleNewTerminalForProject(activeProjectId)}
+              onNewTerminalWithShell={() => handleNewTerminalWithShellForProject(activeProjectId)}
+              onStartAgent={() => {
+                const effect = quickStarts[0] ? getProcessEffectById(quickStarts[0].id) : null;
+                if (effect) handleQuickStartForProject(activeProjectId, effect);
+              }}
+              onConnectSsh={() => handleNewSshForProject(activeProjectId)}
+              onShowShortcuts={() => setShortcutsOpen(true)}
+            />
+          )}
+
           {sessionHistory.length > 1 && (
             <div className="historyBar">
               {sessionHistory.map((sid) => {
@@ -10734,7 +10751,21 @@ export default function App() {
                   {recordingsLoading ? (
                     <div className="empty">Loading…</div>
                   ) : recordings.length === 0 ? (
-                    <div className="empty">No recordings yet.</div>
+                    <EmptyState
+                      title="No recordings yet"
+                      hint="Record a session to replay it later or share what happened."
+                      action={
+                        active
+                          ? {
+                              label: "Start recording",
+                              onClick: () => {
+                                setRecordingsOpen(false);
+                                openRecordPrompt(active.id);
+                              },
+                            }
+                          : undefined
+                      }
+                    />
                   ) : (
                     recordings.map((r) => {
                       const meta = r.meta;
@@ -10818,7 +10849,11 @@ export default function App() {
 
                 <div className="recordingsList">
                   {prompts.length === 0 ? (
-                    <div className="empty">No prompts yet.</div>
+                    <EmptyState
+                      title="No prompts yet"
+                      hint="Save reusable prompts; pin your top five to send them with ⌘1–⌘5."
+                      action={{ label: "New prompt", onClick: () => openPromptEditor() }}
+                    />
                   ) : (
                     prompts
                       .slice()
@@ -10946,7 +10981,11 @@ export default function App() {
 
                 <div className="recordingsList">
                   {environments.length === 0 ? (
-                    <div className="empty">No environments yet.</div>
+                    <EmptyState
+                      title="No environments yet"
+                      hint="Define sets of environment variables to inject into a project's new sessions."
+                      action={{ label: "New environment", onClick: () => openEnvironmentEditor() }}
+                    />
                   ) : (
                     environments
                       .slice()
@@ -11418,9 +11457,7 @@ export default function App() {
                         </div>
                       ))}
                     {prompts.filter(p => !p.pinned).length === 0 && (
-                      <div className="panelCardMeta" style={{ textAlign: "center", padding: "16px" }}>
-                        No prompts yet
-                      </div>
+                      <EmptyState compact title="No prompts yet" hint="Create one with “New Prompt” below." />
                     )}
                   </div>
                 </div>
@@ -11487,9 +11524,11 @@ export default function App() {
 
                       if (groups.length === 0) {
                         return (
-                          <div className="panelCardMeta" style={{ textAlign: "center", padding: "16px" }}>
-                            No recordings yet
-                          </div>
+                          <EmptyState
+                            compact
+                            title="No recordings yet"
+                            hint="Use “Record Session” below to capture the active terminal."
+                          />
                         );
                       }
 
@@ -11613,9 +11652,11 @@ export default function App() {
 
                       if (filtered.length === 0) {
                         return (
-                          <div className="panelCardMeta" style={{ textAlign: "center", padding: "16px" }}>
-                            No assets yet
-                          </div>
+                          <EmptyState
+                            compact
+                            title="No templates yet"
+                            hint="Templates are files auto-created in new sessions — add one with “New Template” below."
+                          />
                         );
                       }
 

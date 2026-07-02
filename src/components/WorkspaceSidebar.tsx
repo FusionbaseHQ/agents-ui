@@ -4,6 +4,7 @@ import { detectProcessEffect, getProcessEffectById, type ProcessEffect } from ".
 import { shortenPathSmart } from "../pathDisplay";
 import { useClampedMenuPosition } from "../hooks/useClampedMenuPosition";
 import { Icon } from "./Icon";
+import { EmptyState } from "../ui";
 import { TAB_SYMBOLS, TabSymbolIcon, normalizeTabSymbolValue } from "../tabSymbols";
 
 /* -------------------------------------------------------------------------- */
@@ -1114,7 +1115,16 @@ export const WorkspaceSidebar = React.memo(function WorkspaceSidebar(props: Work
       {/* Project tree */}
       <div className="wsTree" ref={treeRef} role="tree" aria-label="Projects and sessions">
         {filtered.length === 0 ? (
-          <div className="wsEmpty">{normalizedQuery ? "No matches." : "No projects in this workspace."}</div>
+          normalizedQuery ? (
+            <div className="wsEmpty">No matches.</div>
+          ) : (
+            <EmptyState
+              compact
+              title="No projects yet"
+              hint="A project groups terminals around a folder or SSH host."
+              action={{ label: "New project", onClick: onNewProject }}
+            />
+          )
         ) : (
           filtered.map(({ project: p, sessions }) => {
             const isExpanded = !collapsedProjects.has(p.id) || Boolean(normalizedQuery);

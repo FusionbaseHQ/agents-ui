@@ -1,4 +1,5 @@
 import React from "react";
+import { EmptyState } from "../../ui";
 
 export type PersistentSessionsModalItem = {
   persistId: string;
@@ -45,7 +46,11 @@ export function PersistentSessionsModal({
           ) : error ? (
             <div className="empty">{error}</div>
           ) : sessions.length === 0 ? (
-            <div className="empty">No persistent terminals found.</div>
+            <EmptyState
+              compact
+              title="No persistent terminals"
+              hint="Sessions started as persistent keep running in the background and show up here."
+            />
           ) : (
             <div className="agentShortcutEditorList">
               {sessions.map((s) => (
