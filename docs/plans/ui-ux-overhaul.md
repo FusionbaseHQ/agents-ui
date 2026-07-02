@@ -58,16 +58,41 @@ items. Agent-native features and the deep state refactor are deferred (§ Deferr
 
 ## Deferred (next phases)
 
-- **Domain-store decomposition** of App.tsx (~11.5k lines, ~120 useState) into
-  zustand/jotai stores + a `ModalHost` registry. The primitives above are the
-  prerequisite; the state split is mechanical but large and deserves its own
-  branch with per-domain commits.
-- **New-session flow consolidation** — one palette-style flow unifying
-  NewSessionModal / ShellPickerModal / agent quick-starts / SSH connect.
-- **Agent-native surfaces** — OSC-133/agsh-driven semantic session timeline
-  (per-command blocks, exit status, collapsible output), agent activity
-  indicators, agsh output-mode/confine controls. Biggest product bet; needs
-  agsh event plumbing over the PTY channel first.
-- Drag-to-reorder tabs/sessions; session drag between projects.
-- Focus-trap loop (Tab cycling) inside `Modal`; broader ARIA pass.
-- styles.css split per component / design tokens extraction.
+## Phase 2 (same day) — the previously-deferred items
+
+11. **Unified new-session flow** (`NewSessionFlow`, on ⌘T + palette "New
+    Session") — one keyboard-first list: Terminal with the effective default
+    shell (created directly), Terminal with shell…, agent quick-starts, SSH
+    connection…, Custom command… (the old command+cwd modal remains as that
+    last option's implementation).
+12. **Semantic command timeline** — `SessionTimeline` (SlidePanel "Timeline"
+    tab, mod+shift+e, ⌘K): per-command rows from the OSC 133 blocks that
+    `SessionShellIntegration` tracks (exit dot, duration — live while
+    running, start time; click scrolls the terminal to the command; hover →
+    Copy output). `SessionShellIntegration` gained change events. Backend:
+    OSC 133 emission wired for every managed shell — agsh (B marker added
+    upstream + sidecars rebuilt), managed zsh ZDOTDIR startup, injected bash
+    PROMPT_COMMAND/PS0/PS1, and the bundled Nushell config.
+13. **Store decomposition begun** — `src/stores/` with the module-store +
+    `useSyncExternalStore` pattern (no new deps): `shells.ts` (detected
+    shells, app default shell, launch-precedence helper) and `updates.ts`
+    (app info + GitHub release check). Toasts already live in `src/ui/toast`.
+    Remaining domains (sessions, projects/workspaces, panels, recordings,
+    prompts, environments, assets, ssh) follow the same pattern; migrate one
+    per PR. App.tsx shrinks with each tranche.
+14. **Modal consistency completed** — the remaining component dialogs
+    (ShellPicker, NewSession, Project, SshManager, PathPicker, ApplyAsset,
+    Update) migrated onto the `Modal` primitive as well.
+15. Inline session-color affordance on sidebar row hover (wand button opens
+    the color picker directly; right-click keeps symbol & the rest).
+
+## Roadmap (beyond this branch)
+
+- Finish the store migration domain-by-domain until App.tsx is a composition
+  root; then a `ModalHost` registry for dialog state.
+- Agent-native, next level: agsh output-mode/confine controls as first-class
+  session UI; agent activity feed (commands/min, sandbox status) in the
+  sidebar; collapsible output folding inside the terminal view itself.
+- Drag-to-reorder tabs in the tab strip (sidebar rows already drag).
+- styles.css split per component / design-token extraction.
+- Broader ARIA pass beyond modals/menus/timeline.
