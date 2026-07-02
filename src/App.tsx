@@ -62,6 +62,7 @@ import { ConfirmDeleteRecordingModal } from "./components/modals/ConfirmDeleteRe
 import { ApplyAssetModal } from "./components/modals/ApplyAssetModal";
 import { ConfirmActionModal } from "./components/modals/ConfirmActionModal";
 import { ShortcutsModal } from "./components/modals/ShortcutsModal";
+import { SettingsModal } from "./components/modals/SettingsModal";
 import { WelcomePane } from "./components/WelcomePane";
 import { matchBinding } from "./keymap";
 import { ToastHost, showToast, EmptyState } from "./ui";
@@ -234,6 +235,23 @@ const STORAGE_SPLIT_VIEWS_KEY = "agents-ui-split-views-v1";
 const STORAGE_AGENT_PANEL_WIDTH_KEY = "agents-ui-agent-panel-width-v1";
 const STORAGE_UI_THEME_KEY = "agents-ui-ui-theme-v1";
 const STORAGE_AUTO_CAFFEINATE_KEY = "agents-ui-auto-caffeinate-v1";
+const STORAGE_APP_DEFAULT_SHELL_KEY = "agents-ui-app-default-shell-v1";
+
+// App-global default shell (Settings → Terminal). null ⇒ bundled agsh.
+function loadAppDefaultShell(): ShellChoice | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_APP_DEFAULT_SHELL_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as ShellChoice;
+    if (parsed && parsed.kind === "bundled-nu") return { kind: "bundled-nu" };
+    if (parsed && parsed.kind === "system" && typeof parsed.path === "string" && parsed.path) {
+      return { kind: "system", path: parsed.path, family: parsed.family ?? "" };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 const STORAGE_WORKSPACES_KEY = "agents-ui-workspaces-v1";
 const STORAGE_SIDEBAR_COLLAPSED_KEY = "agents-ui-sidebar-collapsed-v1";
 const DEFAULT_UI_THEME: UiTheme = "midnight";
@@ -2022,8 +2040,24 @@ export default function App() {
     null,
   );
   const activityCenterMenuRef = useRef<HTMLDivElement | null>(null);
-  const [appSettingsOpen, setAppSettingsOpen] = useState(false);
-  const appSettingsMenuRef = useRef<HTMLDivElement | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [appDefaultShell, setAppDefaultShell] = useState<ShellChoice | null>(() => loadAppDefaultShell());
+  const appDefaultShellRef = useRef(appDefaultShell);
+  useEffect(() => {
+    appDefaultShellRef.current = appDefaultShell;
+    try {
+      if (appDefaultShell) localStorage.setItem(STORAGE_APP_DEFAULT_SHELL_KEY, JSON.stringify(appDefaultShell));
+      else localStorage.removeItem(STORAGE_APP_DEFAULT_SHELL_KEY);
+    } catch {
+      // Best-effort: localStorage may be unavailable in some contexts.
+    }
+  }, [appDefaultShell]);
+  // Shell for a new session: project default > app default (Settings) > bundled agsh.
+  const shellChoiceForProject = useCallback(
+    (project: { defaultShell?: ShellChoice | null } | null | undefined): ShellChoice | null =>
+      project?.defaultShell ?? appDefaultShellRef.current ?? null,
+    [],
+  );
   const [activeId, setActiveId] = useState<string | null>(null);
   const [sessionHistory, setSessionHistory] = useState<string[]>([]);
   const [splitViews, setSplitViews] = useState<SplitView[]>(() => loadPersistedSplitViews());
@@ -2066,17 +2100,6 @@ export default function App() {
       unlisten?.();
     };
   }, []);
-  useEffect(() => {
-    if (!appSettingsOpen) return;
-    const handlePointerDown = (event: MouseEvent) => {
-      const target = event.target;
-      if (!(target instanceof Node)) return;
-      if (appSettingsMenuRef.current?.contains(target)) return;
-      setAppSettingsOpen(false);
-    };
-    document.addEventListener("mousedown", handlePointerDown);
-    return () => document.removeEventListener("mousedown", handlePointerDown);
-  }, [appSettingsOpen]);
   useEffect(() => {
     if (!activityCenterOpen) return;
     const handlePointerDown = (event: MouseEvent) => {
@@ -2592,6 +2615,7 @@ export default function App() {
     assetEditorOpen: false,
     commandPaletteOpen: false,
     shortcutsOpen: false,
+    settingsOpen: false,
     slidePanelOpen: false,
     slidePanelTab: "prompts" as string,
     prompts: [] as Prompt[],
@@ -5292,6 +5316,7 @@ export default function App() {
     s.assetEditorOpen = assetEditorOpen;
     s.commandPaletteOpen = commandPaletteOpen;
     s.shortcutsOpen = shortcutsOpen;
+    s.settingsOpen = settingsOpen;
     s.slidePanelOpen = slidePanelOpen;
     s.slidePanelTab = slidePanelTab;
     s.prompts = prompts;
@@ -5681,11 +5706,12 @@ export default function App() {
         applyAssetRequest, replayOpen, recordPromptOpen, recordingsOpen,
         secureStorageSettingsOpen, promptsOpen, promptEditorOpen,
         environmentsOpen, environmentEditorOpen, assetEditorOpen,
-        commandPaletteOpen, shortcutsOpen, slidePanelOpen, slidePanelTab, prompts,
+        commandPaletteOpen, shortcutsOpen, settingsOpen, slidePanelOpen, slidePanelTab, prompts,
         applyAssetApplying,
       } = ks;
       const modalOpen =
         shortcutsOpen ||
+        settingsOpen ||
         newOpen ||
         sshManagerOpen ||
         agentShortcutsOpen ||
@@ -5851,6 +5877,10 @@ export default function App() {
         e.preventDefault();
         if (shortcutsOpen) {
           setShortcutsOpen(false);
+          return;
+        }
+        if (settingsOpen) {
+          setSettingsOpen(false);
           return;
         }
         if (applyAssetRequest) {
@@ -6054,7 +6084,6 @@ export default function App() {
   function showScreenCapturePermissionRequired(err: unknown) {
     const message = formatError(err).replace(/^SCREEN_RECORDING_PERMISSION_REQUIRED:\s*/, "");
     setScreenCapturePermissionIssue(message);
-    setAppSettingsOpen(false);
     setActivityCenterAutoOpenSource(null);
     setActivityCenterOpen(true);
   }
@@ -6914,7 +6943,7 @@ export default function App() {
         launchCommand: effect.matchCommands[0] ?? effect.label,
         cwd,
         envVars: envVarsForProjectId(projectId, projects, environments),
-        shellChoice: projects.find((p) => p.id === projectId)?.defaultShell ?? null,
+        shellChoice: shellChoiceForProject(projects.find((p) => p.id === projectId)),
       });
       const s = applyPendingExit(createdRaw);
       addSessionWithProjectSafeActivation(s);
@@ -7648,7 +7677,7 @@ export default function App() {
           projectId: id,
           cwd: validatedBasePath!,
           envVars: envVarsForProjectId(id, [...projects, project], environments),
-          shellChoice: project.defaultShell ?? null,
+          shellChoice: shellChoiceForProject(project),
         });
         const s = applyPendingExit(createdRaw);
         addSessionWithProjectSafeActivation(s);
@@ -8511,7 +8540,7 @@ export default function App() {
         cwd: validatedCwd,
         envVars: envVarsForProjectId(activeProjectId, projects, environments),
         // Fast default flow: inherit the project's default shell.
-        shellChoice: activeProject?.defaultShell ?? null,
+        shellChoice: shellChoiceForProject(activeProject),
       });
       const s = applyPendingExit(createdRaw);
       addSessionWithProjectSafeActivation(s);
@@ -8823,7 +8852,7 @@ export default function App() {
         cwd,
         envVars: envVarsForProjectId(targetProjectId, projects, environments),
         // Agent quick-starts run under the project's default shell.
-        shellChoice: targetProject?.defaultShell ?? null,
+        shellChoice: shellChoiceForProject(targetProject),
       });
       const created = applyPendingExit(createdRaw);
       const next = created;
@@ -8965,7 +8994,6 @@ export default function App() {
     };
 
     if (!activityCenterOpen) {
-      setAppSettingsOpen(false);
       setActivityCenterAutoOpenSource("auto-rename");
       setActivityCenterOpen(true);
     }
@@ -9516,15 +9544,14 @@ export default function App() {
   }, [activeProjectId, splitViews]);
 
   const handleToggleActivityCenter = useCallback(() => {
-    setAppSettingsOpen(false);
     setActivityCenterAutoOpenSource(null);
     setActivityCenterOpen((prev) => !prev);
   }, []);
 
-  const handleToggleAppSettings = useCallback(() => {
+  const handleOpenSettings = useCallback(() => {
     setActivityCenterOpen(false);
     setActivityCenterAutoOpenSource(null);
-    setAppSettingsOpen((prev) => !prev);
+    setSettingsOpen(true);
   }, []);
 
   const activityItems = useMemo<ActivityCenterItem[]>(() => {
@@ -9794,67 +9821,15 @@ export default function App() {
           onToggle={handleToggleActivityCenter}
           onActionError={(item, err) => reportError(`Activity action failed: ${item.title}`, err)}
         />
-        <div className="topbarSettingsMenu sidebarActionMenu" ref={appSettingsMenuRef}>
-          <button
-            type="button"
-            className={`iconBtn ${appSettingsOpen ? "iconBtnActive" : ""}`}
-            onClick={handleToggleAppSettings}
-            title="Application settings"
-            aria-label="Application settings"
-            aria-haspopup="menu"
-            aria-expanded={appSettingsOpen}
-          >
-            <Icon name="settings" />
-          </button>
-          {appSettingsOpen ? (
-            <div className="sidebarActionMenuDropdown topbarSettingsMenuDropdown" role="menu">
-              <div className="topbarSettingsLabel">Theme</div>
-              {([
-                ["dawn", "Dawn"],
-                ["sepia", "Sepia"],
-                ["ember", "Ember"],
-                ["slate", "Slate"],
-                ["midnight", "Midnight"],
-                ["cobalt", "Cobalt"],
-                ["neon", "Neon"],
-                ["forest", "Forest"],
-                ["matrix", "Matrix"],
-                ["synthwave", "Synthwave"],
-                ["quantum", "Quantum"],
-              ] as const).map(([id, label]) => (
-                <button
-                  key={id}
-                  type="button"
-                  className={`sidebarActionMenuItem topbarSettingsItem ${uiTheme === id ? "topbarSettingsItemActive" : ""}`}
-                  onClick={() => {
-                    setUiTheme(id);
-                    setAppSettingsOpen(false);
-                  }}
-                  role="menuitemradio"
-                  aria-checked={uiTheme === id}
-                >
-                  <span className={`topbarSettingsDot ${uiTheme === id ? "active" : ""}`} aria-hidden="true" />
-                  {label}
-                </button>
-              ))}
-              <div className="topbarSettingsLabel">Power</div>
-              <button
-                type="button"
-                className={`sidebarActionMenuItem topbarSettingsItem ${autoCaffeinate ? "topbarSettingsItemActive" : ""}`}
-                onClick={() => setAutoCaffeinate((prev) => !prev)}
-                role="menuitemcheckbox"
-                aria-checked={autoCaffeinate}
-                title="Keep the Mac awake while SSH sessions are active so connections (and remote processes) survive idle periods"
-              >
-                <span className={`topbarSettingsDot ${autoCaffeinate ? "active" : ""}`} aria-hidden="true" />
-                Auto-Caffeinate
-              </button>
-              {autoCaffeinate && keepAwakeActive ? (
-                <div className="topbarSettingsHint">Keeping Mac awake — SSH session active</div>
-              ) : null}
-            </div>
-          ) : null}
-        </div>
+        <button
+          type="button"
+          className={`iconBtn ${settingsOpen ? "iconBtnActive" : ""}`}
+          onClick={handleOpenSettings}
+          title="Settings"
+          aria-label="Settings"
+        >
+          <Icon name="settings" />
+        </button>
 
         {showShortcutHint && (
           <div className="shortcutHint">
@@ -10006,9 +9981,9 @@ export default function App() {
     </div>
   ), [
     active, activeProject, activeIsSsh, activeSshTarget, activeWorkspaceView, hydrated,
-    activityCenterOpen, activityItems, slidePanelOpen, agentPanelOpen, appSettingsOpen,
+    activityCenterOpen, activityItems, slidePanelOpen, agentPanelOpen, settingsOpen,
     uiTheme, autoCaffeinate, keepAwakeActive, showShortcutHint,
-    handleToggleActivityCenter, handleToggleAppSettings, reportError,
+    handleToggleActivityCenter, handleOpenSettings, reportError,
     updateActiveWorkspaceView, refreshRecordings,
   ]);
 
@@ -10223,7 +10198,7 @@ export default function App() {
                       launchCommand: command,
                       cwd,
                       envVars: envVarsForProjectId(activeProjectId, projects, environments),
-                      shellChoice: activeProject?.defaultShell ?? null,
+                      shellChoice: shellChoiceForProject(activeProject),
                     });
                     const s = applyPendingExit(createdRaw);
                     addSessionWithProjectSafeActivation(s);
@@ -10239,7 +10214,7 @@ export default function App() {
                     launchCommand: command,
                     cwd,
                     envVars: envVarsForProjectId(activeProjectId, projects, environments),
-                    shellChoice: activeProject?.defaultShell ?? null,
+                    shellChoice: shellChoiceForProject(activeProject),
                   });
                   const s = applyPendingExit(createdRaw);
                   addSessionWithProjectSafeActivation(s);
@@ -10371,6 +10346,43 @@ export default function App() {
 
           {shortcutsOpen && <ShortcutsModal onClose={() => setShortcutsOpen(false)} />}
 
+          {settingsOpen && (
+            <SettingsModal
+              themes={[
+                { id: "dawn", label: "Dawn" },
+                { id: "sepia", label: "Sepia" },
+                { id: "ember", label: "Ember" },
+                { id: "slate", label: "Slate" },
+                { id: "midnight", label: "Midnight" },
+                { id: "cobalt", label: "Cobalt" },
+                { id: "neon", label: "Neon" },
+                { id: "forest", label: "Forest" },
+                { id: "matrix", label: "Matrix" },
+                { id: "synthwave", label: "Synthwave" },
+                { id: "quantum", label: "Quantum" },
+              ]}
+              uiTheme={uiTheme}
+              onSetTheme={(id) => setUiTheme(id as UiTheme)}
+              autoCaffeinate={autoCaffeinate}
+              keepAwakeActive={keepAwakeActive}
+              onToggleAutoCaffeinate={() => setAutoCaffeinate((prev) => !prev)}
+              appDefaultShell={appDefaultShell}
+              onSetAppDefaultShell={setAppDefaultShell}
+              shells={detectedShells}
+              shellsLoading={shellsLoading}
+              onLoadShells={() => void loadShells()}
+              onOpenSecureStorage={() => {
+                setSettingsOpen(false);
+                openSecureStorageSettings();
+              }}
+              onOpenUpdates={() => {
+                setSettingsOpen(false);
+                setUpdatesOpen(true);
+              }}
+              onClose={() => setSettingsOpen(false)}
+            />
+          )}
+
           {shellPicker && (
             <ShellPickerModal
               projectTitle={
@@ -10378,9 +10390,9 @@ export default function App() {
               }
               shells={detectedShells}
               loading={shellsLoading}
-              projectDefault={
-                projects.find((p) => p.id === shellPicker.projectId)?.defaultShell ?? null
-              }
+              projectDefault={shellChoiceForProject(
+                projects.find((p) => p.id === shellPicker.projectId),
+              )}
               onRescan={() => void loadShells(true)}
               onClose={() => setShellPicker(null)}
               onPick={(choice) => {
