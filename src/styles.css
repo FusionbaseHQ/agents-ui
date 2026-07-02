@@ -8996,3 +8996,144 @@ select.input {
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+/* ───────────────────────── UI primitives (src/ui/) ───────────────────────── */
+
+/* Toasts — transient bottom-right notifications (ToastHost). */
+.toastHost {
+  position: fixed;
+  right: 16px;
+  bottom: 40px;
+  z-index: 700;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: min(420px, calc(100vw - 32px));
+}
+
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 12px;
+  border-radius: var(--radius-lg);
+  border: 1px solid rgba(var(--ink-rgb), 0.14);
+  background: rgba(var(--paper-panel-rgb), 0.97);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  box-shadow: 0 14px 40px rgba(var(--shadow-rgb), 0.35);
+  animation: toastIn 0.16s ease-out;
+  border-left-width: 3px;
+}
+
+@keyframes toastIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.toast-info { border-left-color: rgba(var(--accent-rgb), 0.8); }
+.toast-success { border-left-color: rgba(110, 190, 130, 0.9); }
+.toast-warning { border-left-color: rgba(224, 176, 96, 0.9); }
+.toast-error { border-left-color: rgb(var(--danger-rgb)); }
+
+.toastBody {
+  flex: 1;
+  min-width: 0;
+}
+
+.toastTitle {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-bright);
+  margin-bottom: 2px;
+}
+
+.toastMessage {
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.toastAction {
+  flex-shrink: 0;
+  align-self: center;
+  border: 1px solid rgba(var(--accent-rgb), 0.4);
+  background: rgba(var(--accent-rgb), 0.1);
+  color: var(--accent);
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+.toastAction:hover { background: rgba(var(--accent-rgb), 0.18); }
+
+.toastClose {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+
+.toastClose:hover { color: var(--text-bright); background: rgba(var(--ink-rgb), 0.08); }
+
+/* Empty states — title + hint + CTA (EmptyState). */
+.emptyState {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 28px 16px;
+  text-align: center;
+}
+
+.emptyStateCompact { padding: 16px 12px; }
+
+.emptyStateTitle {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.emptyStateHint {
+  font-size: 11.5px;
+  color: var(--muted);
+  max-width: 360px;
+  line-height: 1.5;
+}
+
+.emptyStateAction { margin-top: 8px; }
+
+/* Badges — inline tag chips (Badge). */
+.uiBadge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+}
+
+.uiBadge-accent { color: var(--accent); background: rgba(var(--accent-rgb), 0.13); }
+.uiBadge-muted { color: var(--muted); background: rgba(var(--ink-rgb), 0.07); }
+.uiBadge-outline { color: var(--muted); background: transparent; border: 1px solid rgba(var(--ink-rgb), 0.16); }
+.uiBadge-danger { color: rgb(var(--danger-rgb)); background: rgba(var(--danger-rgb), 0.12); }
+
+/* Menu shortcut hints (Menu). */
+.uiMenuHint {
+  flex-shrink: 0;
+  margin-left: 12px;
+  font-size: 10.5px;
+  color: var(--muted);
+  font-family: ui-monospace, monospace;
+}
