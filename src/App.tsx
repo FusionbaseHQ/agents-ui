@@ -2064,7 +2064,6 @@ export default function App() {
     [],
   );
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [sessionHistory, setSessionHistory] = useState<string[]>([]);
   const [splitViews, setSplitViews] = useState<SplitView[]>(() => loadPersistedSplitViews());
   const splitViewsRef = useRef(splitViews);
   useEffect(() => {
@@ -4193,25 +4192,6 @@ export default function App() {
 	      }
 	    }
 	  }, [activeId, flushQueuedOutput]);
-
-  // Track session history for the quick-switch bar (prepend new, stable order)
-  useEffect(() => {
-    if (!activeId) return;
-    setSessionHistory((prev) => {
-      if (prev.includes(activeId)) return prev;
-      const next = [activeId, ...prev];
-      return next.length > 10 ? next.slice(0, 10) : next;
-    });
-  }, [activeId]);
-
-  // Prune history entries for sessions that no longer exist
-  useEffect(() => {
-    const ids = new Set(sessions.map((s) => s.id));
-    setSessionHistory((prev) => {
-      const pruned = prev.filter((id) => ids.has(id));
-      return pruned.length === prev.length ? prev : pruned;
-    });
-  }, [sessions]);
 
   // Split view invariant: while a split view is active, the focused session must be a member.
   // If the user switches to a different session (sidebar click, Ctrl+Tab, etc), exit the split view
@@ -10266,63 +10246,80 @@ export default function App() {
             />
           )}
 
-          {sessionHistory.length > 1 && (
-            <div className="historyBar">
-              {sessionHistory.map((sid) => {
-                const s = sessions.find((x) => x.id === sid);
-                if (!s) return null;
-                const proj = projects.find((p) => p.id === s.projectId);
-                const isActive = sid === activeId;
-                const isSsh = isSshCommandLine(s.launchCommand ?? s.restoreCommand ?? null);
-                const isPersistent = Boolean(s.persistent);
-                const isSshType = isSsh && !isPersistent;
-                const isDefaultType = !isPersistent && !isSshType;
-                const historyEffect =
-                  getProcessEffectById(s.effectId) ??
-                  detectProcessEffect({
-                    command:
-                      s.launchCommand ??
-                      (s.restoreCommand?.trim() ? s.restoreCommand.trim() : null) ??
-                      null,
-                    name: s.name,
-                  });
-                return (
-                  <div
-                    key={sid}
-                    className={`historyTab ${isActive ? "historyTabActive" : ""} ${
-                      isSshType ? "sessionItemSsh" : ""
-                    } ${isPersistent ? "sessionItemPersistent" : ""} ${
-                      isDefaultType ? "sessionItemDefault" : ""
-                    } ${s.color ? "sessionItemColored" : ""} ${
-                      s.exited ? "sessionItemExited" : ""
-                    }`}
-                    style={s.color ? { "--tab-color": s.color } as React.CSSProperties : undefined}
-                    onClick={() => selectSessionById(sid)}
-                  >
-                    {s.symbol ? (
-                      <TabSymbolIcon symbol={s.symbol} />
-                    ) : historyEffect?.iconSrc ? (
-                      <span className={`agentBadge historyAgentBadge chip-${historyEffect.id}`} title={historyEffect.label}>
-                        <img className="agentIcon" src={historyEffect.iconSrc} alt={historyEffect.label} />
-                      </span>
-                    ) : null}
-                    <span className="historyTabProject">{proj?.title ?? "?"}</span>
-                    <span className="historyTabSep">/</span>
-                    <span className="historyTabName">{s.name}</span>
-                    <button
-                      className="historyTabClose"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setSessionHistory((prev) => prev.filter((id) => id !== sid));
+          {(() => {
+            // Session tab strip: the active project's sessions in stable
+            // (sidebar) order — a real tab strip, not a recency list.
+            const tabSessions = sessions
+              .filter((s) => s.projectId === activeProjectId && !s.closing)
+              .slice()
+              .sort(
+                (a, b) => (a.sidebarOrder ?? a.createdAt) - (b.sidebarOrder ?? b.createdAt),
+              );
+            if (tabSessions.length === 0) return null;
+            return (
+              <div className="historyBar" role="tablist" aria-label="Sessions">
+                {tabSessions.map((s) => {
+                  const sid = s.id;
+                  const isActive = sid === activeId;
+                  const isSsh = isSshCommandLine(s.launchCommand ?? s.restoreCommand ?? null);
+                  const isPersistent = Boolean(s.persistent);
+                  const isSshType = isSsh && !isPersistent;
+                  const isDefaultType = !isPersistent && !isSshType;
+                  const tabEffect =
+                    getProcessEffectById(s.effectId) ??
+                    detectProcessEffect({
+                      command:
+                        s.launchCommand ??
+                        (s.restoreCommand?.trim() ? s.restoreCommand.trim() : null) ??
+                        null,
+                      name: s.name,
+                    });
+                  return (
+                    <div
+                      key={sid}
+                      role="tab"
+                      aria-selected={isActive}
+                      className={`historyTab ${isActive ? "historyTabActive" : ""} ${
+                        isSshType ? "sessionItemSsh" : ""
+                      } ${isPersistent ? "sessionItemPersistent" : ""} ${
+                        isDefaultType ? "sessionItemDefault" : ""
+                      } ${s.color ? "sessionItemColored" : ""} ${
+                        s.exited ? "sessionItemExited" : ""
+                      }`}
+                      style={s.color ? { "--tab-color": s.color } as React.CSSProperties : undefined}
+                      onClick={() => selectSessionById(sid)}
+                      onAuxClick={(e) => {
+                        if (e.button === 1) {
+                          e.preventDefault();
+                          void onClose(sid);
+                        }
                       }}
+                      title={s.cwd ?? s.name}
                     >
-                      ×
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-          )}
+                      {s.symbol ? (
+                        <TabSymbolIcon symbol={s.symbol} />
+                      ) : tabEffect?.iconSrc ? (
+                        <span className={`agentBadge historyAgentBadge chip-${tabEffect.id}`} title={tabEffect.label}>
+                          <img className="agentIcon" src={tabEffect.iconSrc} alt={tabEffect.label} />
+                        </span>
+                      ) : null}
+                      <span className="historyTabName">{s.name}</span>
+                      <button
+                        className="historyTabClose"
+                        title="Close session"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void onClose(sid);
+                        }}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
 
           {newOpen && <NewSessionModal
             ref={newSessionModalRef}
