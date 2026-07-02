@@ -5,9 +5,11 @@ function normalizeSmartQuotes(input: string): string {
   return input.replace(/[""„‟«»]/g, '"').replace(/[''‚‛‹›]/g, "'");
 }
 
-// The <select> uses string keys: "bundled-nu" for the default, else the shell path.
+// The <select> uses string keys: the bundled kind ("bundled-agsh"/"bundled-nu")
+// for a bundled shell, else the shell path.
 function choiceToKey(choice: ShellChoice | null | undefined): string {
-  if (!choice || choice.kind === "bundled-nu") return "bundled-nu";
+  if (!choice || choice.kind === "bundled-agsh") return "bundled-agsh";
+  if (choice.kind === "bundled-nu") return "bundled-nu";
   return choice.path;
 }
 
@@ -16,7 +18,8 @@ function keyToChoice(
   shells: ShellInfo[],
   fallback: ShellChoice | null,
 ): ShellChoice | null {
-  if (key === "bundled-nu") return null; // null ⇒ bundled default
+  if (key === "bundled-agsh") return null; // null ⇒ bundled default (agsh)
+  if (key === "bundled-nu") return { kind: "bundled-nu" };
   const match = shells.find((s) => s.kind === "system" && s.path === key);
   if (match) return { kind: "system", path: match.path, family: match.family };
   // Preserve a previously-selected shell even if detection hasn't (re)found it.
@@ -373,12 +376,19 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
                   value={defaultShellKey}
                   onChange={(e) => setDefaultShellKey(e.target.value)}
                 >
-                  <option value="bundled-nu">Bundled Nushell (default)</option>
-                  {shellOptions.map((o) => (
-                    <option key={o.key} value={o.key}>
-                      {o.label} — {o.detail}
-                    </option>
-                  ))}
+                  <optgroup label="Bundled with the app">
+                    <option value="bundled-agsh">agsh (default)</option>
+                    <option value="bundled-nu">Nushell</option>
+                  </optgroup>
+                  {shellOptions.length > 0 && (
+                    <optgroup label="Installed shells">
+                      {shellOptions.map((o) => (
+                        <option key={o.key} value={o.key}>
+                          {o.label} — {o.detail}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
                 </select>
                 <div className="hint">
                   {shellsLoading

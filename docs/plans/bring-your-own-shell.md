@@ -29,6 +29,35 @@ Key files: backend `detect_shells` + `ShellChoice`/`resolve_shell` in
 (`persist.rs`); frontend `src/shells.ts`, `ShellPickerModal.tsx`, wiring in
 `App.tsx` / `WorkspaceSidebar.tsx` / `ProjectModal.tsx`.
 
+### Addendum — second bundled shell: agsh (2026-07-02)
+
+The app now also bundles **agsh** as a sidecar (`bin/agsh` in `externalBin`,
+built from a local checkout via `scripts/build-agsh-macos.sh`) — and as of the
+same change, agsh is the **app default** shell. Design points:
+
+- New `ShellChoice.kind == "bundled-agsh"` (choice + `ShellInfo` + persisted
+  project default all round-trip it). A `null`/absent choice now means bundled
+  agsh; picking Nushell stores an explicit `{kind: "bundled-nu"}`. The default
+  resolution chain is agsh → nu → `$SHELL` (`resolve_shell`). Note that
+  projects saved before this change with "Bundled Nushell" selected were stored
+  as `null` (then = the default) and therefore now open agsh.
+- Picker order: Recommended = bundled agsh, bundled Nushell, the login shell
+  (plus the project default if it's some other system shell); all remaining
+  installed shells under "Other".
+- `ResolvedShell::BundledAgsh` launches the sidecar bare (agsh has no
+  `-l`/`-i`; bare invocation is interactive). The zellij persistent wrapper
+  gets `AGENTS_UI_ZELLIJ_LOGIN=0` for agsh, and a *system-installed* agsh runs
+  commands as `agsh -c …` (no `-l`). Agent quick-start (run-a-command) sessions
+  keep `$SHELL -lc` for both bundled shells.
+- `$SHELL` / login-PATH import stay pointed at the user's login shell for both
+  bundled shells (an in-bundle SHELL path would break when the app moves).
+- UI: bundled vs system shells are differentiated — a "Bundled" badge per row
+  in `ShellPickerModal`, and `<optgroup>`s ("Bundled with the app" /
+  "Installed shells") in the ProjectModal default-shell select. The picker's
+  bundled rows are detection-driven (missing sidecars don't show); the
+  ProjectModal always offers both bundled options, and a missing sidecar falls
+  back gracefully at spawn.
+
 ---
 
 ---

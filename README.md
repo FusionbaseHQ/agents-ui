@@ -294,11 +294,12 @@ scripts/purge-agents-ui-macos.sh
 
 ### Bundled Tools (macOS)
 
-Agents UI bundles `nu` (Nushell) and `zellij` as Tauri sidecars under `src-tauri/bin` so the app runs without system dependencies.
+Agents UI bundles `nu` (Nushell), `agsh`, and `zellij` as Tauri sidecars under `src-tauri/bin` so the app runs without system dependencies. Nushell and Zellij are fetched from their GitHub releases; agsh is built from a local checkout.
 
 ```bash
 ./scripts/fetch-nu-macos.sh 0.104.0
 ./scripts/fetch-zellij-macos.sh latest
+./scripts/build-agsh-macos.sh ../agsh   # or AGSH_DIR=/path/to/agsh
 ```
 
 ### Production Build

@@ -2,8 +2,9 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   type ShellChoice,
   type ShellInfo,
-  BUNDLED_NU,
+  BUNDLED_AGSH,
   choiceMatchesInfo,
+  isBundledKind,
   shellInfoToChoice,
 } from "../../shells";
 
@@ -23,32 +24,38 @@ type Row = { info: ShellInfo; group: "recommended" | "other" };
 /**
  * "Which shell?" prompt for opening an individual terminal. The fast path (the
  * plain "Terminal" button) skips this and uses the project default; this is the
- * explicit per-terminal override. The project default and the OS login shell are
- * surfaced under "Recommended"; everything else under "Other". Uses the shared
- * modal chrome (.modal / .modalTitle / .modalActions / .btn) for consistency.
+ * explicit per-terminal override. "Recommended" lists the bundled shells (agsh —
+ * the default — then Nushell), the OS login shell, and the project default;
+ * every other installed shell goes under "Other". Uses the shared modal chrome
+ * (.modal / .modalTitle / .modalActions / .btn) for consistency.
  */
 export function ShellPickerModal(props: ShellPickerModalProps) {
   const { projectTitle, shells, loading, projectDefault, onRescan, onClose, onPick } = props;
-  const defaultChoice = projectDefault ?? BUNDLED_NU;
+  const defaultChoice = projectDefault ?? BUNDLED_AGSH;
 
   const [selected, setSelected] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
 
-  // Ordered list: bundled + login shell first (Recommended), then the rest.
+  // Ordered list: agsh, Nushell (bundled), the login shell, and the project
+  // default under "Recommended"; every other installed shell under "Other".
   const rows = useMemo<Row[]>(() => {
-    const synthetic: ShellInfo = {
-      id: "bundled-nu",
-      kind: "bundled-nu",
-      family: "nu",
-      displayName: "Bundled Nushell",
+    const syntheticAgsh: ShellInfo = {
+      id: "bundled-agsh",
+      kind: "bundled-agsh",
+      family: "agsh",
+      displayName: "Bundled agsh",
       path: "",
       version: null,
       verified: true,
       isLoginDefault: false,
-      supportsIntegration: true,
+      supportsIntegration: false,
     };
-    const bundled = shells.find((s) => s.kind === "bundled-nu") ?? synthetic;
-    const all = [bundled, ...shells.filter((s) => s.kind === "system")];
+    // Bundled shells as detected (backend lists agsh first, then Nushell);
+    // synthesize the default while detection is still loading so the list is
+    // never empty.
+    const bundled = shells.filter((s) => isBundledKind(s.kind));
+    const bundledList = bundled.length ? bundled : [syntheticAgsh];
+    const all = [...bundledList, ...shells.filter((s) => s.kind === "system")];
 
     const recIds = new Set<string>();
     const rec: ShellInfo[] = [];
@@ -58,8 +65,10 @@ export function ShellPickerModal(props: ShellPickerModalProps) {
         rec.push(info);
       }
     };
-    add(all.find((s) => choiceMatchesInfo(defaultChoice, s)) ?? bundled);
+    for (const b of bundledList) add(b);
     add(all.find((s) => s.isLoginDefault));
+    // A project default that is some other system shell is recommended too.
+    add(all.find((s) => choiceMatchesInfo(defaultChoice, s)));
     const others = all.filter((s) => !recIds.has(s.id));
 
     return [
@@ -114,7 +123,9 @@ export function ShellPickerModal(props: ShellPickerModalProps) {
   const openLabel = selectedInfo
     ? selectedInfo.kind === "bundled-nu"
       ? "Nushell"
-      : selectedInfo.displayName
+      : selectedInfo.kind === "bundled-agsh"
+        ? "agsh"
+        : selectedInfo.displayName
     : "shell";
 
   return (
@@ -130,7 +141,16 @@ export function ShellPickerModal(props: ShellPickerModalProps) {
               const prev = rows[i - 1];
               const showHeader = !prev || prev.group !== group;
               const isDefault = choiceMatchesInfo(defaultChoice, info);
-              const sub = info.kind === "bundled-nu" ? "bundled · cross-platform" : info.path;
+              const sub =
+                info.kind === "bundled-nu"
+                  ? "ships with the app · cross-platform"
+                  : info.kind === "bundled-agsh"
+                    ? "ships with the app · built for coding agents"
+                    : info.path;
+              // The "Bundled" tag carries the bundled-ness; drop the prefix.
+              const nameLabel = isBundledKind(info.kind)
+                ? info.displayName.replace(/^Bundled\s+/, "")
+                : info.displayName;
               return (
                 <React.Fragment key={info.id}>
                   {showHeader ? (
@@ -149,7 +169,10 @@ export function ShellPickerModal(props: ShellPickerModalProps) {
                     <span className="shellOptionIcon">{info.family}</span>
                     <span className="shellOptionMain">
                       <span className="shellOptionName">
-                        {info.displayName}
+                        {nameLabel}
+                        {isBundledKind(info.kind) ? (
+                          <span className="shellTag bundled">Bundled</span>
+                        ) : null}
                         {isDefault ? <span className="shellTag">Default</span> : null}
                         {info.isLoginDefault ? <span className="shellTag login">Login shell</span> : null}
                       </span>

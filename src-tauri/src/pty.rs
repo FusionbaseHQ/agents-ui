@@ -1132,16 +1132,33 @@ fn find_bundled_nu() -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_family = "unix")]
+fn find_bundled_agsh() -> Option<PathBuf> {
+    let sidecar = sidecar_path("agsh").filter(|p| p.is_file());
+    if sidecar.is_some() {
+        return sidecar;
+    }
+    #[cfg(debug_assertions)]
+    {
+        let dev = dev_sidecar_path("agsh").filter(|p| p.is_file());
+        if dev.is_some() {
+            return dev;
+        }
+    }
+    None
+}
+
 // ───────────────────────── Bring-your-own-shell ─────────────────────────
 //
-// The app bundles Nushell and uses it as the default interactive shell. This
-// block lets a user instead launch one of their own installed shells (zsh /
-// bash / fish / …) per project or per session, while keeping bundled Nushell
-// the default. Detection is advisory and never blocks a launch: if a chosen
-// shell is missing at spawn time `resolve_shell` falls back to the default.
+// The app bundles two shells — agsh (the default interactive shell) and
+// Nushell — and this block lets a user instead launch one of their own
+// installed shells (zsh / bash / fish / …) per project or per session.
+// Detection is advisory and never blocks a launch: if a chosen shell is
+// missing at spawn time `resolve_shell` falls back to the default.
 
 /// A shell selection passed from the frontend to `create_session`.
-/// `kind == "bundled-nu"` (or `None`) keeps the default bundled Nushell;
+/// `kind == "bundled-agsh"` (or `None`) keeps the default bundled agsh;
+/// `kind == "bundled-nu"` launches the bundled Nushell sidecar;
 /// `kind == "system"` launches `path` (an installed shell binary).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1157,11 +1174,11 @@ pub struct ShellChoice {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShellInfo {
-    /// Stable key: canonical path, or "bundled-nu" for the built-in.
+    /// Stable key: canonical path, or "bundled-nu" / "bundled-agsh" for built-ins.
     pub id: String,
-    /// "bundled-nu" | "system"
+    /// "bundled-nu" | "bundled-agsh" | "system"
     pub kind: String,
-    /// "nu" | "zsh" | "bash" | "fish" | "sh" | "dash" | "ksh" | …
+    /// "nu" | "agsh" | "zsh" | "bash" | "fish" | "sh" | "dash" | "ksh" | …
     pub family: String,
     pub display_name: String,
     /// Absolute launch path; empty for the bundled shell (resolved at spawn).
@@ -1179,6 +1196,8 @@ fn shell_family_from_name(name: &str) -> &'static str {
     let n = name.trim().to_ascii_lowercase();
     if n == "nu" || n == "nushell" {
         "nu"
+    } else if n.contains("agsh") {
+        "agsh"
     } else if n.contains("pwsh") || n.contains("powershell") {
         "pwsh"
     } else if n.contains("fish") {
@@ -1209,6 +1228,7 @@ fn shell_family_from_name(name: &str) -> &'static str {
 fn shell_display_name(family: &str, file_name: &str) -> String {
     match family {
         "nu" => "Nushell".to_string(),
+        "agsh" => "agsh".to_string(),
         "zsh" => "Zsh".to_string(),
         "bash" => "Bash".to_string(),
         "fish" => "Fish".to_string(),
@@ -1251,7 +1271,7 @@ fn is_executable_file(path: &Path) -> bool {
 /// hanging binary can never wedge detection.
 #[cfg(target_family = "unix")]
 fn probe_shell_version(path: &str, family: &str) -> Option<String> {
-    if !matches!(family, "nu" | "zsh" | "bash" | "fish" | "pwsh") {
+    if !matches!(family, "nu" | "agsh" | "zsh" | "bash" | "fish" | "pwsh") {
         return None;
     }
     let mut cmd = Command::new(path);
@@ -1307,8 +1327,8 @@ fn shell_candidate_paths() -> Vec<String> {
     }
 
     // 4. Well-known absolute paths.
-    const NAMES: [&str; 10] = [
-        "zsh", "bash", "fish", "nu", "pwsh", "dash", "ksh", "tcsh", "elvish", "xonsh",
+    const NAMES: [&str; 11] = [
+        "zsh", "bash", "fish", "nu", "agsh", "pwsh", "dash", "ksh", "tcsh", "elvish", "xonsh",
     ];
     const DIRS: [&str; 5] = [
         "/bin",
@@ -1354,7 +1374,22 @@ fn detect_shells_uncached() -> Vec<ShellInfo> {
     let mut seen: Vec<String> = Vec::new();
     let mut shells: Vec<ShellInfo> = Vec::new();
 
-    // Bundled Nushell is always first and always available.
+    // Bundled shells come first: agsh (the app default), then Nushell. Both
+    // ship inside the app bundle, so `path` stays empty and is resolved at
+    // spawn time — a stored choice survives the app being moved or updated.
+    if find_bundled_agsh().is_some() {
+        shells.push(ShellInfo {
+            id: "bundled-agsh".to_string(),
+            kind: "bundled-agsh".to_string(),
+            family: "agsh".to_string(),
+            display_name: "Bundled agsh".to_string(),
+            path: String::new(),
+            version: None,
+            verified: true,
+            is_login_default: false,
+            supports_integration: false,
+        });
+    }
     if find_bundled_nu().is_some() {
         shells.push(ShellInfo {
             id: "bundled-nu".to_string(),
@@ -1436,23 +1471,28 @@ pub fn detect_shells(
 /// The interactive shell a session will actually launch.
 #[cfg(target_family = "unix")]
 enum ResolvedShell {
-    /// Bundled Nushell (the default). Carries the resolved `nu` binary path.
+    /// Bundled Nushell. Carries the resolved `nu` binary path.
     BundledNu(PathBuf),
+    /// Bundled agsh (the default). Carries the resolved `agsh` binary path.
+    BundledAgsh(PathBuf),
     /// A user-installed shell at this absolute path.
     System(String),
 }
 
 /// Resolve a frontend `ShellChoice` into a concrete shell, falling back to the
-/// default (bundled nu, else `$SHELL`) when a chosen system shell is missing.
-/// Returns an optional warning describing any fallback.
+/// default (bundled agsh, else bundled nu, else `$SHELL`) when a chosen shell
+/// is missing. Returns an optional warning describing any fallback.
 #[cfg(target_family = "unix")]
 fn resolve_shell(
     choice: Option<&ShellChoice>,
     default_shell: &str,
 ) -> (ResolvedShell, Option<String>) {
-    let default_resolved = || match find_bundled_nu() {
-        Some(nu) => ResolvedShell::BundledNu(nu),
-        None => ResolvedShell::System(default_shell.to_string()),
+    let default_resolved = || match find_bundled_agsh() {
+        Some(agsh) => ResolvedShell::BundledAgsh(agsh),
+        None => match find_bundled_nu() {
+            Some(nu) => ResolvedShell::BundledNu(nu),
+            None => ResolvedShell::System(default_shell.to_string()),
+        },
     };
 
     match choice {
@@ -1466,6 +1506,17 @@ fn resolve_shell(
             ),
             None => (default_resolved(), None),
         },
+        Some(c) if c.kind == "bundled-nu" => match find_bundled_nu() {
+            Some(nu) => (ResolvedShell::BundledNu(nu), None),
+            None => (
+                default_resolved(),
+                Some(
+                    "Bundled Nushell is missing in this build; started the default shell instead."
+                        .to_string(),
+                ),
+            ),
+        },
+        // `None` / "bundled-agsh" (and anything unrecognized) ⇒ the app default.
         _ => (default_resolved(), None),
     }
 }
@@ -1475,8 +1526,16 @@ fn interactive_login_args(path: &str) -> Vec<String> {
     match shell_family_from_name(&file_name_of(path)) {
         // fish only enters interactive mode reliably with an explicit -i.
         "fish" => vec!["-l".to_string(), "-i".to_string()],
+        // agsh has no login/interactive flags; bare invocation is interactive.
+        "agsh" => Vec::new(),
         _ => vec!["-l".to_string()],
     }
+}
+
+/// Whether this shell accepts `-l` (used by the zellij wrapper's login exec).
+#[cfg(target_family = "unix")]
+fn shell_accepts_login_flag(path: &str) -> bool {
+    shell_family_from_name(&file_name_of(path)) != "agsh"
 }
 
 #[cfg(target_family = "unix")]
@@ -1748,15 +1807,19 @@ pub fn create_session(
     #[cfg(not(target_family = "unix"))]
     let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
 
-    // Resolve the requested shell up front. `None`/`bundled-nu` keeps today's
-    // default (bundled Nushell); a `system` choice launches the user's own
-    // shell, with a graceful fallback if it has gone missing.
+    // Resolve the requested shell up front. `None`/`bundled-agsh` keeps the
+    // default (bundled agsh); `bundled-nu` launches bundled Nushell; a `system`
+    // choice launches the user's own shell, with a graceful fallback if it has
+    // gone missing.
     #[cfg(target_family = "unix")]
     let (resolved_shell, shell_warning) = resolve_shell(shell_choice.as_ref(), &shell);
     #[cfg(target_family = "unix")]
     let effective_shell = match &resolved_shell {
         ResolvedShell::System(p) => p.clone(),
-        ResolvedShell::BundledNu(_) => shell.clone(),
+        // Bundled shells keep $SHELL / PATH-import pointed at the user's login
+        // shell: their profile config lives there, and a SHELL that points into
+        // the .app bundle would break if the app moves.
+        ResolvedShell::BundledNu(_) | ResolvedShell::BundledAgsh(_) => shell.clone(),
     };
 
     let persistent = persistent.unwrap_or(false);
@@ -1811,6 +1874,7 @@ pub fn create_session(
 
         let (inner_shell, inner_use_nu) = match &resolved_shell {
             ResolvedShell::BundledNu(nu) => (nu.to_string_lossy().to_string(), true),
+            ResolvedShell::BundledAgsh(agsh) => (agsh.to_string_lossy().to_string(), false),
             ResolvedShell::System(p) => (p.clone(), false),
         };
 
@@ -1859,6 +1923,15 @@ pub fn create_session(
                 true,
                 shell.clone(),
             ),
+            // inner_shell is the agsh path (not $SHELL) so the zsh/bash
+            // integration blocks below don't fire for an agsh session.
+            ResolvedShell::BundledAgsh(agsh) => (
+                agsh.to_string_lossy().to_string(),
+                Vec::new(),
+                "agsh".to_string(),
+                false,
+                agsh.to_string_lossy().to_string(),
+            ),
             ResolvedShell::System(p) => {
                 let args = interactive_login_args(p);
                 let shown = format!("{p} {}", args.join(" "));
@@ -1866,18 +1939,22 @@ pub fn create_session(
             }
         }
     } else {
-        // Run-a-command sessions (agent quick-starts like claude/codex). Nushell
-        // is not used as the command runner; the default path keeps `$SHELL -lc`,
-        // while an explicitly chosen system shell runs `<shell> -l -c <command>`.
+        // Run-a-command sessions (agent quick-starts like claude/codex). Bundled
+        // shells are not used as the command runner; those paths keep `$SHELL -lc`,
+        // while an explicitly chosen system shell runs `<shell> -l -c <command>`
+        // (agsh takes no `-l`, so it gets a plain `-c`).
         match &resolved_shell {
-            ResolvedShell::System(p) => (
-                p.clone(),
-                vec!["-l".to_string(), "-c".to_string(), command.clone()],
-                format!("{p} -l -c {command}"),
-                false,
-                p.clone(),
-            ),
-            ResolvedShell::BundledNu(_) => (
+            ResolvedShell::System(p) => {
+                let mut args: Vec<String> = Vec::new();
+                if shell_accepts_login_flag(p) {
+                    args.push("-l".to_string());
+                }
+                args.push("-c".to_string());
+                args.push(command.clone());
+                let shown = format!("{p} {} {command}", if shell_accepts_login_flag(p) { "-l -c" } else { "-c" });
+                (p.clone(), args, shown, false, p.clone())
+            }
+            ResolvedShell::BundledNu(_) | ResolvedShell::BundledAgsh(_) => (
                 shell.clone(),
                 vec!["-lc".to_string(), command.clone()],
                 format!("{shell} -lc {command}"),
@@ -1960,7 +2037,11 @@ pub fn create_session(
         if let Some(wrapper) = ensure_zellij_shell_wrapper(&app) {
             cmd.env("SHELL", wrapper.to_string_lossy().to_string());
             cmd.env("AGENTS_UI_ZELLIJ_REAL_SHELL", inner_shell.clone());
-            cmd.env("AGENTS_UI_ZELLIJ_LOGIN", "1");
+            // agsh takes no `-l`; the wrapper execs the real shell bare then.
+            cmd.env(
+                "AGENTS_UI_ZELLIJ_LOGIN",
+                if shell_accepts_login_flag(&inner_shell) { "1" } else { "0" },
+            );
             cmd.env("AGENTS_UI_ZELLIJ_RESTORE_XDG", if use_nu { "0" } else { "1" });
 
             capture_original_env(&mut cmd, "HOME", "AGENTS_UI_ORIG_HOME_PRESENT", "AGENTS_UI_ORIG_HOME");

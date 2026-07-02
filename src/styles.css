@@ -4947,6 +4947,13 @@ select.input {
   background: rgba(var(--ink-rgb), 0.07);
 }
 
+/* Shells that ship with the app, vs. shells installed on the system. */
+.shellTag.bundled {
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid rgba(var(--ink-rgb), 0.16);
+}
+
 .shellOptionCheck {
   flex-shrink: 0;
   color: var(--accent);

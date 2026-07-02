@@ -7,6 +7,7 @@ This project aims to follow Semantic Versioning.
 ## Unreleased
 
 - **Bring your own shell**: terminals can now launch with one of your own installed shells (zsh, bash, fish, …) instead of the bundled Nushell. Set a per-project **Default shell** in Project settings (default stays Bundled Nushell), and use the new **Terminal with shell…** menu item to open a one-off terminal with any detected shell. Shell detection is multi-source (`/etc/shells`, `$SHELL`, `PATH`, well-known locations) and never blocks a launch — if a chosen shell goes missing the session falls back to the default with a toast.
+- **Bundled agsh, now the default shell**: the app ships [agsh](https://github.com/FusionbaseHQ/agsh) as a second bundled shell and makes it the default for new terminals (projects with no explicit default shell now open agsh; bundled Nushell remains available as an option). The picker recommends agsh, Nushell, and your login shell — with bundled shells marked by a **Bundled** badge — and lists all other installed shells below; the project **Default shell** select groups bundled and installed shells separately.
 
 ## 0.10.0
 
