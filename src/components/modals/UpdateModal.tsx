@@ -1,4 +1,5 @@
 import React from "react";
+import { Modal } from "../../ui";
 
 export type UpdateCheckState =
   | { status: "idle" }
@@ -40,40 +41,11 @@ export function UpdateModal({
   const releaseUrl = releaseUrlFromState ?? fallbackReleaseUrl;
 
   return (
-    <div className="modalBackdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h3 className="modalTitle">Updates</h3>
-        <div className="hint" style={{ marginTop: 0 }}>
-          {appName} {currentVersion ? `v${currentVersion}` : ""}
-        </div>
-        {updateSourceLabel ? <div className="hint">Source: {updateSourceLabel}</div> : null}
-        <div className="hint">
-          Checking for updates contacts GitHub; opening a release launches your browser to download the installer.
-        </div>
-        {checkUrl ? (
-          <div className="hint" style={{ fontFamily: "ui-monospace, monospace" }}>
-            Checks: {checkUrl}
-          </div>
-        ) : null}
-        {releaseUrl ? (
-          <div className="hint" style={{ fontFamily: "ui-monospace, monospace" }}>
-            Opens: {releaseUrl}
-          </div>
-        ) : null}
-
-        {state.status === "idle" ? (
-          <div className="hint">Check GitHub Releases for a newer version.</div>
-        ) : null}
-        {state.status === "checking" ? <div className="hint">Checking…</div> : null}
-        {state.status === "upToDate" ? (
-          <div className="hint">Up to date (latest: {state.latestVersion}).</div>
-        ) : null}
-        {state.status === "updateAvailable" ? (
-          <div className="hint">Update available: {state.latestVersion}.</div>
-        ) : null}
-        {state.status === "error" ? <div className="hint">{state.message}</div> : null}
-
-        <div className="modalActions">
+    <Modal
+      title="Updates"
+      onClose={onClose}
+      actions={
+        <>
           <button type="button" className="btn" onClick={onClose}>
             Close
           </button>
@@ -90,8 +62,38 @@ export function UpdateModal({
           <button type="button" className="btn" onClick={onCheck} disabled={isChecking}>
             {isChecking ? "Checking…" : "Check now"}
           </button>
-        </div>
+        </>
+      }
+    >
+      <div className="hint" style={{ marginTop: 0 }}>
+        {appName} {currentVersion ? `v${currentVersion}` : ""}
       </div>
-    </div>
+      {updateSourceLabel ? <div className="hint">Source: {updateSourceLabel}</div> : null}
+      <div className="hint">
+        Checking for updates contacts GitHub; opening a release launches your browser to download the installer.
+      </div>
+      {checkUrl ? (
+        <div className="hint" style={{ fontFamily: "ui-monospace, monospace" }}>
+          Checks: {checkUrl}
+        </div>
+      ) : null}
+      {releaseUrl ? (
+        <div className="hint" style={{ fontFamily: "ui-monospace, monospace" }}>
+          Opens: {releaseUrl}
+        </div>
+      ) : null}
+
+      {state.status === "idle" ? (
+        <div className="hint">Check GitHub Releases for a newer version.</div>
+      ) : null}
+      {state.status === "checking" ? <div className="hint">Checking…</div> : null}
+      {state.status === "upToDate" ? (
+        <div className="hint">Up to date (latest: {state.latestVersion}).</div>
+      ) : null}
+      {state.status === "updateAvailable" ? (
+        <div className="hint">Update available: {state.latestVersion}.</div>
+      ) : null}
+      {state.status === "error" ? <div className="hint">{state.message}</div> : null}
+    </Modal>
   );
 }

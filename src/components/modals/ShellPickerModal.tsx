@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Modal } from "../../ui";
 import {
   type ShellChoice,
   type ShellInfo,
@@ -113,9 +114,6 @@ export function ShellPickerModal(props: ShellPickerModalProps) {
     } else if (e.key === "Enter") {
       e.preventDefault();
       confirm();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      onClose();
     }
   };
 
@@ -129,10 +127,11 @@ export function ShellPickerModal(props: ShellPickerModalProps) {
     : "shell";
 
   return (
-    <div className="modalBackdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()} onKeyDown={onKeyDown}>
-        <h3 className="modalTitle">Open terminal{projectTitle ? ` — ${projectTitle}` : ""}</h3>
-
+    <Modal title={`Open terminal${projectTitle ? ` — ${projectTitle}` : ""}`} onClose={onClose}>
+      {/* Wrapper carries the listbox keyboard handling so arrows/Enter work
+          from anywhere inside the dialog (as before, when the handler sat on
+          the .modal panel). Escape is handled by the shared Modal chrome. */}
+      <div onKeyDown={onKeyDown}>
         <div className="formRow">
           <div className="label">Shell</div>
           <div className="shellList" role="listbox" aria-label="Available shells" tabIndex={0} ref={listRef}>
@@ -211,6 +210,6 @@ export function ShellPickerModal(props: ShellPickerModalProps) {
           </button>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

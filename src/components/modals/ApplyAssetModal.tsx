@@ -1,4 +1,5 @@
 import React from "react";
+import { Modal } from "../../ui";
 
 type ApplyAssetModalProps = {
   isOpen: boolean;
@@ -26,31 +27,14 @@ export function ApplyAssetModal({
   if (!isOpen) return null;
 
   return (
-    <div
-      className="modalBackdrop"
-      onClick={() => {
+    <Modal
+      title="Apply template"
+      onClose={() => {
         if (applying) return;
         onClose();
       }}
-    >
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h3 className="modalTitle">Apply template</h3>
-
-        {error && (
-          <div className="pathPickerError" role="alert">
-            {error}
-          </div>
-        )}
-
-        <div className="hint" style={{ marginTop: 0 }}>
-          Template: {templateName}
-          <br />
-          Relative path: {relativePath}
-          <br />
-          Target ({targetLabel}): {targetDir}
-        </div>
-
-        <div className="modalActions">
+      actions={
+        <>
           <button type="button" className="btn" onClick={onClose} disabled={applying}>
             Cancel
           </button>
@@ -72,9 +56,23 @@ export function ApplyAssetModal({
           >
             {applying ? "Applying…" : "Apply & overwrite"}
           </button>
+        </>
+      }
+    >
+      {error && (
+        <div className="pathPickerError" role="alert">
+          {error}
         </div>
+      )}
+
+      <div className="hint" style={{ marginTop: 0 }}>
+        Template: {templateName}
+        <br />
+        Relative path: {relativePath}
+        <br />
+        Target ({targetLabel}): {targetDir}
       </div>
-    </div>
+    </Modal>
   );
 }
 

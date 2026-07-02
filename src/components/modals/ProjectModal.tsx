@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo, useImperativeHandle, forwardRef } from "react";
+import { Modal } from "../../ui";
 import type { ShellChoice, ShellInfo } from "../../shells";
 
 function normalizeSmartQuotes(input: string): string {
@@ -199,227 +200,224 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
     };
 
     return (
-      <div className="modalBackdrop" onClick={onClose}>
-        <div className="modal" onClick={(e) => e.stopPropagation()}>
-          <h3 className="modalTitle">{mode === "new" ? "New project" : "Project settings"}</h3>
-          <form onSubmit={handleSubmit}>
-            <div className="formRow">
-              <div className="label">Title</div>
-              <input
-                className="input"
-                ref={titleRef}
-                value={title}
-                onChange={(e) => setTitle(normalizeSmartQuotes(e.target.value))}
-                placeholder="e.g. my-repo"
-              />
+      <Modal title={mode === "new" ? "New project" : "Project settings"} onClose={onClose}>
+        <form onSubmit={handleSubmit}>
+          <div className="formRow">
+            <div className="label">Title</div>
+            <input
+              className="input"
+              ref={titleRef}
+              value={title}
+              onChange={(e) => setTitle(normalizeSmartQuotes(e.target.value))}
+              placeholder="e.g. my-repo"
+            />
+          </div>
+          <div className="formRow">
+            <div className="label">Type</div>
+            <div className="segmentedControl">
+              <button
+                type="button"
+                className={`segmentedBtn segmentedBtnLocal ${!isSsh ? "segmentedBtnActive" : ""}`}
+                onClick={() => setProjectType("local")}
+              >
+                Local
+              </button>
+              <button
+                type="button"
+                className={`segmentedBtn segmentedBtnSsh ${isSsh ? "segmentedBtnActive" : ""}`}
+                onClick={() => setProjectType("ssh")}
+              >
+                SSH
+              </button>
             </div>
-            <div className="formRow">
-              <div className="label">Type</div>
-              <div className="segmentedControl">
-                <button
-                  type="button"
-                  className={`segmentedBtn segmentedBtnLocal ${!isSsh ? "segmentedBtnActive" : ""}`}
-                  onClick={() => setProjectType("local")}
-                >
-                  Local
-                </button>
-                <button
-                  type="button"
-                  className={`segmentedBtn segmentedBtnSsh ${isSsh ? "segmentedBtnActive" : ""}`}
-                  onClick={() => setProjectType("ssh")}
-                >
-                  SSH
-                </button>
-              </div>
-            </div>
+          </div>
 
-            {isSsh ? (
-              <>
-                <div className="formRow">
-                  <div className="label">SSH host</div>
-                  <input
-                    className="input"
-                    value={sshTarget}
-                    onChange={(e) => setSshTarget(e.target.value)}
-                    placeholder="Start typing an SSH host…"
-                    autoComplete="off"
-                    autoCapitalize="off"
-                    autoCorrect="off"
-                    spellCheck={false}
-                  />
-                  {!sshHostsLoading && sshTarget.trim() && (
-                    <div className="sshHostList" aria-label="SSH config hosts">
-                      {hostCandidates.length === 0 ? (
-                        <div className="sshHostListEmpty">
-                          No matches. You can still type a hostname directly.
-                        </div>
-                      ) : (
-                        <div className="sshHostListItems" role="listbox" aria-label="Matches">
-                          {hostCandidates.map((h) => {
-                            const isSelected = h.alias === sshTarget.trim();
-                            const meta = formatHostDetails(h);
-                            return (
-                              <button
-                                key={h.alias}
-                                type="button"
-                                className={`sshHostItem ${isSelected ? "sshHostItemActive" : ""}`}
-                                onClick={() => setSshTarget(h.alias)}
-                                title={meta ? `${h.alias}\n${meta}` : h.alias}
-                              >
-                                <div className="sshHostItemMain">
-                                  <div className="sshHostAlias">{h.alias}</div>
-                                  {meta && <div className="sshHostMeta">{meta}</div>}
-                                </div>
-                                <div className="sshHostPick" aria-hidden="true">
-                                  {isSelected ? "✓" : ""}
-                                </div>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  )}
-                  {sshHostsLoading ? (
-                    <div className="hint">Loading hosts…</div>
-                  ) : selectedHostDetails ? (
-                    <div className="hint">Resolves to: {selectedHostDetails}</div>
-                  ) : (
-                    <div className="hint">Tip: type a hostname or choose from ~/.ssh/config.</div>
-                  )}
-                </div>
-                <div className="formRow">
-                  <div className="label">Remote path</div>
-                  <div className="pathRow">
-                    <input
-                      className="input"
-                      value={sshRemotePath}
-                      onChange={(e) => setSshRemotePath(normalizeSmartQuotes(e.target.value))}
-                      placeholder="~ (remote home)"
-                    />
-                    <button
-                      type="button"
-                      className="btn"
-                      disabled={!sshTarget.trim()}
-                      onClick={() => onBrowseRemotePath(sshTarget.trim(), sshRemotePath.trim())}
-                    >
-                      Browse
-                    </button>
-                  </div>
-                  <div className="hint">Remote working directory for new sessions.</div>
-                </div>
-              </>
-            ) : (
+          {isSsh ? (
+            <>
               <div className="formRow">
-                <div className="label">Base path</div>
+                <div className="label">SSH host</div>
+                <input
+                  className="input"
+                  value={sshTarget}
+                  onChange={(e) => setSshTarget(e.target.value)}
+                  placeholder="Start typing an SSH host…"
+                  autoComplete="off"
+                  autoCapitalize="off"
+                  autoCorrect="off"
+                  spellCheck={false}
+                />
+                {!sshHostsLoading && sshTarget.trim() && (
+                  <div className="sshHostList" aria-label="SSH config hosts">
+                    {hostCandidates.length === 0 ? (
+                      <div className="sshHostListEmpty">
+                        No matches. You can still type a hostname directly.
+                      </div>
+                    ) : (
+                      <div className="sshHostListItems" role="listbox" aria-label="Matches">
+                        {hostCandidates.map((h) => {
+                          const isSelected = h.alias === sshTarget.trim();
+                          const meta = formatHostDetails(h);
+                          return (
+                            <button
+                              key={h.alias}
+                              type="button"
+                              className={`sshHostItem ${isSelected ? "sshHostItemActive" : ""}`}
+                              onClick={() => setSshTarget(h.alias)}
+                              title={meta ? `${h.alias}\n${meta}` : h.alias}
+                            >
+                              <div className="sshHostItemMain">
+                                <div className="sshHostAlias">{h.alias}</div>
+                                {meta && <div className="sshHostMeta">{meta}</div>}
+                              </div>
+                              <div className="sshHostPick" aria-hidden="true">
+                                {isSelected ? "✓" : ""}
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {sshHostsLoading ? (
+                  <div className="hint">Loading hosts…</div>
+                ) : selectedHostDetails ? (
+                  <div className="hint">Resolves to: {selectedHostDetails}</div>
+                ) : (
+                  <div className="hint">Tip: type a hostname or choose from ~/.ssh/config.</div>
+                )}
+              </div>
+              <div className="formRow">
+                <div className="label">Remote path</div>
                 <div className="pathRow">
                   <input
                     className="input"
-                    value={basePath}
-                    onChange={(e) => setBasePath(normalizeSmartQuotes(e.target.value))}
-                    placeholder={basePathPlaceholder}
+                    value={sshRemotePath}
+                    onChange={(e) => setSshRemotePath(normalizeSmartQuotes(e.target.value))}
+                    placeholder="~ (remote home)"
                   />
-                  <button type="button" className="btn" onClick={() => onBrowseBasePath(basePath)}>
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={!sshTarget.trim()}
+                    onClick={() => onBrowseRemotePath(sshTarget.trim(), sshRemotePath.trim())}
+                  >
                     Browse
                   </button>
                 </div>
-                <div className="pathActions">
-                  <button
-                    type="button"
-                    className="btnSmall"
-                    onClick={() => setBasePath(currentTabCwd ?? "")}
-                    disabled={!canUseCurrentTab}
-                  >
-                    Use current tab
-                  </button>
-                  <button
-                    type="button"
-                    className="btnSmall"
-                    onClick={() => setBasePath(homeDir ?? "")}
-                    disabled={!canUseHome}
-                  >
-                    Home
-                  </button>
-                </div>
-                <div className="hint">New sessions in this project start here.</div>
+                <div className="hint">Remote working directory for new sessions.</div>
               </div>
-            )}
+            </>
+          ) : (
             <div className="formRow">
-              <div className="label">Environment (.env)</div>
+              <div className="label">Base path</div>
               <div className="pathRow">
-                <select
+                <input
                   className="input"
-                  value={environmentId}
-                  onChange={(e) => setEnvironmentId(e.target.value)}
-                >
-                  <option value="">None</option>
-                  {environments
-                    .slice()
-                    .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()))
-                    .map((env) => (
-                      <option key={env.id} value={env.id}>
-                        {env.name}
-                      </option>
-                    ))}
-                </select>
-                <button type="button" className="btn" onClick={onOpenEnvironments}>
-                  Manage
+                  value={basePath}
+                  onChange={(e) => setBasePath(normalizeSmartQuotes(e.target.value))}
+                  placeholder={basePathPlaceholder}
+                />
+                <button type="button" className="btn" onClick={() => onBrowseBasePath(basePath)}>
+                  Browse
                 </button>
               </div>
-              <div className="hint">Applied to new sessions in this project.</div>
-            </div>
-            {!isSsh && (
-              <div className="formRow">
-                <div className="label">Default shell</div>
-                <select
-                  className="input"
-                  value={defaultShellKey}
-                  onChange={(e) => setDefaultShellKey(e.target.value)}
+              <div className="pathActions">
+                <button
+                  type="button"
+                  className="btnSmall"
+                  onClick={() => setBasePath(currentTabCwd ?? "")}
+                  disabled={!canUseCurrentTab}
                 >
-                  <optgroup label="Bundled with the app">
-                    <option value="bundled-agsh">agsh (default)</option>
-                    <option value="bundled-nu">Nushell</option>
-                  </optgroup>
-                  {shellOptions.length > 0 && (
-                    <optgroup label="Installed shells">
-                      {shellOptions.map((o) => (
-                        <option key={o.key} value={o.key}>
-                          {o.label} — {o.detail}
-                        </option>
-                      ))}
-                    </optgroup>
-                  )}
-                </select>
-                <div className="hint">
-                  {shellsLoading
-                    ? "Detecting installed shells…"
-                    : "New terminals in this project start with this shell. Use the “Terminal with shell…” menu to override per terminal."}
-                </div>
+                  Use current tab
+                </button>
+                <button
+                  type="button"
+                  className="btnSmall"
+                  onClick={() => setBasePath(homeDir ?? "")}
+                  disabled={!canUseHome}
+                >
+                  Home
+                </button>
               </div>
-            )}
+              <div className="hint">New sessions in this project start here.</div>
+            </div>
+          )}
+          <div className="formRow">
+            <div className="label">Environment (.env)</div>
+            <div className="pathRow">
+              <select
+                className="input"
+                value={environmentId}
+                onChange={(e) => setEnvironmentId(e.target.value)}
+              >
+                <option value="">None</option>
+                {environments
+                  .slice()
+                  .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()))
+                  .map((env) => (
+                    <option key={env.id} value={env.id}>
+                      {env.name}
+                    </option>
+                  ))}
+              </select>
+              <button type="button" className="btn" onClick={onOpenEnvironments}>
+                Manage
+              </button>
+            </div>
+            <div className="hint">Applied to new sessions in this project.</div>
+          </div>
+          {!isSsh && (
             <div className="formRow">
-              <div className="label">Assets</div>
-              <label className="checkRow">
-                <input
-                  type="checkbox"
-                  checked={assetsEnabled}
-                  onChange={(e) => setAssetsEnabled(e.target.checked)}
-                />
-                Auto-create enabled assets on new sessions
-              </label>
-              <div className="hint">Manage templates in the Assets panel.</div>
+              <div className="label">Default shell</div>
+              <select
+                className="input"
+                value={defaultShellKey}
+                onChange={(e) => setDefaultShellKey(e.target.value)}
+              >
+                <optgroup label="Bundled with the app">
+                  <option value="bundled-agsh">agsh (default)</option>
+                  <option value="bundled-nu">Nushell</option>
+                </optgroup>
+                {shellOptions.length > 0 && (
+                  <optgroup label="Installed shells">
+                    {shellOptions.map((o) => (
+                      <option key={o.key} value={o.key}>
+                        {o.label} — {o.detail}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+              </select>
+              <div className="hint">
+                {shellsLoading
+                  ? "Detecting installed shells…"
+                  : "New terminals in this project start with this shell. Use the “Terminal with shell…” menu to override per terminal."}
+              </div>
             </div>
-            <div className="modalActions">
-              <button type="button" className="btn" onClick={onClose}>
-                Cancel
-              </button>
-              <button type="submit" className="btn">
-                {mode === "new" ? "Create" : "Save"}
-              </button>
-            </div>
-          </form>
-        </div>
-      </div>
+          )}
+          <div className="formRow">
+            <div className="label">Assets</div>
+            <label className="checkRow">
+              <input
+                type="checkbox"
+                checked={assetsEnabled}
+                onChange={(e) => setAssetsEnabled(e.target.checked)}
+              />
+              Auto-create enabled assets on new sessions
+            </label>
+            <div className="hint">Manage templates in the Assets panel.</div>
+          </div>
+          <div className="modalActions">
+            <button type="button" className="btn" onClick={onClose}>
+              Cancel
+            </button>
+            <button type="submit" className="btn">
+              {mode === "new" ? "Create" : "Save"}
+            </button>
+          </div>
+        </form>
+      </Modal>
     );
   }
 );

@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect, useImperativeHandle, forwardRef } from "react";
+import { Modal } from "../../ui";
 
 function normalizeSmartQuotes(input: string): string {
   return input.replace(/[""„‟«»]/g, '"').replace(/[''‚‛‹›]/g, "'");
@@ -57,95 +58,92 @@ export const NewSessionModal = forwardRef<NewSessionModalHandle, NewSessionModal
     };
 
     return (
-      <div className="modalBackdrop" onClick={onClose}>
-        <div className="modal" onClick={(e) => e.stopPropagation()}>
-          <h3 className="modalTitle">New terminal{projectTitle ? ` — ${projectTitle}` : ""}</h3>
-          <form onSubmit={handleSubmit}>
-            <div className="formRow">
-              <div className="label">Name (optional)</div>
+      <Modal title={`New terminal${projectTitle ? ` — ${projectTitle}` : ""}`} onClose={onClose}>
+        <form onSubmit={handleSubmit}>
+          <div className="formRow">
+            <div className="label">Name (optional)</div>
+            <input
+              className="input"
+              ref={nameRef}
+              value={name}
+              onChange={(e) => setName(normalizeSmartQuotes(e.target.value))}
+              placeholder="e.g. codex"
+            />
+          </div>
+          <div className="formRow">
+            <div className="label">Command (optional)</div>
+            <input
+              className="input"
+              value={command}
+              onChange={(e) => setCommand(normalizeSmartQuotes(e.target.value))}
+              list={commandSuggestions && commandSuggestions.length ? datalistId : undefined}
+              placeholder="e.g. codex  (leave blank for a shell)"
+            />
+            {commandSuggestions && commandSuggestions.length ? (
+              <datalist id={datalistId}>
+                {commandSuggestions.map((cmd) => (
+                  <option key={cmd} value={cmd} />
+                ))}
+              </datalist>
+            ) : null}
+            <div className="hint">Uses your $SHELL by default; commands run as "$SHELL -lc".</div>
+          </div>
+          <div className="formRow">
+            <label className="checkRow">
+              <input
+                type="checkbox"
+                checked={persistent}
+                onChange={(e) => setPersistent(e.target.checked)}
+              />
+              Persistent terminal (zellij)
+            </label>
+            <div className="hint">
+              Keeps the shell running after you close the app so you can resume later (uses a bundled{" "}
+              <code>zellij</code>).
+            </div>
+          </div>
+          <div className="formRow">
+            <div className="label">Working directory</div>
+            <div className="pathRow">
               <input
                 className="input"
-                ref={nameRef}
-                value={name}
-                onChange={(e) => setName(normalizeSmartQuotes(e.target.value))}
-                placeholder="e.g. codex"
+                value={cwd}
+                onChange={(e) => setCwd(normalizeSmartQuotes(e.target.value))}
+                placeholder={cwdPlaceholder}
               />
-            </div>
-            <div className="formRow">
-              <div className="label">Command (optional)</div>
-              <input
-                className="input"
-                value={command}
-                onChange={(e) => setCommand(normalizeSmartQuotes(e.target.value))}
-                list={commandSuggestions && commandSuggestions.length ? datalistId : undefined}
-                placeholder="e.g. codex  (leave blank for a shell)"
-              />
-              {commandSuggestions && commandSuggestions.length ? (
-                <datalist id={datalistId}>
-                  {commandSuggestions.map((cmd) => (
-                    <option key={cmd} value={cmd} />
-                  ))}
-                </datalist>
-              ) : null}
-              <div className="hint">Uses your $SHELL by default; commands run as "$SHELL -lc".</div>
-            </div>
-            <div className="formRow">
-              <label className="checkRow">
-                <input
-                  type="checkbox"
-                  checked={persistent}
-                  onChange={(e) => setPersistent(e.target.checked)}
-                />
-                Persistent terminal (zellij)
-              </label>
-              <div className="hint">
-                Keeps the shell running after you close the app so you can resume later (uses a bundled{" "}
-                <code>zellij</code>).
-              </div>
-            </div>
-            <div className="formRow">
-              <div className="label">Working directory</div>
-              <div className="pathRow">
-                <input
-                  className="input"
-                  value={cwd}
-                  onChange={(e) => setCwd(normalizeSmartQuotes(e.target.value))}
-                  placeholder={cwdPlaceholder}
-                />
-                <button type="button" className="btn" onClick={() => onBrowseCwd(cwd)}>
-                  Browse
-                </button>
-              </div>
-              <div className="pathActions">
-                <button
-                  type="button"
-                  className="btnSmall"
-                  onClick={() => setCwd(projectBasePath ?? "")}
-                  disabled={!canUseProjectBase}
-                >
-                  Use project base
-                </button>
-                <button
-                  type="button"
-                  className="btnSmall"
-                  onClick={() => setCwd(currentTabCwd ?? "")}
-                  disabled={!canUseCurrentTab}
-                >
-                  Use current tab
-                </button>
-              </div>
-            </div>
-            <div className="modalActions">
-              <button type="button" className="btn" onClick={onClose}>
-                Cancel
-              </button>
-              <button type="submit" className="btn">
-                Create
+              <button type="button" className="btn" onClick={() => onBrowseCwd(cwd)}>
+                Browse
               </button>
             </div>
-          </form>
-        </div>
-      </div>
+            <div className="pathActions">
+              <button
+                type="button"
+                className="btnSmall"
+                onClick={() => setCwd(projectBasePath ?? "")}
+                disabled={!canUseProjectBase}
+              >
+                Use project base
+              </button>
+              <button
+                type="button"
+                className="btnSmall"
+                onClick={() => setCwd(currentTabCwd ?? "")}
+                disabled={!canUseCurrentTab}
+              >
+                Use current tab
+              </button>
+            </div>
+          </div>
+          <div className="modalActions">
+            <button type="button" className="btn" onClick={onClose}>
+              Cancel
+            </button>
+            <button type="submit" className="btn">
+              Create
+            </button>
+          </div>
+        </form>
+      </Modal>
     );
   }
 );

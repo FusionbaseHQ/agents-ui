@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from "react";
+import { Modal } from "../../ui";
 
 type DirectoryEntry = { name: string; path: string };
 type DirectoryListing = { path: string; parent: string | null; entries: DirectoryEntry[] };
@@ -43,64 +44,11 @@ export function PathPickerModal({
   }, []);
 
   return (
-    <div className="modalBackdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h3 className="modalTitle">Select folder</h3>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            void load(input.trim() || null);
-          }}
-        >
-          <div className="pathPickerHeader">
-            <button
-              type="button"
-              className="btn"
-              disabled={!listing?.parent || loading}
-              onClick={() => void load(listing?.parent ?? null)}
-              title="Up"
-            >
-              Up
-            </button>
-            <input
-              className="input"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder={placeholder}
-            />
-            <button type="submit" className="btn" disabled={loading}>
-              Go
-            </button>
-          </div>
-        </form>
-
-        {error && (
-          <div className="pathPickerError" role="alert">
-            {error}
-          </div>
-        )}
-
-        <div className="pathPickerList">
-          {loading ? (
-            <div className="empty">Loading…</div>
-          ) : listing && listing.entries.length === 0 ? (
-            <div className="empty">No subfolders.</div>
-          ) : (
-            listing?.entries.map((e) => (
-              <button
-                key={e.path}
-                type="button"
-                className="pathPickerItem"
-                onClick={() => void load(e.path)}
-                title={e.path}
-              >
-                {e.name}
-              </button>
-            ))
-          )}
-        </div>
-
-        <div className="modalActions">
+    <Modal
+      title="Select folder"
+      onClose={onClose}
+      actions={
+        <>
           <button type="button" className="btn" onClick={onClose}>
             Cancel
           </button>
@@ -112,8 +60,62 @@ export function PathPickerModal({
           >
             Select
           </button>
+        </>
+      }
+    >
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          void load(input.trim() || null);
+        }}
+      >
+        <div className="pathPickerHeader">
+          <button
+            type="button"
+            className="btn"
+            disabled={!listing?.parent || loading}
+            onClick={() => void load(listing?.parent ?? null)}
+            title="Up"
+          >
+            Up
+          </button>
+          <input
+            className="input"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder={placeholder}
+          />
+          <button type="submit" className="btn" disabled={loading}>
+            Go
+          </button>
         </div>
+      </form>
+
+      {error && (
+        <div className="pathPickerError" role="alert">
+          {error}
+        </div>
+      )}
+
+      <div className="pathPickerList">
+        {loading ? (
+          <div className="empty">Loading…</div>
+        ) : listing && listing.entries.length === 0 ? (
+          <div className="empty">No subfolders.</div>
+        ) : (
+          listing?.entries.map((e) => (
+            <button
+              key={e.path}
+              type="button"
+              className="pathPickerItem"
+              onClick={() => void load(e.path)}
+              title={e.path}
+            >
+              {e.name}
+            </button>
+          ))
+        )}
       </div>
-    </div>
+    </Modal>
   );
 }
