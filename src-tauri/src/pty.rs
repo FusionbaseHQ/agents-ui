@@ -1093,6 +1093,32 @@ typeset -ga precmd_functions preexec_functions
 precmd_functions+=__agents_ui_emit_cwd
 preexec_functions+=__agents_ui_emit_command
 __agents_ui_emit_cwd
+
+# OSC 133 shell integration (installed after the user's zshrc so prompt
+# config there cannot clobber the hooks).
+if [[ -z "$__AGENTS_UI_SHELL_INTEGRATION" ]]; then
+  __AGENTS_UI_SHELL_INTEGRATION=1
+
+  __agents_ui_osc133_precmd() {
+    local exit_code=$?
+    # D marker for the previous command, then A marker for the new prompt.
+    print -Pn "\e]133;D;${exit_code}\a\e]133;A\a"
+  }
+
+  __agents_ui_osc133_preexec() {
+    # C marker when the command begins executing.
+    print -Pn '\e]133;C\a'
+  }
+
+  # PREPEND to precmd so we capture $? before other hooks can modify it.
+  precmd_functions=(__agents_ui_osc133_precmd "${precmd_functions[@]}")
+  preexec_functions+=__agents_ui_osc133_preexec
+
+  # B marker at the end of the prompt (prompt end = input start). $'...' turns
+  # \e/\a into real bytes — zsh prompt expansion does not process backslash
+  # escapes; %{...%} marks the sequence as zero-width.
+  PS1=$PS1$'%{\e]133;B\a%}'
+fi
 "#,
     );
     fs::write(&zshrc, zshrc_contents).map_err(|e| e.to_string())?;
@@ -1558,6 +1584,9 @@ fn ensure_nu_config(app: &AppHandle, env_keys: &[String]) -> Option<(String, Str
     let mut config = String::new();
     config.push_str("# Agents UI managed Nushell config\n\n");
     config.push_str("$env.config = ($env.config | upsert show_banner false)\n\n");
+    config.push_str(
+        "# Shell integration: emit OSC 133 prompt/command marks (A/B/C/D) so the\n# frontend can build command blocks.\n$env.config = ($env.config | upsert shell_integration.osc133 true)\n\n",
+    );
     config.push_str(
         r#"# Completion UX (standalone)
 $env.config = ($env.config | upsert completions.algorithm "fuzzy")
@@ -2210,9 +2239,16 @@ pub fn create_session(
             if let Some(orig) = orig_prompt {
                 cmd.env("AGENTS_UI_ORIG_PROMPT_COMMAND", orig);
             }
+            // OSC 133 + 1337 shell integration via PROMPT_COMMAND:
+            // - exit code is captured FIRST (before anything else can clobber $?),
+            //   then D;<exit> for the previous command + A for the new prompt;
+            // - the user's original PROMPT_COMMAND is chained afterwards;
+            // - PS1 gets a trailing B marker (prompt end = input start) and PS0 a
+            //   leading C marker (pre-execution; bash >= 4.4), (re)appended after
+            //   the user's PROMPT_COMMAND runs so prompt rewrites can't drop them.
             cmd.env(
                 "PROMPT_COMMAND",
-                "printf '\\033]1337;CurrentDir=%s\\007' \"$PWD\"; if [ -n \"$AGENTS_UI_ORIG_PROMPT_COMMAND\" ]; then eval \"$AGENTS_UI_ORIG_PROMPT_COMMAND\"; fi",
+                "__agents_ui_ec=$?; printf '\\033]133;D;%s\\007\\033]133;A\\007' \"$__agents_ui_ec\"; printf '\\033]1337;CurrentDir=%s\\007' \"$PWD\"; if [ -n \"$AGENTS_UI_ORIG_PROMPT_COMMAND\" ]; then eval \"$AGENTS_UI_ORIG_PROMPT_COMMAND\"; fi; case $PS1 in *']133;B'*) ;; *) PS1=\"${PS1}\\[\\e]133;B\\a\\]\";; esac; case $PS0 in *']133;C'*) ;; *) PS0=\"\\e]133;C\\a${PS0}\";; esac",
             );
         }
 

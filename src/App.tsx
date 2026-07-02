@@ -60,6 +60,12 @@ import {
   shellChoiceForProject,
 } from "./stores/shells";
 import {
+  useUpdatesStore,
+  fetchAppInfo,
+  checkForUpdates,
+  parseGithubRepo,
+} from "./stores/updates";
+import {
   PersistentSessionsModal,
   type PersistentSessionsModalItem,
 } from "./components/modals/PersistentSessionsModal";
@@ -74,7 +80,7 @@ import { NewSessionFlow, type NewSessionFlowItem } from "./components/modals/New
 import { matchBinding } from "./keymap";
 import { ToastHost, showToast, EmptyState, Modal } from "./ui";
 import { PathPickerModal } from "./components/modals/PathPickerModal";
-import { UpdateModal, UpdateCheckState } from "./components/modals/UpdateModal";
+import { UpdateModal } from "./components/modals/UpdateModal";
 import {
   SshManagerModal,
   type SshConnectData,
@@ -190,7 +196,6 @@ type PtyExit = { id: string; exit_code?: number | null };
 type AgentOutputPayload = { runId: string; data: string };
 type AgentDonePayload = { runId: string; exitCode: number | null };
 type AgentStderrPayload = { runId: string; data: string };
-type AppInfo = { name: string; version: string; homepage?: string | null };
 type AppMenuEventPayload = { id: string };
 type StartupFlags = { clearData: boolean };
 type TrayMenuEventPayload = {
@@ -475,50 +480,6 @@ const INITIAL_AUTO_CAFFEINATE: boolean = readStoredAutoCaffeinate();
 const INITIAL_UI_THEME: UiTheme = readStoredUiTheme();
 if (typeof document !== "undefined") {
   document.documentElement.setAttribute("data-theme", INITIAL_UI_THEME);
-}
-
-function parseGithubRepo(value: string | null | undefined): { owner: string; repo: string } | null {
-  const raw = value?.trim() ?? "";
-  if (!raw) return null;
-
-  const direct = raw.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(?:\.git)?\/?$/);
-  if (direct) {
-    return { owner: direct[1], repo: direct[2] };
-  }
-
-  try {
-    const url = new URL(raw);
-    if (url.hostname !== "github.com") return null;
-    const parts = url.pathname.split("/").filter(Boolean);
-    if (parts.length < 2) return null;
-    let repo = parts[1];
-    if (repo.endsWith(".git")) repo = repo.slice(0, -4);
-    return { owner: parts[0], repo };
-  } catch {
-    return null;
-  }
-}
-
-function parseSemver(input: string): number[] | null {
-  const match = input.trim().match(/\d+(?:\.\d+)+/);
-  if (!match) return null;
-  const parts = match[0].split(".").filter(Boolean);
-  const nums = parts.map((p) => Number.parseInt(p, 10));
-  if (nums.some((n) => Number.isNaN(n))) return null;
-  return nums;
-}
-
-function compareSemver(a: string, b: string): number | null {
-  const pa = parseSemver(a);
-  const pb = parseSemver(b);
-  if (!pa || !pb) return null;
-  const len = Math.max(pa.length, pb.length);
-  for (let i = 0; i < len; i++) {
-    const av = pa[i] ?? 0;
-    const bv = pb[i] ?? 0;
-    if (av !== bv) return av > bv ? 1 : -1;
-  }
-  return 0;
 }
 
 function isValidEnvKey(key: string): boolean {
@@ -2256,9 +2217,9 @@ export default function App() {
     setActivityCenterAutoOpenSource(null);
   }, [activityCenterAutoOpenSource, autoRenameActivity]);
   const secureStoragePromptedRef = useRef(false);
-  const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
+  // Updates domain lives in src/stores/updates.ts (App.tsx decomposition).
+  const { appInfo, updateCheckState } = useUpdatesStore();
   const [updatesOpen, setUpdatesOpen] = useState(false);
-  const [updateCheckState, setUpdateCheckState] = useState<UpdateCheckState>({ status: "idle" });
   const [pendingTrayAction, setPendingTrayAction] = useState<TrayMenuEventPayload | null>(null);
   const [recentSessionKeys, setRecentSessionKeys] = useState<RecentSessionKey[]>(() => {
     try {
@@ -2630,12 +2591,7 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    invoke<AppInfo>("get_app_info")
-      .then((info) => {
-        if (cancelled) return;
-        setAppInfo(info);
-      })
-      .catch(() => {});
+    void fetchAppInfo();
 
     return () => {
       cancelled = true;
@@ -6365,79 +6321,6 @@ export default function App() {
     },
     [reportError],
   );
-
-  const checkForUpdates = useCallback(async () => {
-    setUpdateCheckState({ status: "checking" });
-
-    let info: AppInfo | null = null;
-    try {
-      info = await invoke<AppInfo>("get_app_info");
-      setAppInfo(info);
-    } catch {
-      info = null;
-    }
-
-    if (!info) {
-      setUpdateCheckState({ status: "error", message: "Unable to read app info." });
-      return;
-    }
-
-    const repo = parseGithubRepo(info.homepage);
-    if (!repo) {
-      setUpdateCheckState({
-        status: "error",
-        message: "Update source not configured. Set bundle.homepage to your GitHub repo URL.",
-      });
-      return;
-    }
-
-    const fallbackReleaseUrl = `https://github.com/${repo.owner}/${repo.repo}/releases/latest`;
-    const apiUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/releases/latest`;
-
-    try {
-      const response = await fetch(apiUrl, {
-        headers: { Accept: "application/vnd.github+json" },
-      });
-      if (!response.ok) {
-        throw new Error(`GitHub API returned ${response.status}`);
-      }
-      const data = (await response.json()) as { tag_name?: string };
-      const tag = data.tag_name?.trim();
-      if (!tag) {
-        setUpdateCheckState({ status: "error", message: "Latest release has no tag name." });
-        return;
-      }
-
-      const current = info.version;
-      const cmp = compareSemver(tag, current);
-
-      const releaseUrl = fallbackReleaseUrl;
-      const isNewer =
-        cmp === null
-          ? tag.trim().replace(/^v/i, "") !== current.trim().replace(/^v/i, "")
-          : cmp > 0;
-
-      if (isNewer) {
-        setUpdateCheckState({
-          status: "updateAvailable",
-          latestVersion: tag,
-          releaseUrl,
-        });
-        return;
-      }
-
-      setUpdateCheckState({
-        status: "upToDate",
-        latestVersion: tag,
-        releaseUrl,
-      });
-    } catch (err) {
-      setUpdateCheckState({
-        status: "error",
-        message: `Update check failed: ${formatError(err)}`,
-      });
-    }
-  }, []);
 
   function sanitizeRecordedInputForReplay(input: string): string {
     // Remove common ANSI/terminal control sequences; recordings should be replayable as plain input.
