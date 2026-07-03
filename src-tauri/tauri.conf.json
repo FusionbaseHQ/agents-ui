@@ -4,8 +4,8 @@
   "version": "0.10.0",
   "identifier": "com.agents-ui.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "bash scripts/sync-agsh.sh dev && npm run dev",
+    "beforeBuildCommand": "bash scripts/sync-agsh.sh build && npm run build",
     "devUrl": "http://localhost:1420",
     "frontendDist": "../dist"
   },

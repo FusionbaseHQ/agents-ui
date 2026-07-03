@@ -302,6 +302,8 @@ Agents UI bundles `nu` (Nushell), `agsh`, and `zellij` as Tauri sidecars under `
 ./scripts/build-agsh-macos.sh ../agsh   # or AGSH_DIR=/path/to/agsh
 ```
 
+**agsh stays current automatically**: `tauri dev` and `tauri build` run `scripts/sync-agsh.sh` first (wired via `beforeDevCommand`/`beforeBuildCommand`), which rebuilds the sidecars from the local checkout (`../agsh`, override with `AGSH_DIR`). Dev builds only the native arch and falls back to the committed sidecar with a warning if agsh doesn't compile; `tauri build` builds both arches and fails hard. Machines without an agsh checkout skip the sync and use the committed binaries. Cargo's incremental check makes the no-change case cost well under a second.
+
 ### Production Build
 
 ```bash
