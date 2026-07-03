@@ -1838,9 +1838,8 @@ export function FileExplorerPanel({
             onClick={refreshRoot}
             title="Refresh"
             disabled={refreshing}
-            style={refreshing ? { animation: "spin 1s linear infinite" } : undefined}
           >
-            <Icon name="refresh" />
+            <Icon name="refresh" className={refreshing ? "iconSpin" : undefined} />
           </button>
           <button type="button" className="btnSmall btnIcon" onClick={onClose} title="Close">
             <Icon name="close" />

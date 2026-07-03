@@ -703,6 +703,12 @@ body::after {
   animation: spin 1s linear infinite;
 }
 
+/* Generic spinner for an icon inside an otherwise-static control (e.g. the
+   file explorer's refresh button — only the glyph rotates, not the button). */
+.iconSpin {
+  animation: spin 1s linear infinite;
+}
+
 /* Agent instruction modal */
 .agentInstructionBackdrop {
   position: fixed;
