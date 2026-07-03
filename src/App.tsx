@@ -72,6 +72,7 @@ import {
   useUpdatesStore,
   fetchAppInfo,
   checkForUpdates,
+  checkForUpdatesSilently,
   parseGithubRepo,
 } from "./stores/updates";
 import {
@@ -2597,6 +2598,44 @@ export default function App() {
       void invoke("save_persisted_state", { state }).catch(() => {});
       pendingSaveRef.current = null;
     }
+  }, []);
+
+  // Maintenance-free update notifications: quietly check the GitHub latest
+  // release shortly after launch and every 6 hours, toast once per new
+  // version (the status-bar chip stays lit as the ambient reminder).
+  useEffect(() => {
+    const NOTIFIED_KEY = "agents-ui-update-notified-version";
+    let disposed = false;
+    const run = async () => {
+      const result = await checkForUpdatesSilently();
+      if (disposed || result.status !== "updateAvailable") return;
+      let notified: string | null = null;
+      try {
+        notified = localStorage.getItem(NOTIFIED_KEY);
+      } catch {
+        // Best-effort: localStorage may be unavailable in some contexts.
+      }
+      if (notified === result.latestVersion) return;
+      try {
+        localStorage.setItem(NOTIFIED_KEY, result.latestVersion);
+      } catch {
+        // Best-effort.
+      }
+      showToast({
+        tone: "info",
+        title: "Update available",
+        message: `Agents UI ${result.latestVersion} has been released.`,
+        duration: 12000,
+        action: { label: "View", onClick: () => setUpdatesOpen(true) },
+      });
+    };
+    const initial = window.setTimeout(() => void run(), 10_000);
+    const interval = window.setInterval(() => void run(), 6 * 60 * 60 * 1000);
+    return () => {
+      disposed = true;
+      window.clearTimeout(initial);
+      window.clearInterval(interval);
+    };
   }, []);
 
   useEffect(() => {

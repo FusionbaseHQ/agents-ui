@@ -98,25 +98,19 @@ export async function fetchAppInfo(): Promise<AppInfo | null> {
   }
 }
 
-/** Check the GitHub latest release against the running version. */
-export async function checkForUpdates(): Promise<void> {
-  setState({ updateCheckState: { status: "checking" } });
-
+/** Query the GitHub latest release and compare against the running version. */
+async function queryLatestRelease(): Promise<UpdateCheckState> {
   const info = await fetchAppInfo();
   if (!info) {
-    setState({ updateCheckState: { status: "error", message: "Unable to read app info." } });
-    return;
+    return { status: "error", message: "Unable to read app info." };
   }
 
   const repo = parseGithubRepo(info.homepage);
   if (!repo) {
-    setState({
-      updateCheckState: {
-        status: "error",
-        message: "Update source not configured. Set bundle.homepage to your GitHub repo URL.",
-      },
-    });
-    return;
+    return {
+      status: "error",
+      message: "Update source not configured. Set bundle.homepage to your GitHub repo URL.",
+    };
   }
 
   const fallbackReleaseUrl = `https://github.com/${repo.owner}/${repo.repo}/releases/latest`;
@@ -132,8 +126,7 @@ export async function checkForUpdates(): Promise<void> {
     const data = (await response.json()) as { tag_name?: string };
     const tag = data.tag_name?.trim();
     if (!tag) {
-      setState({ updateCheckState: { status: "error", message: "Latest release has no tag name." } });
-      return;
+      return { status: "error", message: "Latest release has no tag name." };
     }
 
     const current = info.version;
@@ -145,17 +138,29 @@ export async function checkForUpdates(): Promise<void> {
         ? tag.trim().replace(/^v/i, "") !== current.trim().replace(/^v/i, "")
         : cmp > 0;
 
-    setState({
-      updateCheckState: isNewer
-        ? { status: "updateAvailable", latestVersion: tag, releaseUrl }
-        : { status: "upToDate", latestVersion: tag, releaseUrl },
-    });
+    return isNewer
+      ? { status: "updateAvailable", latestVersion: tag, releaseUrl }
+      : { status: "upToDate", latestVersion: tag, releaseUrl };
   } catch (err) {
-    setState({
-      updateCheckState: {
-        status: "error",
-        message: `Update check failed: ${formatUpdateError(err)}`,
-      },
-    });
+    return { status: "error", message: `Update check failed: ${formatUpdateError(err)}` };
   }
+}
+
+/** Explicit check (Updates dialog / ⌘K): shows progress and surfaces errors. */
+export async function checkForUpdates(): Promise<void> {
+  setState({ updateCheckState: { status: "checking" } });
+  setState({ updateCheckState: await queryLatestRelease() });
+}
+
+/**
+ * Background check (startup + periodic): commits only definitive results —
+ * errors (offline, rate limit) neither surface nor clobber existing state,
+ * and no transient "checking" state flashes through the UI.
+ */
+export async function checkForUpdatesSilently(): Promise<UpdateCheckState> {
+  const result = await queryLatestRelease();
+  if (result.status === "updateAvailable" || result.status === "upToDate") {
+    setState({ updateCheckState: result });
+  }
+  return result;
 }
