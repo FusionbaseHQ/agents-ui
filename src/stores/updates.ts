@@ -7,6 +7,9 @@ import type { UpdateCheckState } from "../components/modals/UpdateModal";
 
 export type AppInfo = { name: string; version: string; homepage?: string | null };
 
+/** The app's GitHub repo. bundle.homepage overrides it when set (e.g. forks). */
+const DEFAULT_REPO_URL = "https://github.com/FusionbaseHQ/agents-ui";
+
 type UpdatesState = {
   appInfo: AppInfo | null;
   updateCheckState: UpdateCheckState;
@@ -105,7 +108,7 @@ async function queryLatestRelease(): Promise<UpdateCheckState> {
     return { status: "error", message: "Unable to read app info." };
   }
 
-  const repo = parseGithubRepo(info.homepage);
+  const repo = parseGithubRepo(info.homepage) ?? parseGithubRepo(DEFAULT_REPO_URL);
   if (!repo) {
     return {
       status: "error",
