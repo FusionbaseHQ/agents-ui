@@ -11768,7 +11768,7 @@ export default function App() {
                 : null
             }
             onShellClick={() => handleNewTerminalWithShellForProject(activeProjectId)}
-            cwd={active?.cwd ? shortenPathSmart(active.cwd, 60) : null}
+            cwd={active?.cwd ? shortenPathSmart(active.cwd, 44) : null}
             sshTarget={activeIsSsh ? activeSshTarget : null}
             connectionState={active?.connectionState ?? null}
             recordingActive={Boolean(active?.recordingActive)}
