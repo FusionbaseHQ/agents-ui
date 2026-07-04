@@ -4,8 +4,9 @@ All notable changes to this project will be documented in this file.
 
 This project aims to follow Semantic Versioning.
 
-## Unreleased
+## 0.11.0
 
+- **Bundled agsh 0.2.0** (session journaling/resume, `agshd` PTY broker, hardened release gates) and automatic sidecar sync from the local checkout on dev/build.
 - **UI/UX overhaul (phase 1)**:
   - **Welcome pane**: projects with no sessions (including first run) now show action cards — New terminal, Terminal with shell…, first agent quick-start, Connect SSH — plus the key shortcuts, instead of a blank area. All empty states across the app gained hints and call-to-action buttons.
   - **Unified Settings** (gear button): Appearance with a hover-to-preview theme grid, Terminal with a new **app-global default shell** (precedence: per-terminal pick > project default > app default > bundled agsh), Power, Keyboard cheat sheet, and Storage & updates.
