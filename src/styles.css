@@ -2353,16 +2353,26 @@ body::after {
 }
 
 /* ── History quick-switch bar ── */
-.historyBar {
+/* Merged bottom bar: session tabs (left, scrollable) + status (right) in one
+   28px strip instead of two stacked bars. */
+.bottomBar {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 2px;
-  padding: 3px 8px;
-  border-top: 1px solid rgba(var(--ink-rgb), 0.06);
+  min-height: 28px;
+  border-top: 1px solid rgba(var(--ink-rgb), 0.08);
   background: rgba(var(--paper-panel-rgb), 0.65);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
+}
+
+.historyBar {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 8px;
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
@@ -9426,14 +9436,11 @@ select.input {
 /* Bottom status bar (StatusBar). */
 .statusBar {
   flex: 0 0 auto;
+  margin-left: auto;
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
-  height: 24px;
   padding: 0 10px;
-  border-top: 1px solid rgba(var(--ink-rgb), 0.08);
-  background: rgba(var(--paper-panel-rgb), 0.6);
   font-size: 11px;
   color: var(--muted);
   user-select: none;

@@ -10176,110 +10176,7 @@ export default function App() {
             terminalOverlayHost,
           )}
 
-          {(() => {
-            // Session tab strip: the active project's sessions in the same
-            // order as the sidebar — a real tab strip, not a recency list.
-            // Tabs drag-reorder via the same handler the sidebar uses.
-            const tabSessions = sortProjectSessionsForSidebar(sessions, activeProjectId).filter(
-              (s) => !s.closing,
-            );
-            if (tabSessions.length === 0) return null;
-            return (
-              <div className="historyBar" role="tablist" aria-label="Sessions">
-                {tabSessions.map((s) => {
-                  const sid = s.id;
-                  const isActive = sid === activeId;
-                  const isSsh = isSshCommandLine(s.launchCommand ?? s.restoreCommand ?? null);
-                  const isPersistent = Boolean(s.persistent);
-                  const isSshType = isSsh && !isPersistent;
-                  const isDefaultType = !isPersistent && !isSshType;
-                  const tabEffect =
-                    getProcessEffectById(s.effectId) ??
-                    detectProcessEffect({
-                      command:
-                        s.launchCommand ??
-                        (s.restoreCommand?.trim() ? s.restoreCommand.trim() : null) ??
-                        null,
-                      name: s.name,
-                    });
-                  return (
-                    <div
-                      key={sid}
-                      role="tab"
-                      aria-selected={isActive}
-                      className={`historyTab ${isActive ? "historyTabActive" : ""} ${
-                        isSshType ? "sessionItemSsh" : ""
-                      } ${isPersistent ? "sessionItemPersistent" : ""} ${
-                        isDefaultType ? "sessionItemDefault" : ""
-                      } ${s.color ? "sessionItemColored" : ""} ${
-                        s.exited ? "sessionItemExited" : ""
-                      } ${
-                        tabDrop?.id === sid
-                          ? tabDrop.position === "before"
-                            ? "historyTabDropBefore"
-                            : "historyTabDropAfter"
-                          : ""
-                      }`}
-                      style={s.color ? { "--tab-color": s.color } as React.CSSProperties : undefined}
-                      onClick={() => selectSessionById(sid)}
-                      onAuxClick={(e) => {
-                        if (e.button === 1) {
-                          e.preventDefault();
-                          void onClose(sid);
-                        }
-                      }}
-                      draggable
-                      onDragStart={(e) => {
-                        e.dataTransfer.setData("text/x-session-id", sid);
-                        e.dataTransfer.effectAllowed = "move";
-                      }}
-                      onDragOver={(e) => {
-                        if (!e.dataTransfer.types.includes("text/x-session-id")) return;
-                        e.preventDefault();
-                        e.dataTransfer.dropEffect = "move";
-                        const r = e.currentTarget.getBoundingClientRect();
-                        const position = e.clientX < r.left + r.width / 2 ? "before" : "after";
-                        setTabDrop((prev) =>
-                          prev?.id === sid && prev.position === position ? prev : { id: sid, position },
-                        );
-                      }}
-                      onDragLeave={() => setTabDrop((prev) => (prev?.id === sid ? null : prev))}
-                      onDrop={(e) => {
-                        const sourceId = e.dataTransfer.getData("text/x-session-id");
-                        setTabDrop(null);
-                        if (!sourceId || sourceId === sid) return;
-                        e.preventDefault();
-                        const r = e.currentTarget.getBoundingClientRect();
-                        const position = e.clientX < r.left + r.width / 2 ? "before" : "after";
-                        handleReorderSession(sourceId, sid, position);
-                      }}
-                      onDragEnd={() => setTabDrop(null)}
-                      title={s.cwd ?? s.name}
-                    >
-                      {s.symbol ? (
-                        <TabSymbolIcon symbol={s.symbol} />
-                      ) : tabEffect?.iconSrc ? (
-                        <span className={`agentBadge historyAgentBadge chip-${tabEffect.id}`} title={tabEffect.label}>
-                          <img className="agentIcon" src={tabEffect.iconSrc} alt={tabEffect.label} />
-                        </span>
-                      ) : null}
-                      <span className="historyTabName">{s.name}</span>
-                      <button
-                        className="historyTabClose"
-                        title="Close session"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          void onClose(sid);
-                        }}
-                      >
-                        ×
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-            );
-          })()}
+
 
           {newOpen && <NewSessionModal
             ref={newSessionModalRef}
@@ -11758,22 +11655,129 @@ export default function App() {
           </SlidePanel>}
         </div>
 
-        <StatusBar
-          shellLabel={
-            active && !active.launchCommand && !activeIsSsh && !active.exited
-              ? shellChoiceLabel(active.shellChoice ?? shellChoiceForProject(activeProject), detectedShells)
-              : null
-          }
-          onShellClick={() => handleNewTerminalWithShellForProject(activeProjectId)}
-          cwd={active?.cwd ? shortenPathSmart(active.cwd, 60) : null}
-          sshTarget={activeIsSsh ? activeSshTarget : null}
-          connectionState={active?.connectionState ?? null}
-          recordingActive={Boolean(active?.recordingActive)}
-          keepAwake={autoCaffeinate && keepAwakeActive}
-          updateAvailable={updateCheckState.status === "updateAvailable"}
-          onOpenUpdates={() => setUpdatesOpen(true)}
-          version={appInfo?.version ?? null}
-        />
+        {/* One bottom bar: session tabs (left, scrollable) + status (right). */}
+        <div className="bottomBar">
+            {(() => {
+              // Session tab strip: the active project's sessions in the same
+              // order as the sidebar — a real tab strip, not a recency list.
+              // Tabs drag-reorder via the same handler the sidebar uses.
+              const tabSessions = sortProjectSessionsForSidebar(sessions, activeProjectId).filter(
+                (s) => !s.closing,
+              );
+              if (tabSessions.length === 0) return null;
+              return (
+                <div className="historyBar" role="tablist" aria-label="Sessions">
+                  {tabSessions.map((s) => {
+                    const sid = s.id;
+                    const isActive = sid === activeId;
+                    const isSsh = isSshCommandLine(s.launchCommand ?? s.restoreCommand ?? null);
+                    const isPersistent = Boolean(s.persistent);
+                    const isSshType = isSsh && !isPersistent;
+                    const isDefaultType = !isPersistent && !isSshType;
+                    const tabEffect =
+                      getProcessEffectById(s.effectId) ??
+                      detectProcessEffect({
+                        command:
+                          s.launchCommand ??
+                          (s.restoreCommand?.trim() ? s.restoreCommand.trim() : null) ??
+                          null,
+                        name: s.name,
+                      });
+                    return (
+                      <div
+                        key={sid}
+                        role="tab"
+                        aria-selected={isActive}
+                        className={`historyTab ${isActive ? "historyTabActive" : ""} ${
+                          isSshType ? "sessionItemSsh" : ""
+                        } ${isPersistent ? "sessionItemPersistent" : ""} ${
+                          isDefaultType ? "sessionItemDefault" : ""
+                        } ${s.color ? "sessionItemColored" : ""} ${
+                          s.exited ? "sessionItemExited" : ""
+                        } ${
+                          tabDrop?.id === sid
+                            ? tabDrop.position === "before"
+                              ? "historyTabDropBefore"
+                              : "historyTabDropAfter"
+                            : ""
+                        }`}
+                        style={s.color ? { "--tab-color": s.color } as React.CSSProperties : undefined}
+                        onClick={() => selectSessionById(sid)}
+                        onAuxClick={(e) => {
+                          if (e.button === 1) {
+                            e.preventDefault();
+                            void onClose(sid);
+                          }
+                        }}
+                        draggable
+                        onDragStart={(e) => {
+                          e.dataTransfer.setData("text/x-session-id", sid);
+                          e.dataTransfer.effectAllowed = "move";
+                        }}
+                        onDragOver={(e) => {
+                          if (!e.dataTransfer.types.includes("text/x-session-id")) return;
+                          e.preventDefault();
+                          e.dataTransfer.dropEffect = "move";
+                          const r = e.currentTarget.getBoundingClientRect();
+                          const position = e.clientX < r.left + r.width / 2 ? "before" : "after";
+                          setTabDrop((prev) =>
+                            prev?.id === sid && prev.position === position ? prev : { id: sid, position },
+                          );
+                        }}
+                        onDragLeave={() => setTabDrop((prev) => (prev?.id === sid ? null : prev))}
+                        onDrop={(e) => {
+                          const sourceId = e.dataTransfer.getData("text/x-session-id");
+                          setTabDrop(null);
+                          if (!sourceId || sourceId === sid) return;
+                          e.preventDefault();
+                          const r = e.currentTarget.getBoundingClientRect();
+                          const position = e.clientX < r.left + r.width / 2 ? "before" : "after";
+                          handleReorderSession(sourceId, sid, position);
+                        }}
+                        onDragEnd={() => setTabDrop(null)}
+                        title={s.cwd ?? s.name}
+                      >
+                        {s.symbol ? (
+                          <TabSymbolIcon symbol={s.symbol} />
+                        ) : tabEffect?.iconSrc ? (
+                          <span className={`agentBadge historyAgentBadge chip-${tabEffect.id}`} title={tabEffect.label}>
+                            <img className="agentIcon" src={tabEffect.iconSrc} alt={tabEffect.label} />
+                          </span>
+                        ) : null}
+                        <span className="historyTabName">{s.name}</span>
+                        <button
+                          className="historyTabClose"
+                          title="Close session"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void onClose(sid);
+                          }}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+          <StatusBar
+            shellLabel={
+              active && !active.launchCommand && !activeIsSsh && !active.exited
+                ? shellChoiceLabel(active.shellChoice ?? shellChoiceForProject(activeProject), detectedShells)
+                : null
+            }
+            onShellClick={() => handleNewTerminalWithShellForProject(activeProjectId)}
+            cwd={active?.cwd ? shortenPathSmart(active.cwd, 60) : null}
+            sshTarget={activeIsSsh ? activeSshTarget : null}
+            connectionState={active?.connectionState ?? null}
+            recordingActive={Boolean(active?.recordingActive)}
+            keepAwake={autoCaffeinate && keepAwakeActive}
+            updateAvailable={updateCheckState.status === "updateAvailable"}
+            onOpenUpdates={() => setUpdatesOpen(true)}
+            version={appInfo?.version ?? null}
+          />
+        </div>
       </main>
 
       {/* Command Palette */}
