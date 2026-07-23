@@ -55,7 +55,7 @@ use mcp_tools::OutputBuffers;
 use server_control::{get_server_status, set_api_enabled, set_mcp_enabled, ServerControl};
 use tray::{build_status_tray, set_tray_agent_count, set_tray_recent_sessions, set_tray_status};
 use std::sync::Arc;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 /// Raise the open-file-descriptor soft limit on Unix. The macOS default is only
 /// 256, which a terminal multiplexer exhausts fast: each PTY session holds ~3
@@ -101,6 +101,11 @@ fn raise_fd_limit() {
             );
         }
     }
+}
+
+#[tauri::command]
+fn acknowledge_display_recovery_event(generation: u64) {
+    display_recovery::acknowledge_recovery_event(generation);
 }
 
 fn main() {
@@ -205,6 +210,7 @@ fn main() {
             start_session_recording,
             stop_session_recording,
             power_assertion::set_auto_caffeinate,
+            acknowledge_display_recovery_event,
             get_startup_flags,
             load_persisted_state,
             load_persisted_state_meta,
@@ -292,11 +298,24 @@ fn main() {
                     }
                     api_discovery::cleanup();
                 }
-                tauri::RunEvent::Resumed { .. } => {
-                    // emit_to by label, not get_webview_window("main"): a browser
-                    // child webview makes the main window stop being a
-                    // WebviewWindow, which would make get_webview_window return None.
-                    let _ = app.emit_to("main", "system-resumed", ());
+                tauri::RunEvent::Resumed => {
+                    // This is an event-loop lifecycle signal and can also mean a
+                    // normal poll. The recovery module acts only if AppKit or
+                    // CoreGraphics previously observed actual display sleep.
+                    display_recovery::runtime_resumed(app);
+                }
+                tauri::RunEvent::WindowEvent {
+                    label,
+                    event: tauri::WindowEvent::Focused(true),
+                    ..
+                } if label == "main" => {
+                    // A wake recovery is deferred while the window is hidden or
+                    // minimized. Consume it only once the window is presentable.
+                    display_recovery::recover_if_pending(app, "main-window-focused");
+                }
+                #[cfg(target_os = "macos")]
+                tauri::RunEvent::Reopen { .. } => {
+                    display_recovery::recover_if_pending(app, "application-reopened");
                 }
                 _ => {}
             }

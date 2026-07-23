@@ -7,7 +7,18 @@ import { SearchAddon } from "@xterm/addon-search";
 import { SessionShellIntegration, type CommandBlock } from "./shellIntegration";
 import { notifyStateChange } from "./apiBridge";
 
-export type CanvasRecoveryOptions = { force?: boolean; source?: string };
+export type CanvasRecoveryGeneration = string | number;
+export type CanvasRecoveryOptions = {
+  force?: boolean;
+  source?: string;
+  /** Bypass the recent-swap guard for a loss on the currently loaded canvas. */
+  contextLoss?: boolean;
+  /**
+   * Opaque identity for one recovery request. Repeated calls with the same
+   * generation rebuild this terminal's CanvasAddon at most once.
+   */
+  generation?: CanvasRecoveryGeneration;
+};
 export type TerminalRegistry = Map<string, { term: Terminal; fit: FitAddon; search: SearchAddon; shellInt?: SessionShellIntegration; recoverCanvas: (options?: CanvasRecoveryOptions) => void; needsCanvasRecovery?: boolean }>;
 export type PendingDataBuffer = Map<string, string[]>;
 
@@ -43,6 +54,8 @@ const KNOWN_XTERM_RESIZE_RACE_SIGNATURES = [
   "this._renderer.value.handleresize",
   "undefined is not an object (evaluating 'this._renderer.value.handleresize')",
 ];
+const MAX_TRACKED_CANVAS_RECOVERY_GENERATIONS = 32;
+const RECENT_CANVAS_REPLACEMENT_GAP_MS = 2_000;
 const TERMINAL_FONT_FAMILY = "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
 const TERMINAL_THEME_BY_UI_THEME: Record<UiTheme, TerminalTheme> = {
   dawn: {
@@ -335,6 +348,12 @@ function SessionTerminal(props: SessionTerminalProps) {
   const canvasAddonRef = useRef<CanvasAddon | null>(null);
   const recoverCanvasRef = useRef<(options?: CanvasRecoveryOptions) => void>(() => {});
   const lastCanvasRecoveryRef = useRef(0);
+  const attemptedCanvasRecoveryGenerationsRef = useRef<Set<CanvasRecoveryGeneration>>(new Set());
+  const attemptedCanvasRecoveryGenerationOrderRef = useRef<CanvasRecoveryGeneration[]>([]);
+  const deferredCanvasRecoveryRef = useRef<CanvasRecoveryOptions | null>(null);
+  const queuedCanvasRecoveryRef = useRef<CanvasRecoveryOptions | null>(null);
+  const canvasRecoveryInProgressRef = useRef(false);
+  const canvasContextRecoverySequenceRef = useRef(0);
   const canvasRecoveryTimersRef = useRef<number[]>([]);
   const resizeRafRef = useRef<number | null>(null);
   const resizeTimeoutRef = useRef<number | null>(null);
@@ -343,7 +362,12 @@ function SessionTerminal(props: SessionTerminalProps) {
   const resizeCooldownTimerRef = useRef<number | null>(null);
   const lastSizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const activeRef = useRef(props.active);
-  activeRef.current = props.active;
+  React.useLayoutEffect(() => {
+    // Commit visibility atomically with React. Mutating this ref during render
+    // lets timers observe an uncommitted concurrent render and rebuild a canvas
+    // while its container is still hidden.
+    activeRef.current = props.active;
+  }, [props.active]);
   const needsResizeRef = useRef(false);
   const zellijAutoScrollRef = useRef<{
     active: boolean;
@@ -405,6 +429,17 @@ function SessionTerminal(props: SessionTerminalProps) {
         reportTransportError("resize", err);
       });
 
+    const refreshTerminal = () => {
+      const t = termRef.current;
+      if (!t || !t.element) return;
+
+      try {
+        t.refresh(0, Math.max(0, t.rows - 1));
+      } catch {
+        // best-effort redraw
+      }
+    };
+
     const repaintTerminal = () => {
       const t = termRef.current;
       const fitAddon = fitRef.current;
@@ -427,54 +462,194 @@ function SessionTerminal(props: SessionTerminalProps) {
         }
       }
 
-      try {
-        t.refresh(0, Math.max(0, t.rows - 1));
-      } catch {
-        // best-effort repaint
-      }
+      refreshTerminal();
     };
 
-    const scheduleTerminalRepaint = (delayMs: number) => {
+    const scheduleTerminalRefresh = (delayMs: number) => {
       const timer = window.setTimeout(() => {
         canvasRecoveryTimersRef.current = canvasRecoveryTimersRef.current.filter((id) => id !== timer);
-        repaintTerminal();
+        if (activeRef.current) refreshTerminal();
       }, delayMs);
       canvasRecoveryTimersRef.current.push(timer);
     };
 
+    const clearCanvasRecoveryTimers = () => {
+      for (const timer of canvasRecoveryTimersRef.current) {
+        window.clearTimeout(timer);
+      }
+      canvasRecoveryTimersRef.current = [];
+    };
+
+    const hasAttemptedCanvasRecoveryGeneration = (generation: CanvasRecoveryGeneration | undefined) =>
+      generation !== undefined && attemptedCanvasRecoveryGenerationsRef.current.has(generation);
+
+    const markCanvasRecoveryGenerationAttempted = (generation: CanvasRecoveryGeneration | undefined) => {
+      if (generation === undefined || attemptedCanvasRecoveryGenerationsRef.current.has(generation)) return;
+
+      attemptedCanvasRecoveryGenerationsRef.current.add(generation);
+      const order = attemptedCanvasRecoveryGenerationOrderRef.current;
+      order.push(generation);
+      if (order.length > MAX_TRACKED_CANVAS_RECOVERY_GENERATIONS) {
+        const expired = order.shift();
+        if (expired !== undefined) attemptedCanvasRecoveryGenerationsRef.current.delete(expired);
+      }
+    };
+
+    const deferCanvasRecovery = (options?: CanvasRecoveryOptions) => {
+      // Only the newest deferred request matters: one fresh CanvasAddon repairs
+      // every recovery generation missed while this terminal was hidden. Keep
+      // context-loss urgency sticky, though: a later routine wake request must
+      // not let the recent-swap guard suppress a genuinely lost current canvas.
+      const previous = deferredCanvasRecoveryRef.current;
+      deferredCanvasRecoveryRef.current = {
+        ...(options ?? {}),
+        force: true,
+        contextLoss: previous?.contextLoss === true || options?.contextLoss === true,
+      };
+      const entry = props.registry.current.get(props.id);
+      if (entry) entry.needsCanvasRecovery = true;
+    };
+
     // Recovery function for canvas context loss (e.g. after macOS sleep/GPU reset).
-    // Disposes the stale CanvasAddon and loads a fresh one with valid 2D contexts.
+    // It is generation-idempotent and never rebuilds an inactive terminal. Hidden
+    // terminals retain just the newest request and recover immediately on activation.
     const recoverCanvas = (options?: CanvasRecoveryOptions) => {
-      const now = Date.now();
-      if (!options?.force && now - lastCanvasRecoveryRef.current < 5_000) return;
-      lastCanvasRecoveryRef.current = now;
+      const generation = options?.generation;
+      if (hasAttemptedCanvasRecoveryGeneration(generation)) {
+        // Later probes in one recovery generation should confirm that xterm can
+        // draw without repeatedly swapping renderers or resizing the PTY.
+        if (activeRef.current && !canvasRecoveryInProgressRef.current) refreshTerminal();
+        return;
+      }
+
+      if (!activeRef.current) {
+        deferCanvasRecovery(options);
+        return;
+      }
+
+      if (canvasRecoveryInProgressRef.current) {
+        // Re-entrant context events can fire while an addon is being replaced.
+        // Coalesce them and drain the newest request after the current swap,
+        // without allowing a routine request to erase a real context loss.
+        const previous = queuedCanvasRecoveryRef.current;
+        queuedCanvasRecoveryRef.current = {
+          ...(options ?? {}),
+          contextLoss: previous?.contextLoss === true || options?.contextLoss === true,
+        };
+        return;
+      }
 
       const t = termRef.current;
-      if (!t || !t.element) return;
-      try { canvasAddonRef.current?.dispose(); } catch { /* best-effort */ }
+      if (!t || !t.element) {
+        deferCanvasRecovery(options);
+        return;
+      }
+
+      const now = Date.now();
+      if (
+        !options?.contextLoss &&
+        canvasAddonRef.current !== null &&
+        now - lastCanvasRecoveryRef.current < RECENT_CANVAS_REPLACEMENT_GAP_MS
+      ) {
+        // A native wake and a canvas context event often describe the same GPU
+        // reset. Treat the newer generation as satisfied by the recent healthy
+        // replacement; a loss on the replacement canvas bypasses this guard.
+        markCanvasRecoveryGenerationAttempted(generation);
+        refreshTerminal();
+        return;
+      }
+      if (!options?.force && now - lastCanvasRecoveryRef.current < 5_000) return;
+
+      lastCanvasRecoveryRef.current = now;
+      markCanvasRecoveryGenerationAttempted(generation);
+      canvasRecoveryInProgressRef.current = true;
+      clearCanvasRecoveryTimers();
+
+      const registryEntry = props.registry.current.get(props.id);
+      if (registryEntry) registryEntry.needsCanvasRecovery = false;
+      // A successful renderer replacement also satisfies any older recovery
+      // that was queued while the terminal was hidden.
+      deferredCanvasRecoveryRef.current = null;
+
+      const previous = canvasAddonRef.current;
+      canvasAddonRef.current = null;
+      try { previous?.dispose(); } catch { /* best-effort */ }
+
+      let fresh: CanvasAddon | null = null;
       try {
-        const fresh = new CanvasAddon();
+        fresh = new CanvasAddon();
+        // Publish identity before activation so a context-loss event raised
+        // during addon setup is attributed to this fresh renderer, not to the
+        // intentionally empty handoff state.
         canvasAddonRef.current = fresh;
         t.loadAddon(fresh);
         patchXtermRenderServiceDimensions(t);
         patchXtermPausedResizeTask(t);
         repaintTerminal();
-        scheduleTerminalRepaint(250);
-        scheduleTerminalRepaint(1_000);
+        scheduleTerminalRefresh(250);
+        scheduleTerminalRefresh(1_000);
       } catch {
         // CanvasAddon failed — terminal falls back to DOM renderer which still works
+        try { fresh?.dispose(); } catch { /* best-effort */ }
         canvasAddonRef.current = null;
         repaintTerminal();
+      } finally {
+        canvasRecoveryInProgressRef.current = false;
+        const queued = queuedCanvasRecoveryRef.current;
+        queuedCanvasRecoveryRef.current = null;
+        if (queued) {
+          queueMicrotask(() => recoverCanvasRef.current(queued));
+        }
       }
     };
     recoverCanvasRef.current = recoverCanvas;
 
+    const contextRecoveryStates = new WeakMap<
+      EventTarget,
+      { generation: CanvasRecoveryGeneration; addonAtLoss: CanvasAddon | null }
+    >();
+    const contextRecoveryStateFor = (target: EventTarget) => {
+      const currentAddon = canvasAddonRef.current;
+      const existing = contextRecoveryStates.get(target);
+      if (existing !== undefined && existing.addonAtLoss === currentAddon) return existing;
+      canvasContextRecoverySequenceRef.current += 1;
+      const generation = `context-${canvasContextRecoverySequenceRef.current}`;
+      const state = { generation, addonAtLoss: currentAddon };
+      contextRecoveryStates.set(target, state);
+      return state;
+    };
     const handleCanvasContextLost = (event: Event) => {
       event.preventDefault();
-      window.setTimeout(() => recoverCanvas({ force: true, source: event.type }), 250);
+      const target = event.target ?? container;
+      const { generation, addonAtLoss } = contextRecoveryStateFor(target);
+      const source = event.type;
+      const timer = window.setTimeout(() => {
+        canvasRecoveryTimersRef.current = canvasRecoveryTimersRef.current.filter((id) => id !== timer);
+        // Another wake/context callback already replaced the addon that owned
+        // this event. Its delayed callback is stale and must not swap again.
+        if (canvasAddonRef.current !== addonAtLoss) return;
+        recoverCanvas({ force: true, source, generation, contextLoss: true });
+      }, 250);
+      canvasRecoveryTimersRef.current.push(timer);
     };
-    const handleCanvasContextRestored = () => {
-      recoverCanvas({ force: true, source: "contextrestored" });
+    const handleCanvasContextRestored = (event: Event) => {
+      const target = event.target ?? container;
+      const state = contextRecoveryStates.get(target);
+      if (state === undefined) {
+        refreshTerminal();
+        return;
+      }
+      contextRecoveryStates.delete(target);
+      if (canvasAddonRef.current !== state.addonAtLoss) {
+        refreshTerminal();
+        return;
+      }
+      recoverCanvas({
+        force: true,
+        source: event.type,
+        generation: state.generation,
+        contextLoss: true,
+      });
     };
     container.addEventListener("contextlost", handleCanvasContextLost, true);
     container.addEventListener("contextrestored", handleCanvasContextRestored, true);
@@ -1039,10 +1214,7 @@ function SessionTerminal(props: SessionTerminalProps) {
 		      container.removeEventListener("contextrestored", handleCanvasContextRestored, true);
 		      container.removeEventListener("webglcontextlost", handleCanvasContextLost, true);
 		      container.removeEventListener("webglcontextrestored", handleCanvasContextRestored, true);
-		      for (const timer of canvasRecoveryTimersRef.current) {
-		        window.clearTimeout(timer);
-		      }
-		      canvasRecoveryTimersRef.current = [];
+		      clearCanvasRecoveryTimers();
 		      resizeObserver.disconnect();
 		      if (resizeRafRef.current !== null) {
 		        window.cancelAnimationFrame(resizeRafRef.current);
@@ -1066,6 +1238,9 @@ function SessionTerminal(props: SessionTerminalProps) {
 	      try { canvasAddonRef.current?.dispose(); } catch { /* best-effort */ }
 	      canvasAddonRef.current = null;
         recoverCanvasRef.current = () => {};
+	      deferredCanvasRecoveryRef.current = null;
+	      queuedCanvasRecoveryRef.current = null;
+	      canvasRecoveryInProgressRef.current = false;
 	      term.dispose();
 	      termRef.current = null;
 	      fitRef.current = null;
@@ -1081,6 +1256,25 @@ function SessionTerminal(props: SessionTerminalProps) {
 	    };
 	  }, [props.id, props.persistent, props.registry, props.pendingData]);
 
+  React.useLayoutEffect(() => {
+    if (!props.active) return;
+
+    // Drain deferred work before the browser paints the newly-visible terminal.
+    // The generation token makes this safe under StrictMode and duplicate wake
+    // callbacks, while the boolean branch preserves the existing App contract.
+    const registryEntry = props.registry.current.get(props.id);
+    const deferredCanvasRecovery = deferredCanvasRecoveryRef.current;
+    if (registryEntry?.needsCanvasRecovery || deferredCanvasRecovery) {
+      if (registryEntry) registryEntry.needsCanvasRecovery = false;
+      deferredCanvasRecoveryRef.current = null;
+      recoverCanvasRef.current({
+        ...(deferredCanvasRecovery ?? {}),
+        force: true,
+        source: deferredCanvasRecovery?.source ?? "activation",
+      });
+    }
+  }, [props.active, props.id, props.registry]);
+
   useEffect(() => {
     if (!props.active) return;
     needsResizeRef.current = false;
@@ -1089,16 +1283,6 @@ function SessionTerminal(props: SessionTerminalProps) {
     const fit = fitRef.current;
     const container = containerRef.current;
     if (!term || !fit || !container) return;
-
-    // If a display-wake / GPU-reset recovery occurred while this session was
-    // hidden, its canvas rebuild was deferred (see App.recoverAllCanvases).
-    // Rebuild it now, before we fit/refresh for activation, so the user never
-    // sees a stale or blank canvas on switch-in.
-    const registryEntry = props.registry.current.get(props.id);
-    if (registryEntry?.needsCanvasRecovery) {
-      registryEntry.needsCanvasRecovery = false;
-      recoverCanvasRef.current({ force: true, source: "activation" });
-    }
 
     let cancelled = false;
 	    const attemptFit = (attemptsLeft: number) => {

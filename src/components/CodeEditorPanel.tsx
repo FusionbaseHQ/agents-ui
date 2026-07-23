@@ -11,6 +11,7 @@ import { ConfirmActionModal } from "./modals/ConfirmActionModal";
 import { concatBytes } from "../fileViewer/bytes";
 import { useChunkCache } from "../fileViewer/useChunkCache";
 import { registerCodeEditorThemes, type CodeEditorThemeId } from "../monaco/editorThemes";
+import { closeBrowserNativeView } from "../browser/nativeViewLifecycle";
 
 type MonacoType = typeof import("monaco-editor");
 type MonacoTypeScriptDefaults = {
@@ -236,6 +237,12 @@ const LazyBrowserView = React.lazy(() => import("../browser/BrowserView"));
 // key ("browser://<n>", never an absolute path) so the file-loading machinery skips them.
 const BROWSER_PREFIX = "browser://";
 const BROWSER_START_URL = "https://duckduckgo.com";
+const BROWSER_LABEL_PROCESS_NONCE = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+let browserLabelSequence = 0;
+const nextBrowserLabel = () => {
+  browserLabelSequence += 1;
+  return `browser-${BROWSER_LABEL_PROCESS_NONCE}-${browserLabelSequence.toString(36)}`;
+};
 const isBrowserPath = (path: string) => path.startsWith(BROWSER_PREFIX);
 function urlHost(url: string): string {
   try {
@@ -1064,7 +1071,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       }
       // Tear down any embedded-browser webviews so they don't linger off-screen.
       for (const meta of browserMetaRef.current.values()) {
-        void invoke("browser_close", { label: meta.label }).catch(() => {});
+        void closeBrowserNativeView(meta.label).catch(() => {});
       }
       browserMetaRef.current.clear();
       editorRef.current?.setModel(null);
@@ -1531,7 +1538,10 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     (url: string = BROWSER_START_URL, title = "New tab") => {
       const seq = ++browserSeqRef.current;
       const path = `${BROWSER_PREFIX}${seq}`;
-      const label = `browser-${seq}`;
+      // Labels address process-lifetime native WKWebViews. They must not be
+      // reused when an editor panel remounts while an old async close is still
+      // draining, or that stale close could target the new tab.
+      const label = nextBrowserLabel();
       browserMetaRef.current.set(path, { label, url });
       openPathsRef.current.add(path);
       const tab: Tab = {
@@ -1826,7 +1836,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     (path: string) => {
       const browserMeta = browserMetaRef.current.get(path);
       if (browserMeta) {
-        void invoke("browser_close", { label: browserMeta.label }).catch(() => {});
+        void closeBrowserNativeView(browserMeta.label).catch(() => {});
         browserMetaRef.current.delete(path);
       }
       const editor = editorRef.current;
@@ -1874,7 +1884,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       for (const p of toClose) {
         const browserMeta = browserMetaRef.current.get(p);
         if (browserMeta) {
-          void invoke("browser_close", { label: browserMeta.label }).catch(() => {});
+          void closeBrowserNativeView(browserMeta.label).catch(() => {});
           browserMetaRef.current.delete(p);
         }
         const model = modelsRef.current.get(p);

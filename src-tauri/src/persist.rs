@@ -32,6 +32,14 @@ pub struct PersistedProjectV1 {
     pub base_path: Option<String>,
     pub environment_id: Option<String>,
     pub assets_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_remote_path: Option<String>,
     /// Per-project default shell. Absent ⇒ bundled Nushell (the app default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_shell: Option<PersistedShellChoiceV1>,
@@ -50,6 +58,14 @@ pub struct PersistedSessionV1 {
     pub last_recording_id: Option<String>,
     pub cwd: Option<String>,
     pub persistent: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_order: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     pub created_at: u64,
 }
 
@@ -60,6 +76,10 @@ pub struct PersistedPromptV1 {
     pub title: String,
     pub content: String,
     pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_order: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -351,4 +371,112 @@ pub fn list_directories(path: Option<String>) -> Result<DirectoryListing, String
         parent,
         entries,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PersistedStateV1;
+    use serde_json::{json, Value};
+
+    fn round_trip(value: Value) -> Value {
+        let state: PersistedStateV1 =
+            serde_json::from_value(value).expect("state should deserialize");
+        serde_json::to_value(state).expect("state should serialize")
+    }
+
+    #[test]
+    fn state_round_trip_preserves_frontend_metadata() {
+        let output = round_trip(json!({
+            "schemaVersion": 1,
+            "projects": [{
+                "id": "project-1",
+                "title": "Project",
+                "basePath": "/tmp/project",
+                "environmentId": null,
+                "assetsEnabled": true,
+                "symbol": "rocket",
+                "color": "80, 120, 240",
+                "sshTarget": "dev@example.test",
+                "sshRemotePath": "/srv/project"
+            }],
+            "activeProjectId": "project-1",
+            "sessions": [{
+                "persistId": "session-1",
+                "projectId": "project-1",
+                "name": "Terminal",
+                "launchCommand": null,
+                "restoreCommand": null,
+                "sshTarget": null,
+                "sshRootDir": null,
+                "lastRecordingId": null,
+                "cwd": "/tmp/project",
+                "persistent": false,
+                "pinned": true,
+                "sidebarOrder": 3,
+                "symbol": "terminal",
+                "color": "220, 90, 120",
+                "createdAt": 123
+            }],
+            "activeSessionByProject": { "project-1": "session-1" },
+            "prompts": [{
+                "id": "prompt-1",
+                "title": "Prompt",
+                "content": "Content",
+                "createdAt": 456,
+                "pinned": true,
+                "pinOrder": 2
+            }],
+            "environments": [],
+            "assets": [],
+            "assetSettings": null
+        }));
+
+        assert_eq!(output["projects"][0]["symbol"], "rocket");
+        assert_eq!(output["projects"][0]["color"], "80, 120, 240");
+        assert_eq!(output["projects"][0]["sshTarget"], "dev@example.test");
+        assert_eq!(output["projects"][0]["sshRemotePath"], "/srv/project");
+        assert_eq!(output["sessions"][0]["pinned"], true);
+        assert_eq!(output["sessions"][0]["sidebarOrder"], 3);
+        assert_eq!(output["sessions"][0]["symbol"], "terminal");
+        assert_eq!(output["sessions"][0]["color"], "220, 90, 120");
+        assert_eq!(output["prompts"][0]["pinned"], true);
+        assert_eq!(output["prompts"][0]["pinOrder"], 2);
+    }
+
+    #[test]
+    fn older_v1_state_without_frontend_metadata_stays_compatible() {
+        let output = round_trip(json!({
+            "schemaVersion": 1,
+            "projects": [{
+                "id": "project-1",
+                "title": "Project",
+                "basePath": null,
+                "environmentId": null,
+                "assetsEnabled": true
+            }],
+            "activeProjectId": "project-1",
+            "sessions": [{
+                "persistId": "session-1",
+                "projectId": "project-1",
+                "name": "Terminal",
+                "launchCommand": null,
+                "restoreCommand": null,
+                "sshTarget": null,
+                "sshRootDir": null,
+                "lastRecordingId": null,
+                "cwd": null,
+                "persistent": false,
+                "createdAt": 123
+            }],
+            "activeSessionByProject": {},
+            "prompts": [],
+            "environments": [],
+            "assets": [],
+            "assetSettings": null
+        }));
+
+        assert!(output["projects"][0].get("color").is_none());
+        assert!(output["sessions"][0].get("color").is_none());
+        assert!(output["sessions"][0].get("sidebarOrder").is_none());
+    }
 }

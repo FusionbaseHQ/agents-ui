@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
+const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
 
 /// Get the user's default login shell, same logic as pty.rs.
 fn default_user_shell() -> String {

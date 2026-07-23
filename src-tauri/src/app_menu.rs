@@ -7,6 +7,7 @@ use tauri::{AppHandle, Emitter, Runtime};
 pub const MENU_ID_CHECK_UPDATES: &str = "help-check-updates";
 pub const MENU_ID_SELECT_ALL: &str = "edit-select-all";
 pub const MENU_ID_TOGGLE_TERMINAL_SEARCH: &str = "window-toggle-terminal-search";
+pub const MENU_ID_RECOVER_DISPLAY: &str = "window-recover-display";
 pub const EVENT_APP_MENU: &str = "app-menu";
 
 #[derive(serde::Serialize, Clone)]
@@ -27,6 +28,11 @@ pub fn build_app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
     let find_terminal_item = MenuItemBuilder::with_id(MENU_ID_TOGGLE_TERMINAL_SEARCH, "Find")
         .accelerator("CmdOrCtrl+F")
         .build(app)?;
+    #[cfg(target_os = "macos")]
+    let recover_display_item =
+        MenuItemBuilder::with_id(MENU_ID_RECOVER_DISPLAY, "Recover Display")
+            .accelerator("CmdOrCtrl+Alt+R")
+            .build(app)?;
 
     if let Some(MenuItemKind::Submenu(help_menu)) = menu.get(HELP_SUBMENU_ID) {
         help_menu.insert(&check_updates_item, 0)?;
@@ -50,6 +56,12 @@ pub fn build_app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
     if let Some(MenuItemKind::Submenu(window_menu)) = menu.get(WINDOW_SUBMENU_ID) {
         let window_separator = PredefinedMenuItem::separator(app)?;
         window_menu.insert(&find_terminal_item, 0)?;
+        #[cfg(target_os = "macos")]
+        {
+            window_menu.insert(&recover_display_item, 1)?;
+            window_menu.insert(&window_separator, 2)?;
+        }
+        #[cfg(not(target_os = "macos"))]
         window_menu.insert(&window_separator, 1)?;
     }
     replace_default_select_all(&menu, &select_all_item)?;
@@ -88,8 +100,12 @@ fn replace_default_select_all<R: Runtime>(
     Ok(())
 }
 
-pub fn handle_app_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
+pub fn handle_app_menu_event(app: &AppHandle, event: MenuEvent) {
     let id = event.id().as_ref();
+    if id == MENU_ID_RECOVER_DISPLAY {
+        crate::display_recovery::request_recovery(app, "native-app-menu");
+        return;
+    }
     if id == MENU_ID_CHECK_UPDATES
         || id == MENU_ID_SELECT_ALL
         || id == MENU_ID_TOGGLE_TERMINAL_SEARCH

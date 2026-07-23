@@ -285,7 +285,11 @@ const SLEEP_DETECTION_GAP_MS = 15_000;
 const DISPLAY_WAKE_RENDER_GAP_MS = 8_000;
 const DISPLAY_WAKE_TIMER_INTERVAL_MS = 2_000;
 const DISPLAY_WAKE_RECOVERY_MIN_GAP_MS = 4_000;
-const DISPLAY_WAKE_RECOVERY_DELAYS_MS = [0, 250, 1_000, 3_000] as const;
+const DISPLAY_WAKE_RECOVERY_COALESCE_MS = 2_000;
+// Let the native WKWebView pulse and WindowServer presentation settle before
+// replacing xterm's renderer. Later passes share the generation and refresh only.
+const DISPLAY_WAKE_RECOVERY_DELAYS_MS = [250, 750, 1_500, 3_000] as const;
+let displayWakeRecoveryGeneration = 0;
 const SYSTEM_HEALTH_REFRESH_MS = 5_000;
 // Cursor Position Report echo (ESC[row;colR). TUI apps query via ESC[6n and the
 // PTY kernel can echo xterm's response back as visible garbage, so we strip it.
@@ -2537,6 +2541,10 @@ export default function App() {
   const homeDirRef = useRef<string | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const pendingSaveRef = useRef<PersistedStateV1 | null>(null);
+  // Appearance choices are low-frequency, user-authored metadata. Save them on
+  // the next task so a crash immediately after using a picker cannot strand
+  // the change inside the normal autosave debounce window.
+  const urgentPersistenceRef = useRef(false);
   const workspaceViewSaveTimerRef = useRef<number | null>(null);
   const pendingWorkspaceViewSaveRef = useRef<WorkspaceViewStorageV1 | null>(null);
   const agentIdleTimersRef = useRef<Map<string, number>>(new Map());
@@ -3749,6 +3757,13 @@ export default function App() {
     let lastFrameAt = performance.now();
     let lastRecoveryRequestedAt = 0;
     let recoveryBatch = 0;
+    let activeRecoveryBatch: {
+      id: number;
+      generation: number;
+      source: string;
+      force: boolean;
+      healthCheckPending: boolean;
+    } | null = null;
     let frameId: number | null = null;
     let frameProbeRemaining = 0;
     let disposed = false;
@@ -3774,24 +3789,14 @@ export default function App() {
       });
     };
 
-    const recoverAllCanvases = (source: string, force = false) => {
+    const recoverAllCanvases = (source: string, generation: number, force = false) => {
       forceWebviewRepaint();
-      const visibleActiveId = activeIdRef.current;
-      const visibleSecondaryId = splitPaneRef.current?.secondaryId ?? null;
       for (const [id, entry] of registry.current.entries()) {
-        const isVisible = id === visibleActiveId || id === visibleSecondaryId;
-        if (isVisible) {
-          try { entry.recoverCanvas({ force, source }); } catch { console.warn("[agents-ui] Failed to recover canvas for session", id); }
-        } else {
-          // Rebuilding a hidden terminal's canvas (CanvasAddon dispose+recreate +
-          // repaints) on every wake/focus/scale/resize event is wasted work that
-          // scales linearly with session count and is invisible to the user.
-          // Defer it: flag the session so its canvas is rebuilt only when the
-          // user actually switches to it (SessionTerminal activation effect).
-          // The per-canvas contextlost/webglcontextlost listeners still catch a
-          // genuine GPU loss on any terminal immediately.
-          entry.needsCanvasRecovery = true;
-        }
+        // SessionTerminal owns visibility-aware deferral. Passing the same
+        // generation through every delayed probe guarantees one CanvasAddon
+        // replacement at most; subsequent calls are refresh-only and hidden
+        // terminals retain just one deferred request until activation.
+        try { entry.recoverCanvas({ force, source, generation }); } catch { console.warn("[agents-ui] Failed to recover canvas for session", id); }
       }
     };
 
@@ -3800,26 +3805,71 @@ export default function App() {
       options: { force?: boolean; healthCheck?: boolean; bypassThrottle?: boolean } = {},
     ) => {
       const now = Date.now();
+      // Several independent APIs report one physical wake (AppKit, Tauri,
+      // pageshow/focus, and the timer-gap watchdog). Always collapse signals in
+      // this small window, even for otherwise-authoritative sources. Merge the
+      // stronger request into the live batch so an earlier scale notification
+      // cannot discard a later native wake health check.
+      if (
+        now - lastRecoveryRequestedAt < DISPLAY_WAKE_RECOVERY_COALESCE_MS
+        && activeRecoveryBatch !== null
+      ) {
+        activeRecoveryBatch.force ||= options.force ?? true;
+        activeRecoveryBatch.source = source;
+        if (options.healthCheck && !activeRecoveryBatch.healthCheckPending) {
+          activeRecoveryBatch.healthCheckPending = true;
+          const batch = activeRecoveryBatch;
+          const timer = window.setTimeout(() => {
+            const index = recoveryTimers.indexOf(timer);
+            if (index >= 0) recoveryTimers.splice(index, 1);
+            if (!disposed && activeRecoveryBatch?.id === batch.id) {
+              batch.healthCheckPending = false;
+              runSessionHealthCheckRef.current(batch.source, true);
+            }
+          }, 2_000);
+          recoveryTimers.push(timer);
+        }
+        return;
+      }
       if (!options.bypassThrottle && now - lastRecoveryRequestedAt < DISPLAY_WAKE_RECOVERY_MIN_GAP_MS) return;
       lastRecoveryRequestedAt = now;
       recoveryBatch += 1;
       const batch = recoveryBatch;
+      displayWakeRecoveryGeneration += 1;
+      const generation = displayWakeRecoveryGeneration;
+      const healthCheckPending = options.healthCheck === true
+        || activeRecoveryBatch?.healthCheckPending === true;
       clearRecoveryTimers();
+      activeRecoveryBatch = {
+        id: batch,
+        generation,
+        source,
+        force: options.force ?? true,
+        healthCheckPending,
+      };
 
       console.warn(`[agents-ui] Recovering terminal canvases after ${source}.`);
       for (const delay of DISPLAY_WAKE_RECOVERY_DELAYS_MS) {
         const timer = window.setTimeout(() => {
           const index = recoveryTimers.indexOf(timer);
           if (index >= 0) recoveryTimers.splice(index, 1);
-          if (disposed || batch !== recoveryBatch) return;
-          recoverAllCanvases(source, options.force ?? true);
+          const activeBatch = activeRecoveryBatch;
+          if (disposed || batch !== recoveryBatch || activeBatch?.id !== batch) return;
+          recoverAllCanvases(activeBatch.source, activeBatch.generation, activeBatch.force);
         }, delay);
         recoveryTimers.push(timer);
       }
-      if (options.healthCheck) {
-        window.setTimeout(() => {
-          if (!disposed) runSessionHealthCheckRef.current(source, true);
+      if (healthCheckPending) {
+        const timer = window.setTimeout(() => {
+          const index = recoveryTimers.indexOf(timer);
+          if (index >= 0) recoveryTimers.splice(index, 1);
+          const activeBatch = activeRecoveryBatch;
+          if (!disposed && activeBatch?.id === batch) {
+            activeBatch.healthCheckPending = false;
+            runSessionHealthCheckRef.current(activeBatch.source, true);
+          }
         }, 2_000);
+        recoveryTimers.push(timer);
       }
     };
 
@@ -3925,8 +3975,16 @@ export default function App() {
 
     // Tauri emits "system-resumed" when macOS wakes from sleep — more reliable than timestamp gaps
     let unlistenResumed: (() => void) | null = null;
-    listen("system-resumed", () => {
+    listen<number>("system-resumed", ({ payload: generation }) => {
+      if (disposed) return;
       console.warn("[agents-ui] System resumed from sleep (Tauri event).");
+      if (Number.isSafeInteger(generation) && generation > 0) {
+        // This acknowledgement is deliberately only a renderer-liveness signal;
+        // native recovery does not depend on the later canvas/browser work.
+        void invoke("acknowledge_display_recovery_event", { generation }).catch((err) => {
+          console.warn("[agents-ui] Failed to acknowledge display recovery event", err);
+        });
+      }
       lastActiveAt = Date.now();
       lastTimerTickAt = Date.now();
       scheduleCanvasRecovery("sleep-resume", { force: true, healthCheck: true, bypassThrottle: true });
@@ -4482,14 +4540,22 @@ export default function App() {
       "sessions.set_symbol": (p) => {
         const id = p.id as string;
         const symbol = normalizeTabSymbolValue(p.symbol as string | null);
-        setSessionsSync((prev) => prev.map((s) => s.id === id ? { ...s, symbol } : s));
+        setSessionsSync((prev) => prev.map((s) => {
+          if (s.id !== id || (s.symbol ?? null) === symbol) return s;
+          urgentPersistenceRef.current = true;
+          return { ...s, symbol };
+        }));
         notifyStateChange("sessions.updated", { sessionId: id, symbol });
         return null;
       },
       "sessions.set_color": (p) => {
         const id = p.id as string;
         const color = (p.color as string) || null;
-        setSessionsSync((prev) => prev.map((s) => s.id === id ? { ...s, color } : s));
+        setSessionsSync((prev) => prev.map((s) => {
+          if (s.id !== id || (s.color ?? null) === color) return s;
+          urgentPersistenceRef.current = true;
+          return { ...s, color };
+        }));
         notifyStateChange("sessions.updated", { sessionId: id, color });
         return null;
       },
@@ -4600,6 +4666,9 @@ export default function App() {
         const id = p.id as string;
         setProjects((prev) => prev.map((proj) => {
           if (proj.id !== id) return proj;
+          if (p.symbol !== undefined || p.color !== undefined) {
+            urgentPersistenceRef.current = true;
+          }
           return {
             ...proj,
             ...(p.title !== undefined && { title: (p.title as string).trim() }),
@@ -5399,23 +5468,25 @@ export default function App() {
       agentShortcutIds,
     };
 
-      saveTimerRef.current = window.setTimeout(() => {
-        saveTimerRef.current = null;
-        const state = pendingSaveRef.current;
-        if (!state) return;
-        void invoke("save_persisted_state", { state }).catch((err) => {
-          const msg = formatError(err);
-          const lower = msg.toLowerCase();
-          if (
-            secureStorageMode === "keychain" &&
-            (lower.includes("keychain") || lower.includes("keyring"))
-          ) {
-            setPersistenceDisabledReason(`Secure storage is locked (changes won’t be saved): ${msg}`);
-            return;
-          }
-          reportError("Failed to save state", err);
-        });
-      }, 400);
+    const saveDelayMs = urgentPersistenceRef.current ? 0 : 400;
+    urgentPersistenceRef.current = false;
+    saveTimerRef.current = window.setTimeout(() => {
+      saveTimerRef.current = null;
+      const state = pendingSaveRef.current;
+      if (!state) return;
+      void invoke("save_persisted_state", { state }).catch((err) => {
+        const msg = formatError(err);
+        const lower = msg.toLowerCase();
+        if (
+          secureStorageMode === "keychain" &&
+          (lower.includes("keychain") || lower.includes("keyring"))
+        ) {
+          setPersistenceDisabledReason(`Secure storage is locked (changes won’t be saved): ${msg}`);
+          return;
+        }
+        reportError("Failed to save state", err);
+      });
+    }, saveDelayMs);
   }, [projects, activeProjectId, activeSessionByProject, persistedSessions, prompts, environments, assets, assetSettings, agentShortcutIds, secureStorageMode, hydrated, persistenceDisabledReason]);
 
   useEffect(() => {
@@ -6229,19 +6300,7 @@ export default function App() {
 
     const persistedSessions: PersistedSession[] = sessionsRef.current
       .filter((s) => !s.closing)
-      .map((s) => ({
-        persistId: s.persistId,
-        projectId: s.projectId,
-        name: s.name,
-        launchCommand: s.launchCommand,
-        restoreCommand: s.restoreCommand ?? null,
-        sshTarget: s.sshTarget ?? null,
-        sshRootDir: s.sshRootDir ?? null,
-        lastRecordingId: s.lastRecordingId ?? null,
-        cwd: s.cwd,
-        persistent: s.persistent,
-        createdAt: s.createdAt,
-      }))
+      .map(toPersistedSession)
       .sort((a, b) => a.createdAt - b.createdAt);
 
     const state: PersistedStateV1 = {
@@ -8951,6 +9010,7 @@ export default function App() {
       if (idx < 0) return prev;
       const current = prev[idx].symbol ?? null;
       if (current === nextSymbol) return prev;
+      urgentPersistenceRef.current = true;
       const next = prev.slice();
       next[idx] = { ...prev[idx], symbol: nextSymbol };
       return next;
@@ -8963,6 +9023,7 @@ export default function App() {
       if (idx < 0) return prev;
       const current = prev[idx].color ?? null;
       if (current === color) return prev;
+      urgentPersistenceRef.current = true;
       const next = prev.slice();
       next[idx] = { ...prev[idx], color };
       return next;
@@ -9132,6 +9193,7 @@ export default function App() {
       if (idx < 0) return prev;
       const current = prev[idx].symbol ?? null;
       if (current === nextSymbol) return prev;
+      urgentPersistenceRef.current = true;
       const next = prev.slice();
       next[idx] = { ...prev[idx], symbol: nextSymbol };
       return next;
@@ -9144,6 +9206,7 @@ export default function App() {
       if (idx < 0) return prev;
       const current = prev[idx].color ?? null;
       if (current === color) return prev;
+      urgentPersistenceRef.current = true;
       const next = prev.slice();
       next[idx] = { ...prev[idx], color };
       return next;

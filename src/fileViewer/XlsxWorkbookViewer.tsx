@@ -54,7 +54,7 @@ function callXlsxWorker<T>(worker: Worker, request: XlsxWorkerRequest): Promise<
       const response = event.data;
       if (!response || response.id !== id) return;
       cleanup();
-      if (!response.ok) {
+      if (response.ok === false) {
         reject(new Error(response.error));
         return;
       }

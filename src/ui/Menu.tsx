@@ -28,7 +28,7 @@ type MenuProps = {
 };
 
 function isSelectable(e: MenuEntry): e is Extract<MenuEntry, { onSelect: () => void }> {
-  return (e.type === undefined || e.type === "item") && !e.disabled;
+  return "onSelect" in e && !e.disabled;
 }
 
 /**

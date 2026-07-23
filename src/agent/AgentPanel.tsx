@@ -52,9 +52,12 @@ const CLAUDE_MODELS = [
 // Alias values the claude CLI accepts via --model (everything except "Default").
 const CLAUDE_MODEL_ALIASES = CLAUDE_MODELS.map((m) => m.value).filter(Boolean);
 
-const DEFAULT_CODEX_MODEL = "gpt-5.5";
+const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
 const CODEX_MODELS = [
-  { value: DEFAULT_CODEX_MODEL, label: "GPT-5.5" },
+  { value: DEFAULT_CODEX_MODEL, label: "GPT-5.6 Sol" },
+  { value: "gpt-5.6-terra", label: "GPT-5.6 Terra" },
+  { value: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
+  { value: "gpt-5.5", label: "GPT-5.5" },
   { value: "gpt-5.3-codex", label: "GPT-5.3 Codex" },
   { value: "gpt-5.3-codex-spark", label: "GPT-5.3 Spark" },
 ];
@@ -66,7 +69,7 @@ function modelsForProvider(provider: string): { value: string; label: string }[]
 }
 
 function modelDisplayLabel(model: string | undefined, provider: string): string {
-  if (provider === "codex" && !model) return "GPT-5.5";
+  if (provider === "codex" && !model) return "GPT-5.6 Sol";
   if (!model) return "Default";
   const opt = ALL_MODELS.find((o) => o.value === model);
   return opt ? opt.label : model;
@@ -650,7 +653,10 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
                   }
                 }}
               >
-                <option value={DEFAULT_CODEX_MODEL}>GPT-5.5</option>
+                <option value={DEFAULT_CODEX_MODEL}>GPT-5.6 Sol</option>
+                <option value="gpt-5.6-terra">GPT-5.6 Terra</option>
+                <option value="gpt-5.6-luna">GPT-5.6 Luna</option>
+                <option value="gpt-5.5">GPT-5.5</option>
                 <option value="gpt-5.3-codex">GPT-5.3 Codex</option>
                 <option value="gpt-5.3-codex-spark">GPT-5.3 Spark</option>
                 <option value="custom">Custom...</option>
@@ -666,7 +672,7 @@ export function AgentPanel({ onClose, projectBasePath, onCreateTerminalSession, 
               <input
                 className="agentSettingsInput"
                 type="text"
-                placeholder="e.g. gpt-5.5"
+                placeholder="e.g. gpt-5.6-sol"
                 value={settings.model}
                 onChange={(e) =>
                   setSettings((s) => ({ ...s, model: e.target.value || undefined }))

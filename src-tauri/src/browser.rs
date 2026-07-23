@@ -6,14 +6,85 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::Serialize;
-use std::{fs, process::Command, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    process::Command,
+    sync::{Arc, Mutex, OnceLock},
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tauri::{
     webview::{PageLoadEvent, WebviewBuilder},
-    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, Rect, WebviewUrl,
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, Rect, WebviewUrl,
 };
 
-// Parked far off-screen instead of destroyed, so switching tabs keeps page state.
-const OFFSCREEN: f64 = -32000.0;
+// Keep browser webviews alive while their tabs are inactive, but hide them
+// natively instead of parking them far outside the display. Off-screen native
+// layers are prone to retaining stale display coordinates/backing scale across
+// monitor sleep and hot-plug events.
+static VISIBLE_BROWSERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static BROWSER_OPERATIONS: OnceLock<Mutex<HashMap<String, Arc<Mutex<BrowserOperationState>>>>> =
+    OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserOperationKind {
+    Open,
+    Hide,
+    Closed,
+}
+
+#[derive(Default)]
+struct BrowserOperationState {
+    latest_id: Option<u64>,
+    latest_kind: Option<BrowserOperationKind>,
+}
+
+fn browser_operation_state(label: &str) -> Arc<Mutex<BrowserOperationState>> {
+    let states = BROWSER_OPERATIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut states = states
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    states
+        .entry(label.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(BrowserOperationState::default())))
+        .clone()
+}
+
+fn claim_browser_operation(
+    state: &mut BrowserOperationState,
+    operation_id: u64,
+    kind: BrowserOperationKind,
+) -> Result<(), String> {
+    if let Some(latest_id) = state.latest_id {
+        if operation_id < latest_id
+            || (operation_id == latest_id && state.latest_kind != Some(kind))
+        {
+            return Err("browser visibility operation was superseded".to_string());
+        }
+    }
+    state.latest_id = Some(operation_id);
+    state.latest_kind = Some(kind);
+    Ok(())
+}
+
+fn set_browser_visible(label: &str, visible: bool) {
+    let state = VISIBLE_BROWSERS.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut labels) = state.lock() else {
+        return;
+    };
+    if visible {
+        labels.insert(label.to_string());
+    } else {
+        labels.remove(label);
+    }
+}
+
+fn browser_is_visible(label: &str) -> bool {
+    VISIBLE_BROWSERS
+        .get()
+        .and_then(|state| state.lock().ok())
+        .is_some_and(|labels| labels.contains(label))
+}
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -100,11 +171,28 @@ pub fn browser_open(
     width: f64,
     height: f64,
     y_offset: Option<f64>,
+    operation_id: u64,
 ) -> Result<(), String> {
+    let operation_state = browser_operation_state(&label);
+    let mut operation_guard = operation_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    claim_browser_operation(
+        &mut operation_guard,
+        operation_id,
+        BrowserOperationKind::Open,
+    )?;
     let bounds = child_bounds(&app, x, y, width, height, y_offset.unwrap_or(0.0));
     // Already created: just reveal + reposition (keeps the current page).
     if let Some(webview) = app.get_webview(&label) {
-        let _ = webview.set_bounds(bounds);
+        webview
+            .set_bounds(bounds)
+            .map_err(|e| format!("failed to reposition browser webview: {e}"))?;
+        webview
+            .show()
+            .map_err(|e| format!("failed to show browser webview: {e}"))?;
+        set_browser_visible(&label, true);
+        drop(operation_guard);
         return Ok(());
     }
     let window = app
@@ -120,7 +208,7 @@ pub fn browser_open(
         emit_nav(&load_app, &load_label, payload.url().as_str(), loading);
     });
 
-    window
+    let webview = window
         .add_child(
             builder,
             bounds.position,
@@ -129,9 +217,14 @@ pub fn browser_open(
         .map_err(|e| format!("failed to create browser webview: {e}"))?;
     // The main webview may not be positioned yet at first paint; reposition once
     // more now that the child exists.
-    if let Some(webview) = app.get_webview(&label) {
-        let _ = webview.set_bounds(bounds);
-    }
+    webview
+        .set_bounds(bounds)
+        .map_err(|e| format!("failed to position browser webview: {e}"))?;
+    webview
+        .show()
+        .map_err(|e| format!("failed to show browser webview: {e}"))?;
+    set_browser_visible(&label, true);
+    drop(operation_guard);
     Ok(())
 }
 
@@ -153,10 +246,27 @@ pub fn browser_set_bounds(
 }
 
 #[tauri::command]
-pub fn browser_hide(app: AppHandle, label: String) -> Result<(), String> {
+pub fn browser_hide(
+    app: AppHandle,
+    label: String,
+    operation_id: u64,
+) -> Result<(), String> {
+    let operation_state = browser_operation_state(&label);
+    let mut operation_guard = operation_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    claim_browser_operation(
+        &mut operation_guard,
+        operation_id,
+        BrowserOperationKind::Hide,
+    )?;
     if let Some(webview) = app.get_webview(&label) {
-        let _ = webview.set_position(LogicalPosition::new(OFFSCREEN, OFFSCREEN));
+        webview
+            .hide()
+            .map_err(|e| format!("failed to hide browser webview: {e}"))?;
     }
+    set_browser_visible(&label, false);
+    drop(operation_guard);
     Ok(())
 }
 
@@ -186,16 +296,13 @@ pub fn browser_action(app: AppHandle, label: String, action: String) -> Result<(
 
 #[tauri::command]
 pub async fn browser_capture_screenshot(app: AppHandle, label: String) -> Result<BrowserScreenshot, String> {
+    if !browser_is_visible(&label) {
+        return Err("browser tab is not visible yet; focus it and retry".to_string());
+    }
     let webview = app
         .get_webview(&label)
         .ok_or_else(|| "browser not found".to_string())?;
 
-    let child_position = webview
-        .position()
-        .map_err(|e| format!("browser position unavailable: {e}"))?;
-    if child_position.x < -10_000 || child_position.y < -10_000 {
-        return Err("browser tab is not visible yet; focus it and retry".to_string());
-    }
     let child_size = webview
         .size()
         .map_err(|e| format!("browser size unavailable: {e}"))?;
@@ -237,10 +344,42 @@ pub fn open_screen_recording_settings() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn browser_close(app: AppHandle, label: String) -> Result<(), String> {
+pub fn browser_close(
+    app: AppHandle,
+    label: String,
+    operation_id: u64,
+) -> Result<(), String> {
+    let operation_state = browser_operation_state(&label);
+    let mut operation_guard = operation_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    claim_browser_operation(
+        &mut operation_guard,
+        operation_id,
+        BrowserOperationKind::Closed,
+    )?;
     if let Some(webview) = app.get_webview(&label) {
-        let _ = webview.close();
+        if let Err(close_error) = webview.close() {
+            // Close remains the terminal intent and the frontend will retry it.
+            // Hide in the meantime so a transient close failure cannot leave an
+            // unmounted native child intercepting input or exposing page data.
+            match webview.hide() {
+                Ok(()) => {
+                    set_browser_visible(&label, false);
+                    return Err(format!(
+                        "failed to close browser webview (hidden pending retry): {close_error}"
+                    ));
+                }
+                Err(hide_error) => {
+                    return Err(format!(
+                        "failed to close browser webview: {close_error}; fallback hide failed: {hide_error}"
+                    ));
+                }
+            }
+        }
     }
+    set_browser_visible(&label, false);
+    drop(operation_guard);
     Ok(())
 }
 
@@ -416,4 +555,35 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         return None;
     }
     Some((width, height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{claim_browser_operation, BrowserOperationKind, BrowserOperationState};
+
+    #[test]
+    fn operation_ids_reject_older_visibility_intents() {
+        let mut state = BrowserOperationState::default();
+        assert!(claim_browser_operation(&mut state, 10, BrowserOperationKind::Open).is_ok());
+        assert!(claim_browser_operation(&mut state, 9, BrowserOperationKind::Hide).is_err());
+        assert!(claim_browser_operation(&mut state, 11, BrowserOperationKind::Hide).is_ok());
+    }
+
+    #[test]
+    fn identical_operation_retry_is_allowed_but_conflicting_kind_is_not() {
+        let mut state = BrowserOperationState::default();
+        assert!(claim_browser_operation(&mut state, 42, BrowserOperationKind::Hide).is_ok());
+        assert!(claim_browser_operation(&mut state, 42, BrowserOperationKind::Hide).is_ok());
+        assert!(claim_browser_operation(&mut state, 42, BrowserOperationKind::Open).is_err());
+    }
+
+    #[test]
+    fn sequenced_close_invalidates_in_flight_ids_without_blocking_newer_ones() {
+        let mut state = BrowserOperationState::default();
+        assert!(claim_browser_operation(&mut state, 100, BrowserOperationKind::Open).is_ok());
+        assert!(claim_browser_operation(&mut state, 200, BrowserOperationKind::Closed).is_ok());
+        assert!(claim_browser_operation(&mut state, 150, BrowserOperationKind::Open).is_err());
+        assert!(claim_browser_operation(&mut state, 200, BrowserOperationKind::Open).is_err());
+        assert!(claim_browser_operation(&mut state, 201, BrowserOperationKind::Open).is_ok());
+    }
 }

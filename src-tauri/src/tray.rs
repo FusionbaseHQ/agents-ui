@@ -79,6 +79,10 @@ fn on_tray_click(_tray: &TrayIcon, event: TrayIconEvent) {
 fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     match event.id().as_ref() {
         "tray-open" => show_main_window(app),
+        "tray-recover-display" => {
+            show_main_window(app);
+            crate::display_recovery::request_recovery(app, "native-tray-menu");
+        }
         "tray-new-terminal" => {
             show_main_window(app);
             let _ = app.emit(
@@ -277,6 +281,11 @@ pub fn build_status_tray(app: &AppHandle) -> Result<StatusTrayState, String> {
     let open_item = MenuItemBuilder::with_id("tray-open", "Open Agents UI")
         .build(app)
         .map_err(|e| e.to_string())?;
+    #[cfg(target_os = "macos")]
+    let recover_display_item =
+        MenuItemBuilder::with_id("tray-recover-display", "Recover display")
+            .build(app)
+            .map_err(|e| e.to_string())?;
     let new_terminal_item = MenuItemBuilder::with_id("tray-new-terminal", "New terminal")
         .build(app)
         .map_err(|e| e.to_string())?;
@@ -324,8 +333,12 @@ pub fn build_status_tray(app: &AppHandle) -> Result<StatusTrayState, String> {
         .build(app)
         .map_err(|e| e.to_string())?;
 
-    let mut menu_builder = MenuBuilder::new(app)
-        .item(&open_item)
+    let mut menu_builder = MenuBuilder::new(app).item(&open_item);
+    #[cfg(target_os = "macos")]
+    {
+        menu_builder = menu_builder.item(&recover_display_item);
+    }
+    menu_builder = menu_builder
         .item(&new_terminal_item)
         .separator()
         .item(&recent_header_item);
