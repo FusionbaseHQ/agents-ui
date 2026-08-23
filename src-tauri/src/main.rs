@@ -64,10 +64,12 @@ use secure::{prepare_secure_storage, reset_secure_storage};
 use server_control::{get_server_status, set_api_enabled, set_mcp_enabled, ServerControl};
 use ssh::list_ssh_hosts;
 use ssh_fs::{
-    ssh_create_directory, ssh_create_file, ssh_default_root, ssh_delete_fs_entry,
-    ssh_download_file, ssh_download_to_temp, ssh_effective_user, ssh_list_fs_entries,
-    ssh_probe_file, ssh_read_file_range, ssh_read_text_file, ssh_rename_fs_entry,
-    ssh_search_fs_entries, ssh_upload_file, ssh_write_text_file,
+    cancel_active_ssh_downloads_for_renderer_restart, default_download_directory,
+    shutdown_ssh_transfers, ssh_cancel_download, ssh_create_directory, ssh_create_file,
+    ssh_default_root, ssh_delete_fs_entry, ssh_download_file, ssh_download_file_with_progress,
+    ssh_download_to_temp, ssh_effective_user, ssh_list_fs_entries, ssh_probe_file,
+    ssh_read_file_range, ssh_read_text_file, ssh_rename_fs_entry, ssh_search_fs_entries,
+    ssh_upload_file, ssh_write_text_file,
 };
 use startup::get_startup_flags;
 use std::sync::Arc;
@@ -182,6 +184,7 @@ fn main() {
                 // Stop serializing PTY output into a dead JavaScript event queue.
                 // Output remains available in bounded per-session replay buffers.
                 pty::mark_renderer_unavailable();
+                cancel_active_ssh_downloads_for_renderer_restart();
                 // Browser child views belong to the dead renderer's ephemeral
                 // React state. Mark them terminal synchronously, then let the
                 // browser worker hide/close them outside this WebKit callback.
@@ -294,7 +297,10 @@ fn main() {
             ssh_write_text_file,
             ssh_rename_fs_entry,
             ssh_delete_fs_entry,
+            default_download_directory,
+            ssh_cancel_download,
             ssh_download_file,
+            ssh_download_file_with_progress,
             ssh_upload_file,
             ssh_download_to_temp,
             system_health_stats,
@@ -346,6 +352,7 @@ fn main() {
                 tauri::RunEvent::Exit => {
                     // Flush recording buffers and kill PTY children before the
                     // process exits — destructors won't run for managed state.
+                    shutdown_ssh_transfers();
                     {
                         use tauri::Manager;
                         pty::shutdown_flush_all(&app.state::<pty::AppState>());

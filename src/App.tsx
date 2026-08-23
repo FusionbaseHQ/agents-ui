@@ -1335,7 +1335,12 @@ type PersistedStateMetaV1 = {
 };
 
 type DirectoryEntry = { name: string; path: string };
-type DirectoryListing = { path: string; parent: string | null; entries: DirectoryEntry[] };
+type DirectoryListing = {
+  path: string;
+  parent: string | null;
+  entries: DirectoryEntry[];
+  truncated?: boolean;
+};
 
 type PersistentSessionInfo = { persistId: string; sessionName: string };
 

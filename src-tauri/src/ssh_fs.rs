@@ -1,9 +1,15 @@
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+    Arc, Mutex, OnceLock,
+};
 use std::time::{Duration, Instant};
+
+use serde::Serialize;
+use tauri::ipc::Channel;
 
 use crate::files::{probe_from_sample, FileProbe, FsEntry, MAX_RANGE_READ_BYTES, PROBE_BYTES};
 
@@ -13,6 +19,20 @@ const MAX_REMOTE_FILE_SEARCH_RESULTS: usize = 1_000;
 /// How many times an ssh/sftp op (or master-establish) is retried when it hits a
 /// transient transport error before giving up.
 const SSH_OP_ATTEMPTS: usize = 3;
+const MAX_ACTIVE_SSH_SHORT_OPS: usize = 8;
+const MAX_DEFERRED_SSH_CHILDREN: usize = 8;
+const SSH_COMMAND_STDOUT_LIMIT: usize = 16 * 1024 * 1024;
+const SFTP_LIST_STDOUT_LIMIT: usize = 8 * 1024 * 1024;
+const SSH_COMMAND_RUNTIME_LIMIT: Duration = Duration::from_secs(120);
+const SSH_CONTROL_RUNTIME_LIMIT: Duration = Duration::from_secs(5);
+const MAX_REMOTE_DIRECTORY_ENTRIES: usize = 10_000;
+const MAX_ACTIVE_SCP_PROCESSES: usize = 6;
+const MAX_ACTIVE_DOWNLOADS: usize = 4;
+const SCP_DIAGNOSTIC_TAIL_BYTES: usize = 64 * 1024;
+const SCP_POLL_INTERVAL: Duration = Duration::from_millis(125);
+const SCP_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+const SCP_DIRECTORY_PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+const SCP_DIRECTORY_SCAN_ENTRY_LIMIT: usize = 2_000;
 
 fn find_program_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -35,10 +55,12 @@ fn find_program_in_path(name: &str) -> Option<PathBuf> {
 fn find_program_in_common_locations(name: &str) -> Option<PathBuf> {
     #[cfg(target_family = "windows")]
     {
-        let candidates = [
-            std::env::var_os("WINDIR")
-                .map(|w| PathBuf::from(w).join("System32").join("OpenSSH").join(format!("{name}.exe"))),
-        ];
+        let candidates = [std::env::var_os("WINDIR").map(|w| {
+            PathBuf::from(w)
+                .join("System32")
+                .join("OpenSSH")
+                .join(format!("{name}.exe"))
+        })];
         for c in candidates.into_iter().flatten() {
             if c.is_file() {
                 return Some(c);
@@ -177,8 +199,7 @@ fn user_ssh_config_path() -> Option<PathBuf> {
     home_dir().map(|h| h.join(".ssh").join("config"))
 }
 
-fn ssh_common_args() -> Result<Vec<String>, String> {
-    let control = control_path()?;
+fn ssh_base_args() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Some(cfg) = user_ssh_config_path().filter(|p| p.is_file()) {
         out.push("-F".to_string());
@@ -200,6 +221,14 @@ fn ssh_common_args() -> Result<Vec<String>, String> {
         "ServerAliveCountMax=4".to_string(),
         "-o".to_string(),
         "StrictHostKeyChecking=yes".to_string(),
+    ]);
+    out
+}
+
+fn ssh_common_args() -> Result<Vec<String>, String> {
+    let control = control_path()?;
+    let mut out = ssh_base_args();
+    out.extend([
         "-o".to_string(),
         "ControlMaster=auto".to_string(),
         "-o".to_string(),
@@ -210,6 +239,25 @@ fn ssh_common_args() -> Result<Vec<String>, String> {
         format!("ControlPath={control}"),
     ]);
     Ok(out)
+}
+
+/// Long-running transfers deliberately do not join the shared multiplexing
+/// master. A transient directory-listing retry may tear that master down; when
+/// scp shared it, an unrelated poll could terminate a healthy transfer and
+/// trigger overlapping full-copy retries. A dedicated connection gives the
+/// transfer its own keepalive/dead-peer lifecycle.
+fn ssh_transfer_args() -> Vec<String> {
+    let mut out = ssh_base_args();
+    out.extend([
+        "-o".to_string(),
+        "ControlMaster=no".to_string(),
+        "-o".to_string(),
+        // ControlMaster=no still reuses a configured ControlPath if one is
+        // present. Explicitly disable the path so long transfers cannot attach
+        // to the short-operation master under any user SSH configuration.
+        "ControlPath=none".to_string(),
+    ]);
+    out
 }
 
 fn output_to_error(prefix: &str, output: &Output) -> String {
@@ -336,38 +384,283 @@ fn invalidate_master_verified(target: &str) {
     }
 }
 
+struct SshShortOpPermit;
+
+impl Drop for SshShortOpPermit {
+    fn drop(&mut self) {
+        active_ssh_short_ops().fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn active_ssh_short_ops() -> &'static AtomicUsize {
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    &ACTIVE
+}
+
+fn acquire_ssh_short_op_permit() -> Result<SshShortOpPermit, String> {
+    poll_deferred_ssh_fallback();
+    let _ = deferred_ssh_child_sender()?;
+    if deferred_ssh_child_count().load(Ordering::Acquire) >= MAX_DEFERRED_SSH_CHILDREN {
+        return Err("SSH process cleanup is still pending; try again shortly".to_string());
+    }
+    active_ssh_short_ops()
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < MAX_ACTIVE_SSH_SHORT_OPS).then_some(active + 1)
+        })
+        .map(|_| SshShortOpPermit)
+        .map_err(|_| {
+            format!(
+                "too many active SSH filesystem operations (maximum {MAX_ACTIVE_SSH_SHORT_OPS})"
+            )
+        })
+}
+
+fn run_command_bounded(
+    mut command: Command,
+    stdin: Option<&[u8]>,
+    stdout_limit: usize,
+    renderer_generation: Option<u64>,
+    runtime_limit: Option<Duration>,
+    label: &str,
+) -> Result<Output, String> {
+    if renderer_generation.is_some_and(|generation| generation != current_ssh_transfer_generation())
+    {
+        return Err("SSH operation belonged to a terminated renderer".to_string());
+    }
+
+    command.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    let mut child = SupervisedChild::new(
+        command
+            .spawn()
+            .map_err(|error| format!("spawn {label} failed: {error}"))?,
+    );
+    let process_group_id = child.id();
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_scp_process(&mut child);
+            return Err(format!("{label} stdout pipe unavailable"));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            terminate_scp_process(&mut child);
+            return Err(format!("{label} stderr pipe unavailable"));
+        }
+    };
+    if let Err(error) = configure_pipe_nonblocking(&stdout) {
+        terminate_scp_process(&mut child);
+        return Err(format!("configure {label} stdout pipe failed: {error}"));
+    }
+    if let Err(error) = configure_pipe_nonblocking(&stderr) {
+        terminate_scp_process(&mut child);
+        return Err(format!("configure {label} stderr pipe failed: {error}"));
+    }
+
+    let stdout_overflowed = Arc::new(AtomicBool::new(false));
+    let stdout_stop = Arc::new(AtomicBool::new(false));
+    let stdout_overflowed_reader = stdout_overflowed.clone();
+    let stdout_stop_reader = stdout_stop.clone();
+    let (stdout_sender, stdout_receiver) = std::sync::mpsc::sync_channel(1);
+    if let Err(error) = std::thread::Builder::new()
+        .name("ssh-stdout-drain".to_string())
+        .spawn(move || {
+            let output = read_bounded_prefix(
+                stdout,
+                stdout_limit,
+                &stdout_overflowed_reader,
+                &stdout_stop_reader,
+            );
+            let _ = stdout_sender.send(output);
+        })
+    {
+        terminate_scp_process(&mut child);
+        return Err(format!("start {label} stdout reader failed: {error}"));
+    }
+
+    let stderr_stop = Arc::new(AtomicBool::new(false));
+    let stderr_stop_reader = stderr_stop.clone();
+    let (stderr_sender, stderr_receiver) = std::sync::mpsc::sync_channel(1);
+    if let Err(error) = std::thread::Builder::new()
+        .name("ssh-stderr-drain".to_string())
+        .spawn(move || {
+            let output =
+                read_scp_stderr_tail(stderr, SCP_DIAGNOSTIC_TAIL_BYTES, &stderr_stop_reader);
+            let _ = stderr_sender.send(output);
+        })
+    {
+        stdout_stop.store(true, Ordering::Release);
+        terminate_scp_process(&mut child);
+        let _ = collect_scp_stderr(&stdout_receiver, &stdout_stop, process_group_id);
+        return Err(format!("start {label} stderr reader failed: {error}"));
+    }
+
+    let started_at = Instant::now();
+    let mut failure: Option<String> = None;
+    let mut stdin_result = if let Some(input) = stdin {
+        match child.stdin.take() {
+            Some(mut child_stdin) => {
+                let input = input.to_vec();
+                let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+                match std::thread::Builder::new()
+                    .name("ssh-stdin-writer".to_string())
+                    .spawn(move || {
+                        let result = child_stdin
+                            .write_all(&input)
+                            .map_err(|error| format!("write SSH stdin failed: {error}"));
+                        let _ = sender.send(result);
+                    }) {
+                    Ok(_) => Some(receiver),
+                    Err(error) => {
+                        failure = Some(format!("start {label} stdin writer failed: {error}"));
+                        None
+                    }
+                }
+            }
+            None => {
+                failure = Some(format!("{label} stdin pipe unavailable"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let status = loop {
+        if let Some(receiver) = stdin_result.as_ref() {
+            match receiver.try_recv() {
+                Ok(Ok(())) => stdin_result = None,
+                Ok(Err(error)) => {
+                    failure = Some(error);
+                    stdin_result = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    failure = Some(format!("{label} stdin writer stopped unexpectedly"));
+                    stdin_result = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if failure.is_none() && stdout_overflowed.load(Ordering::Acquire) {
+            failure = Some(format!(
+                "{label} output exceeded the {stdout_limit}-byte safety limit"
+            ));
+        }
+        if failure.is_none()
+            && renderer_generation
+                .is_some_and(|generation| generation != current_ssh_transfer_generation())
+        {
+            failure = Some("SSH operation belonged to a terminated renderer".to_string());
+        }
+        if failure.is_none() && runtime_limit.is_some_and(|limit| started_at.elapsed() >= limit) {
+            let seconds = runtime_limit.map(|limit| limit.as_secs()).unwrap_or(0);
+            failure = Some(format!(
+                "{label} exceeded the {seconds} second safety deadline"
+            ));
+        }
+        if failure.is_some() {
+            terminate_scp_process(&mut child);
+            break None;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                terminate_scp_process(&mut child);
+                return Err(format!("wait {label} failed: {error}"));
+            }
+        }
+    };
+
+    let stdout = collect_scp_stderr(&stdout_receiver, &stdout_stop, process_group_id);
+    let stderr = collect_scp_stderr(&stderr_receiver, &stderr_stop, process_group_id);
+    if let Some(receiver) = stdin_result {
+        match receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                failure.get_or_insert(error);
+            }
+            Err(_) => {
+                failure.get_or_insert_with(|| format!("{label} stdin writer did not stop"));
+            }
+        };
+    }
+    #[cfg(target_family = "unix")]
+    if scp_process_group_exists(process_group_id) {
+        terminate_remaining_scp_process_group(process_group_id);
+    }
+    if stdout_overflowed.load(Ordering::Acquire) && failure.is_none() {
+        failure = Some(format!(
+            "{label} output exceeded the {stdout_limit}-byte safety limit"
+        ));
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    let status = status.ok_or_else(|| format!("terminated {label} did not exit"))?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// Whether a multiplexing master process is currently registered for `target`.
-fn master_is_alive(target: &str) -> bool {
+fn master_is_alive(target: &str, renderer_generation: Option<u64>) -> bool {
     let (Ok(ssh), Ok(common)) = (program_path("ssh"), ssh_common_args()) else {
         return false;
     };
-    Command::new(ssh)
-        .args(&common)
-        .args(["-O", "check"])
-        .arg(target)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let mut command = Command::new(ssh);
+    command.args(&common).args(["-O", "check"]).arg(target);
+    run_command_bounded(
+        command,
+        None,
+        SCP_DIAGNOSTIC_TAIL_BYTES,
+        renderer_generation,
+        Some(SSH_CONTROL_RUNTIME_LIMIT),
+        "ssh control check",
+    )
+    .map(|output| output.status.success())
+    .unwrap_or(false)
 }
 
 /// Tear down the master for `target` (best effort) — used when it looks stale
 /// (process alive but its underlying connection dead).
-fn close_master(target: &str) {
+fn close_master(target: &str, renderer_generation: Option<u64>) {
     invalidate_master_verified(target);
     let (Ok(ssh), Ok(common)) = (program_path("ssh"), ssh_common_args()) else {
         return;
     };
-    let _ = Command::new(ssh)
-        .args(&common)
-        .args(["-O", "exit"])
-        .arg(target)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let mut command = Command::new(ssh);
+    command.args(&common).args(["-O", "exit"]).arg(target);
+    let _ = run_command_bounded(
+        command,
+        None,
+        SCP_DIAGNOSTIC_TAIL_BYTES,
+        renderer_generation,
+        Some(SSH_CONTROL_RUNTIME_LIMIT),
+        "ssh control exit",
+    );
+}
+
+fn supervisor_error_is_retryable(error: &str) -> bool {
+    !error.contains("terminated renderer")
+        && !error.contains("output exceeded")
+        && !error.contains("not found")
+        && !error.contains("invalid SSH")
 }
 
 /// Ensure the multiplexing master for `target` is up. Serialized per target so
@@ -375,7 +668,7 @@ fn close_master(target: &str) {
 /// every concurrent op racing to open its own connection — a burst the server
 /// rate-limits, surfacing as "Connection reset by peer" /
 /// "kex_exchange_identification" / "Session open refused by peer".
-fn ensure_master(target: &str) -> Result<(), String> {
+fn ensure_master(target: &str, renderer_generation: Option<u64>) -> Result<(), String> {
     let lock = ssh_master_lock(target);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -386,7 +679,7 @@ fn ensure_master(target: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    if master_is_alive(target) {
+    if master_is_alive(target, renderer_generation) {
         mark_master_verified(target);
         return Ok(());
     }
@@ -397,22 +690,30 @@ fn ensure_master(target: &str) -> Result<(), String> {
     for attempt in 0..SSH_OP_ATTEMPTS {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(250 * attempt as u64));
-            if master_is_alive(target) {
+            if master_is_alive(target, renderer_generation) {
                 mark_master_verified(target);
                 return Ok(());
             }
         }
         // `true` is a trivial remote command; with ControlMaster=auto it opens
         // and persists the shared master, then returns immediately.
-        let output = Command::new(&ssh)
-            .args(&common)
-            .arg(target)
-            .arg("true")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| format!("spawn ssh failed: {e}"))?;
+        let mut command = Command::new(&ssh);
+        command.args(&common).arg(target).arg("true");
+        let output = match run_command_bounded(
+            command,
+            None,
+            SCP_DIAGNOSTIC_TAIL_BYTES,
+            renderer_generation,
+            Some(SSH_COMMAND_RUNTIME_LIMIT),
+            "ssh connect",
+        ) {
+            Ok(output) => output,
+            Err(error) if supervisor_error_is_retryable(&error) => {
+                last_err = error;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if output.status.success() {
             mark_master_verified(target);
             return Ok(());
@@ -428,49 +729,53 @@ fn ensure_master(target: &str) -> Result<(), String> {
     ))
 }
 
-fn run_ssh_once(target: &str, remote_args: &[String], stdin: Option<&[u8]>) -> Result<Output, String> {
+fn run_ssh_once(
+    target: &str,
+    remote_args: &[String],
+    stdin: Option<&[u8]>,
+    renderer_generation: Option<u64>,
+) -> Result<Output, String> {
     let mut cmd = Command::new(program_path("ssh")?);
     cmd.args(ssh_common_args()?);
     cmd.arg(target);
     cmd.args(remote_args);
-    match stdin {
-        Some(_) => {
-            cmd.stdin(Stdio::piped());
-        }
-        None => {
-            cmd.stdin(Stdio::null());
-        }
-    }
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    if let Some(input) = stdin {
-        let mut child = cmd.spawn().map_err(|e| format!("spawn ssh failed: {e}"))?;
-        if let Some(mut child_stdin) = child.stdin.take() {
-            child_stdin
-                .write_all(input)
-                .map_err(|e| format!("write ssh stdin failed: {e}"))?;
-        }
-        child
-            .wait_with_output()
-            .map_err(|e| format!("wait ssh failed: {e}"))
-    } else {
-        cmd.output().map_err(|e| format!("run ssh failed: {e}"))
-    }
+    run_command_bounded(
+        cmd,
+        stdin,
+        SSH_COMMAND_STDOUT_LIMIT,
+        renderer_generation,
+        None,
+        "ssh",
+    )
 }
 
 fn run_ssh(target: &str, remote_args: &[String], stdin: Option<&[u8]>) -> Result<Output, String> {
+    run_ssh_with_generation(target, remote_args, stdin, None)
+}
+
+fn run_ssh_with_generation(
+    target: &str,
+    remote_args: &[String],
+    stdin: Option<&[u8]>,
+    renderer_generation: Option<u64>,
+) -> Result<Output, String> {
+    let _permit = acquire_ssh_short_op_permit()?;
     let mut last_output: Option<Output> = None;
     for attempt in 0..SSH_OP_ATTEMPTS {
         if attempt > 0 {
             // The previous attempt hit a transient transport error. The shared
             // master may be stale (process alive but its connection dead); drop
             // it so ensure_master rebuilds a fresh one, then back off.
-            close_master(target);
+            close_master(target, renderer_generation);
             std::thread::sleep(Duration::from_millis(250 * attempt as u64));
         }
-        ensure_master(target)?;
-        let output = run_ssh_once(target, remote_args, stdin)?;
+        ensure_master(target, renderer_generation)?;
+        // A local supervision failure is ambiguous for generic SSH commands:
+        // the remote side may already have performed a mutation before our
+        // wait/pipe failed. Never replay that command automatically. SFTP
+        // directory listings are explicitly read-only and use their own safe
+        // retry path below.
+        let output = run_ssh_once(target, remote_args, stdin, renderer_generation)?;
         if output.status.success() {
             return Ok(output);
         }
@@ -482,7 +787,10 @@ fn run_ssh(target: &str, remote_args: &[String], stdin: Option<&[u8]>) -> Result
         }
         last_output = Some(output);
     }
-    Ok(last_output.expect("ssh retry loop runs at least once"))
+    match last_output {
+        Some(output) => Ok(output),
+        None => Err("ssh failed before its first attempt".to_string()),
+    }
 }
 
 pub(crate) fn run_ssh_script(target: &str, script: &str) -> Result<Output, String> {
@@ -490,38 +798,50 @@ pub(crate) fn run_ssh_script(target: &str, script: &str) -> Result<Output, Strin
     run_ssh(target, &args, Some(script.as_bytes()))
 }
 
-fn run_sftp_once(target: &str, batch: &str) -> Result<Output, String> {
+fn run_sftp_once(
+    target: &str,
+    batch: &str,
+    renderer_generation: Option<u64>,
+) -> Result<Output, String> {
     let mut cmd = Command::new(program_path("sftp")?);
     cmd.args(ssh_common_args()?);
     cmd.arg("-q");
     cmd.arg("-b");
     cmd.arg("-");
     cmd.arg(target);
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().map_err(|e| format!("spawn sftp failed: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(batch.as_bytes())
-            .map_err(|e| format!("write sftp stdin failed: {e}"))?;
-    }
-    child
-        .wait_with_output()
-        .map_err(|e| format!("wait sftp failed: {e}"))
+    run_command_bounded(
+        cmd,
+        Some(batch.as_bytes()),
+        SFTP_LIST_STDOUT_LIMIT,
+        renderer_generation,
+        Some(SSH_COMMAND_RUNTIME_LIMIT),
+        "sftp",
+    )
 }
 
-fn run_sftp_batch(target: &str, batch: &str) -> Result<Output, String> {
+fn run_sftp_batch(
+    target: &str,
+    batch: &str,
+    renderer_generation: Option<u64>,
+) -> Result<Output, String> {
+    let _permit = acquire_ssh_short_op_permit()?;
     let mut last_output: Option<Output> = None;
+    let mut last_error: Option<String> = None;
     for attempt in 0..SSH_OP_ATTEMPTS {
         if attempt > 0 {
-            close_master(target);
+            close_master(target, renderer_generation);
             std::thread::sleep(Duration::from_millis(250 * attempt as u64));
         }
         // Reuse the shared master rather than racing to open a fresh connection.
-        ensure_master(target)?;
-        let output = run_sftp_once(target, batch)?;
+        ensure_master(target, renderer_generation)?;
+        let output = match run_sftp_once(target, batch, renderer_generation) {
+            Ok(output) => output,
+            Err(error) if supervisor_error_is_retryable(&error) => {
+                last_error = Some(error);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if output.status.success() {
             return Ok(output);
         }
@@ -531,7 +851,12 @@ fn run_sftp_batch(target: &str, batch: &str) -> Result<Output, String> {
         }
         last_output = Some(output);
     }
-    Ok(last_output.expect("sftp retry loop runs at least once"))
+    match last_output {
+        Some(output) => Ok(output),
+        None => {
+            Err(last_error.unwrap_or_else(|| "sftp failed before its first attempt".to_string()))
+        }
+    }
 }
 
 fn sftp_escape_arg(value: &str) -> String {
@@ -547,7 +872,10 @@ fn sftp_escape_arg(value: &str) -> String {
     out
 }
 
-fn split_whitespace_with_remainder<'a>(line: &'a str, token_count: usize) -> Option<(Vec<&'a str>, &'a str)> {
+fn split_whitespace_with_remainder<'a>(
+    line: &'a str,
+    token_count: usize,
+) -> Option<(Vec<&'a str>, &'a str)> {
     let bytes = line.as_bytes();
     let mut i = 0usize;
     let mut tokens: Vec<&'a str> = Vec::with_capacity(token_count);
@@ -574,7 +902,7 @@ fn split_whitespace_with_remainder<'a>(line: &'a str, token_count: usize) -> Opt
     Some((tokens, remainder))
 }
 
-fn parse_sftp_ls(dir_path: &str, stdout: &str) -> Vec<FsEntry> {
+fn parse_sftp_ls(dir_path: &str, stdout: &str) -> Result<Vec<FsEntry>, String> {
     let mut entries: Vec<FsEntry> = Vec::new();
 
     for raw in stdout.lines() {
@@ -601,19 +929,23 @@ fn parse_sftp_ls(dir_path: &str, stdout: &str) -> Vec<FsEntry> {
         if name_field.is_empty() {
             continue;
         }
-        let raw_name = name_field
-            .split(" -> ")
-            .next()
-            .unwrap_or(name_field)
-            .trim();
+        let raw_name = name_field.split(" -> ").next().unwrap_or(name_field).trim();
         // Some SFTP servers return full absolute paths; extract just the basename.
         let name = raw_name.rsplit('/').next().unwrap_or(raw_name);
         if name.is_empty() || name == "." || name == ".." {
             continue;
         }
 
-        let size = tokens.get(4).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let size = tokens
+            .get(4)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
         let is_dir = kind == 'd';
+        if entries.len() >= MAX_REMOTE_DIRECTORY_ENTRIES {
+            return Err(format!(
+                "remote directory exceeds the {MAX_REMOTE_DIRECTORY_ENTRIES}-entry safety limit"
+            ));
+        }
         entries.push(FsEntry {
             name: name.to_string(),
             path: join_posix_path(dir_path, name),
@@ -631,7 +963,7 @@ fn parse_sftp_ls(dir_path: &str, stdout: &str) -> Vec<FsEntry> {
         a.name.to_lowercase().cmp(&b.name.to_lowercase())
     });
 
-    entries
+    Ok(entries)
 }
 
 #[tauri::command]
@@ -697,13 +1029,25 @@ fn ssh_default_root_sync(target: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn ssh_list_fs_entries(target: String, root: String, path: String) -> Result<Vec<FsEntry>, String> {
-    tauri::async_runtime::spawn_blocking(move || ssh_list_fs_entries_sync(target, root, path))
-        .await
-        .map_err(|e| format!("ssh task join failed: {e:?}"))?
+pub async fn ssh_list_fs_entries(
+    target: String,
+    root: String,
+    path: String,
+) -> Result<Vec<FsEntry>, String> {
+    let renderer_generation = current_ssh_transfer_generation();
+    tauri::async_runtime::spawn_blocking(move || {
+        ssh_list_fs_entries_sync(target, root, path, renderer_generation)
+    })
+    .await
+    .map_err(|e| format!("ssh task join failed: {e:?}"))?
 }
 
-fn ssh_list_fs_entries_sync(target: String, root: String, path: String) -> Result<Vec<FsEntry>, String> {
+fn ssh_list_fs_entries_sync(
+    target: String,
+    root: String,
+    path: String,
+    renderer_generation: u64,
+) -> Result<Vec<FsEntry>, String> {
     let target = target.trim();
     if target.is_empty() {
         return Err("missing ssh target".to_string());
@@ -711,11 +1055,11 @@ fn ssh_list_fs_entries_sync(target: String, root: String, path: String) -> Resul
     let (_root, path) = ensure_within_root(&root, &path)?;
 
     let batch = format!("ls -la {}\n", sftp_escape_arg(&path));
-    let output = run_sftp_batch(target, &batch)?;
+    let output = run_sftp_batch(target, &batch, Some(renderer_generation))?;
     if !output.status.success() {
         return Err(output_to_error("sftp failed", &output));
     }
-    Ok(parse_sftp_ls(&path, &String::from_utf8_lossy(&output.stdout)))
+    parse_sftp_ls(&path, &String::from_utf8_lossy(&output.stdout))
 }
 
 #[tauri::command]
@@ -725,9 +1069,11 @@ pub async fn ssh_search_fs_entries(
     query: String,
     limit: Option<usize>,
 ) -> Result<Vec<FsEntry>, String> {
-    tauri::async_runtime::spawn_blocking(move || ssh_search_fs_entries_sync(target, root, query, limit))
-        .await
-        .map_err(|e| format!("ssh task join failed: {e:?}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        ssh_search_fs_entries_sync(target, root, query, limit)
+    })
+    .await
+    .map_err(|e| format!("ssh task join failed: {e:?}"))?
 }
 
 fn ssh_search_fs_entries_sync(
@@ -745,14 +1091,24 @@ fn ssh_search_fs_entries_sync(
     if query.len() < 2 {
         return Ok(Vec::new());
     }
-    let limit = limit.unwrap_or(200).clamp(1, MAX_REMOTE_FILE_SEARCH_RESULTS);
+    let limit = limit
+        .unwrap_or(200)
+        .clamp(1, MAX_REMOTE_FILE_SEARCH_RESULTS);
 
     let mut out: Vec<FsEntry> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
     ssh_search_pass(target, &root, &query, limit, false, &mut seen, &mut out)?;
     if out.len() < limit {
-        ssh_search_pass(target, &root, &query, limit - out.len(), true, &mut seen, &mut out)?;
+        ssh_search_pass(
+            target,
+            &root,
+            &query,
+            limit - out.len(),
+            true,
+            &mut seen,
+            &mut out,
+        )?;
     }
 
     Ok(out)
@@ -829,7 +1185,11 @@ exit 0
 }
 
 #[tauri::command]
-pub async fn ssh_read_text_file(target: String, root: String, path: String) -> Result<String, String> {
+pub async fn ssh_read_text_file(
+    target: String,
+    root: String,
+    path: String,
+) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || ssh_read_text_file_sync(target, root, path))
         .await
         .map_err(|e| format!("ssh task join failed: {e:?}"))?
@@ -986,13 +1346,25 @@ fi"#;
 }
 
 #[tauri::command]
-pub async fn ssh_write_text_file(target: String, root: String, path: String, content: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || ssh_write_text_file_sync(target, root, path, content))
-        .await
-        .map_err(|e| format!("ssh task join failed: {e:?}"))?
+pub async fn ssh_write_text_file(
+    target: String,
+    root: String,
+    path: String,
+    content: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ssh_write_text_file_sync(target, root, path, content)
+    })
+    .await
+    .map_err(|e| format!("ssh task join failed: {e:?}"))?
 }
 
-fn ssh_write_text_file_sync(target: String, root: String, path: String, content: String) -> Result<(), String> {
+fn ssh_write_text_file_sync(
+    target: String,
+    root: String,
+    path: String,
+    content: String,
+) -> Result<(), String> {
     let target = target.trim();
     if target.is_empty() {
         return Err("missing ssh target".to_string());
@@ -1041,7 +1413,11 @@ fn ssh_create_file_sync(target: String, root: String, path: String) -> Result<()
 }
 
 #[tauri::command]
-pub async fn ssh_create_directory(target: String, root: String, path: String) -> Result<(), String> {
+pub async fn ssh_create_directory(
+    target: String,
+    root: String,
+    path: String,
+) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || ssh_create_directory_sync(target, root, path))
         .await
         .map_err(|e| format!("ssh task join failed: {e:?}"))?
@@ -1066,13 +1442,25 @@ fn ssh_create_directory_sync(target: String, root: String, path: String) -> Resu
 }
 
 #[tauri::command]
-pub async fn ssh_rename_fs_entry(target: String, root: String, path: String, new_name: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || ssh_rename_fs_entry_sync(target, root, path, new_name))
-        .await
-        .map_err(|e| format!("ssh task join failed: {e:?}"))?
+pub async fn ssh_rename_fs_entry(
+    target: String,
+    root: String,
+    path: String,
+    new_name: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ssh_rename_fs_entry_sync(target, root, path, new_name)
+    })
+    .await
+    .map_err(|e| format!("ssh task join failed: {e:?}"))?
 }
 
-fn ssh_rename_fs_entry_sync(target: String, root: String, path: String, new_name: String) -> Result<String, String> {
+fn ssh_rename_fs_entry_sync(
+    target: String,
+    root: String,
+    path: String,
+    new_name: String,
+) -> Result<String, String> {
     let target = target.trim();
     if target.is_empty() {
         return Err("missing ssh target".to_string());
@@ -1093,7 +1481,11 @@ fn ssh_rename_fs_entry_sync(target: String, root: String, path: String, new_name
 
     let parent = {
         let idx = path.rfind('/').unwrap_or(0);
-        if idx == 0 { "/".to_string() } else { path[..idx].to_string() }
+        if idx == 0 {
+            "/".to_string()
+        } else {
+            path[..idx].to_string()
+        }
     };
     let to = join_posix_path(&parent, name);
     let (_, to_checked) = ensure_within_root(&root, &to)?;
@@ -1141,7 +1533,10 @@ fn scp_escape_remote_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for ch in path.chars() {
         let safe = ch.is_ascii_alphanumeric()
-            || matches!(ch, '/' | '-' | '_' | '.' | '+' | ',' | '@' | ':' | '=' | '%');
+            || matches!(
+                ch,
+                '/' | '-' | '_' | '.' | '+' | ',' | '@' | ':' | '=' | '%'
+            );
         if !safe {
             out.push('\\');
         }
@@ -1150,53 +1545,1750 @@ fn scp_escape_remote_path(path: &str) -> String {
     out
 }
 
-fn run_scp_once(scp_flags: &[&str], paths: &[String]) -> Result<Output, String> {
-    let mut cmd = Command::new(program_path("scp")?);
-    // scp flags first (like -r)
-    cmd.args(scp_flags);
-    // SSH options next (shared multiplexing master, timeouts, host-key policy)
-    cmd.args(ssh_common_args()?);
-    // Source and destination paths last
-    cmd.args(paths);
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    cmd.output().map_err(|e| format!("run scp failed: {e}"))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScpProgressSample {
+    bytes_transferred: u64,
+    total_bytes: Option<u64>,
+    bytes_per_second: Option<u64>,
+    eta_seconds: Option<u64>,
+    attempt: usize,
 }
 
-/// Run scp over the shared multiplexing master with the same ensure_master +
-/// transient-retry handling as `run_ssh` / `run_sftp_batch`. Without this, scp
-/// is the one SSH op that surfaces a transient mux failure raw to the user:
-/// when a burst of concurrent channels is already open on the master, the server
-/// refuses scp's new session ("mux_client_request_session ... Session open
-/// refused by peer"), which is exactly the class of error the other paths absorb.
-/// `target` is the bare ssh destination (e.g. `user@host`) used to verify and,
-/// on failure, tear down the master; `paths` already embed `target:remote_path`.
-fn run_scp(target: &str, scp_flags: &[&str], paths: &[String]) -> Result<Output, String> {
-    let mut last_output: Option<Output> = None;
-    for attempt in 0..SSH_OP_ATTEMPTS {
-        if attempt > 0 {
-            // The previous attempt hit a transient transport error. The shared
-            // master may be stale or saturated; drop it so ensure_master rebuilds
-            // a fresh one, then back off.
-            close_master(target);
-            std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+#[derive(Clone, Copy, Debug)]
+enum ScpProgressEvent {
+    Transferring(ScpProgressSample),
+    Retrying { attempt: usize },
+}
+
+struct ScpPermit;
+
+impl Drop for ScpPermit {
+    fn drop(&mut self) {
+        active_scp_processes().fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn active_scp_processes() -> &'static AtomicUsize {
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    &ACTIVE
+}
+
+fn scp_shutdown_requested() -> &'static AtomicBool {
+    static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+    &SHUTTING_DOWN
+}
+
+fn ssh_transfer_generation() -> &'static AtomicU64 {
+    static GENERATION: AtomicU64 = AtomicU64::new(1);
+    &GENERATION
+}
+
+fn current_ssh_transfer_generation() -> u64 {
+    ssh_transfer_generation().load(Ordering::Acquire)
+}
+
+fn active_scp_process_groups() -> &'static Mutex<HashMap<u32, Option<u64>>> {
+    static PROCESS_GROUPS: OnceLock<Mutex<HashMap<u32, Option<u64>>>> = OnceLock::new();
+    PROCESS_GROUPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct ScpProcessRegistration<'a> {
+    pid: u32,
+    owner_slot: Option<&'a AtomicU64>,
+}
+
+impl<'a> ScpProcessRegistration<'a> {
+    fn new(pid: u32, owner_slot: Option<&'a AtomicU64>, renderer_generation: Option<u64>) -> Self {
+        active_scp_process_groups()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(pid, renderer_generation);
+        if let Some(slot) = owner_slot {
+            slot.store(pid as u64, Ordering::Release);
         }
-        // Reuse the shared master rather than racing to open a fresh connection,
-        // and make sure it is up before scp tries to open its session channel.
-        ensure_master(target)?;
-        let output = run_scp_once(scp_flags, paths)?;
+        Self { pid, owner_slot }
+    }
+}
+
+impl Drop for ScpProcessRegistration<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.owner_slot {
+            let _ = slot.compare_exchange(self.pid as u64, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
+        active_scp_process_groups()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.pid);
+    }
+}
+
+fn acquire_scp_permit() -> Result<ScpPermit, String> {
+    if scp_shutdown_requested().load(Ordering::Acquire) {
+        return Err("file transfers are shutting down".to_string());
+    }
+    poll_deferred_ssh_fallback();
+    let _ = deferred_ssh_child_sender()?;
+    if deferred_ssh_child_count().load(Ordering::Acquire) >= MAX_DEFERRED_SSH_CHILDREN {
+        return Err("SSH process cleanup is still pending; try again shortly".to_string());
+    }
+    let active = active_scp_processes();
+    let mut current = active.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_ACTIVE_SCP_PROCESSES {
+            return Err(format!(
+                "too many active file transfers (maximum {MAX_ACTIVE_SCP_PROCESSES})"
+            ));
+        }
+        match active.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(ScpPermit),
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn validate_ssh_target(target: &str) -> Result<&str, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("missing ssh target".to_string());
+    }
+    if target.starts_with('-') || target.chars().any(char::is_control) {
+        return Err("invalid ssh target".to_string());
+    }
+    Ok(target)
+}
+
+fn push_bounded_tail(out: &mut Vec<u8>, bytes: &[u8], limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    if bytes.len() >= limit {
+        out.clear();
+        out.extend_from_slice(&bytes[bytes.len() - limit..]);
+        return;
+    }
+    let overflow = out.len().saturating_add(bytes.len()).saturating_sub(limit);
+    if overflow > 0 {
+        out.drain(..overflow);
+    }
+    out.extend_from_slice(bytes);
+}
+
+#[cfg(target_family = "unix")]
+fn configure_pipe_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> std::io::Result<()> {
+    let fd = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_family = "unix"))]
+fn configure_pipe_nonblocking<T>(_pipe: &T) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn read_bounded_prefix(
+    mut reader: std::process::ChildStdout,
+    limit: usize,
+    overflowed: &AtomicBool,
+    stop: &AtomicBool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(limit.min(8 * 1024));
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                let remaining = limit.saturating_sub(out.len());
+                let retained = remaining.min(read);
+                out.extend_from_slice(&chunk[..retained]);
+                if retained < read {
+                    overflowed.store(true, Ordering::Release);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+fn read_scp_stderr_tail(
+    mut reader: std::process::ChildStderr,
+    limit: usize,
+    stop: &AtomicBool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(limit.min(8 * 1024));
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => push_bounded_tail(&mut out, &chunk[..read], limit),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+fn path_size_for_progress_controlled(
+    path: &Path,
+    is_directory_hint: bool,
+    cancelled: Option<&AtomicBool>,
+    entry_limit: usize,
+) -> Option<u64> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return None;
+    }
+    if !is_directory_hint {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.is_dir() {
+            return Some(metadata.len());
+        }
+    }
+
+    let mut total = 0u64;
+    let mut visited = 0usize;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return None;
+        }
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        visited += 1;
+        if visited > entry_limit {
+            // Re-walking a huge tree every second would turn progress reporting
+            // into the bottleneck. Keep folder progress honest/indeterminate.
+            return None;
+        }
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        } else if metadata.is_dir() {
+            let entries = std::fs::read_dir(&current).ok()?;
+            for entry in entries {
+                if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                    return None;
+                }
+                if visited.saturating_add(pending.len()) >= entry_limit {
+                    return None;
+                }
+                pending.push(entry.ok()?.path());
+            }
+        }
+    }
+    Some(total)
+}
+
+fn path_size_for_progress(
+    path: &Path,
+    is_directory_hint: bool,
+    cancelled: Option<&AtomicBool>,
+) -> Option<u64> {
+    path_size_for_progress_controlled(
+        path,
+        is_directory_hint,
+        cancelled,
+        SCP_DIRECTORY_SCAN_ENTRY_LIMIT,
+    )
+}
+
+struct ProgressEstimator {
+    started_at: Instant,
+    last_sample_at: Instant,
+    last_progress_at: Instant,
+    last_bytes: u64,
+    smoothed_rate: Option<f64>,
+}
+
+impl ProgressEstimator {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started_at: now,
+            last_sample_at: now,
+            last_progress_at: now,
+            last_bytes: 0,
+            smoothed_rate: None,
+        }
+    }
+
+    fn sample(
+        &mut self,
+        bytes: u64,
+        total_bytes: Option<u64>,
+        attempt: usize,
+    ) -> ScpProgressSample {
+        // The tree listing is a point-in-time hint. If the remote file grew
+        // after that listing, stop claiming a false percentage/ETA.
+        let total_bytes = total_bytes.filter(|total| *total >= bytes);
+        let now = Instant::now();
+        let elapsed = now
+            .saturating_duration_since(self.last_sample_at)
+            .as_secs_f64();
+        if bytes >= self.last_bytes && elapsed > 0.0 {
+            let delta = bytes - self.last_bytes;
+            if delta > 0 {
+                self.last_progress_at = now;
+                let instantaneous = delta as f64 / elapsed;
+                self.smoothed_rate = Some(match self.smoothed_rate {
+                    Some(previous) => previous * 0.75 + instantaneous * 0.25,
+                    None => instantaneous,
+                });
+            }
+            if delta == 0
+                && now.saturating_duration_since(self.last_progress_at) >= Duration::from_secs(3)
+            {
+                self.smoothed_rate = None;
+            }
+        } else if bytes < self.last_bytes {
+            self.smoothed_rate = None;
+            self.last_progress_at = now;
+        }
+        self.last_sample_at = now;
+        self.last_bytes = bytes;
+
+        let bytes_per_second = self
+            .smoothed_rate
+            .filter(|rate| rate.is_finite() && *rate >= 1.0)
+            .map(|rate| rate.min(u64::MAX as f64) as u64);
+        let eta_seconds = if self.started_at.elapsed() >= Duration::from_secs(2) {
+            total_bytes
+                .zip(self.smoothed_rate)
+                .and_then(|(total, rate)| {
+                    total.checked_sub(bytes).map(|remaining| (remaining, rate))
+                })
+                .filter(|(_, rate)| rate.is_finite() && *rate >= 1.0)
+                .map(|(remaining, rate)| {
+                    (remaining as f64 / rate).ceil().min(u64::MAX as f64) as u64
+                })
+        } else {
+            None
+        };
+
+        ScpProgressSample {
+            bytes_transferred: bytes,
+            total_bytes,
+            bytes_per_second,
+            eta_seconds,
+            attempt,
+        }
+    }
+}
+
+fn sleep_with_cancellation(duration: Duration, cancelled: &AtomicBool) -> Result<(), String> {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        if cancelled.load(Ordering::Acquire) {
+            return Err("download cancelled".to_string());
+        }
+        std::thread::sleep(
+            SCP_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+    Ok(())
+}
+
+struct SupervisedChild(Option<std::process::Child>);
+
+impl SupervisedChild {
+    fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+}
+
+impl std::ops::Deref for SupervisedChild {
+    type Target = std::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_ref()
+            .expect("supervised child used after ownership transfer")
+    }
+}
+
+impl std::ops::DerefMut for SupervisedChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
+            .as_mut()
+            .expect("supervised child used after ownership transfer")
+    }
+}
+
+impl Drop for SupervisedChild {
+    fn drop(&mut self) {
+        // std::process::Child::drop neither kills nor reaps. Contain panics in
+        // progress/channel code and every early-return path with an RAII guard.
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => terminate_owned_scp_process(child),
+            Err(error) => {
+                // An error can mean another owner already reaped the process.
+                // Never signal a raw, potentially reusable PID in that state.
+                eprintln!("[ssh] query supervised child during drop failed: {error}");
+            }
+        }
+    }
+}
+
+fn deferred_ssh_child_count() -> &'static AtomicUsize {
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    &COUNT
+}
+
+fn deferred_ssh_fallback() -> &'static Mutex<Vec<std::process::Child>> {
+    static CHILDREN: OnceLock<Mutex<Vec<std::process::Child>>> = OnceLock::new();
+    CHILDREN.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+// `try_wait()` above the removal has already reaped completed children; Clippy
+// cannot follow that state through `swap_remove`.
+#[allow(clippy::zombie_processes)]
+fn poll_deferred_ssh_fallback() {
+    let mut children = deferred_ssh_fallback()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut index = 0;
+    while index < children.len() {
+        let finished = match children[index].try_wait() {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(error) => {
+                eprintln!("[ssh] fallback child reap failed: {error}");
+                true
+            }
+        };
+        if finished {
+            children.swap_remove(index);
+            deferred_ssh_child_count().fetch_sub(1, Ordering::AcqRel);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+// The reaper calls `try_wait()` before removing each completed Child handle.
+#[allow(clippy::zombie_processes)]
+fn deferred_ssh_child_sender() -> Result<std::sync::mpsc::Sender<std::process::Child>, String> {
+    static SENDER: OnceLock<std::sync::mpsc::Sender<std::process::Child>> = OnceLock::new();
+    if let Some(sender) = SENDER.get() {
+        return Ok(sender.clone());
+    }
+
+    let (sender, receiver) = std::sync::mpsc::channel::<std::process::Child>();
+    std::thread::Builder::new()
+        .name("ssh-child-reaper".to_string())
+        .spawn(move || {
+            let mut pending = Vec::<std::process::Child>::new();
+            loop {
+                match receiver.recv_timeout(Duration::from_millis(250)) {
+                    Ok(child) => pending.push(child),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        if pending.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                while let Ok(child) = receiver.try_recv() {
+                    pending.push(child);
+                }
+                let mut index = 0;
+                while index < pending.len() {
+                    let finished = match pending[index].try_wait() {
+                        Ok(Some(_)) => true,
+                        Ok(None) => false,
+                        Err(error) => {
+                            eprintln!("[ssh] deferred child reap failed: {error}");
+                            true
+                        }
+                    };
+                    if finished {
+                        pending.swap_remove(index);
+                        deferred_ssh_child_count().fetch_sub(1, Ordering::AcqRel);
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+        })
+        .map_err(|error| format!("start SSH child reaper failed: {error}"))?;
+
+    let _ = SENDER.set(sender.clone());
+    Ok(SENDER.get().cloned().unwrap_or(sender))
+}
+
+fn defer_ssh_child_reap(child: std::process::Child) {
+    let sender = match deferred_ssh_child_sender() {
+        Ok(sender) => sender,
+        Err(error) => {
+            eprintln!("[ssh] {error}; retaining child for bounded polling");
+            deferred_ssh_child_count().fetch_add(1, Ordering::AcqRel);
+            deferred_ssh_fallback()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(child);
+            return;
+        }
+    };
+    deferred_ssh_child_count().fetch_add(1, Ordering::AcqRel);
+    if let Err(error) = sender.send(child) {
+        eprintln!("[ssh] child reaper stopped unexpectedly; retaining child for bounded polling");
+        deferred_ssh_fallback()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(error.0);
+    }
+}
+
+fn terminate_scp_process(child: &mut SupervisedChild) {
+    if let Some(child) = child.0.take() {
+        terminate_owned_scp_process(child);
+    }
+}
+
+fn terminate_owned_scp_process(mut child: std::process::Child) {
+    let process_group_id = child.id();
+    let mut parent_reaped = match child.try_wait() {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(error) => {
+            // Losing wait ownership makes this numeric PID unsafe to signal:
+            // it may already have been reaped and reused.
+            eprintln!("[ssh] query child before termination failed: {error}");
+            return;
+        }
+    };
+    if parent_reaped {
+        return;
+    }
+
+    #[cfg(target_family = "unix")]
+    unsafe {
+        // scp is placed in its own process group before spawn. Terminating the
+        // group also stops its ssh child, so cancellation cannot leave a hidden
+        // process holding pipes, sockets, or the destination file.
+        let _ = libc::kill(-(process_group_id as i32), libc::SIGTERM);
+    }
+    #[cfg(not(target_family = "unix"))]
+    let _ = child.kill();
+
+    let deadline = Instant::now() + Duration::from_millis(750);
+    while Instant::now() < deadline {
+        if !parent_reaped {
+            match child.try_wait() {
+                Ok(Some(_)) => parent_reaped = true,
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("[ssh] query child during termination failed: {error}");
+                    return;
+                }
+            }
+        }
+
+        #[cfg(target_family = "unix")]
+        if !scp_process_group_exists(process_group_id) {
+            break;
+        }
+        #[cfg(not(target_family = "unix"))]
+        if parent_reaped {
+            break;
+        }
+
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    #[cfg(target_family = "unix")]
+    if scp_process_group_exists(process_group_id) {
+        // Do this even when the direct scp parent already exited: an ssh child
+        // may ignore or outlive SIGTERM while retaining pipes/files.
+        unsafe {
+            let _ = libc::kill(-(process_group_id as i32), libc::SIGKILL);
+        }
+    }
+    if !parent_reaped {
+        let _ = child.kill();
+        // SIGKILL can remain pending while a process is stuck in an
+        // uninterruptible kernel I/O operation. Never turn our bounded grace
+        // period back into an unbounded Child::wait(). Give it one final
+        // bounded reap window, then let the global WNOHANG reaper own it.
+        let reap_deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < reap_deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    parent_reaped = true;
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                Err(error) => {
+                    eprintln!("[ssh] query killed child failed: {error}");
+                    return;
+                }
+            }
+        }
+        if !parent_reaped {
+            defer_ssh_child_reap(child);
+        }
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn scp_process_group_exists(pid: u32) -> bool {
+    unsafe { libc::kill(-(pid as i32), 0) == 0 }
+}
+
+#[cfg(target_family = "unix")]
+fn terminate_remaining_scp_process_group(pid: u32) {
+    unsafe {
+        let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    if scp_process_group_exists(pid) {
+        unsafe {
+            let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+}
+
+fn collect_scp_stderr(
+    receiver: &std::sync::mpsc::Receiver<Vec<u8>>,
+    stop: &AtomicBool,
+    process_group_id: u32,
+) -> Vec<u8> {
+    match receiver.recv_timeout(Duration::from_millis(250)) {
+        Ok(stderr) => stderr,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // A descendant that inherited stderr can keep the pipe open after
+            // scp exits. Stop the nonblocking reader and tear down the leftover
+            // process group so neither a thread nor a child leaks per transfer.
+            stop.store(true, Ordering::Release);
+            #[cfg(target_family = "unix")]
+            terminate_remaining_scp_process_group(process_group_id);
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_default()
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ScpControl<'a> {
+    cancelled: &'a AtomicBool,
+    renderer_generation: Option<u64>,
+    process_group_slot: Option<&'a AtomicU64>,
+    progress_path: Option<&'a Path>,
+    is_directory: bool,
+    total_bytes: Option<u64>,
+    clean_stage_between_attempts: bool,
+}
+
+fn scp_control_cancelled(control: ScpControl<'_>) -> bool {
+    control.cancelled.load(Ordering::Acquire)
+        || control
+            .renderer_generation
+            .is_some_and(|generation| generation != current_ssh_transfer_generation())
+        || scp_shutdown_requested().load(Ordering::Acquire)
+}
+
+fn run_scp_once_controlled<F>(
+    scp_program: &Path,
+    scp_flags: &[&str],
+    paths: &[String],
+    control: ScpControl<'_>,
+    attempt: usize,
+    on_progress: &mut F,
+) -> Result<Output, String>
+where
+    F: FnMut(ScpProgressEvent),
+{
+    let mut cmd = Command::new(scp_program);
+    cmd.args(scp_flags);
+    cmd.args(ssh_transfer_args());
+    // End option parsing before source/destination strings. In particular, an
+    // option-shaped target must never be interpreted as an scp flag.
+    cmd.arg("--");
+    cmd.args(paths);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let mut child =
+        SupervisedChild::new(cmd.spawn().map_err(|e| format!("spawn scp failed: {e}"))?);
+    let process_group_id = child.id();
+    let process_registration = ScpProcessRegistration::new(
+        process_group_id,
+        control.process_group_slot,
+        control.renderer_generation,
+    );
+    if scp_control_cancelled(control) {
+        terminate_scp_process(&mut child);
+        return Err("file transfer cancelled".to_string());
+    }
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            terminate_scp_process(&mut child);
+            return Err("scp stderr pipe unavailable".to_string());
+        }
+    };
+    if let Err(error) = configure_pipe_nonblocking(&stderr) {
+        terminate_scp_process(&mut child);
+        return Err(format!("configure scp stderr pipe failed: {error}"));
+    }
+    let (stderr_sender, stderr_receiver) = std::sync::mpsc::sync_channel(1);
+    let stderr_stop = Arc::new(AtomicBool::new(false));
+    let stderr_reader_stop = stderr_stop.clone();
+    let stderr_reader = std::thread::Builder::new()
+        .name("scp-stderr-drain".to_string())
+        .spawn(move || {
+            let tail = read_scp_stderr_tail(stderr, SCP_DIAGNOSTIC_TAIL_BYTES, &stderr_reader_stop);
+            let _ = stderr_sender.send(tail);
+        });
+    if let Err(error) = stderr_reader {
+        terminate_scp_process(&mut child);
+        return Err(format!("start scp diagnostics reader failed: {error}"));
+    }
+
+    let mut estimator = ProgressEstimator::new();
+    let mut last_emitted_sample = Some(ScpProgressSample {
+        bytes_transferred: 0,
+        total_bytes: control.total_bytes,
+        bytes_per_second: None,
+        eta_seconds: None,
+        attempt,
+    });
+    let mut next_progress_at = Instant::now();
+    let progress_interval = if control.is_directory {
+        SCP_DIRECTORY_PROGRESS_INTERVAL
+    } else {
+        SCP_PROGRESS_INTERVAL
+    };
+
+    let status = loop {
+        if scp_control_cancelled(control) {
+            terminate_scp_process(&mut child);
+            let _ = collect_scp_stderr(&stderr_receiver, &stderr_stop, process_group_id);
+            return Err("file transfer cancelled".to_string());
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                terminate_scp_process(&mut child);
+                let _ = collect_scp_stderr(&stderr_receiver, &stderr_stop, process_group_id);
+                return Err(format!("wait scp failed: {error}"));
+            }
+        }
+
+        let now = Instant::now();
+        if now >= next_progress_at {
+            if let Some(path) = control.progress_path {
+                let bytes =
+                    path_size_for_progress(path, control.is_directory, Some(control.cancelled))
+                        .unwrap_or(estimator.last_bytes);
+                let sample = estimator.sample(bytes, control.total_bytes, attempt);
+                // Channel delivery ultimately queues work for the WebContent
+                // event loop. Coalesce unchanged samples so display sleep or a
+                // paused renderer cannot accumulate identical scripts. A
+                // sample still changes once when a 3s stall clears rate/ETA.
+                if last_emitted_sample != Some(sample) {
+                    on_progress(ScpProgressEvent::Transferring(sample));
+                    last_emitted_sample = Some(sample);
+                }
+            }
+            // Schedule from the completed scan. Otherwise a scan that takes
+            // longer than its interval immediately starts another traversal.
+            next_progress_at = Instant::now() + progress_interval;
+        }
+        std::thread::sleep(SCP_POLL_INTERVAL);
+    };
+
+    let stderr = collect_scp_stderr(&stderr_receiver, &stderr_stop, process_group_id);
+    #[cfg(target_family = "unix")]
+    if scp_process_group_exists(process_group_id) {
+        terminate_remaining_scp_process_group(process_group_id);
+    }
+    // Clear the externally visible process handle immediately after the child
+    // tree is gone, before any potentially slow final filesystem scan.
+    drop(process_registration);
+
+    if let Some(path) = control.progress_path {
+        let bytes = path_size_for_progress(path, control.is_directory, Some(control.cancelled))
+            .unwrap_or(estimator.last_bytes);
+        let sample = estimator.sample(bytes, control.total_bytes, attempt);
+        if last_emitted_sample != Some(sample) {
+            on_progress(ScpProgressEvent::Transferring(sample));
+        }
+    }
+    Ok(Output {
+        status,
+        stdout: Vec::new(),
+        stderr,
+    })
+}
+
+fn remove_owned_stage(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path)
+            .map_err(|e| format!("remove partial download failed: {e}")),
+        Ok(_) => {
+            std::fs::remove_file(path).map_err(|e| format!("remove partial download failed: {e}"))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("inspect partial download failed: {error}")),
+    }
+}
+
+struct OwnedStageGuard {
+    root: PathBuf,
+    payload: PathBuf,
+}
+
+impl OwnedStageGuard {
+    fn create(parent: &Path) -> Result<Self, String> {
+        static NEXT_STAGE: AtomicU64 = AtomicU64::new(1);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        for _ in 0..10_000 {
+            let root = parent.join(format!(
+                ".agents-ui-download-{}-{timestamp}-{}.part",
+                std::process::id(),
+                NEXT_STAGE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(target_family = "unix")]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&root) {
+                Ok(()) => {
+                    let payload = root.join("payload");
+                    return Ok(Self { root, payload });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("create private download stage failed: {error}")),
+            }
+        }
+        Err("could not allocate a private download staging directory".to_string())
+    }
+}
+
+impl Drop for OwnedStageGuard {
+    fn drop(&mut self) {
+        // The payload is moved out on success, leaving an empty private root.
+        // On every failure path this removes the partial payload recursively.
+        let _ = remove_owned_stage(&self.root);
+    }
+}
+
+/// Run scp on a dedicated SSH connection with bounded diagnostics, bounded
+/// concurrency, cancellation, guaranteed reaping, and transient retries.
+fn run_scp_controlled<F>(
+    target: &str,
+    scp_flags: &[&str],
+    paths: &[String],
+    control: ScpControl<'_>,
+    mut on_progress: F,
+) -> Result<Output, String>
+where
+    F: FnMut(ScpProgressEvent),
+{
+    validate_ssh_target(target)?;
+    let _permit = acquire_scp_permit()?;
+    let scp_program = program_path("scp")?;
+    if scp_control_cancelled(control) {
+        return Err("file transfer cancelled".to_string());
+    }
+    let mut last_output: Option<Output> = None;
+    // Retrying a recursive copy into a partial destination can nest or merge
+    // stale contents. Only the private-stage path can be cleaned safely between
+    // attempts; direct API downloads and uploads fail honestly after one try.
+    let max_attempts = if control.clean_stage_between_attempts {
+        SSH_OP_ATTEMPTS
+    } else {
+        1
+    };
+    for attempt_index in 0..max_attempts {
+        let attempt = attempt_index + 1;
+        if attempt_index > 0 {
+            on_progress(ScpProgressEvent::Retrying { attempt });
+            sleep_with_cancellation(
+                Duration::from_millis(250 * attempt_index as u64),
+                control.cancelled,
+            )?;
+            if control.clean_stage_between_attempts {
+                if let Some(path) = control.progress_path {
+                    remove_owned_stage(path)?;
+                }
+            }
+        }
+        if scp_control_cancelled(control) {
+            return Err("file transfer cancelled".to_string());
+        }
+
+        let output = run_scp_once_controlled(
+            &scp_program,
+            scp_flags,
+            paths,
+            control,
+            attempt,
+            &mut on_progress,
+        )?;
         if output.status.success() {
             return Ok(output);
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !is_transient_ssh_error(&stderr) {
-            // Genuine failure (permission denied, no such file) — surface it.
             return Ok(output);
         }
         last_output = Some(output);
     }
-    Ok(last_output.expect("scp retry loop runs at least once"))
+    last_output.ok_or_else(|| "scp failed before its first attempt".to_string())
+}
+
+fn run_scp(
+    target: &str,
+    scp_flags: &[&str],
+    paths: &[String],
+    renderer_generation: Option<u64>,
+) -> Result<Output, String> {
+    let cancelled = AtomicBool::new(false);
+    run_scp_controlled(
+        target,
+        scp_flags,
+        paths,
+        ScpControl {
+            cancelled: &cancelled,
+            renderer_generation,
+            process_group_slot: None,
+            progress_path: None,
+            is_directory: false,
+            total_bytes: None,
+            clean_stage_between_attempts: false,
+        },
+        |_| {},
+    )
+}
+
+#[derive(Clone)]
+struct ActiveDownload {
+    cancelled: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
+    process_group: Arc<AtomicU64>,
+    renderer_generation: Option<u64>,
+    destination: PathBuf,
+    stage_root: Option<PathBuf>,
+}
+
+const DOWNLOAD_PHASE_TRANSFERRING: u8 = 0;
+const DOWNLOAD_PHASE_CANCELLED: u8 = 1;
+const DOWNLOAD_PHASE_COMMITTING: u8 = 2;
+
+struct DownloadJobPermit;
+
+impl Drop for DownloadJobPermit {
+    fn drop(&mut self) {
+        active_download_jobs().fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn active_download_jobs() -> &'static AtomicUsize {
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    &ACTIVE
+}
+
+fn acquire_download_job_permit() -> Result<DownloadJobPermit, String> {
+    active_download_jobs()
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < MAX_ACTIVE_DOWNLOADS).then_some(active + 1)
+        })
+        .map(|_| DownloadJobPermit)
+        .map_err(|_| format!("too many active downloads (maximum {MAX_ACTIVE_DOWNLOADS})"))
+}
+
+#[derive(Default)]
+struct DownloadRegistry {
+    active: HashMap<String, ActiveDownload>,
+    pending_cancellations: HashMap<String, Instant>,
+}
+
+fn download_registry() -> &'static Mutex<DownloadRegistry> {
+    static DOWNLOADS: OnceLock<Mutex<DownloadRegistry>> = OnceLock::new();
+    DOWNLOADS.get_or_init(|| Mutex::new(DownloadRegistry::default()))
+}
+
+fn prune_pending_cancellations(registry: &mut DownloadRegistry) {
+    const PENDING_CANCELLATION_TTL: Duration = Duration::from_secs(60);
+    registry
+        .pending_cancellations
+        .retain(|_, created_at| created_at.elapsed() < PENDING_CANCELLATION_TTL);
+}
+
+struct ActiveDownloadGuard {
+    transfer_id: String,
+}
+
+type DownloadRegistration = (
+    ActiveDownloadGuard,
+    Arc<AtomicBool>,
+    Arc<AtomicU8>,
+    Arc<AtomicU64>,
+);
+type ReservedDownloadRegistration = (
+    ActiveDownloadGuard,
+    Arc<AtomicBool>,
+    Arc<AtomicU8>,
+    Arc<AtomicU64>,
+    PathBuf,
+);
+
+impl Drop for ActiveDownloadGuard {
+    fn drop(&mut self) {
+        let mut registry = download_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.active.remove(&self.transfer_id);
+    }
+}
+
+fn validate_transfer_id(transfer_id: &str) -> Result<&str, String> {
+    if transfer_id.is_empty()
+        || transfer_id.len() > 128
+        || !transfer_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("invalid download transfer id".to_string());
+    }
+    Ok(transfer_id)
+}
+
+fn validate_download_name(name: &str) -> Result<&str, String> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err("invalid download file name".to_string());
+    }
+    Ok(name)
+}
+
+fn numbered_destination(directory: &Path, name: &str, index: usize) -> PathBuf {
+    if index == 0 {
+        return directory.join(name);
+    }
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(name);
+    let extension = path.extension().and_then(|value| value.to_str());
+    let numbered = match extension {
+        Some(extension) if !extension.is_empty() => format!("{stem} ({index}).{extension}"),
+        _ => format!("{stem} ({index})"),
+    };
+    directory.join(numbered)
+}
+
+fn register_download(
+    transfer_id: String,
+    destination: PathBuf,
+) -> Result<DownloadRegistration, String> {
+    validate_transfer_id(&transfer_id)?;
+    let mut registry = download_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_pending_cancellations(&mut registry);
+    if registry.active.len() >= MAX_ACTIVE_DOWNLOADS {
+        return Err(format!(
+            "too many active downloads (maximum {MAX_ACTIVE_DOWNLOADS})"
+        ));
+    }
+    if registry.active.contains_key(&transfer_id) {
+        return Err("download transfer id is already active".to_string());
+    }
+    if registry
+        .active
+        .values()
+        .any(|download| download.destination == destination)
+    {
+        return Err("another download is already writing to that destination".to_string());
+    }
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let phase = Arc::new(AtomicU8::new(DOWNLOAD_PHASE_TRANSFERRING));
+    let process_group = Arc::new(AtomicU64::new(0));
+    if registry
+        .pending_cancellations
+        .remove(&transfer_id)
+        .is_some()
+    {
+        cancelled.store(true, Ordering::Release);
+        phase.store(DOWNLOAD_PHASE_CANCELLED, Ordering::Release);
+    }
+    registry.active.insert(
+        transfer_id.clone(),
+        ActiveDownload {
+            cancelled: cancelled.clone(),
+            phase: phase.clone(),
+            process_group: process_group.clone(),
+            renderer_generation: None,
+            destination,
+            stage_root: None,
+        },
+    );
+    Ok((
+        ActiveDownloadGuard { transfer_id },
+        cancelled,
+        phase,
+        process_group,
+    ))
+}
+
+fn reserve_download_destination(
+    transfer_id: String,
+    local_directory: &str,
+    suggested_name: &str,
+    renderer_generation: u64,
+) -> Result<ReservedDownloadRegistration, String> {
+    if renderer_generation != current_ssh_transfer_generation() {
+        return Err("download belonged to a terminated renderer".to_string());
+    }
+    validate_transfer_id(&transfer_id)?;
+    let suggested_name = validate_download_name(suggested_name)?;
+    if local_directory.is_empty() {
+        return Err("missing download folder".to_string());
+    }
+    let directory = std::fs::canonicalize(local_directory)
+        .map_err(|e| format!("open download folder failed: {e}"))?;
+    if renderer_generation != current_ssh_transfer_generation() {
+        return Err("download belonged to a terminated renderer".to_string());
+    }
+    if !directory.is_dir() {
+        return Err("download destination is not a directory".to_string());
+    }
+
+    for index in 0..10_000 {
+        let destination = numbered_destination(&directory, suggested_name, index);
+        match std::fs::symlink_metadata(&destination) {
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!("inspect download destination failed: {error}"));
+            }
+        }
+
+        // Do not hold the registry mutex across filesystem calls: a slow
+        // network-backed destination must never block a cancellation command.
+        let mut registry = download_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_pending_cancellations(&mut registry);
+        if registry.active.len() >= MAX_ACTIVE_DOWNLOADS {
+            return Err(format!(
+                "too many active downloads (maximum {MAX_ACTIVE_DOWNLOADS})"
+            ));
+        }
+        if registry.active.contains_key(&transfer_id) {
+            return Err("download transfer id is already active".to_string());
+        }
+        if registry
+            .active
+            .values()
+            .any(|download| download.destination == destination)
+        {
+            continue;
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let phase = Arc::new(AtomicU8::new(DOWNLOAD_PHASE_TRANSFERRING));
+        let process_group = Arc::new(AtomicU64::new(0));
+        if registry
+            .pending_cancellations
+            .remove(&transfer_id)
+            .is_some()
+        {
+            cancelled.store(true, Ordering::Release);
+            phase.store(DOWNLOAD_PHASE_CANCELLED, Ordering::Release);
+        }
+        registry.active.insert(
+            transfer_id.clone(),
+            ActiveDownload {
+                cancelled: cancelled.clone(),
+                phase: phase.clone(),
+                process_group: process_group.clone(),
+                renderer_generation: Some(renderer_generation),
+                destination: destination.clone(),
+                stage_root: None,
+            },
+        );
+        return Ok((
+            ActiveDownloadGuard { transfer_id },
+            cancelled,
+            phase,
+            process_group,
+            destination,
+        ));
+    }
+    Err("could not allocate a unique download destination".to_string())
+}
+
+fn set_download_stage(transfer_id: &str, stage_root: PathBuf) -> Result<(), String> {
+    let mut registry = download_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let download = registry
+        .active
+        .get_mut(transfer_id)
+        .ok_or_else(|| "download registration disappeared".to_string())?;
+    download.stage_root = Some(stage_root);
+    Ok(())
+}
+
+fn begin_download_commit(phase: &AtomicU8) -> Result<(), String> {
+    phase
+        .compare_exchange(
+            DOWNLOAD_PHASE_TRANSFERRING,
+            DOWNLOAD_PHASE_COMMITTING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(|_| ())
+        .map_err(|observed| match observed {
+            DOWNLOAD_PHASE_CANCELLED => "download cancelled".to_string(),
+            DOWNLOAD_PHASE_COMMITTING => "download is already finalizing".to_string(),
+            _ => "download entered an invalid state".to_string(),
+        })
+}
+
+fn next_internal_transfer_id() -> String {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "internal-{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn path_to_c_string(path: &Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "download path contains a NUL byte",
+        )
+    })
+}
+
+/// Publish a sibling staging path without ever replacing an entry that another
+/// process created after reservation. The platform primitives make the
+/// no-overwrite property atomic rather than relying on a racy exists check.
+#[allow(clippy::needless_return)] // cfg branches are clearer as explicit platform returns.
+fn publish_stage_no_replace(stage: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let stage = path_to_c_string(stage)?;
+        let destination = path_to_c_string(destination)?;
+        let result = unsafe {
+            libc::renameatx_np(
+                libc::AT_FDCWD,
+                stage.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        return if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let stage = path_to_c_string(stage)?;
+        let destination = path_to_c_string(destination)?;
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                stage.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        return if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        };
+    }
+
+    #[cfg(target_family = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "Kernel32")]
+        extern "system" {
+            fn MoveFileW(existing: *const u16, new: *const u16) -> i32;
+        }
+        let existing = stage
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let new = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let result = unsafe { MoveFileW(existing.as_ptr(), new.as_ptr()) };
+        return if result != 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        };
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_family = "windows")))]
+    {
+        let _ = (stage, destination);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic no-replace download publishing is unsupported on this platform",
+        ))
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshTransferProgress {
+    transfer_id: String,
+    phase: String,
+    bytes_transferred: u64,
+    total_bytes: Option<u64>,
+    bytes_per_second: Option<u64>,
+    eta_seconds: Option<u64>,
+    attempt: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshDownloadResult {
+    local_path: String,
+}
+
+#[tauri::command]
+pub fn default_download_directory() -> Result<String, String> {
+    // Return Home without touching the filesystem. Homes can be network-backed;
+    // probing Downloads here could strand a blocking task before the bounded
+    // async folder browser even opens. Downloads remains one visible click.
+    let home = home_dir().ok_or_else(|| "could not determine the home directory".to_string())?;
+    Ok(home.to_string_lossy().to_string())
+}
+
+fn request_download_cancellation(download: &ActiveDownload) -> bool {
+    loop {
+        match download.phase.load(Ordering::Acquire) {
+            DOWNLOAD_PHASE_TRANSFERRING => {
+                if download
+                    .phase
+                    .compare_exchange(
+                        DOWNLOAD_PHASE_TRANSFERRING,
+                        DOWNLOAD_PHASE_CANCELLED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    download.cancelled.store(true, Ordering::Release);
+                    return true;
+                }
+            }
+            DOWNLOAD_PHASE_CANCELLED => {
+                download.cancelled.store(true, Ordering::Release);
+                return true;
+            }
+            DOWNLOAD_PHASE_COMMITTING => return false,
+            _ => return false,
+        }
+    }
+}
+
+fn signal_active_download(download: &ActiveDownload) {
+    let process_group = download.process_group.load(Ordering::Acquire);
+    if process_group == 0 || process_group > u32::MAX as u64 {
+        return;
+    }
+    #[cfg(target_family = "unix")]
+    unsafe {
+        // Best effort and nonblocking. The supervised worker performs the
+        // grace-period escalation and reap; this wakes a stopped/stuck child
+        // immediately so it can observe the cancellation state.
+        let _ = libc::kill(-(process_group as i32), libc::SIGTERM);
+    }
+}
+
+#[tauri::command]
+pub fn ssh_cancel_download(transfer_id: String) -> Result<bool, String> {
+    validate_transfer_id(&transfer_id)?;
+    let mut registry = download_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_pending_cancellations(&mut registry);
+    if let Some(download) = registry.active.get(&transfer_id).cloned() {
+        drop(registry);
+        let accepted = request_download_cancellation(&download);
+        if accepted {
+            signal_active_download(&download);
+        }
+        return Ok(accepted);
+    }
+    // Cancellation can overtake spawn_blocking registration even when the UI
+    // sent the download invoke first. Retain a short-lived, bounded tombstone
+    // so the worker observes that intent before spawning scp.
+    const MAX_PENDING_CANCELLATIONS: usize = 128;
+    if registry.pending_cancellations.len() >= MAX_PENDING_CANCELLATIONS {
+        if let Some(oldest) = registry
+            .pending_cancellations
+            .iter()
+            .min_by_key(|(_, created_at)| *created_at)
+            .map(|(transfer_id, _)| transfer_id.clone())
+        {
+            registry.pending_cancellations.remove(&oldest);
+        }
+    }
+    registry
+        .pending_cancellations
+        .insert(transfer_id, Instant::now());
+    // The cancellation intent is accepted even though registration has not
+    // happened yet. `false` is reserved for the only genuinely too-late case:
+    // this transfer has already linearized into its atomic commit.
+    Ok(true)
+}
+
+/// A terminated WebContent process cannot run React cleanup or receive further
+/// progress events. Cancel renderer-owned downloads synchronously so reloads
+/// cannot strand invisible jobs and exhaust the download slots.
+pub fn cancel_active_ssh_downloads_for_renderer_restart() {
+    let current_generation = ssh_transfer_generation()
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    let downloads = download_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .active
+        .values()
+        .filter(|download| {
+            download
+                .renderer_generation
+                .is_some_and(|generation| generation != current_generation)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for download in downloads {
+        if request_download_cancellation(&download) {
+            signal_active_download(&download);
+        }
+    }
+    #[cfg(target_family = "unix")]
+    {
+        let process_groups = active_scp_process_groups()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter_map(|(pid, generation)| {
+                generation
+                    .is_some_and(|generation| generation != current_generation)
+                    .then_some(*pid)
+            })
+            .collect::<Vec<_>>();
+        for pid in process_groups {
+            unsafe {
+                let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+            }
+        }
+    }
+}
+
+pub fn shutdown_ssh_transfers() {
+    scp_shutdown_requested().store(true, Ordering::Release);
+    {
+        let registry = download_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for download in registry.active.values() {
+            request_download_cancellation(download);
+        }
+    }
+
+    #[cfg(target_family = "unix")]
+    {
+        let process_groups = || {
+            active_scp_process_groups()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        for pid in process_groups() {
+            unsafe {
+                let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            if process_groups().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        for pid in process_groups() {
+            if scp_process_group_exists(pid) {
+                unsafe {
+                    let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    // Process supervision ends before the higher-level worker has necessarily
+    // removed its private staging tree. Give guards a bounded cleanup window.
+    // Do not call remove_dir_all from the event-loop exit callback after that
+    // deadline: the destination may itself be a stalled network/File Provider
+    // volume, and shutdown must remain bounded.
+    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let active_count = download_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active
+            .len();
+        if active_count == 0 || Instant::now() >= cleanup_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let pending_stage_count = download_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .active
+        .values()
+        .filter(|download| download.stage_root.is_some())
+        .count();
+    if pending_stage_count > 0 {
+        eprintln!(
+            "[ssh-download] {pending_stage_count} private staging cleanup(s) exceeded the shutdown deadline"
+        );
+    }
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn ssh_download_file_with_progress(
+    target: String,
+    root: String,
+    remote_path: String,
+    local_directory: String,
+    suggested_name: String,
+    is_directory: bool,
+    expected_bytes: Option<u64>,
+    transfer_id: String,
+    on_progress: Channel<SshTransferProgress>,
+) -> Result<SshDownloadResult, String> {
+    let renderer_generation = current_ssh_transfer_generation();
+    let download_job_permit = acquire_download_job_permit()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _download_job_permit = download_job_permit;
+        ssh_download_file_with_progress_sync(
+            target,
+            root,
+            remote_path,
+            local_directory,
+            suggested_name,
+            is_directory,
+            expected_bytes,
+            transfer_id,
+            on_progress,
+            renderer_generation,
+        )
+    })
+    .await
+    .map_err(|e| format!("ssh download task failed: {e}"))?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ssh_download_file_with_progress_sync(
+    target: String,
+    root: String,
+    remote_path: String,
+    local_directory: String,
+    suggested_name: String,
+    is_directory: bool,
+    expected_bytes: Option<u64>,
+    transfer_id: String,
+    on_progress: Channel<SshTransferProgress>,
+    renderer_generation: u64,
+) -> Result<SshDownloadResult, String> {
+    let target = validate_ssh_target(&target)?;
+    let (_root, remote_path) = ensure_within_root(&root, &remote_path)?;
+    let (_guard, cancelled, download_phase, download_process_group, destination) =
+        reserve_download_destination(
+            transfer_id.clone(),
+            &local_directory,
+            &suggested_name,
+            renderer_generation,
+        )?;
+    let directory = destination
+        .parent()
+        .ok_or_else(|| "download destination has no parent directory".to_string())?;
+    let stage_guard = OwnedStageGuard::create(directory)?;
+    set_download_stage(&transfer_id, stage_guard.root.clone())?;
+    let stage = stage_guard.payload.clone();
+
+    let total_bytes = if is_directory { None } else { expected_bytes };
+    let send_progress = |phase: &str, sample: ScpProgressSample| {
+        let _ = on_progress.send(SshTransferProgress {
+            transfer_id: transfer_id.clone(),
+            phase: phase.to_string(),
+            bytes_transferred: sample.bytes_transferred,
+            total_bytes: sample.total_bytes,
+            bytes_per_second: sample.bytes_per_second,
+            eta_seconds: sample.eta_seconds,
+            attempt: sample.attempt,
+        });
+    };
+    send_progress(
+        "transferring",
+        ScpProgressSample {
+            bytes_transferred: 0,
+            total_bytes,
+            bytes_per_second: None,
+            eta_seconds: None,
+            attempt: 1,
+        },
+    );
+
+    let source = format!("{}:{}", target, scp_escape_remote_path(&remote_path));
+    let paths = vec![source, stage.to_string_lossy().to_string()];
+    let mut last_attempt = 1usize;
+    let mut last_reported_bytes = 0u64;
+    let transfer_result = run_scp_controlled(
+        target,
+        &["-r"],
+        &paths,
+        ScpControl {
+            cancelled: &cancelled,
+            renderer_generation: Some(renderer_generation),
+            process_group_slot: Some(&download_process_group),
+            progress_path: Some(&stage),
+            is_directory,
+            total_bytes,
+            clean_stage_between_attempts: true,
+        },
+        |event| match event {
+            ScpProgressEvent::Transferring(sample) => {
+                last_attempt = sample.attempt;
+                last_reported_bytes = sample.bytes_transferred;
+                send_progress("transferring", sample);
+            }
+            ScpProgressEvent::Retrying { attempt } => {
+                last_attempt = attempt;
+                last_reported_bytes = 0;
+                send_progress(
+                    "retrying",
+                    ScpProgressSample {
+                        bytes_transferred: 0,
+                        total_bytes,
+                        bytes_per_second: None,
+                        eta_seconds: None,
+                        attempt,
+                    },
+                );
+            }
+        },
+    );
+
+    match transfer_result {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            return Err(output_to_error("scp download failed", &output));
+        }
+        Err(error) => return Err(error),
+    }
+
+    if cancelled.load(Ordering::Acquire) {
+        return Err("download cancelled".to_string());
+    }
+    let downloaded_is_directory = std::fs::symlink_metadata(&stage)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(is_directory);
+    let final_bytes = path_size_for_progress(&stage, downloaded_is_directory, Some(&cancelled))
+        .unwrap_or(last_reported_bytes);
+    let final_total_bytes = (!downloaded_is_directory).then_some(final_bytes);
+    // Linearize Cancel versus publication. If Cancel wins this transition,
+    // publishing is forbidden. If commit wins, a later Cancel returns false
+    // (too late) instead of claiming that a published file was cancelled.
+    begin_download_commit(&download_phase)?;
+    send_progress(
+        "finalizing",
+        ScpProgressSample {
+            bytes_transferred: final_bytes,
+            total_bytes: final_total_bytes,
+            bytes_per_second: None,
+            eta_seconds: final_total_bytes.map(|_| 0),
+            attempt: last_attempt,
+        },
+    );
+    publish_stage_no_replace(&stage, &destination)
+        .map_err(|error| format!("finalize download failed: {error}"))?;
+
+    Ok(SshDownloadResult {
+        local_path: destination.to_string_lossy().to_string(),
+    })
 }
 
 #[tauri::command]
@@ -1219,10 +3311,7 @@ fn ssh_download_file_sync(
     remote_path: String,
     local_path: String,
 ) -> Result<(), String> {
-    let target = target.trim();
-    if target.is_empty() {
-        return Err("missing ssh target".to_string());
-    }
+    let target = validate_ssh_target(&target)?;
     let (_root, remote_path) = ensure_within_root(&root, &remote_path)?;
 
     let local = local_path.trim();
@@ -1230,13 +3319,31 @@ fn ssh_download_file_sync(
         return Err("missing local path".to_string());
     }
 
+    let transfer_id = next_internal_transfer_id();
+    let (_guard, cancelled, _phase, _process_group) =
+        register_download(transfer_id, PathBuf::from(local))?;
+
     // Use scp -r for recursive copy (works for files and directories)
     // Format: scp -r user@host:/remote/path /local/path
     // Remote path must be escaped (remote shell in legacy mode, client-side
     // glob in sftp mode); the local path is passed verbatim.
     let source = format!("{}:{}", target, scp_escape_remote_path(&remote_path));
     let paths = vec![source, local.to_string()];
-    let output = run_scp(target, &["-r"], &paths)?;
+    let output = run_scp_controlled(
+        target,
+        &["-r"],
+        &paths,
+        ScpControl {
+            cancelled: &cancelled,
+            renderer_generation: None,
+            process_group_slot: None,
+            progress_path: None,
+            is_directory: false,
+            total_bytes: None,
+            clean_stage_between_attempts: false,
+        },
+        |_| {},
+    )?;
     if !output.status.success() {
         return Err(output_to_error("scp download failed", &output));
     }
@@ -1283,7 +3390,10 @@ fn ssh_upload_file_sync(
     // glob in sftp mode); the local path is passed verbatim.
     let dest = format!("{}:{}", target, scp_escape_remote_path(&remote_path));
     let paths = vec![local.to_string(), dest];
-    let output = run_scp(target, &["-r"], &paths)?;
+    // Uploads write directly to the remote destination and cannot yet be
+    // atomically rolled back. Do not kill one on renderer restart: interruption
+    // would turn a recoverable invisible job into visible remote corruption.
+    let output = run_scp(target, &["-r"], &paths, None)?;
     if !output.status.success() {
         return Err(output_to_error("scp upload failed", &output));
     }
@@ -1296,8 +3406,9 @@ pub async fn ssh_download_to_temp(
     root: String,
     remote_path: String,
 ) -> Result<String, String> {
+    let renderer_generation = current_ssh_transfer_generation();
     tauri::async_runtime::spawn_blocking(move || {
-        ssh_download_to_temp_sync(target, root, remote_path)
+        ssh_download_to_temp_sync(target, root, remote_path, renderer_generation)
     })
     .await
     .map_err(|e| format!("ssh task join failed: {e:?}"))?
@@ -1307,7 +3418,11 @@ fn ssh_download_to_temp_sync(
     target: String,
     root: String,
     remote_path: String,
+    renderer_generation: u64,
 ) -> Result<String, String> {
+    if renderer_generation != current_ssh_transfer_generation() {
+        return Err("download belonged to a terminated renderer".to_string());
+    }
     let target = target.trim();
     if target.is_empty() {
         return Err("missing ssh target".to_string());
@@ -1325,14 +3440,31 @@ fn ssh_download_to_temp_sync(
     std::fs::create_dir_all(&temp_base)
         .map_err(|e| format!("failed to create temp directory: {e}"))?;
 
-    // Generate unique subdirectory
-    let unique_id = std::time::SystemTime::now()
+    // Atomically claim a unique subdirectory so concurrent panels/processes
+    // cannot ever share a partial drag download.
+    static NEXT_TEMP_DOWNLOAD: AtomicU64 = AtomicU64::new(1);
+    let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
+        .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    let unique_dir = temp_base.join(format!("{unique_id}"));
-    std::fs::create_dir_all(&unique_dir)
-        .map_err(|e| format!("failed to create temp subdirectory: {e}"))?;
+    let mut unique_dir = None;
+    for _ in 0..10_000 {
+        let candidate = temp_base.join(format!(
+            "{timestamp}-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_DOWNLOAD.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                unique_dir = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("failed to create temp subdirectory: {error}")),
+        }
+    }
+    let unique_dir =
+        unique_dir.ok_or_else(|| "failed to allocate temp subdirectory".to_string())?;
 
     let local_path = unique_dir.join(file_name);
     let local_path_str = local_path.to_string_lossy().to_string();
@@ -1340,10 +3472,698 @@ fn ssh_download_to_temp_sync(
     // Download using scp (remote path escaped for both scp protocol modes)
     let source = format!("{}:{}", target, scp_escape_remote_path(&remote_path));
     let paths = vec![source, local_path_str.clone()];
-    let output = run_scp(target, &["-r"], &paths)?;
-    if !output.status.success() {
-        return Err(output_to_error("scp download failed", &output));
-    }
+    let cancelled = AtomicBool::new(false);
+    let transfer = run_scp_controlled(
+        target,
+        &["-r"],
+        &paths,
+        ScpControl {
+            cancelled: &cancelled,
+            renderer_generation: Some(renderer_generation),
+            process_group_slot: None,
+            progress_path: Some(&local_path),
+            is_directory: false,
+            total_bytes: None,
+            clean_stage_between_attempts: true,
+        },
+        |_| {},
+    );
+    let output = match transfer {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            let error = output_to_error("scp download failed", &output);
+            let _ = remove_owned_stage(&unique_dir);
+            return Err(error);
+        }
+        Err(error) => {
+            let _ = remove_owned_stage(&unique_dir);
+            return Err(error);
+        }
+    };
+    debug_assert!(output.status.success());
 
     Ok(local_path_str)
+}
+
+#[cfg(test)]
+mod download_safety_tests {
+    use super::*;
+
+    fn registry_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn unique_test_path(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        std::env::temp_dir().join(format!(
+            "agents-ui-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[cfg(target_family = "unix")]
+    fn write_test_program(label: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = unique_test_path(label);
+        std::fs::write(&path, script).expect("write test program");
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).expect("make test program executable");
+        path
+    }
+
+    #[test]
+    fn bounded_tail_never_exceeds_limit_and_keeps_latest_bytes() {
+        let mut tail = Vec::new();
+        for value in 0..200u8 {
+            push_bounded_tail(&mut tail, &vec![value; 1_024], 64 * 1_024);
+        }
+        assert_eq!(tail.len(), 64 * 1_024);
+        assert!(tail.iter().all(|value| *value >= 136));
+
+        push_bounded_tail(&mut tail, &vec![255; 128 * 1_024], 64 * 1_024);
+        assert_eq!(tail.len(), 64 * 1_024);
+        assert!(tail.iter().all(|value| *value == 255));
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn bounded_command_supervisor_rejects_oversized_stdout() {
+        let program = write_test_program(
+            "stdout-flood",
+            "#!/bin/sh\n/bin/dd if=/dev/zero bs=65536 count=32 2>/dev/null\n",
+        );
+        let command = Command::new(&program);
+        let started_at = Instant::now();
+        let error = run_command_bounded(
+            command,
+            None,
+            64 * 1024,
+            None,
+            Some(Duration::from_secs(2)),
+            "test stdout flood",
+        )
+        .expect_err("oversized stdout must fail");
+        assert!(error.contains("output exceeded"), "{error}");
+        assert!(started_at.elapsed() < Duration::from_secs(2));
+        std::fs::remove_file(program).expect("remove stdout flood program");
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn bounded_command_supervisor_can_cancel_a_blocked_stdin_writer() {
+        let program = write_test_program("stdin-stall", "#!/bin/sh\nsleep 5\n");
+        let command = Command::new(&program);
+        let input = vec![7u8; 4 * 1024 * 1024];
+        let started_at = Instant::now();
+        let error = run_command_bounded(
+            command,
+            Some(&input),
+            64 * 1024,
+            None,
+            Some(Duration::from_millis(250)),
+            "test stdin stall",
+        )
+        .expect_err("stalled stdin must hit the supervisor deadline");
+        assert!(error.contains("safety deadline"), "{error}");
+        assert!(started_at.elapsed() < Duration::from_secs(2));
+        std::fs::remove_file(program).expect("remove stdin stall program");
+    }
+
+    #[test]
+    fn remote_directory_parser_returns_an_explicit_error_at_its_bound() {
+        let mut listing = String::new();
+        for index in 0..=MAX_REMOTE_DIRECTORY_ENTRIES {
+            listing.push_str(&format!(
+                "-rw-r--r-- 1 user group 1 Jan 1 00:00 file-{index}\n"
+            ));
+        }
+        let error = match parse_sftp_ls("/remote", &listing) {
+            Err(error) => error,
+            Ok(_) => panic!("oversized remote directory must not be silently truncated"),
+        };
+        assert!(error.contains("entry safety limit"));
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn controlled_child_drains_large_stderr_without_unbounded_capture() {
+        let program = write_test_program(
+            "stderr-flood",
+            "#!/bin/sh\n/bin/dd if=/dev/zero bs=65536 count=64 1>&2 2>/dev/null\nprintf '\\nFINAL_DIAGNOSTIC\\n' >&2\nexit 7\n",
+        );
+        let cancelled = AtomicBool::new(false);
+        let output = run_scp_once_controlled(
+            &program,
+            &[],
+            &[],
+            ScpControl {
+                cancelled: &cancelled,
+                renderer_generation: None,
+                process_group_slot: None,
+                progress_path: None,
+                is_directory: false,
+                total_bytes: None,
+                clean_stage_between_attempts: false,
+            },
+            1,
+            &mut |_| {},
+        )
+        .expect("run controlled child");
+        assert!(!output.status.success());
+        assert!(output.stderr.len() <= SCP_DIAGNOSTIC_TAIL_BYTES);
+        assert!(output.stderr.ends_with(b"FINAL_DIAGNOSTIC\n"));
+        std::fs::remove_file(program).expect("remove test program");
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn controlled_child_emits_monotonic_file_progress() {
+        let program = write_test_program(
+            "progress-writer",
+            "#!/bin/sh\nfor last do :; done\n: > \"$last\"\n/bin/dd if=/dev/zero bs=1024 count=1 >> \"$last\" 2>/dev/null\nsleep 0.3\n/bin/dd if=/dev/zero bs=1024 count=1 >> \"$last\" 2>/dev/null\nsleep 0.3\n/bin/dd if=/dev/zero bs=1024 count=1 >> \"$last\" 2>/dev/null\n",
+        );
+        let destination = unique_test_path("progress-output");
+        let cancelled = AtomicBool::new(false);
+        let mut samples = Vec::new();
+        let output = run_scp_once_controlled(
+            &program,
+            &[],
+            &[destination.to_string_lossy().to_string()],
+            ScpControl {
+                cancelled: &cancelled,
+                renderer_generation: None,
+                process_group_slot: None,
+                progress_path: Some(&destination),
+                is_directory: false,
+                total_bytes: Some(3_072),
+                clean_stage_between_attempts: false,
+            },
+            1,
+            &mut |event| {
+                if let ScpProgressEvent::Transferring(sample) = event {
+                    samples.push(sample.bytes_transferred);
+                }
+            },
+        )
+        .expect("run progress child");
+        assert!(output.status.success());
+        assert!(samples.len() >= 2, "samples: {samples:?}");
+        assert!(samples.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(samples.last(), Some(&3_072));
+        std::fs::remove_file(program).expect("remove test program");
+        std::fs::remove_file(destination).expect("remove progress output");
+    }
+
+    #[test]
+    fn progress_estimator_reports_smoothed_rate_and_eta_after_warmup() {
+        let now = Instant::now();
+        let mut estimator = ProgressEstimator {
+            started_at: now - Duration::from_secs(3),
+            last_sample_at: now - Duration::from_secs(1),
+            last_progress_at: now - Duration::from_secs(1),
+            last_bytes: 1_000,
+            smoothed_rate: None,
+        };
+        let sample = estimator.sample(2_000, Some(4_000), 1);
+        assert!((900..=1_100).contains(&sample.bytes_per_second.unwrap_or_default()));
+        assert!((2..=3).contains(&sample.eta_seconds.unwrap_or_default()));
+    }
+
+    #[test]
+    fn progress_estimator_clears_stale_speed_and_eta_after_a_stall() {
+        let now = Instant::now();
+        let mut estimator = ProgressEstimator {
+            started_at: now - Duration::from_secs(10),
+            last_sample_at: now - Duration::from_secs(4),
+            last_progress_at: now - Duration::from_secs(4),
+            last_bytes: 2_000,
+            smoothed_rate: Some(1_000.0),
+        };
+        let sample = estimator.sample(2_000, Some(4_000), 1);
+        assert_eq!(sample.bytes_per_second, None);
+        assert_eq!(sample.eta_seconds, None);
+    }
+
+    #[test]
+    fn download_name_and_target_validation_reject_option_and_path_injection() {
+        assert!(validate_ssh_target("-Fmalicious").is_err());
+        assert!(validate_ssh_target("host\nother").is_err());
+        assert!(validate_ssh_target("user@example.test").is_ok());
+        assert!(validate_download_name("../secret").is_err());
+        assert!(validate_download_name("folder\\secret").is_err());
+        assert!(validate_download_name("report 2026.pdf").is_ok());
+        assert_eq!(validate_download_name(" report "), Ok(" report "));
+    }
+
+    #[test]
+    fn transfer_arguments_disable_every_control_socket() {
+        let args = ssh_transfer_args();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-o", "ControlMaster=no"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-o", "ControlPath=none"]));
+    }
+
+    #[test]
+    fn destination_numbering_preserves_extensions() {
+        let directory = Path::new("/tmp");
+        assert_eq!(
+            numbered_destination(directory, "report.tar.gz", 2),
+            directory.join("report.tar (2).gz")
+        );
+        assert_eq!(
+            numbered_destination(directory, "archive", 3),
+            directory.join("archive (3)")
+        );
+    }
+
+    #[test]
+    fn destination_reservation_never_overwrites_an_existing_file() {
+        let _test_guard = registry_test_lock().lock().unwrap();
+        let directory = unique_test_path("destination-collision");
+        std::fs::create_dir_all(&directory).expect("create destination directory");
+        std::fs::write(directory.join("report.txt"), b"existing").expect("write existing file");
+        let transfer_id = format!(
+            "collision-{}-{}",
+            std::process::id(),
+            next_internal_transfer_id()
+        );
+        let (guard, _cancelled, _phase, _process_group, destination) =
+            reserve_download_destination(
+                transfer_id,
+                directory.to_str().expect("utf8 test path"),
+                "report.txt",
+                current_ssh_transfer_generation(),
+            )
+            .expect("reserve destination");
+        assert_eq!(
+            destination,
+            std::fs::canonicalize(&directory)
+                .unwrap()
+                .join("report (1).txt")
+        );
+        assert_eq!(
+            std::fs::read(directory.join("report.txt")).unwrap(),
+            b"existing"
+        );
+        drop(guard);
+        std::fs::remove_dir_all(&directory).expect("remove destination directory");
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn dangling_symlink_is_occupied_during_destination_reservation() {
+        let _test_guard = registry_test_lock().lock().unwrap();
+        let directory = unique_test_path("destination-dangling-link");
+        std::fs::create_dir_all(&directory).expect("create destination directory");
+        std::os::unix::fs::symlink(
+            directory.join("missing-target"),
+            directory.join("report.txt"),
+        )
+        .expect("create dangling destination symlink");
+        let transfer_id = format!("dangling-{}", next_internal_transfer_id());
+        let (guard, _, _, _, destination) = reserve_download_destination(
+            transfer_id,
+            directory.to_str().expect("utf8 test path"),
+            "report.txt",
+            current_ssh_transfer_generation(),
+        )
+        .expect("reserve around dangling symlink");
+        assert_eq!(destination.file_name().unwrap(), "report (1).txt");
+        drop(guard);
+        std::fs::remove_dir_all(directory).expect("remove dangling-link directory");
+    }
+
+    #[test]
+    fn atomic_publish_never_replaces_a_destination_created_after_reservation() {
+        let directory = unique_test_path("atomic-publish-collision");
+        std::fs::create_dir_all(&directory).expect("create publish directory");
+        let stage = directory.join("stage");
+        let destination = directory.join("destination");
+        std::fs::write(&stage, b"downloaded").expect("write stage");
+        std::fs::write(&destination, b"competing").expect("write competing destination");
+
+        let error = publish_stage_no_replace(&stage, &destination)
+            .expect_err("no-replace publish must reject a competing destination");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"competing");
+        assert_eq!(std::fs::read(&stage).unwrap(), b"downloaded");
+        std::fs::remove_dir_all(directory).expect("remove publish directory");
+    }
+
+    #[test]
+    fn atomic_publish_succeeds_for_files_and_directories() {
+        let directory = unique_test_path("atomic-publish-success");
+        std::fs::create_dir_all(&directory).expect("create publish directory");
+
+        let staged_file = directory.join("staged-file");
+        let published_file = directory.join("published-file");
+        std::fs::write(&staged_file, b"complete").expect("write staged file");
+        publish_stage_no_replace(&staged_file, &published_file).expect("publish file");
+        assert!(!staged_file.exists());
+        assert_eq!(std::fs::read(&published_file).unwrap(), b"complete");
+
+        let staged_directory = directory.join("staged-directory");
+        let published_directory = directory.join("published-directory");
+        std::fs::create_dir(&staged_directory).expect("create staged directory");
+        std::fs::write(staged_directory.join("payload"), b"complete")
+            .expect("write staged directory payload");
+        publish_stage_no_replace(&staged_directory, &published_directory)
+            .expect("publish directory");
+        assert!(!staged_directory.exists());
+        assert_eq!(
+            std::fs::read(published_directory.join("payload")).unwrap(),
+            b"complete"
+        );
+
+        std::fs::remove_dir_all(directory).expect("remove publish directory");
+    }
+
+    #[test]
+    fn private_stage_is_atomically_owned_and_cleaned_by_its_guard() {
+        let directory = unique_test_path("private-stage");
+        std::fs::create_dir_all(&directory).expect("create private-stage parent");
+        let guard = OwnedStageGuard::create(&directory).expect("create private stage");
+        let root = guard.root.clone();
+        assert!(root.is_dir());
+        assert!(!guard.payload.exists());
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        drop(guard);
+        assert!(!root.exists());
+        std::fs::remove_dir_all(directory).expect("remove private-stage parent");
+    }
+
+    #[test]
+    fn cancellation_is_idempotent_and_registry_entry_is_released() {
+        let _test_guard = registry_test_lock().lock().unwrap();
+        let transfer_id = format!(
+            "test-{}-{}",
+            std::process::id(),
+            next_internal_transfer_id()
+        );
+        let destination = unique_test_path("registry-destination");
+        let (guard, cancelled, _phase, _process_group) =
+            register_download(transfer_id.clone(), destination).expect("register download");
+        assert_eq!(ssh_cancel_download(transfer_id.clone()), Ok(true));
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(ssh_cancel_download(transfer_id.clone()), Ok(true));
+        drop(guard);
+        assert_eq!(ssh_cancel_download(transfer_id), Ok(true));
+    }
+
+    #[test]
+    fn cancellation_that_overtakes_worker_registration_is_not_lost() {
+        let _test_guard = registry_test_lock().lock().unwrap();
+        let transfer_id = format!(
+            "precancel-{}-{}",
+            std::process::id(),
+            next_internal_transfer_id()
+        );
+        assert_eq!(ssh_cancel_download(transfer_id.clone()), Ok(true));
+        let destination = unique_test_path("precancel-destination");
+        let (guard, cancelled, _phase, _process_group) =
+            register_download(transfer_id, destination).expect("register pre-cancelled download");
+        assert!(cancelled.load(Ordering::Acquire));
+        drop(guard);
+    }
+
+    #[test]
+    fn cancellation_reports_too_late_after_commit_linearizes() {
+        let _test_guard = registry_test_lock().lock().unwrap();
+        let transfer_id = format!("committing-{}", next_internal_transfer_id());
+        let destination = unique_test_path("committing-destination");
+        let (guard, _cancelled, phase, _process_group) =
+            register_download(transfer_id.clone(), destination).expect("register download");
+        begin_download_commit(&phase).expect("begin commit");
+        assert_eq!(ssh_cancel_download(transfer_id), Ok(false));
+        drop(guard);
+    }
+
+    #[test]
+    fn cancel_and_commit_have_exactly_one_linearized_winner() {
+        for round in 0..256 {
+            let phase = Arc::new(AtomicU8::new(DOWNLOAD_PHASE_TRANSFERRING));
+            let download = ActiveDownload {
+                cancelled: Arc::new(AtomicBool::new(false)),
+                phase: phase.clone(),
+                process_group: Arc::new(AtomicU64::new(0)),
+                renderer_generation: None,
+                destination: PathBuf::from(format!("unused-{round}")),
+                stage_root: None,
+            };
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let (cancel_won, commit_won) = std::thread::scope(|scope| {
+                let cancel_barrier = barrier.clone();
+                let cancel_download = download.clone();
+                let cancel = scope.spawn(move || {
+                    cancel_barrier.wait();
+                    request_download_cancellation(&cancel_download)
+                });
+                let commit_barrier = barrier.clone();
+                let commit_phase = phase.clone();
+                let commit = scope.spawn(move || {
+                    commit_barrier.wait();
+                    begin_download_commit(&commit_phase).is_ok()
+                });
+                barrier.wait();
+                (cancel.join().unwrap(), commit.join().unwrap())
+            });
+            assert_ne!(cancel_won, commit_won, "round {round}");
+        }
+    }
+
+    #[test]
+    fn renderer_restart_cancels_only_renderer_owned_downloads() {
+        let _test_guard = registry_test_lock().lock().unwrap();
+        let legacy_id = format!("legacy-{}", next_internal_transfer_id());
+        let (legacy_guard, legacy_cancelled, _, _) =
+            register_download(legacy_id, unique_test_path("legacy-renderer-owner"))
+                .expect("register legacy download");
+
+        let directory = unique_test_path("renderer-owned-download");
+        std::fs::create_dir_all(&directory).expect("create renderer destination");
+        let renderer_id = format!("renderer-{}", next_internal_transfer_id());
+        let generation = current_ssh_transfer_generation();
+        let (renderer_guard, renderer_cancelled, _, _, _) = reserve_download_destination(
+            renderer_id,
+            directory.to_str().expect("utf8 renderer path"),
+            "payload.bin",
+            generation,
+        )
+        .expect("register renderer download");
+
+        cancel_active_ssh_downloads_for_renderer_restart();
+        assert!(renderer_cancelled.load(Ordering::Acquire));
+        assert!(!legacy_cancelled.load(Ordering::Acquire));
+
+        drop(renderer_guard);
+        drop(legacy_guard);
+        std::fs::remove_dir_all(directory).expect("remove renderer destination");
+    }
+
+    #[test]
+    fn preflight_download_jobs_are_bounded_before_filesystem_work() {
+        let permits = (0..MAX_ACTIVE_DOWNLOADS)
+            .map(|_| acquire_download_job_permit().expect("acquire bounded job permit"))
+            .collect::<Vec<_>>();
+        assert!(acquire_download_job_permit().is_err());
+        drop(permits);
+        assert!(acquire_download_job_permit().is_ok());
+    }
+
+    #[test]
+    fn pre_cancelled_transfer_never_spawns_scp() {
+        let cancelled = AtomicBool::new(true);
+        let started_at = Instant::now();
+        let result = run_scp_controlled(
+            "unreachable.invalid",
+            &["-r"],
+            &[
+                "unreachable.invalid:/remote".to_string(),
+                unique_test_path("must-not-be-created")
+                    .to_string_lossy()
+                    .to_string(),
+            ],
+            ScpControl {
+                cancelled: &cancelled,
+                renderer_generation: None,
+                process_group_slot: None,
+                progress_path: None,
+                is_directory: false,
+                total_bytes: None,
+                clean_stage_between_attempts: false,
+            },
+            |_| {},
+        );
+        assert_eq!(result.unwrap_err(), "file transfer cancelled");
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn stale_renderer_generation_never_spawns_scp() {
+        let cancelled = AtomicBool::new(false);
+        let stale_generation = u64::MAX;
+        let started_at = Instant::now();
+        let result = run_scp_controlled(
+            "unreachable.invalid",
+            &["-r"],
+            &[
+                "unreachable.invalid:/remote".to_string(),
+                unique_test_path("stale-renderer-must-not-spawn")
+                    .to_string_lossy()
+                    .to_string(),
+            ],
+            ScpControl {
+                cancelled: &cancelled,
+                renderer_generation: Some(stale_generation),
+                process_group_slot: None,
+                progress_path: None,
+                is_directory: false,
+                total_bytes: None,
+                clean_stage_between_attempts: false,
+            },
+            |_| {},
+        );
+        assert_eq!(result.unwrap_err(), "file transfer cancelled");
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn directory_progress_scan_does_not_follow_symlinks() {
+        let root = unique_test_path("progress-tree");
+        std::fs::create_dir_all(&root).expect("create test directory");
+        std::fs::write(root.join("payload"), vec![7u8; 4_096]).expect("write payload");
+        #[cfg(target_family = "unix")]
+        std::os::unix::fs::symlink(&root, root.join("loop")).expect("create symlink");
+        assert_eq!(path_size_for_progress(&root, true, None), Some(4_096));
+        std::fs::remove_dir_all(&root).expect("remove test directory");
+    }
+
+    #[test]
+    fn flat_directory_progress_frontier_is_bounded_while_discovering_entries() {
+        let root = unique_test_path("progress-wide-tree");
+        std::fs::create_dir_all(&root).expect("create wide progress tree");
+        for index in 0..20 {
+            std::fs::write(root.join(format!("payload-{index}")), b"x")
+                .expect("write wide-tree payload");
+        }
+        assert_eq!(
+            path_size_for_progress_controlled(&root, true, None, 8),
+            None
+        );
+        std::fs::remove_dir_all(root).expect("remove wide progress tree");
+    }
+
+    #[test]
+    fn progress_scan_observes_cancellation_before_filesystem_traversal() {
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            path_size_for_progress_controlled(
+                Path::new("/path-that-must-not-be-opened"),
+                true,
+                Some(&cancelled),
+                8,
+            ),
+            None
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn terminating_scp_process_group_stops_descendants_and_reaps_parent() {
+        use std::os::unix::process::CommandExt;
+
+        let sentinel = unique_test_path("cancel-sentinel");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("(trap '' TERM; sleep 1; printf done > \"$1\") 2>/dev/null & wait")
+            .arg("--")
+            .arg(&sentinel)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.process_group(0);
+        let child = command.spawn().expect("spawn process tree");
+        let process_group_id = child.id();
+        let mut child = SupervisedChild::new(child);
+        std::thread::sleep(Duration::from_millis(100));
+        terminate_scp_process(&mut child);
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert!(
+            !sentinel.exists(),
+            "cancelled descendant wrote after teardown"
+        );
+        assert!(!scp_process_group_exists(process_group_id));
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn deferred_reaper_owns_and_reaps_child_handles() {
+        let _test_guard = registry_test_lock().lock().unwrap();
+        poll_deferred_ssh_fallback();
+        let baseline = deferred_ssh_child_count().load(Ordering::Acquire);
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn deferred-reap child");
+        defer_ssh_child_reap(child);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && deferred_ssh_child_count().load(Ordering::Acquire) != baseline
+        {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(deferred_ssh_child_count().load(Ordering::Acquire), baseline);
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn supervised_child_guard_contains_progress_callback_panics() {
+        let program = write_test_program(
+            "panic-supervision",
+            "#!/bin/sh\nprevious=\nfor argument do second_last=$previous; previous=$argument; done\nprintf x > \"$previous\"\nsleep 1\nprintf done > \"$second_last\"\n",
+        );
+        let sentinel = unique_test_path("panic-sentinel");
+        let progress = unique_test_path("panic-progress");
+        let cancelled = AtomicBool::new(false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = run_scp_once_controlled(
+                &program,
+                &[],
+                &[
+                    sentinel.to_string_lossy().to_string(),
+                    progress.to_string_lossy().to_string(),
+                ],
+                ScpControl {
+                    cancelled: &cancelled,
+                    renderer_generation: None,
+                    process_group_slot: None,
+                    progress_path: Some(&progress),
+                    is_directory: false,
+                    total_bytes: Some(1),
+                    clean_stage_between_attempts: false,
+                },
+                1,
+                &mut |_| panic!("intentional progress callback panic"),
+            );
+        }));
+        assert!(result.is_err());
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert!(!sentinel.exists(), "panicking callback leaked its child");
+        let _ = std::fs::remove_file(progress);
+        std::fs::remove_file(program).expect("remove panic supervision program");
+    }
 }

@@ -3008,9 +3008,21 @@ body::after {
 .fileExplorerTransferBar {
   position: absolute;
   inset: 0;
-  background: rgba(var(--accent-rgb), 0.06);
+  background: linear-gradient(
+    90deg,
+    rgba(var(--accent-rgb), 0.025),
+    rgba(var(--accent-rgb), 0.12),
+    rgba(var(--accent-rgb), 0.025)
+  );
   background-size: 200% 100%;
   animation: transferSlide 1.5s ease-in-out infinite;
+}
+
+.fileExplorerTransferBarDeterminate {
+  right: auto;
+  background: rgba(var(--accent-rgb), 0.12);
+  animation: none;
+  transition: width 180ms linear;
 }
 
 @keyframes transferSlide {
@@ -3026,6 +3038,17 @@ body::after {
   white-space: nowrap;
   flex: 1;
   min-width: 0;
+}
+
+.fileExplorerTransferTextStacked {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+
+.fileExplorerTransferMeta {
+  color: rgba(var(--ink-rgb), 0.52);
+  font-variant-numeric: tabular-nums;
 }
 
 .fileExplorerTransferSuccess {
@@ -3051,6 +3074,37 @@ body::after {
 
 .fileExplorerTransferDismiss:hover {
   color: rgba(var(--ink-rgb), 0.8);
+}
+
+.fileExplorerTransferCancel {
+  position: relative;
+  z-index: 1;
+  flex-shrink: 0;
+  border: 0;
+  background: none;
+  color: rgba(var(--ink-rgb), 0.66);
+  cursor: pointer;
+  padding: 2px 3px;
+  font: inherit;
+}
+
+.fileExplorerTransferCancel:hover:not(:disabled) {
+  color: rgba(var(--ink-rgb), 0.92);
+}
+
+.fileExplorerTransferCancel:disabled {
+  cursor: progress;
+  opacity: 0.55;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fileExplorerTransferBar {
+    animation: none;
+  }
+
+  .fileExplorerTransferBarDeterminate {
+    transition: none;
+  }
 }
 
 .codeEditorPanel {
@@ -4520,9 +4574,28 @@ body::after {
   border-radius: var(--radius-control);
 }
 
+.pathPickerName {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.pathPickerName .input[aria-invalid="true"] {
+  border-color: rgba(var(--danger-rgb), 0.72);
+}
+
 .pathPickerError {
   font-size: 12px;
   color: rgba(var(--danger-rgb), 0.9);
+  margin-bottom: 8px;
+}
+
+.pathPickerNotice {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted);
   margin-bottom: 8px;
 }
 

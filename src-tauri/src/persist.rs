@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tauri::{AppHandle, Manager};
 
 use crate::secure::{decrypt_string_with_key, encrypt_string_with_key, get_or_create_master_key, SecretContext};
@@ -308,10 +309,43 @@ pub struct DirectoryListing {
     pub path: String,
     pub parent: Option<String>,
     pub entries: Vec<DirectoryEntry>,
+    pub truncated: bool,
+}
+
+const MAX_DIRECTORY_PICKER_ENTRIES: usize = 500;
+const MAX_DIRECTORY_PICKER_SCAN_ENTRIES: usize = 5_000;
+const MAX_CONCURRENT_DIRECTORY_LISTINGS: usize = 4;
+static ACTIVE_DIRECTORY_LISTINGS: AtomicUsize = AtomicUsize::new(0);
+
+struct DirectoryListingPermit;
+
+impl Drop for DirectoryListingPermit {
+    fn drop(&mut self) {
+        ACTIVE_DIRECTORY_LISTINGS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn acquire_directory_listing_permit() -> Result<DirectoryListingPermit, String> {
+    ACTIVE_DIRECTORY_LISTINGS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < MAX_CONCURRENT_DIRECTORY_LISTINGS).then_some(active + 1)
+        })
+        .map(|_| DirectoryListingPermit)
+        .map_err(|_| "too many local folder listings are already running".to_string())
 }
 
 #[tauri::command]
-pub fn validate_directory(path: String) -> Result<Option<String>, String> {
+pub async fn validate_directory(path: String) -> Result<Option<String>, String> {
+    let permit = acquire_directory_listing_permit()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        validate_directory_sync(path)
+    })
+    .await
+    .map_err(|error| format!("local folder validation task failed: {error}"))?
+}
+
+fn validate_directory_sync(path: String) -> Result<Option<String>, String> {
     let expanded = expand_home(&path);
     if expanded.trim().is_empty() {
         return Ok(None);
@@ -324,12 +358,38 @@ pub fn validate_directory(path: String) -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-pub fn list_directories(path: Option<String>) -> Result<DirectoryListing, String> {
+pub async fn list_directories(path: Option<String>) -> Result<DirectoryListing, String> {
+    // Local/network-backed directory enumeration can block inside the OS for
+    // seconds. Keep it off Tauri's command/event thread, and cap outstanding
+    // jobs so repeatedly closing/reopening a stalled picker cannot exhaust the
+    // blocking pool.
+    let permit = acquire_directory_listing_permit()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        list_directories_sync(path)
+    })
+    .await
+    .map_err(|error| format!("local folder listing task failed: {error}"))?
+}
+
+fn list_directories_sync(path: Option<String>) -> Result<DirectoryListing, String> {
+    list_directories_sync_with_limits(
+        path,
+        MAX_DIRECTORY_PICKER_ENTRIES,
+        MAX_DIRECTORY_PICKER_SCAN_ENTRIES,
+    )
+}
+
+fn list_directories_sync_with_limits(
+    path: Option<String>,
+    max_entries: usize,
+    max_scanned_entries: usize,
+) -> Result<DirectoryListing, String> {
     let desired = path
         .as_deref()
         .map(expand_home)
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| home_dir())
+        .or_else(home_dir)
         .ok_or("no path")?;
 
     let dir = PathBuf::from(&desired);
@@ -338,21 +398,30 @@ pub fn list_directories(path: Option<String>) -> Result<DirectoryListing, String
     }
 
     let mut entries: Vec<DirectoryEntry> = Vec::new();
+    let mut truncated = false;
     let read_dir = fs::read_dir(&dir).map_err(|e| format!("read dir failed: {e}"))?;
-    for item in read_dir {
+    for (index, item) in read_dir.enumerate() {
+        if index >= max_scanned_entries {
+            truncated = true;
+            break;
+        }
         let item = match item {
             Ok(i) => i,
             Err(_) => continue,
         };
         let path = item.path();
-        let is_dir = fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
+        let is_dir = item
+            .file_type()
+            .map(|file_type| file_type.is_dir() || (file_type.is_symlink() && path.is_dir()))
+            .unwrap_or(false);
         if !is_dir {
             continue;
         }
-        let name = item
-            .file_name()
-            .to_string_lossy()
-            .to_string();
+        if entries.len() >= max_entries {
+            truncated = true;
+            break;
+        }
+        let name = item.file_name().to_string_lossy().to_string();
         entries.push(DirectoryEntry {
             name,
             path: path.to_string_lossy().to_string(),
@@ -370,18 +439,44 @@ pub fn list_directories(path: Option<String>) -> Result<DirectoryListing, String
         path: dir.to_string_lossy().to_string(),
         parent,
         entries,
+        truncated,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PersistedStateV1;
+    use super::{list_directories_sync_with_limits, PersistedStateV1};
     use serde_json::{json, Value};
 
     fn round_trip(value: Value) -> Value {
         let state: PersistedStateV1 =
             serde_json::from_value(value).expect("state should deserialize");
         serde_json::to_value(state).expect("state should serialize")
+    }
+
+    #[test]
+    fn directory_picker_listing_is_bounded_and_reports_truncation() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "agents-ui-picker-limit-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create picker test root");
+        for index in 0..8 {
+            std::fs::create_dir(root.join(format!("folder-{index}")))
+                .expect("create picker test folder");
+        }
+
+        let listing =
+            list_directories_sync_with_limits(Some(root.to_string_lossy().to_string()), 3, 64)
+                .expect("list bounded picker directory");
+        assert_eq!(listing.entries.len(), 3);
+        assert!(listing.truncated);
+
+        std::fs::remove_dir_all(root).expect("remove picker test root");
     }
 
     #[test]

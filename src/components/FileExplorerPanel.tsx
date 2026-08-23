@@ -1,6 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
@@ -9,6 +8,7 @@ import { shortenPathSmart } from "../pathDisplay";
 import { useClampedMenuPosition } from "../hooks/useClampedMenuPosition";
 import { Icon } from "./Icon";
 import { ConfirmActionModal } from "./modals/ConfirmActionModal";
+import { PathPickerModal } from "./modals/PathPickerModal";
 
 // Cache for downloaded SSH files to avoid re-downloading during the same session
 const sshFileCache = new Map<string, string>();
@@ -19,6 +19,51 @@ type FsEntry = {
   path: string;
   isDir: boolean;
   size: number;
+};
+
+type DirectoryListing = {
+  path: string;
+  parent: string | null;
+  entries: Array<{ name: string; path: string }>;
+  truncated?: boolean;
+};
+
+type SshDownloadProgress = {
+  transferId: string;
+  phase: "transferring" | "retrying" | "finalizing";
+  bytesTransferred: number;
+  totalBytes: number | null;
+  bytesPerSecond: number | null;
+  etaSeconds: number | null;
+  attempt: number;
+};
+
+type SshDownloadResult = {
+  localPath: string;
+};
+
+type TransferStatus = {
+  type: "download" | "upload";
+  fileName: string;
+  phase: "choosing" | "active" | "success" | "error" | "cancelled";
+  error?: string;
+  current?: number;
+  total?: number;
+  transferId?: string;
+  downloadPhase?: SshDownloadProgress["phase"];
+  bytesTransferred?: number;
+  totalBytes?: number | null;
+  bytesPerSecond?: number | null;
+  etaSeconds?: number | null;
+  attempt?: number;
+  cancelRequested?: boolean;
+  cancelError?: string;
+  localPath?: string;
+};
+
+type DownloadPickerState = {
+  entry: FsEntry;
+  initialDirectory: string | null;
 };
 
 type DirectoryState = {
@@ -245,11 +290,53 @@ function entriesEqual(a: FsEntry[], b: FsEntry[]): boolean {
   return true;
 }
 
+function finiteNonNegative(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function formatBytes(value: number): string {
+  const bytes = Math.max(0, value);
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const units = ["KB", "MB", "GB", "TB", "PB"];
+  let scaled = bytes / 1024;
+  let unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) {
+    scaled /= 1024;
+    unit += 1;
+  }
+  const digits = scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2;
+  return `${scaled.toFixed(digits)} ${units[unit]}`;
+}
+
+function formatEta(value: number): string {
+  const seconds = Math.max(0, Math.round(value));
+  if (seconds < 1) return "<1s left";
+  if (seconds < 60) return `${seconds}s left`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes < 60) return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s left` : `${minutes}m left`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m left` : `${hours}h left`;
+}
+
+function createTransferId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `ssh-download-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
 const POLL_INTERVAL_MS = 5_000;
-const POLL_TIMEOUT_MS = 15_000;
 const POLL_MAX_PER_TICK = 5;
+const MAX_GLOBAL_SSH_POLLS_IN_FLIGHT = 5;
 const MUTATION_COOLDOWN_MS = 8_000;
 const FILE_EXPLORER_ROW_HEIGHT = 28;
+
+// A timed-out frontend Promise cannot cancel a Tauri command. Keep the permit
+// until the native operation actually settles so a stalled connection cannot
+// accumulate an unbounded number of abandoned SFTP commands.
+let globalSshPollsInFlight = 0;
 
 type FileRowProps = {
   entry: FsEntry;
@@ -458,14 +545,15 @@ export function FileExplorerPanel({
   const [deleteError, setDeleteError] = React.useState<string | null>(null);
 
   const [downloadBusy, setDownloadBusy] = React.useState(false);
-  const [transferStatus, setTransferStatus] = React.useState<{
-    type: "download" | "upload";
-    fileName: string;
-    phase: "active" | "success" | "error";
-    error?: string;
-    current?: number;
-    total?: number;
-  } | null>(null);
+  const [downloadPicker, setDownloadPicker] = React.useState<DownloadPickerState | null>(null);
+  const [transferStatus, setTransferStatus] = React.useState<TransferStatus | null>(null);
+  const downloadSingleFlightRef = React.useRef(false);
+  const activeDownloadIdRef = React.useRef<string | null>(null);
+  const downloadCancelRequestedRef = React.useRef(false);
+  const downloadPickerRequestRef = React.useRef(0);
+  const sshUploadInFlightRef = React.useRef(false);
+  const sshDragDownloadInFlightRef = React.useRef(false);
+  const mountedRef = React.useRef(true);
   const transferDismissTimerRef = React.useRef<number | null>(null);
   const [dragDropActive, setDragDropActive] = React.useState(false);
   const [dropTarget, setDropTarget] = React.useState<string | null>(null);
@@ -538,9 +626,17 @@ export function FileExplorerPanel({
     [],
   );
 
-  // Clean up dismiss timer on unmount
+  // This panel owns the only progress/cancel UI for its transfer. Do not leave
+  // an unreachable native job behind when the workspace or renderer unmounts.
   React.useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
+      downloadPickerRequestRef.current += 1;
+      const activeTransferId = activeDownloadIdRef.current;
+      if (activeTransferId) {
+        void invoke<boolean>("ssh_cancel_download", { transferId: activeTransferId }).catch(() => {});
+      }
       if (transferDismissTimerRef.current !== null) window.clearTimeout(transferDismissTimerRef.current);
     };
   }, []);
@@ -656,20 +752,20 @@ export function FileExplorerPanel({
   const pollDirectory = React.useCallback(
     async (dirPath: string): Promise<void> => {
       const path = normalizePath(dirPath);
+      const isSshPoll = provider === "ssh";
+      if (isSshPoll && (downloadBusy || downloadSingleFlightRef.current)) return;
       if (inFlightPollsRef.current.has(path)) return;
-      inFlightPollsRef.current.add(path);
-      try {
-        const fetchPromise =
-          provider === "ssh"
-            ? invoke<FsEntry[]>("ssh_list_fs_entries", { target: sshTargetValue, root, path })
-            : invoke<FsEntry[]>("list_fs_entries", { root, path });
+      if (isSshPoll && globalSshPollsInFlight >= MAX_GLOBAL_SSH_POLLS_IN_FLIGHT) return;
 
-        const entries = await Promise.race([
-          fetchPromise,
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error("poll timeout")), POLL_TIMEOUT_MS),
-          ),
-        ]);
+      inFlightPollsRef.current.add(path);
+      if (isSshPoll) globalSshPollsInFlight += 1;
+      try {
+        // Do not race the native invoke against a frontend timer. Losing that
+        // race does not cancel the native SSH child and used to release the
+        // per-path guard, allowing another poll to pile on every five seconds.
+        const entries = isSshPoll
+          ? await invoke<FsEntry[]>("ssh_list_fs_entries", { target: sshTargetValue, root, path })
+          : await invoke<FsEntry[]>("list_fs_entries", { root, path });
 
         // Guard: discard result if dir was collapsed/renamed/removed while polling
         if (!expandedDirsRef.current.has(path) && path !== rootRef.current) return;
@@ -731,9 +827,10 @@ export function FileExplorerPanel({
         // Silently skip — keep showing cached data, retry next tick
       } finally {
         inFlightPollsRef.current.delete(path);
+        if (isSshPoll) globalSshPollsInFlight = Math.max(0, globalSshPollsInFlight - 1);
       }
     },
-    [provider, root, sshTargetValue],
+    [downloadBusy, provider, root, sshTargetValue],
   );
 
   React.useEffect(() => {
@@ -840,7 +937,12 @@ export function FileExplorerPanel({
 
   // --- Auto-refresh: polling orchestrator ---
   const pollExpandedDirs = React.useCallback(async () => {
-    if (provider !== "ssh" || !sshTargetValue) return;
+    if (
+      provider !== "ssh" ||
+      !sshTargetValue ||
+      downloadBusy ||
+      downloadSingleFlightRef.current
+    ) return;
 
     const expanded = Array.from(expandedDirsRef.current);
     if (expanded.length === 0) return;
@@ -867,49 +969,46 @@ export function FileExplorerPanel({
       return aTime - bTime;
     });
 
-    const batch = candidates.slice(0, POLL_MAX_PER_TICK);
+    const availableSlots = Math.max(0, MAX_GLOBAL_SSH_POLLS_IN_FLIGHT - globalSshPollsInFlight);
+    const batch = candidates.slice(0, Math.min(POLL_MAX_PER_TICK, availableSlots));
     for (const dir of batch) {
       lastPollTimeRef.current.set(dir, now);
     }
 
     await Promise.allSettled(batch.map((dir) => pollDirectory(dir)));
-  }, [provider, sshTargetValue, pollDirectory]);
+  }, [downloadBusy, provider, sshTargetValue, pollDirectory]);
 
-  // --- Auto-refresh: timer start/stop ---
+  // Own the polling interval in one effect. Sharing the ref between separate
+  // timer and visibility effects allowed visibility restore to create a timer
+  // that neither effect later owned, so it survived downloads and unmounts.
   React.useEffect(() => {
-    if (!isOpen || provider !== "ssh") return;
+    if (!isOpen || provider !== "ssh" || downloadBusy) return;
     if (sshConnectionState === "reconnecting" || sshConnectionState === "disconnected") return;
 
-    const interval = window.setInterval(pollExpandedDirs, POLL_INTERVAL_MS);
-    pollIntervalRef.current = interval;
-
-    return () => {
-      window.clearInterval(interval);
+    const stopPolling = () => {
+      if (pollIntervalRef.current === null) return;
+      window.clearInterval(pollIntervalRef.current);
       pollIntervalRef.current = null;
     };
-  }, [isOpen, provider, sshConnectionState, pollExpandedDirs]);
-
-  // --- Auto-refresh: pause when tab/window is hidden ---
-  React.useEffect(() => {
-    if (!isOpen || provider !== "ssh") return;
-    const handler = () => {
-      if (document.hidden) {
-        if (pollIntervalRef.current !== null) {
-          window.clearInterval(pollIntervalRef.current);
-          pollIntervalRef.current = null;
-        }
-      } else if (
-        pollIntervalRef.current === null &&
-        sshConnectionState !== "reconnecting" &&
-        sshConnectionState !== "disconnected"
-      ) {
+    const startPolling = () => {
+      if (document.hidden || pollIntervalRef.current !== null) return;
+      void pollExpandedDirs();
+      pollIntervalRef.current = window.setInterval(() => {
         void pollExpandedDirs();
-        pollIntervalRef.current = window.setInterval(pollExpandedDirs, POLL_INTERVAL_MS);
-      }
+      }, POLL_INTERVAL_MS);
     };
-    document.addEventListener("visibilitychange", handler);
-    return () => document.removeEventListener("visibilitychange", handler);
-  }, [isOpen, provider, sshConnectionState, pollExpandedDirs]);
+    const handleVisibilityChange = () => {
+      if (document.hidden) stopPolling();
+      else startPolling();
+    };
+
+    startPolling();
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      stopPolling();
+    };
+  }, [downloadBusy, isOpen, provider, sshConnectionState, pollExpandedDirs]);
 
   // --- Local filesystem watcher (OS-native, via notify crate) ---
   const watcherIdRef = React.useRef<string | null>(null);
@@ -1434,37 +1533,236 @@ export function FileExplorerPanel({
     }
   }, [closeDeleteModal, deleteTarget, loadDirectory, onPathDeleted, provider, removeDirectoryPrefix, root, sshTargetValue]);
 
+  const loadLocalDirectoryForPicker = React.useCallback(
+    (path: string | null) => invoke<DirectoryListing>("list_directories", { path }),
+    [],
+  );
+
+  const closeDownloadPicker = React.useCallback(() => {
+    downloadPickerRequestRef.current += 1;
+    setDownloadPicker(null);
+    if (activeDownloadIdRef.current === null) {
+      downloadSingleFlightRef.current = false;
+      setDownloadBusy(false);
+      setTransferStatus((prev) =>
+        prev?.type === "download" && prev.phase === "choosing" ? null : prev,
+      );
+    }
+  }, []);
+
+  const startDownload = React.useCallback(
+    async (entry: FsEntry, localDirectory: string, suggestedName: string) => {
+      if (!sshTargetValue || !downloadSingleFlightRef.current || activeDownloadIdRef.current !== null) return;
+
+      const transferId = createTransferId();
+      const expectedBytes =
+        !entry.isDir && Number.isFinite(entry.size) && entry.size >= 0
+          ? Math.trunc(entry.size)
+          : null;
+      const onProgress = new Channel<SshDownloadProgress>();
+
+      activeDownloadIdRef.current = transferId;
+      downloadCancelRequestedRef.current = false;
+      setDownloadPicker(null);
+      if (transferDismissTimerRef.current !== null) {
+        window.clearTimeout(transferDismissTimerRef.current);
+        transferDismissTimerRef.current = null;
+      }
+      setTransferStatus({
+        type: "download",
+        fileName: suggestedName,
+        phase: "active",
+        transferId,
+        downloadPhase: "transferring",
+        bytesTransferred: 0,
+        totalBytes: expectedBytes,
+        bytesPerSecond: null,
+        etaSeconds: null,
+        attempt: 1,
+      });
+
+      onProgress.onmessage = (event) => {
+        if (!mountedRef.current || event.transferId !== transferId) return;
+        if (activeDownloadIdRef.current !== transferId) return;
+
+        const nextAttempt = Math.max(1, Math.trunc(finiteNonNegative(event.attempt) ?? 1));
+        const reportedBytes = finiteNonNegative(event.bytesTransferred) ?? 0;
+        const reportedTotal = finiteNonNegative(event.totalBytes);
+        const reportedRate = finiteNonNegative(event.bytesPerSecond);
+        const reportedEta = finiteNonNegative(event.etaSeconds);
+
+        setTransferStatus((prev) => {
+          if (prev?.type !== "download" || prev.transferId !== transferId || prev.phase !== "active") {
+            return prev;
+          }
+          const previousAttempt = prev.attempt ?? 1;
+          // Progress is monotonic within one attempt. A retry may restart from
+          // a fresh staging destination and legitimately return to zero.
+          const bytesTransferred =
+            nextAttempt === previousAttempt
+              ? Math.max(prev.bytesTransferred ?? 0, reportedBytes)
+              : reportedBytes;
+          return {
+            ...prev,
+            downloadPhase: event.phase,
+            bytesTransferred,
+            // Null is meaningful: the backend clears a stale size hint when
+            // observed bytes exceed it, so percentage and ETA must disappear.
+            totalBytes: reportedTotal,
+            bytesPerSecond: reportedRate,
+            etaSeconds: reportedEta,
+            attempt: nextAttempt,
+          };
+        });
+      };
+
+      try {
+        const result = await invoke<SshDownloadResult>("ssh_download_file_with_progress", {
+          target: sshTargetValue,
+          root,
+          remotePath: entry.path,
+          transferId,
+          localDirectory,
+          suggestedName,
+          isDirectory: entry.isDir,
+          expectedBytes,
+          onProgress,
+        });
+        if (!mountedRef.current || activeDownloadIdRef.current !== transferId) return;
+
+        setTransferStatus((prev) =>
+          prev?.type === "download" && prev.transferId === transferId
+            ? {
+                ...prev,
+                phase: "success",
+                cancelRequested: false,
+                cancelError: undefined,
+                error: undefined,
+                localPath: result.localPath,
+                fileName: basename(result.localPath),
+              }
+            : prev,
+        );
+        if (transferDismissTimerRef.current !== null) {
+          window.clearTimeout(transferDismissTimerRef.current);
+        }
+        transferDismissTimerRef.current = window.setTimeout(() => {
+          transferDismissTimerRef.current = null;
+          setTransferStatus((prev) =>
+            prev?.type === "download" && prev.transferId === transferId && prev.phase === "success"
+              ? null
+              : prev,
+          );
+        }, 3000);
+      } catch (err) {
+        if (!mountedRef.current || activeDownloadIdRef.current !== transferId) return;
+        const cancelled = downloadCancelRequestedRef.current;
+        const message = err instanceof Error ? err.message : String(err);
+        if (!cancelled) console.error("Download failed:", message);
+        setTransferStatus((prev) =>
+          prev?.type === "download" && prev.transferId === transferId
+            ? {
+                ...prev,
+                phase: cancelled ? "cancelled" : "error",
+                error: cancelled ? undefined : message,
+                cancelRequested: false,
+                cancelError: undefined,
+                bytesPerSecond: null,
+                etaSeconds: null,
+              }
+            : prev,
+        );
+        if (cancelled) {
+          if (transferDismissTimerRef.current !== null) {
+            window.clearTimeout(transferDismissTimerRef.current);
+          }
+          transferDismissTimerRef.current = window.setTimeout(() => {
+            transferDismissTimerRef.current = null;
+            setTransferStatus((prev) =>
+              prev?.type === "download" && prev.transferId === transferId && prev.phase === "cancelled"
+                ? null
+                : prev,
+            );
+          }, 3000);
+        }
+      } finally {
+        onProgress.onmessage = () => {};
+        if (activeDownloadIdRef.current === transferId) {
+          activeDownloadIdRef.current = null;
+          downloadCancelRequestedRef.current = false;
+          downloadSingleFlightRef.current = false;
+          if (mountedRef.current) setDownloadBusy(false);
+        }
+      }
+    },
+    [root, sshTargetValue],
+  );
+
   const handleDownload = React.useCallback(async (entry: FsEntry) => {
     setContextMenu(null);
-    if (!sshTargetValue) return;
+    if (
+      !sshTargetValue ||
+      downloadSingleFlightRef.current ||
+      sshUploadInFlightRef.current ||
+      sshDragDownloadInFlightRef.current
+    ) return;
 
-    try {
-      setDownloadBusy(true);
-      const savePath = await save({
-        defaultPath: entry.name,
-        title: entry.isDir ? "Download folder" : "Download file",
-      });
-      if (!savePath) {
-        setDownloadBusy(false);
-        return;
-      }
-
-      setTransferStatus({ type: "download", fileName: entry.name, phase: "active" });
-      await invoke("ssh_download_file", {
-        target: sshTargetValue,
-        root,
-        remotePath: entry.path,
-        localPath: savePath,
-      });
-      showTransferSuccess("download", entry.name);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error("Download failed:", message);
-      showTransferError("download", entry.name, message);
-    } finally {
-      setDownloadBusy(false);
+    downloadSingleFlightRef.current = true;
+    setDownloadBusy(true);
+    if (transferDismissTimerRef.current !== null) {
+      window.clearTimeout(transferDismissTimerRef.current);
+      transferDismissTimerRef.current = null;
     }
-  }, [sshTargetValue, root, showTransferSuccess, showTransferError]);
+    setTransferStatus({ type: "download", fileName: entry.name, phase: "choosing" });
+
+    const requestId = downloadPickerRequestRef.current + 1;
+    downloadPickerRequestRef.current = requestId;
+    const initialDirectory = await invoke<string>("default_download_directory")
+      .then((value) => value.trim() || null)
+      .catch(() => null);
+
+    if (!mountedRef.current || downloadPickerRequestRef.current !== requestId) return;
+    setDownloadPicker({ entry, initialDirectory });
+  }, [sshTargetValue]);
+
+  const cancelDownload = React.useCallback(async () => {
+    const transferId = activeDownloadIdRef.current;
+    if (!transferId || downloadCancelRequestedRef.current) return;
+
+    downloadCancelRequestedRef.current = true;
+    setTransferStatus((prev) =>
+      prev?.type === "download" && prev.transferId === transferId && prev.phase === "active"
+        ? { ...prev, cancelRequested: true, cancelError: undefined }
+        : prev,
+    );
+    try {
+      const accepted = await invoke<boolean>("ssh_cancel_download", { transferId });
+      if (!accepted && mountedRef.current && activeDownloadIdRef.current === transferId) {
+        // Commit won the backend's cancel-vs-publish race. Keep reporting the
+        // real final result instead of later misclassifying a commit error as
+        // a successful cancellation.
+        downloadCancelRequestedRef.current = false;
+        setTransferStatus((prev) =>
+          prev?.type === "download" && prev.transferId === transferId && prev.phase === "active"
+            ? {
+                ...prev,
+                cancelRequested: false,
+                cancelError: "Download is already finalizing and can no longer be cancelled.",
+              }
+            : prev,
+        );
+      }
+    } catch (err) {
+      if (!mountedRef.current || activeDownloadIdRef.current !== transferId) return;
+      downloadCancelRequestedRef.current = false;
+      const message = err instanceof Error ? err.message : String(err);
+      setTransferStatus((prev) =>
+        prev?.type === "download" && prev.transferId === transferId && prev.phase === "active"
+          ? { ...prev, cancelRequested: false, cancelError: message }
+          : prev,
+      );
+    }
+  }, []);
 
   const getDragIcon = React.useCallback((kind: "file" | "folder"): string => {
     const cached = dragIconCache.get(kind);
@@ -1550,81 +1848,93 @@ export function FileExplorerPanel({
       if (!destDir) return;
 
       if (provider === "ssh" && !sshTargetValue) return;
-
-      setExpandedDirs((prev) => {
-        if (prev.has(destDir)) return prev;
-        const next = new Set(prev);
-        next.add(destDir);
-        return next;
-      });
-
       const isSsh = provider === "ssh" && !!sshTargetValue;
-      const total = paths.length;
-      let completed = 0;
-      let lastError: string | null = null;
-      let lastName = "";
+      if (
+        isSsh &&
+        (downloadSingleFlightRef.current ||
+          sshUploadInFlightRef.current ||
+          sshDragDownloadInFlightRef.current)
+      ) return;
+      if (isSsh) sshUploadInFlightRef.current = true;
 
-      for (const sourcePathRaw of paths) {
-        const raw = sourcePathRaw.trim();
-        const sourcePath = parseFileUrlPath(raw) ?? raw;
-        if (!sourcePath) continue;
+      try {
+        setExpandedDirs((prev) => {
+          if (prev.has(destDir)) return prev;
+          const next = new Set(prev);
+          next.add(destDir);
+          return next;
+        });
 
-        const name = basename(sourcePath);
-        if (!name || name === "/") continue;
-        const destPath = joinPath(destDir, name);
-        lastName = name;
+        const total = paths.length;
+        let completed = 0;
+        let lastError: string | null = null;
+        let lastName = "";
 
-        if (normalizePath(sourcePath) === normalizePath(destPath)) continue;
-        if (normalizePath(destPath).startsWith(`${normalizePath(sourcePath)}/`)) continue;
+        for (const sourcePathRaw of paths) {
+          const raw = sourcePathRaw.trim();
+          const sourcePath = parseFileUrlPath(raw) ?? raw;
+          if (!sourcePath) continue;
 
-        if (isSsh) {
-          setTransferStatus({
-            type: "upload",
-            fileName: name,
-            phase: "active",
-            current: completed + 1,
-            total,
-          });
-        }
+          const name = basename(sourcePath);
+          if (!name || name === "/") continue;
+          const destPath = joinPath(destDir, name);
+          lastName = name;
 
-        try {
+          if (normalizePath(sourcePath) === normalizePath(destPath)) continue;
+          if (normalizePath(destPath).startsWith(`${normalizePath(sourcePath)}/`)) continue;
+
           if (isSsh) {
-            await invoke("ssh_upload_file", {
-              target: sshTargetValue,
-              root,
-              localPath: sourcePath,
-              remotePath: destPath,
-            });
-          } else if (provider === "local") {
-            await invoke("copy_fs_entry", {
-              root,
-              sourcePath,
-              destPath,
+            setTransferStatus({
+              type: "upload",
+              fileName: name,
+              phase: "active",
+              current: completed + 1,
+              total,
             });
           }
-          completed++;
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          console.error("File transfer failed:", message);
-          lastError = message;
-        }
-      }
 
-      if (isSsh) {
-        if (lastError) {
-          showTransferError("upload", lastName, lastError);
-        } else {
-          showTransferSuccess("upload", lastName, total);
+          try {
+            if (isSsh) {
+              await invoke("ssh_upload_file", {
+                target: sshTargetValue,
+                root,
+                localPath: sourcePath,
+                remotePath: destPath,
+              });
+            } else if (provider === "local") {
+              await invoke("copy_fs_entry", {
+                root,
+                sourcePath,
+                destPath,
+              });
+            }
+            completed++;
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            console.error("File transfer failed:", message);
+            lastError = message;
+          }
         }
-      }
 
-      void loadDirectory(destDir);
+        if (isSsh) {
+          if (lastError) {
+            showTransferError("upload", lastName, lastError);
+          } else {
+            showTransferSuccess("upload", lastName, total);
+          }
+        }
+
+        void loadDirectory(destDir);
+      } finally {
+        if (isSsh) sshUploadInFlightRef.current = false;
+      }
     },
     [loadDirectory, provider, root, sshTargetValue, showTransferSuccess, showTransferError],
   );
 
   // Initiate native drag to Finder/Desktop
   const initiateNativeDrag = React.useCallback(async (entry: FsEntry, attemptId: number) => {
+    let ownsSshDragSlot = false;
     try {
       if (mouseDownRef.current?.attemptId !== attemptId) return;
       let localPath: string;
@@ -1640,6 +1950,13 @@ export function FileExplorerPanel({
         if (cached) {
           localPath = cached;
         } else {
+          if (
+            downloadSingleFlightRef.current ||
+            sshUploadInFlightRef.current ||
+            sshDragDownloadInFlightRef.current
+          ) return;
+          sshDragDownloadInFlightRef.current = true;
+          ownsSshDragSlot = true;
           // Download to temp
           setDragPreparing(entry.path);
           if (!sshTargetValue) return;
@@ -1664,7 +1981,11 @@ export function FileExplorerPanel({
       });
     } catch (err) {
       console.error("Native drag failed:", err);
-      setDragPreparing(null);
+    } finally {
+      if (ownsSshDragSlot) {
+        sshDragDownloadInFlightRef.current = false;
+        setDragPreparing((current) => (current === entry.path ? null : current));
+      }
     }
   }, [getDragIcon, provider, sshTargetValue, root]);
 
@@ -1807,6 +2128,33 @@ export function FileExplorerPanel({
       unlistenWindow?.();
     };
   }, [isOpen, resolveDropDestination, transferDroppedPaths]);
+
+  const displayedBytes = finiteNonNegative(transferStatus?.bytesTransferred);
+  const displayedTotalBytes = finiteNonNegative(transferStatus?.totalBytes);
+  const displayedRate = finiteNonNegative(transferStatus?.bytesPerSecond);
+  const displayedEta = finiteNonNegative(transferStatus?.etaSeconds);
+  const downloadPercent =
+    transferStatus?.type === "download" &&
+    transferStatus.phase === "active" &&
+    displayedBytes !== null &&
+    displayedTotalBytes !== null &&
+    displayedTotalBytes > 0
+      ? Math.max(0, Math.min(100, (displayedBytes / displayedTotalBytes) * 100))
+      : null;
+  const downloadProgressDetails =
+    transferStatus?.type === "download" && transferStatus.phase === "active"
+      ? [
+          displayedBytes !== null
+            ? displayedTotalBytes !== null && displayedTotalBytes > 0
+              ? `${formatBytes(displayedBytes)} / ${formatBytes(displayedTotalBytes)}`
+              : formatBytes(displayedBytes)
+            : null,
+          displayedRate !== null && displayedRate > 0 ? `${formatBytes(displayedRate)}/s` : null,
+          displayedEta !== null && displayedRate !== null && displayedRate > 0 ? formatEta(displayedEta) : null,
+        ]
+          .filter((value): value is string => Boolean(value))
+          .join(" · ")
+      : "";
 
   if (!isOpen) return null;
 
@@ -2234,6 +2582,23 @@ export function FileExplorerPanel({
         </div>
       )}
 
+      {downloadPicker && (
+        <PathPickerModal
+          initialPath={downloadPicker.initialDirectory}
+          placeholder={downloadPicker.initialDirectory ?? "Select a local folder"}
+          title={`Download ${downloadPicker.entry.isDir ? "folder" : "file"}`}
+          selectLabel="Download here"
+          suggestedName={downloadPicker.entry.name}
+          nameLabel="Save as"
+          loadDirectory={loadLocalDirectoryForPicker}
+          onClose={closeDownloadPicker}
+          onSelect={(localDirectory, suggestedName) => {
+            const entry = downloadPicker.entry;
+            void startDownload(entry, localDirectory, suggestedName ?? entry.name);
+          }}
+        />
+      )}
+
       <ConfirmActionModal
         isOpen={Boolean(deleteTarget)}
         title="Delete"
@@ -2263,22 +2628,76 @@ export function FileExplorerPanel({
       />
 
       {transferStatus && (
-        <div className="fileExplorerTransfer" role="status">
-          {transferStatus.phase === "active" && (
+        <div
+          className="fileExplorerTransfer"
+          role={transferStatus.phase === "active" ? undefined : "status"}
+          aria-live={transferStatus.phase === "active" ? "off" : "polite"}
+        >
+          {transferStatus.phase === "choosing" && (
             <>
               <div className="fileExplorerTransferBar" />
               <span className="fileExplorerTransferText">
-                {transferStatus.type === "download" ? "\u2193" : "\u2191"}{" "}
-                {transferStatus.current != null && transferStatus.total != null && transferStatus.total > 1
-                  ? `${transferStatus.current}/${transferStatus.total}: `
-                  : ""}
-                {transferStatus.type === "download" ? "Downloading" : "Uploading"}{" "}
-                {transferStatus.fileName}\u2026
+                ↓ Preparing destination picker for {transferStatus.fileName}…
               </span>
+              <button type="button" className="fileExplorerTransferCancel" onClick={closeDownloadPicker}>
+                Cancel
+              </button>
+            </>
+          )}
+          {transferStatus.phase === "active" && (
+            <>
+              <div
+                className={`fileExplorerTransferBar ${downloadPercent !== null ? "fileExplorerTransferBarDeterminate" : ""}`}
+                style={downloadPercent !== null ? { width: `${downloadPercent}%` } : undefined}
+                role="progressbar"
+                aria-label={`${transferStatus.type === "download" ? "Download" : "Upload"} progress`}
+                aria-valuemin={downloadPercent !== null ? 0 : undefined}
+                aria-valuemax={downloadPercent !== null ? 100 : undefined}
+                aria-valuenow={downloadPercent !== null ? Math.round(downloadPercent) : undefined}
+              />
+              <span className="fileExplorerTransferText fileExplorerTransferTextStacked">
+                <span>
+                  {transferStatus.type === "download" ? "\u2193" : "\u2191"}{" "}
+                  {transferStatus.type === "download"
+                    ? transferStatus.cancelRequested
+                      ? "Cancelling"
+                      : transferStatus.downloadPhase === "finalizing"
+                        ? "Finalizing"
+                        : transferStatus.downloadPhase === "retrying"
+                          ? `Retrying (attempt ${transferStatus.attempt ?? 1})`
+                          : "Downloading"
+                    : transferStatus.current != null && transferStatus.total != null && transferStatus.total > 1
+                      ? `${transferStatus.current}/${transferStatus.total}: Uploading`
+                      : "Uploading"}{" "}
+                  {transferStatus.fileName}…
+                  {downloadPercent !== null ? ` ${Math.floor(downloadPercent)}%` : ""}
+                </span>
+                {transferStatus.type === "download" && (downloadProgressDetails || transferStatus.cancelError) ? (
+                  <span
+                    className={transferStatus.cancelError ? "fileExplorerTransferMeta fileExplorerTransferError" : "fileExplorerTransferMeta"}
+                    role={transferStatus.cancelError ? "alert" : undefined}
+                  >
+                    {transferStatus.cancelError ?? downloadProgressDetails}
+                  </span>
+                ) : null}
+              </span>
+              {transferStatus.type === "download" && (
+                <button
+                  type="button"
+                  className="fileExplorerTransferCancel"
+                  disabled={transferStatus.cancelRequested}
+                  onClick={() => void cancelDownload()}
+                >
+                  {transferStatus.cancelRequested ? "Cancelling…" : "Cancel"}
+                </button>
+              )}
             </>
           )}
           {transferStatus.phase === "success" && (
-            <span className="fileExplorerTransferText fileExplorerTransferSuccess">
+            <span
+              className="fileExplorerTransferText fileExplorerTransferSuccess"
+              title={transferStatus.type === "download" ? transferStatus.localPath : undefined}
+            >
               {transferStatus.type === "download" ? "\u2193" : "\u2191"}{" "}
               {transferStatus.total != null && transferStatus.total > 1
                 ? `${transferStatus.type === "download" ? "Downloaded" : "Uploaded"} ${transferStatus.total} files`
@@ -2290,6 +2709,19 @@ export function FileExplorerPanel({
               <span className="fileExplorerTransferText fileExplorerTransferError">
                 {transferStatus.type === "download" ? "Download" : "Upload"} failed: {transferStatus.error}
               </span>
+              <button
+                type="button"
+                className="fileExplorerTransferDismiss"
+                onClick={() => setTransferStatus(null)}
+                aria-label="Dismiss"
+              >
+                \u00d7
+              </button>
+            </>
+          )}
+          {transferStatus.phase === "cancelled" && (
+            <>
+              <span className="fileExplorerTransferText">↓ Download cancelled: {transferStatus.fileName}</span>
               <button
                 type="button"
                 className="fileExplorerTransferDismiss"
