@@ -189,57 +189,65 @@ fn matches_glob(pattern: &str, text: &str) -> bool {
 }
 
 fn expand_tilde(path: &str, home: &Path) -> PathBuf {
-    let trimmed = path.trim();
-    if trimmed == "~" {
+    if path == "~" {
         return home.to_path_buf();
     }
-    if let Some(rest) = trimmed.strip_prefix("~/") {
+    if let Some(rest) = path.strip_prefix("~/") {
         return home.join(rest);
     }
-    PathBuf::from(trimmed)
+    PathBuf::from(path)
 }
 
 fn glob_paths(pattern: &Path) -> Vec<PathBuf> {
-    let raw = pattern.to_string_lossy().to_string();
-    if !contains_glob(&raw) {
+    let has_glob = pattern.components().any(|component| match component {
+        std::path::Component::Normal(part) => part.to_str().is_some_and(contains_glob),
+        _ => false,
+    });
+    if !has_glob {
         return vec![pattern.to_path_buf()];
     }
 
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    let mut parts: Vec<String> = Vec::new();
-    for part in raw.split(&['/', '\\'][..]).filter(|s| !s.is_empty()) {
-        parts.push(part.to_string());
-    }
-
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if raw.starts_with('/') {
-        roots.push(PathBuf::from("/"));
-    } else {
-        roots.push(PathBuf::from("."));
-    }
-
-    for part in parts {
-        let has_glob = contains_glob(&part);
+    // Walk components instead of round-tripping the full pattern through a
+    // lossy String. An exact non-UTF-8 parent prefix remains usable; only the
+    // UTF-8 component containing the config glob needs text matching.
+    let mut roots = vec![PathBuf::new()];
+    for component in pattern.components() {
+        let std::path::Component::Normal(part) = component else {
+            for root in &mut roots {
+                root.push(component.as_os_str());
+            }
+            continue;
+        };
+        let glob = part.to_str().filter(|part| contains_glob(part));
         let mut next_roots: Vec<PathBuf> = Vec::new();
 
         for root in &roots {
-            if !has_glob {
-                let next = root.join(&part);
+            let Some(glob) = glob else {
+                let next = root.join(part);
                 if next.exists() {
                     next_roots.push(next);
                 }
                 continue;
-            }
+            };
 
-            let dir = root;
+            let dir = if root.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                root.as_path()
+            };
             let read_dir = match fs::read_dir(dir) {
                 Ok(rd) => rd,
                 Err(_) => continue,
             };
 
             for entry in read_dir.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if matches_glob(&part, &name) {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    // Do not invent a replacement filename that could resolve
+                    // to a different SSH include file.
+                    continue;
+                };
+                if matches_glob(glob, name) {
                     next_roots.push(entry.path());
                 }
             }
@@ -248,11 +256,7 @@ fn glob_paths(pattern: &Path) -> Vec<PathBuf> {
         roots = next_roots;
     }
 
-    for p in roots {
-        candidates.push(p);
-    }
-
-    candidates
+    roots
 }
 
 fn collect_from_config(
@@ -318,7 +322,7 @@ fn collect_from_config(
                     }
 
                     let mut paths = glob_paths(&include_path);
-                    paths.sort_by(|a, b| a.to_string_lossy().to_string().cmp(&b.to_string_lossy().to_string()));
+                    paths.sort();
 
                     for p in paths {
                         if p.is_file() {
@@ -412,3 +416,63 @@ pub fn list_ssh_hosts() -> Result<Vec<SshHostEntry>, String> {
     Ok(out)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{expand_tilde, glob_paths};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn tilde_expansion_preserves_literal_whitespace() {
+        let home = Path::new("/home/literal user ");
+        assert_eq!(
+            expand_tilde("  include path  ", home),
+            PathBuf::from("  include path  ")
+        );
+        assert_eq!(
+            expand_tilde("~/  nested include  ", home),
+            home.join("  nested include  ")
+        );
+    }
+
+    #[test]
+    fn config_include_glob_preserves_exact_unicode_filename() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "agents-ui-ssh-glob-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create glob test root");
+        let exact = root.join("  lowerCase-目录-🚀  ");
+        std::fs::write(&exact, "test").expect("create exact include file");
+
+        let mut matches = glob_paths(&root.join("*"));
+        matches.sort();
+        assert_eq!(matches, vec![exact]);
+        std::fs::remove_dir_all(root).expect("remove glob test root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_include_glob_does_not_lossily_rewrite_parent_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "agents-ui-ssh-non-utf8-{}-{unique}",
+            std::process::id()
+        ));
+        let parent = root.join(std::ffi::OsString::from_vec(vec![b'p', 0x80, b't']));
+        std::fs::create_dir_all(&parent).expect("create exact non-UTF-8 parent");
+        let exact = parent.join("literal-include");
+        std::fs::write(&exact, "test").expect("create exact include file");
+
+        assert_eq!(glob_paths(&parent.join("*")), vec![exact]);
+        std::fs::remove_dir_all(root).expect("remove non-UTF-8 glob test root");
+    }
+}

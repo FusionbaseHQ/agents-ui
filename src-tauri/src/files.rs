@@ -1,7 +1,8 @@
 use serde::Serialize;
 use std::{
     collections::VecDeque,
-    fs::{self, File},
+    ffi::OsStr,
+    fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
@@ -13,6 +14,10 @@ pub(crate) const MAX_RANGE_READ_BYTES: usize = 1024 * 1024;
 pub(crate) const PROBE_BYTES: usize = 64 * 1024;
 const MAX_FILE_SEARCH_RESULTS: usize = 1_000;
 const MAX_FILE_SEARCH_DIRS: usize = 50_000;
+pub(crate) const NON_UTF8_FILESYSTEM_PATH_ERROR: &str =
+    "filesystem path contains a name that is not valid UTF-8";
+static NEXT_TEXT_WRITE_STAGE_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 const FILE_SEARCH_IGNORED_DIRS: &[&str] = &[
     ".git",
     ".hg",
@@ -213,6 +218,171 @@ fn canonicalize_existing(path: &Path) -> Result<PathBuf, String> {
     fs::canonicalize(path).map_err(|e| format!("canonicalize failed: {e}"))
 }
 
+/// Convert an OS-native filesystem value at the IPC boundary without changing it.
+///
+/// JavaScript paths are Unicode strings, so a non-UTF-8 Unix filename cannot be
+/// represented losslessly by the frontend. Returning a stable error is safer
+/// than substituting U+FFFD and exposing a path that points at a different name.
+pub(crate) fn os_str_to_utf8(value: &OsStr) -> Result<&str, String> {
+    value
+        .to_str()
+        .ok_or_else(|| NON_UTF8_FILESYSTEM_PATH_ERROR.to_string())
+}
+
+pub(crate) fn path_to_utf8(path: &Path) -> Result<String, String> {
+    os_str_to_utf8(path.as_os_str()).map(str::to_owned)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn path_to_c_string(path: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "filesystem path contains a NUL byte",
+        )
+    })
+}
+
+/// Atomically rename `source` to `destination` only when no destination entry
+/// exists. Never fall back to ordinary Unix rename semantics, which can replace
+/// a file created between a separate existence check and the rename syscall.
+#[allow(clippy::needless_return)] // Explicit cfg returns keep each platform implementation local.
+pub(crate) fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let source = path_to_c_string(source)?;
+        let destination = path_to_c_string(destination)?;
+        let result = unsafe {
+            libc::renameatx_np(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        return if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let source = path_to_c_string(source)?;
+        let destination = path_to_c_string(destination)?;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        return if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        };
+    }
+
+    #[cfg(target_family = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "Kernel32")]
+        extern "system" {
+            fn MoveFileW(existing: *const u16, new: *const u16) -> i32;
+        }
+        let existing = source
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let new = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let result = unsafe { MoveFileW(existing.as_ptr(), new.as_ptr()) };
+        return if result != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        };
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_family = "windows")))]
+    {
+        let _ = (source, destination);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic no-replace rename is unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rename_no_replace_in_open_dir(
+    directory: &File,
+    source_name: &OsStr,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let source_name = path_to_c_string(Path::new(source_name))?;
+    let destination_name = path_to_c_string(Path::new(destination_name))?;
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::renameatx_np(
+            directory.as_raw_fd(),
+            source_name.as_ptr(),
+            directory.as_raw_fd(),
+            destination_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            directory.as_raw_fd(),
+            source_name.as_ptr(),
+            directory.as_raw_fd(),
+            destination_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn rename_in_same_directory_no_replace(
+    directory_path: &Path,
+    source_name: &OsStr,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let directory = File::open(directory_path)?;
+        return rename_no_replace_in_open_dir(&directory, source_name, destination_name);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    rename_no_replace(
+        &directory_path.join(source_name),
+        &directory_path.join(destination_name),
+    )
+}
+
 fn ensure_root_dir(root: &Path) -> Result<PathBuf, String> {
     if !root.is_absolute() {
         return Err("root must be absolute".to_string());
@@ -237,12 +407,13 @@ fn ensure_within_root(root: &Path, path: &Path) -> Result<PathBuf, String> {
 
 #[tauri::command]
 pub fn list_fs_entries(root: String, path: String) -> Result<Vec<FsEntry>, String> {
-    let root = Path::new(root.trim());
-    let path = Path::new(path.trim());
+    let root = Path::new(&root);
+    let path = Path::new(&path);
     let dir = ensure_within_root(root, path)?;
     if !dir.is_dir() {
         return Err("not a directory".to_string());
     }
+    path_to_utf8(&dir)?;
 
     let mut entries: Vec<FsEntry> = Vec::new();
     let read_dir = fs::read_dir(&dir).map_err(|e| format!("read dir failed: {e}"))?;
@@ -251,6 +422,8 @@ pub fn list_fs_entries(root: String, path: String) -> Result<Vec<FsEntry>, Strin
             Ok(i) => i,
             Err(_) => continue,
         };
+        let file_name = item.file_name();
+        let name = os_str_to_utf8(&file_name)?.to_owned();
         let path = item.path();
         let mut size = 0u64;
         let is_dir = match item.file_type() {
@@ -269,13 +442,9 @@ pub fn list_fs_entries(root: String, path: String) -> Result<Vec<FsEntry>, Strin
                 meta.is_dir()
             }
         };
-        let name = item
-            .file_name()
-            .to_string_lossy()
-            .to_string();
         entries.push(FsEntry {
             name,
-            path: path.to_string_lossy().to_string(),
+            path: path_to_utf8(&path)?,
             is_dir,
             size: if is_dir { 0 } else { size },
         });
@@ -308,7 +477,8 @@ fn file_search_sort_key(name: &str) -> (bool, String) {
 
 #[tauri::command]
 pub fn search_fs_entries(root: String, query: String, limit: Option<usize>) -> Result<Vec<FsEntry>, String> {
-    let root = ensure_root_dir(Path::new(root.trim()))?;
+    let root = ensure_root_dir(Path::new(&root))?;
+    path_to_utf8(&root)?;
     let query = query.trim().to_lowercase();
     if query.len() < 2 {
         return Ok(Vec::new());
@@ -333,18 +503,31 @@ pub fn search_fs_entries(root: String, query: String, limit: Option<usize>) -> R
         let mut files: Vec<(String, PathBuf, u64)> = Vec::new();
 
         for item in read_dir.flatten() {
-            let name = item.file_name().to_string_lossy().to_string();
+            let file_name = item.file_name();
+            let name = os_str_to_utf8(&file_name)?.to_owned();
             let path = item.path();
-            let meta = match fs::metadata(&path) {
-                Ok(meta) => meta,
+            let file_type = match item.file_type() {
+                Ok(file_type) => file_type,
                 Err(_) => continue,
             };
-            if meta.is_dir() {
+            // Search is rooted traversal, not a filesystem browser. Never
+            // follow symlinked directories outside the root or into cycles.
+            if file_type.is_symlink() {
+                let target = match fs::canonicalize(&path) {
+                    Ok(target) if target.starts_with(&root) && target.is_file() => target,
+                    _ => continue,
+                };
+                let size = fs::metadata(target).map(|meta| meta.len()).unwrap_or(0);
+                files.push((name, path, size));
+                continue;
+            }
+            if file_type.is_dir() {
                 if !is_file_search_ignored_dir(&name) {
                     dirs.push((name, path));
                 }
-            } else if meta.is_file() {
-                files.push((name, path, meta.len()));
+            } else if file_type.is_file() {
+                let size = item.metadata().map(|meta| meta.len()).unwrap_or(0);
+                files.push((name, path, size));
             }
         }
 
@@ -352,16 +535,14 @@ pub fn search_fs_entries(root: String, query: String, limit: Option<usize>) -> R
         files.sort_by_key(|(name, _path, _size)| file_search_sort_key(name));
 
         for (name, path, size) in files {
-            let rel = path
+            let rel_path = path
                 .strip_prefix(&root)
-                .ok()
-                .and_then(|p| p.to_str())
-                .unwrap_or(&name)
-                .to_lowercase();
+                .map_err(|_| "file search path escaped root".to_string())?;
+            let rel = path_to_utf8(rel_path)?.to_lowercase();
             if name.to_lowercase().contains(&query) || rel.contains(&query) {
                 out.push(FsEntry {
                     name,
-                    path: path.to_string_lossy().to_string(),
+                    path: path_to_utf8(&path)?,
                     is_dir: false,
                     size,
                 });
@@ -381,8 +562,8 @@ pub fn search_fs_entries(root: String, query: String, limit: Option<usize>) -> R
 
 #[tauri::command]
 pub fn read_text_file(root: String, path: String) -> Result<String, String> {
-    let root = Path::new(root.trim());
-    let path = Path::new(path.trim());
+    let root = Path::new(&root);
+    let path = Path::new(&path);
     let file = ensure_within_root(root, path)?;
     if !file.is_file() {
         return Err("not a file".to_string());
@@ -409,8 +590,8 @@ pub fn read_text_file(root: String, path: String) -> Result<String, String> {
 
 #[tauri::command]
 pub fn probe_file(root: String, path: String) -> Result<FileProbe, String> {
-    let root = Path::new(root.trim());
-    let path = Path::new(path.trim());
+    let root = Path::new(&root);
+    let path = Path::new(&path);
     let file = ensure_within_root(root, path)?;
     if !file.is_file() {
         return Err("not a file".to_string());
@@ -446,8 +627,8 @@ pub fn read_file_range(
         ));
     }
 
-    let root = Path::new(root.trim());
-    let path = Path::new(path.trim());
+    let root = Path::new(&root);
+    let path = Path::new(&path);
     let file = ensure_within_root(root, path)?;
     if !file.is_file() {
         return Err("not a file".to_string());
@@ -472,75 +653,337 @@ pub fn read_file_range(
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+fn text_write_stage_name(id: u64) -> String {
+    format!(
+        ".agents-ui-write-stage-{}-{id}",
+        std::process::id()
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct AnchoredTextWriteStage {
+    directory: std::sync::Arc<File>,
+    name: std::ffi::CString,
+    armed: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Drop for AnchoredTextWriteStage {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        use std::os::fd::AsRawFd;
+        // SAFETY: the directory descriptor and NUL-terminated stage name stay
+        // alive for the complete call. Failure is best-effort cleanup only.
+        unsafe {
+            libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0);
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn open_directory_componentwise_no_follow(path: &Path) -> io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "directory path must be absolute",
+        ));
+    }
+
+    let root = std::ffi::CString::new("/").expect("root path has no NUL");
+    // SAFETY: root is a valid NUL-terminated path; a successful descriptor is
+    // immediately transferred into File ownership.
+    let root_fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut directory = unsafe { File::from_raw_fd(root_fd) };
+
+    for component in path.components() {
+        let name = match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => name,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "directory path contains an unsupported component",
+                ));
+            }
+        };
+        let name = path_to_c_string(Path::new(name))?;
+        // SAFETY: directory is an open directory and name is NUL-terminated.
+        let child_fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if child_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        directory = unsafe { File::from_raw_fd(child_fd) };
+    }
+
+    Ok(directory)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn directory_handle_matches_path(directory: &File, path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let handle = directory.metadata()?;
+    let current = fs::symlink_metadata(path)?;
+    Ok(!current.file_type().is_symlink()
+        && current.is_dir()
+        && handle.dev() == current.dev()
+        && handle.ino() == current.ino())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn create_anchored_text_write_stage(
+    directory: std::sync::Arc<File>,
+    mut next_id: impl FnMut() -> u64,
+) -> Result<(AnchoredTextWriteStage, File), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    const MAX_ATTEMPTS: usize = 128;
+    for _ in 0..MAX_ATTEMPTS {
+        let name = std::ffi::CString::new(text_write_stage_name(next_id()))
+            .expect("generated staging name has no NUL");
+        // O_EXCL makes every writer own a distinct inode. O_NOFOLLOW is
+        // defense-in-depth and guarantees a planted symlink is never opened.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd >= 0 {
+            let file = unsafe { File::from_raw_fd(fd) };
+            return Ok((
+                AnchoredTextWriteStage {
+                    directory,
+                    name,
+                    armed: true,
+                },
+                file,
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(format!("create staging file failed: {error}"));
+        }
+    }
+    Err("could not create a unique text-write staging file".to_string())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_text_file_atomic_with_stage_ids(
+    file: &Path,
+    content: &str,
+    next_id: impl FnMut() -> u64,
+) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let parent = file.parent().ok_or("invalid file path")?;
+    let file_name = file.file_name().ok_or("invalid file name")?;
+    let directory = std::sync::Arc::new(
+        open_directory_componentwise_no_follow(parent)
+            .map_err(|error| format!("open parent directory failed: {error}"))?,
+    );
+    if !directory_handle_matches_path(&directory, parent)
+        .map_err(|error| format!("verify parent directory failed: {error}"))?
+    {
+        return Err("parent directory changed during save".to_string());
+    }
+
+    let file_name_c = path_to_c_string(Path::new(file_name))
+        .map_err(|error| format!("invalid file name: {error}"))?;
+    // O_NONBLOCK prevents a raced-in FIFO from hanging the save worker. The
+    // descriptor is used only for fstat/permissions and must be a regular file.
+    let original_fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            file_name_c.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if original_fd < 0 {
+        return Err(format!("open failed: {}", io::Error::last_os_error()));
+    }
+    let original = unsafe { File::from_raw_fd(original_fd) };
+    let original_metadata = original
+        .metadata()
+        .map_err(|error| format!("metadata failed: {error}"))?;
+    if !original_metadata.is_file() {
+        return Err("not a file".to_string());
+    }
+    let original_permissions = original_metadata.permissions();
+
+    let (mut staging, mut output) =
+        create_anchored_text_write_stage(std::sync::Arc::clone(&directory), next_id)?;
+    output
+        .write_all(content.as_bytes())
+        .map_err(|error| format!("write failed: {error}"))?;
+    output
+        .set_permissions(original_permissions)
+        .map_err(|error| format!("set permissions failed: {error}"))?;
+    output
+        .sync_all()
+        .map_err(|error| format!("sync failed: {error}"))?;
+    drop(output);
+
+    if !directory_handle_matches_path(&directory, parent)
+        .map_err(|error| format!("verify parent directory failed: {error}"))?
+    {
+        return Err("parent directory changed during save".to_string());
+    }
+
+    // Both names are interpreted relative to the verified directory handle,
+    // so a concurrent ancestor rename/symlink swap cannot redirect the write.
+    let rename_result = unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            staging.name.as_ptr(),
+            directory.as_raw_fd(),
+            file_name_c.as_ptr(),
+        )
+    };
+    if rename_result != 0 {
+        return Err(format!("rename failed: {}", io::Error::last_os_error()));
+    }
+    staging.armed = false;
+
+    // The file was already atomically committed. Some network/FileProvider
+    // directories reject fsync, so keep the prior best-effort durability
+    // semantics and never report a false post-commit failure.
+    let _ = directory.sync_all();
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+struct PathTextWriteStage {
+    path: PathBuf,
+    armed: bool,
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+impl Drop for PathTextWriteStage {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn write_text_file_atomic_with_stage_ids(
+    file: &Path,
+    content: &str,
+    mut next_id: impl FnMut() -> u64,
+) -> Result<(), String> {
+    let parent = file.parent().ok_or("invalid file path")?;
+    let original_permissions = fs::metadata(file)
+        .map_err(|error| format!("metadata failed: {error}"))?
+        .permissions();
+    const MAX_ATTEMPTS: usize = 128;
+    let (mut staging, mut output) = (0..MAX_ATTEMPTS)
+        .find_map(|_| {
+            let path = parent.join(text_write_stage_name(next_id()));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => Some(Ok((PathTextWriteStage { path, armed: true }, file))),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(format!("create staging file failed: {error}"))),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| "could not create a unique text-write staging file".to_string())?;
+    output
+        .write_all(content.as_bytes())
+        .map_err(|error| format!("write failed: {error}"))?;
+    output
+        .set_permissions(original_permissions)
+        .map_err(|error| format!("set permissions failed: {error}"))?;
+    output
+        .sync_all()
+        .map_err(|error| format!("sync failed: {error}"))?;
+    drop(output);
+    fs::rename(&staging.path, file).map_err(|error| format!("rename failed: {error}"))?;
+    staging.armed = false;
+    let _ = File::open(parent).and_then(|directory| directory.sync_all());
+    Ok(())
+}
+
 #[tauri::command]
 pub fn write_text_file(root: String, path: String, content: String) -> Result<(), String> {
-    let root = Path::new(root.trim());
-    let path = Path::new(path.trim());
+    let root = Path::new(&root);
+    let path = Path::new(&path);
     let file = ensure_within_root(root, path)?;
     if !file.is_file() {
         return Err("not a file".to_string());
     }
 
-    // Write to a sibling temp file and rename over the original so a crash or
-    // full disk mid-write can never leave the file truncated. The rename also
-    // means the watcher/editor sees either the old or the new content, never a
-    // partial state.
-    let original_perms = fs::metadata(&file).ok().map(|m| m.permissions());
-    let dir = file.parent().ok_or("invalid file path")?;
-    let file_name = file
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or("invalid file name")?;
-    let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
-
-    let write_result = (|| -> Result<(), String> {
-        let mut out = File::create(&tmp).map_err(|e| format!("write failed: {e}"))?;
-        out.write_all(content.as_bytes())
-            .map_err(|e| format!("write failed: {e}"))?;
-        out.sync_all().map_err(|e| format!("sync failed: {e}"))?;
-        drop(out);
-        if let Some(perms) = original_perms {
-            let _ = fs::set_permissions(&tmp, perms);
-        }
-        fs::rename(&tmp, &file).map_err(|e| format!("rename failed: {e}"))?;
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    write_result?;
-
-    // Best-effort: make the directory entry for the rename durable.
-    let _ = File::open(dir).and_then(|d| d.sync_all());
-    Ok(())
+    write_text_file_atomic_with_stage_ids(&file, &content, || {
+        NEXT_TEXT_WRITE_STAGE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    })
 }
 
 #[tauri::command]
 pub fn create_file(root: String, path: String) -> Result<(), String> {
-    let root = Path::new(root.trim());
-    let path = Path::new(path.trim());
+    if has_forbidden_terminal_component(&path) {
+        return Err("invalid file path".to_string());
+    }
+    let root = Path::new(&root);
+    let path = Path::new(&path);
     let (_, canon_parent) = ensure_parent_within_root(root, path)?;
     let name = path.file_name().ok_or_else(|| "missing file name".to_string())?;
     let target = canon_parent.join(name);
-    if target.exists() {
-        return Err("file already exists".to_string());
-    }
-    fs::write(&target, b"").map_err(|e| format!("create failed: {e}"))?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                "file already exists".to_string()
+            } else {
+                format!("create failed: {error}")
+            }
+        })?;
     Ok(())
 }
 
 #[tauri::command]
 pub fn create_directory(root: String, path: String) -> Result<(), String> {
-    let root = Path::new(root.trim());
-    let path = Path::new(path.trim());
+    if has_forbidden_terminal_component(&path) {
+        return Err("invalid directory path".to_string());
+    }
+    let root = Path::new(&root);
+    let path = Path::new(&path);
     let (_, canon_parent) = ensure_parent_within_root(root, path)?;
     let name = path.file_name().ok_or_else(|| "missing directory name".to_string())?;
     let target = canon_parent.join(name);
-    if target.exists() {
-        return Err("directory already exists".to_string());
-    }
-    fs::create_dir(&target).map_err(|e| format!("create failed: {e}"))?;
+    fs::create_dir(&target).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            "directory already exists".to_string()
+        } else {
+            format!("create failed: {error}")
+        }
+    })?;
     Ok(())
 }
 
@@ -557,51 +1000,90 @@ fn ensure_parent_within_root(root: &Path, path: &Path) -> Result<(PathBuf, PathB
     Ok((root, canon_parent))
 }
 
+fn has_forbidden_terminal_component(raw_path: &str) -> bool {
+    raw_path
+        .rsplit(std::path::is_separator)
+        .find(|component| !component.is_empty())
+        .is_some_and(|component| component == "." || component == "..")
+}
+
 #[tauri::command]
 pub fn rename_fs_entry(root: String, path: String, new_name: String) -> Result<String, String> {
-    let root = Path::new(root.trim());
-    let path = Path::new(path.trim());
-    let (canon_root, _) = ensure_parent_within_root(root, path)?;
-    let from = path.to_path_buf();
+    if has_forbidden_terminal_component(&path) {
+        return Err("invalid source path".to_string());
+    }
+    let root = Path::new(&root);
+    let path = Path::new(&path);
+    let (canon_root, canon_parent) = ensure_parent_within_root(root, path)?;
+    let source_name = path
+        .file_name()
+        .ok_or_else(|| "missing file name".to_string())?;
+    let from = canon_parent.join(source_name);
     if from == canon_root {
         return Err("cannot rename root".to_string());
     }
 
-    let name = new_name.trim();
+    let name = new_name.as_str();
     if name.is_empty() {
         return Err("missing new name".to_string());
     }
     if name == "." || name == ".." {
         return Err("invalid name".to_string());
     }
-    if name.contains('/') || name.contains('\\') {
+    if name.chars().any(std::path::is_separator) {
         return Err("name must not contain path separators".to_string());
     }
-
-    let parent = from
-        .parent()
-        .ok_or_else(|| "missing parent directory".to_string())?;
-    let to = parent.join(name);
-    if to.exists() {
-        return Err("target already exists".to_string());
+    if name.contains('\0') {
+        return Err("name must not contain NUL".to_string());
     }
+
+    let to = canon_parent.join(name);
+    let returned_path = path
+        .parent()
+        .ok_or_else(|| "missing parent directory".to_string())?
+        .join(name);
+    let to_utf8 = path_to_utf8(&returned_path)?;
     fs::symlink_metadata(&from).map_err(|e| format!("metadata failed: {e}"))?;
 
-    fs::rename(&from, &to).map_err(|e| format!("rename failed: {e}"))?;
-    Ok(to.to_string_lossy().to_string())
+    if from == to {
+        return Ok(to_utf8);
+    }
+
+    rename_in_same_directory_no_replace(&canon_parent, source_name, OsStr::new(name)).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            "target already exists".to_string()
+        } else {
+            format!("rename failed: {error}")
+        }
+    })?;
+    Ok(to_utf8)
 }
 
 #[tauri::command]
 pub fn delete_fs_entry(root: String, path: String) -> Result<(), String> {
-    let root = Path::new(root.trim());
-    let path = Path::new(path.trim());
-    let (canon_root, _) = ensure_parent_within_root(root, path)?;
-    let target = path.to_path_buf();
+    if has_forbidden_terminal_component(&path) {
+        return Err("invalid target path".to_string());
+    }
+    let root = Path::new(&root);
+    let path = Path::new(&path);
+    let (canon_root, canon_parent) = ensure_parent_within_root(root, path)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| "missing target name".to_string())?;
+    let requested_target = canon_parent.join(name);
+    let meta = fs::symlink_metadata(&requested_target).map_err(|e| format!("metadata failed: {e}"))?;
+    let target = if meta.file_type().is_symlink() {
+        requested_target
+    } else {
+        canonicalize_existing(&requested_target)?
+    };
     if target == canon_root {
         return Err("cannot delete root".to_string());
     }
+    if !target.starts_with(&canon_root) {
+        return Err("path is outside root".to_string());
+    }
 
-    let meta = fs::symlink_metadata(&target).map_err(|e| format!("metadata failed: {e}"))?;
     if meta.file_type().is_symlink() {
         return fs::remove_file(&target).map_err(|e| format!("delete failed: {e}"));
     }
@@ -630,9 +1112,9 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> io::Result<()> {
 
 #[tauri::command]
 pub fn copy_fs_entry(root: String, source_path: String, dest_path: String) -> Result<(), String> {
-    let root = Path::new(root.trim());
-    let source = Path::new(source_path.trim());
-    let dest = Path::new(dest_path.trim());
+    let root = Path::new(&root);
+    let source = Path::new(&source_path);
+    let dest = Path::new(&dest_path);
 
     // Validate root
     let canon_root = ensure_root_dir(root)?;
@@ -674,7 +1156,66 @@ pub fn copy_fs_entry(root: String, source_path: String, dest_path: String) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::{
+        path::Path,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock must be after Unix epoch")
+                .as_nanos();
+            let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "agents-ui-files-{label}-{}-{unique}-{counter}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create isolated test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn utf8_path(&self) -> String {
+            path_to_utf8(self.path()).expect("test directory path must be UTF-8")
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn result_error<T>(result: Result<T, String>) -> String {
+        match result {
+            Ok(_) => panic!("expected command to fail"),
+            Err(error) => error,
+        }
+    }
+
+    fn text_write_stages(parent: &Path) -> Vec<PathBuf> {
+        fs::read_dir(parent)
+            .expect("read staging parent")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".agents-ui-write-stage-"))
+            })
+            .map(|entry| entry.path())
+            .collect()
+    }
 
     fn kind_of(sample: &[u8]) -> String {
         probe_from_sample(sample.len() as u64, None, sample, None).kind
@@ -746,5 +1287,464 @@ mod tests {
         assert_eq!(kind_of(avif), "image");
         let heic = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00";
         assert_eq!(kind_of(heic), "image");
+    }
+
+    #[test]
+    fn local_names_round_trip_case_and_unicode_exactly() {
+        // The two cafe spellings are canonically equivalent but deliberately
+        // use distinct NFC and NFD byte sequences. Never normalize either.
+        let names = [
+            "lowercase-folder",
+            "MixedCase-ß",
+            "目录-🚀",
+            "café",
+            "cafe\u{301}",
+            "  surrounding spaces  ",
+        ];
+
+        for (index, name) in names.into_iter().enumerate() {
+            let dir = TestDir::new(&format!("unicode-{index}"));
+            let original = dir.path().join("original");
+            fs::write(&original, b"content").expect("create source file");
+
+            let renamed = rename_fs_entry(
+                dir.utf8_path(),
+                path_to_utf8(&original).expect("source path must be UTF-8"),
+                name.to_string(),
+            )
+            .expect("rename Unicode file");
+            let expected_rename =
+                path_to_utf8(&dir.path().join(name)).expect("target path must be UTF-8");
+            assert_eq!(renamed, expected_rename);
+
+            let entries = list_fs_entries(dir.utf8_path(), dir.utf8_path())
+                .expect("list Unicode filename");
+            let canonical_dir = fs::canonicalize(dir.path()).expect("canonicalize test directory");
+            let expected_listed =
+                path_to_utf8(&canonical_dir.join(name)).expect("listed path must be UTF-8");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].name.as_bytes(), name.as_bytes());
+            assert_eq!(entries[0].path, expected_listed);
+
+            let matches = search_fs_entries(dir.utf8_path(), name.to_string(), Some(10))
+                .expect("search Unicode filename");
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].name.as_bytes(), name.as_bytes());
+            assert_eq!(matches[0].path, expected_listed);
+        }
+    }
+
+    #[test]
+    fn local_actions_preserve_edge_whitespace_exactly() {
+        let dir = TestDir::new("edge-whitespace");
+        let original = dir.path().join("original");
+        fs::write(&original, b"content").expect("create source file");
+        let exact_name = " leading and trailing ";
+
+        let renamed = rename_fs_entry(
+            dir.utf8_path(),
+            path_to_utf8(&original).expect("source path must be UTF-8"),
+            exact_name.to_string(),
+        )
+        .expect("rename exact whitespace name");
+        assert_eq!(
+            renamed,
+            path_to_utf8(&dir.path().join(exact_name)).expect("target path must be UTF-8")
+        );
+        assert_eq!(
+            read_text_file(dir.utf8_path(), renamed.clone()).expect("read exact renamed path"),
+            "content"
+        );
+        delete_fs_entry(dir.utf8_path(), renamed).expect("delete exact renamed path");
+        assert!(!dir.path().join(exact_name).exists());
+    }
+
+    #[test]
+    fn concurrent_text_saves_publish_only_complete_unique_contents() {
+        use std::sync::{Arc, Barrier};
+
+        const WRITERS: usize = 8;
+        let dir = TestDir::new("concurrent-text-save");
+        let target = dir.path().join("document.txt");
+        fs::write(&target, b"initial").expect("create text target");
+        let root = dir.utf8_path();
+        let target_utf8 = path_to_utf8(&target).expect("target path must be UTF-8");
+        let barrier = Arc::new(Barrier::new(WRITERS + 1));
+        let candidates = (0..WRITERS)
+            .map(|index| format!("writer-{index}:{}", "x".repeat(128 * 1024)))
+            .collect::<Vec<_>>();
+
+        let writers = candidates
+            .iter()
+            .cloned()
+            .map(|content| {
+                let barrier = Arc::clone(&barrier);
+                let root = root.clone();
+                let target = target_utf8.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    write_text_file(root, target, content)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for writer in writers {
+            writer
+                .join()
+                .expect("save worker must not panic")
+                .expect("concurrent atomic save");
+        }
+
+        let published = fs::read_to_string(&target).expect("read published text");
+        assert!(
+            candidates.iter().any(|candidate| candidate == &published),
+            "published text must be one complete writer payload"
+        );
+        assert!(text_write_stages(dir.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn text_save_never_follows_a_preplanted_staging_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TestDir::new("text-save-stage-symlink");
+        let target = dir.path().join("document.txt");
+        let victim = dir.path().join("victim.txt");
+        fs::write(&target, b"old").expect("create target");
+        fs::write(&victim, b"must remain").expect("create victim");
+
+        let planted_id = u64::MAX - 10;
+        let planted = dir.path().join(text_write_stage_name(planted_id));
+        symlink(&victim, &planted).expect("plant staging symlink");
+        let mut ids = [planted_id, planted_id + 1].into_iter();
+        let canonical_target = fs::canonicalize(&target).expect("canonicalize target");
+        write_text_file_atomic_with_stage_ids(&canonical_target, "new content", || {
+            ids.next().expect("staging allocator made too many attempts")
+        })
+        .expect("save must skip the planted entry safely");
+
+        assert_eq!(fs::read(&victim).expect("read victim"), b"must remain");
+        assert_eq!(fs::read(&target).expect("read target"), b"new content");
+        assert!(
+            fs::symlink_metadata(&planted)
+                .expect("planted symlink remains")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!dir
+            .path()
+            .join(text_write_stage_name(planted_id + 1))
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn text_save_preserves_the_existing_permission_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new("text-save-mode");
+        let target = dir.path().join("document.txt");
+        fs::write(&target, b"old").expect("create target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640))
+            .expect("set original permissions");
+
+        write_text_file(
+            dir.utf8_path(),
+            path_to_utf8(&target).expect("target path must be UTF-8"),
+            "new".to_string(),
+        )
+        .expect("atomic save");
+
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("target metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_actions_preserve_backslashes_as_literal_name_characters() {
+        let dir = TestDir::new("literal-backslash");
+        let source = dir.path().join("original");
+        fs::write(&source, b"content").expect("create source file");
+        let exact_name = "folder\\report";
+
+        let renamed = rename_fs_entry(
+            dir.utf8_path(),
+            path_to_utf8(&source).expect("source path must be UTF-8"),
+            exact_name.to_string(),
+        )
+        .expect("rename with a literal backslash");
+        assert_eq!(
+            renamed,
+            path_to_utf8(&dir.path().join(exact_name)).expect("target path must be UTF-8")
+        );
+        assert_eq!(
+            fs::read(dir.path().join(exact_name)).expect("read literal backslash filename"),
+            b"content"
+        );
+    }
+
+    #[test]
+    fn local_create_never_clobbers_an_existing_file() {
+        let dir = TestDir::new("exclusive-create");
+        let target = dir.path().join("existing");
+        fs::write(&target, b"keep me").expect("create existing target");
+
+        assert_eq!(
+            result_error(create_file(
+                dir.utf8_path(),
+                path_to_utf8(&target).expect("target path must be UTF-8"),
+            )),
+            "file already exists"
+        );
+        assert_eq!(fs::read(&target).expect("read existing target"), b"keep me");
+    }
+
+    #[test]
+    fn local_create_commands_preserve_literal_names() {
+        let dir = TestDir::new("literal-create");
+        let names = [
+            "lowercase",
+            "MixedCase-ß",
+            "目录-🚀",
+            "café",
+            "cafe\u{301}",
+            "  surrounding spaces  ",
+        ];
+
+        for (index, name) in names.into_iter().enumerate() {
+            let case_root = dir.path().join(format!("case-{index}"));
+            fs::create_dir(&case_root).expect("create isolated literal-name case");
+            let directory_name = format!("dir-{name}");
+            let file_name = format!("file-{name}");
+            create_directory(
+                dir.utf8_path(),
+                path_to_utf8(&case_root.join(&directory_name))
+                    .expect("directory path must be UTF-8"),
+            )
+            .expect("create literal directory");
+            create_file(
+                dir.utf8_path(),
+                path_to_utf8(&case_root.join(&file_name)).expect("file path must be UTF-8"),
+            )
+            .expect("create literal file");
+            let case_root_utf8 = path_to_utf8(&case_root).expect("case root must be UTF-8");
+            let entries = list_fs_entries(dir.utf8_path(), case_root_utf8)
+                .expect("list literal creations");
+            let listed_names = entries
+                .iter()
+                .map(|entry| entry.name.as_bytes().to_vec())
+                .collect::<Vec<_>>();
+            assert!(listed_names.contains(&directory_name.into_bytes()));
+            assert!(listed_names.contains(&file_name.into_bytes()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_create_and_rename_reject_dangling_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TestDir::new("dangling-target");
+        let dangling = dir.path().join("dangling");
+        symlink("missing-target", &dangling).expect("create dangling symlink");
+
+        assert_eq!(
+            result_error(create_file(
+                dir.utf8_path(),
+                path_to_utf8(&dangling).expect("symlink path must be UTF-8"),
+            )),
+            "file already exists"
+        );
+        assert_eq!(
+            result_error(create_directory(
+                dir.utf8_path(),
+                path_to_utf8(&dangling).expect("symlink path must be UTF-8"),
+            )),
+            "directory already exists"
+        );
+
+        let source = dir.path().join("source");
+        fs::write(&source, b"source data").expect("create rename source");
+        assert_eq!(
+            result_error(rename_fs_entry(
+                dir.utf8_path(),
+                path_to_utf8(&source).expect("source path must be UTF-8"),
+                "dangling".to_string(),
+            )),
+            "target already exists"
+        );
+        assert_eq!(fs::read(&source).expect("source remains"), b"source data");
+        assert_eq!(
+            fs::read_link(&dangling).expect("dangling symlink remains"),
+            PathBuf::from("missing-target")
+        );
+    }
+
+    #[test]
+    fn concurrent_local_renames_never_replace_each_other() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = TestDir::new("rename-race");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        fs::write(&first, b"first data").expect("create first source");
+        fs::write(&second, b"second data").expect("create second source");
+
+        let root = dir.utf8_path();
+        let barrier = Arc::new(Barrier::new(3));
+        let spawn_rename = |source: PathBuf| {
+            let root = root.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                rename_fs_entry(
+                    root,
+                    path_to_utf8(&source).expect("source path must be UTF-8"),
+                    "winner".to_string(),
+                )
+            })
+        };
+        let first_result = spawn_rename(first.clone());
+        let second_result = spawn_rename(second.clone());
+        barrier.wait();
+        let results = [
+            first_result.join().expect("first rename thread"),
+            second_result.join().expect("second rename thread"),
+        ];
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["target already exists"]
+        );
+        let mut contents = vec![fs::read(dir.path().join("winner")).expect("read winner")];
+        if first.exists() {
+            contents.push(fs::read(&first).expect("read remaining first"));
+        }
+        if second.exists() {
+            contents.push(fs::read(&second).expect("read remaining second"));
+        }
+        contents.sort();
+        assert_eq!(contents, vec![b"first data".to_vec(), b"second data".to_vec()]);
+    }
+
+    #[test]
+    fn local_case_only_rename_is_supported_without_overwrite() {
+        let dir = TestDir::new("case-only");
+        let source = dir.path().join("lowercase");
+        fs::write(&source, b"content").expect("create lowercase source");
+
+        let renamed = rename_fs_entry(
+            dir.utf8_path(),
+            path_to_utf8(&source).expect("source path must be UTF-8"),
+            "LowerCase".to_string(),
+        )
+        .expect("case-only rename");
+        assert_eq!(
+            renamed,
+            path_to_utf8(&dir.path().join("LowerCase")).expect("renamed path must be UTF-8")
+        );
+        let entries = list_fs_entries(dir.utf8_path(), dir.utf8_path()).expect("list renamed file");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "LowerCase");
+        assert_eq!(fs::read(dir.path().join("LowerCase")).expect("read renamed file"), b"content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_search_does_not_follow_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDir::new("search-root");
+        let outside = TestDir::new("search-outside");
+        fs::write(root.path().join("inside-target.txt"), b"inside")
+            .expect("create inside target");
+        symlink("inside-target.txt", root.path().join("inside-link.txt"))
+            .expect("create internal file symlink");
+        fs::write(outside.path().join("outside-match.txt"), b"outside")
+            .expect("create outside file");
+        symlink(outside.path(), root.path().join("outside-link"))
+            .expect("create external directory symlink");
+        symlink(root.path(), root.path().join("self-loop")).expect("create cycle symlink");
+
+        let matches = search_fs_entries(root.utf8_path(), "outside-match".to_string(), Some(10))
+            .expect("bounded rooted search");
+        assert!(matches.is_empty());
+
+        let matches = search_fs_entries(root.utf8_path(), "inside-link".to_string(), Some(10))
+            .expect("search internal file symlink");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "inside-link.txt");
+        assert_eq!(matches[0].size, 6);
+    }
+
+    #[test]
+    fn delete_rejects_dot_aliases_of_the_root() {
+        let root = TestDir::new("delete-root-alias");
+        fs::write(root.path().join("must-remain"), b"content").expect("create protected child");
+        let root_path = root.utf8_path();
+
+        assert_eq!(
+            result_error(delete_fs_entry(root_path.clone(), format!("{root_path}/."))),
+            "invalid target path"
+        );
+        let child_parent_alias = format!("{root_path}/child/..");
+        fs::create_dir(root.path().join("child")).expect("create child directory");
+        assert_eq!(
+            result_error(delete_fs_entry(root_path.clone(), child_parent_alias)),
+            "invalid target path"
+        );
+        assert_eq!(
+            fs::read(root.path().join("must-remain")).expect("protected child remains"),
+            b"content"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_listing_and_search_reject_non_utf8_names() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = TestDir::new("non-utf8");
+        let invalid_name = std::ffi::OsString::from_vec(vec![b'b', b'a', b'd', 0xff]);
+        assert_eq!(
+            result_error(os_str_to_utf8(&invalid_name)),
+            NON_UTF8_FILESYSTEM_PATH_ERROR
+        );
+        assert_eq!(
+            result_error(path_to_utf8(Path::new(&invalid_name))),
+            NON_UTF8_FILESYSTEM_PATH_ERROR
+        );
+
+        if let Err(error) = fs::write(dir.path().join(&invalid_name), b"content") {
+            // Darwin rejects invalid UTF-8 at the filesystem boundary with
+            // EILSEQ. The direct conversion assertions above still cover the
+            // application's boundary on that platform; Unix filesystems that
+            // accept arbitrary bytes continue through the command-level checks.
+            if cfg!(target_os = "macos") && error.raw_os_error() == Some(92) {
+                return;
+            }
+            panic!("create invalid-byte test filename: {error}");
+        }
+
+        assert_eq!(
+            result_error(list_fs_entries(dir.utf8_path(), dir.utf8_path())),
+            NON_UTF8_FILESYSTEM_PATH_ERROR
+        );
+        assert_eq!(
+            result_error(search_fs_entries(dir.utf8_path(), "bad".to_string(), Some(10))),
+            NON_UTF8_FILESYSTEM_PATH_ERROR
+        );
     }
 }

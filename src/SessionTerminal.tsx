@@ -872,9 +872,8 @@ function SessionTerminal(props: SessionTerminalProps) {
 
     const oscDisposables: Array<{ dispose: () => void }> = [];
     const reportCwd = (cwd: string) => {
-      const trimmed = cwd.trim();
-      if (!trimmed) return;
-      onCwdChangeRef.current?.(props.id, trimmed);
+      if (!cwd) return;
+      onCwdChangeRef.current?.(props.id, cwd);
     };
     const reportCommand = (commandLine: string, source: "osc" | "osc133" = "osc") => {
       onCommandChangeRef.current?.(props.id, commandLine, source);

@@ -6,6 +6,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
 
+use crate::files::path_to_utf8;
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct FsChangeEvent {
@@ -65,7 +67,20 @@ pub fn start_fs_watcher(
 
         let flush = |set: &mut HashSet<PathBuf>, app: &AppHandle, wid: &str| {
             for dir in set.drain() {
-                let path_str = dir.to_string_lossy().to_string();
+                // The frontend cannot address a Unix path that is not valid
+                // UTF-8. Silently substituting U+FFFD would emit a different,
+                // potentially actionable path. Notify the nearest representable
+                // parent instead, whose strict refresh will surface the child as
+                // an explicit unsupported-name error.
+                let path_str = match path_to_utf8(&dir) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        let Some(parent) = dir.parent().and_then(|parent| path_to_utf8(parent).ok()) else {
+                            continue;
+                        };
+                        parent
+                    }
+                };
                 let _ = app.emit(
                     "fs-changed",
                     FsChangeEvent {

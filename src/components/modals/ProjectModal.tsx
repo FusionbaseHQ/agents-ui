@@ -1,6 +1,12 @@
 import React, { useState, useRef, useEffect, useMemo, useImperativeHandle, forwardRef } from "react";
 import { Modal } from "../../ui";
 import type { ShellChoice, ShellInfo } from "../../shells";
+import {
+  FILESYSTEM_TEXT_INPUT_PROPS,
+  armImeSubmitSuppression,
+  classifyImeEnter,
+  consumeImeSubmitSuppression,
+} from "../filesystemInput";
 
 function normalizeSmartQuotes(input: string): string {
   return input.replace(/[""„‟«»]/g, '"').replace(/[''‚‛‹›]/g, "'");
@@ -115,6 +121,10 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
     const [sshRemotePath, setSshRemotePath] = useState(initialSshRemotePath);
     const [defaultShellKey, setDefaultShellKey] = useState(choiceToKey(initialDefaultShell));
     const titleRef = useRef<HTMLInputElement>(null);
+    const basePathInputRef = useRef<HTMLInputElement>(null);
+    const sshRemotePathInputRef = useRef<HTMLInputElement>(null);
+    const formCompositionRef = useRef(false);
+    const formSubmitSuppressionRef = useRef(0);
 
     useImperativeHandle(ref, () => ({ setBasePath, setSshRemotePath }));
 
@@ -187,13 +197,14 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
 
     const handleSubmit = (e: React.FormEvent) => {
       e.preventDefault();
+      if (formCompositionRef.current || consumeImeSubmitSuppression(formSubmitSuppressionRef)) return;
       onSubmit({
         title,
-        basePath,
+        basePath: basePathInputRef.current?.value ?? basePath,
         environmentId,
         assetsEnabled,
         sshTarget: isSsh ? sshTarget : "",
-        sshRemotePath: isSsh ? sshRemotePath : "",
+        sshRemotePath: isSsh ? (sshRemotePathInputRef.current?.value ?? sshRemotePath) : "",
         // Shell choice applies to local projects only.
         defaultShell: isSsh ? null : keyToChoice(defaultShellKey, shells, initialDefaultShell),
       });
@@ -201,7 +212,22 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
 
     return (
       <Modal title={mode === "new" ? "New project" : "Project settings"} onClose={onClose}>
-        <form onSubmit={handleSubmit}>
+        <form
+          onSubmit={handleSubmit}
+          onCompositionStart={() => {
+            formCompositionRef.current = true;
+          }}
+          onCompositionEnd={() => {
+            formCompositionRef.current = false;
+          }}
+          onKeyDown={(event) => {
+            const disposition = classifyImeEnter(event.nativeEvent, formCompositionRef.current);
+            if (disposition === "none") return;
+            armImeSubmitSuppression(formSubmitSuppressionRef);
+            if (disposition === "trailing-enter") event.preventDefault();
+            event.stopPropagation();
+          }}
+        >
           <div className="formRow">
             <div className="label">Title</div>
             <input
@@ -291,16 +317,19 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
                 <div className="label">Remote path</div>
                 <div className="pathRow">
                   <input
+                    {...FILESYSTEM_TEXT_INPUT_PROPS}
+                    ref={sshRemotePathInputRef}
                     className="input"
                     value={sshRemotePath}
-                    onChange={(e) => setSshRemotePath(normalizeSmartQuotes(e.target.value))}
+                    onChange={(e) => setSshRemotePath(e.target.value)}
                     placeholder="~ (remote home)"
+                    aria-label="Remote path"
                   />
                   <button
                     type="button"
                     className="btn"
                     disabled={!sshTarget.trim()}
-                    onClick={() => onBrowseRemotePath(sshTarget.trim(), sshRemotePath.trim())}
+                    onClick={() => onBrowseRemotePath(sshTarget.trim(), sshRemotePath)}
                   >
                     Browse
                   </button>
@@ -313,10 +342,13 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
               <div className="label">Base path</div>
               <div className="pathRow">
                 <input
+                  {...FILESYSTEM_TEXT_INPUT_PROPS}
+                  ref={basePathInputRef}
                   className="input"
                   value={basePath}
-                  onChange={(e) => setBasePath(normalizeSmartQuotes(e.target.value))}
+                  onChange={(e) => setBasePath(e.target.value)}
                   placeholder={basePathPlaceholder}
+                  aria-label="Base path"
                 />
                 <button type="button" className="btn" onClick={() => onBrowseBasePath(basePath)}>
                   Browse

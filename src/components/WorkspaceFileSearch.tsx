@@ -1,6 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import React from "react";
 import { Icon } from "./Icon";
+import {
+  FILESYSTEM_TEXT_INPUT_PROPS,
+  isImeCompositionKey,
+  isUnsupportedFilenameEncodingError,
+} from "./filesystemInput";
 
 type FsEntry = {
   name: string;
@@ -122,9 +127,11 @@ export function WorkspaceFileSearch({
   }>({ query: "", entries: [], status: "", loading: false });
   const [selectedIndex, setSelectedIndex] = React.useState(0);
   const inputRef = React.useRef<HTMLInputElement | null>(null);
+  const compositionRef = React.useRef(false);
 
   React.useLayoutEffect(() => {
     if (!isOpen) return;
+    compositionRef.current = false;
     setQuery("");
     setSelectedIndex(0);
     window.setTimeout(() => inputRef.current?.focus(), 0);
@@ -132,7 +139,7 @@ export function WorkspaceFileSearch({
 
   React.useEffect(() => {
     if (!isOpen) return;
-    const root = rootDir.trim();
+    const root = rootDir;
     const target = (sshTarget ?? "").trim();
     let cancelled = false;
     setSearchState({ query: "", entries: [], status: "", loading: false });
@@ -166,6 +173,7 @@ export function WorkspaceFileSearch({
       const maxFiles = provider === "ssh" ? MAX_SAMPLE_FILES_SSH : MAX_SAMPLE_FILES_LOCAL;
       let scannedDirs = 0;
       let skipped = false;
+      let fatalSampleError: string | null = null;
       let cursor = 0;
 
       while (cursor < queue.length && !cancelled && scannedDirs < maxDirs && files.length < maxFiles) {
@@ -203,13 +211,23 @@ export function WorkspaceFileSearch({
           for (const child of dirs) {
             queue.push(child.path);
           }
-        } catch {
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (isUnsupportedFilenameEncodingError(message)) {
+            fatalSampleError = message;
+            break;
+          }
           skipped = true;
         }
       }
 
       if (cancelled) return;
       const finalEntries = files.slice();
+      if (fatalSampleError) {
+        setSampleEntries(finalEntries);
+        setSampleStatus(`Workspace sample failed: ${fatalSampleError}`);
+        return;
+      }
       const capped = scannedDirs >= maxDirs || files.length >= maxFiles;
       const status =
         `${files.length.toLocaleString()} sampled` +
@@ -228,7 +246,7 @@ export function WorkspaceFileSearch({
 
   React.useEffect(() => {
     if (!isOpen) return;
-    const root = rootDir.trim();
+    const root = rootDir;
     const target = (sshTarget ?? "").trim();
     const q = query.trim();
     if (!root || q.length < MIN_BACKEND_QUERY_LENGTH) {
@@ -282,7 +300,7 @@ export function WorkspaceFileSearch({
   }, [isOpen, provider, query, rootDir, sshTarget]);
 
   const results = React.useMemo(() => {
-    const root = rootDir.trim();
+    const root = rootDir;
     const q = query.trim();
     const fullSearchReady = q.length >= MIN_BACKEND_QUERY_LENGTH && searchState.query === q && !searchState.loading;
     const fullSearchFailed = searchState.status.startsWith("Full search failed:");
@@ -323,6 +341,7 @@ export function WorkspaceFileSearch({
 
   const onKeyDown = React.useCallback(
     (event: React.KeyboardEvent) => {
+      if (compositionRef.current || isImeCompositionKey(event.nativeEvent)) return;
       if (event.key === "Escape") {
         event.preventDefault();
         onClose();
@@ -354,15 +373,30 @@ export function WorkspaceFileSearch({
         <div className="workspaceFileSearchInputRow">
           <Icon name="search" size={15} />
           <input
+            {...FILESYSTEM_TEXT_INPUT_PROPS}
             ref={inputRef}
             className="workspaceFileSearchInput"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
+            onCompositionStart={() => {
+              compositionRef.current = true;
+            }}
+            onCompositionEnd={(event) => {
+              compositionRef.current = false;
+              setQuery(event.currentTarget.value);
+            }}
             onKeyDown={onKeyDown}
             placeholder="Open file by name or path"
+            aria-label="Search workspace files by name or path"
           />
         </div>
-        <div className="workspaceFileSearchStatus">{status}</div>
+        <div
+          className="workspaceFileSearchStatus"
+          role={isUnsupportedFilenameEncodingError(status) ? "alert" : "status"}
+          aria-live={isUnsupportedFilenameEncodingError(status) ? "assertive" : "polite"}
+        >
+          {status}
+        </div>
         <div className="workspaceFileSearchList">
           {results.length === 0 ? (
             <div className="workspaceFileSearchEmpty">

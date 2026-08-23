@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tauri::{AppHandle, Manager};
 
+use crate::files::{os_str_to_utf8, path_to_utf8};
 use crate::secure::{decrypt_string_with_key, encrypt_string_with_key, get_or_create_master_key, SecretContext};
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
@@ -178,16 +179,16 @@ pub fn load_persisted_state_meta(app: AppHandle) -> Result<Option<PersistedState
 }
 
 fn expand_home(input: &str) -> String {
-    let trimmed = input.trim();
-    if trimmed == "~" {
-        return home_dir().unwrap_or_else(|| trimmed.to_string());
+    if input == "~" {
+        return home_dir().unwrap_or_else(|| input.to_string());
     }
-    if let Some(rest) = trimmed.strip_prefix("~/") {
+    if let Some(rest) = input.strip_prefix("~/") {
         if let Some(home) = home_dir() {
-            return Path::new(&home).join(rest).to_string_lossy().to_string();
+            let expanded = Path::new(&home).join(rest);
+            return path_to_utf8(&expanded).unwrap_or_else(|_| input.to_string());
         }
     }
-    trimmed.to_string()
+    input.to_string()
 }
 
 fn home_dir() -> Option<String> {
@@ -347,7 +348,7 @@ pub async fn validate_directory(path: String) -> Result<Option<String>, String> 
 
 fn validate_directory_sync(path: String) -> Result<Option<String>, String> {
     let expanded = expand_home(&path);
-    if expanded.trim().is_empty() {
+    if expanded.is_empty() {
         return Ok(None);
     }
     let p = Path::new(&expanded);
@@ -388,7 +389,7 @@ fn list_directories_sync_with_limits(
     let desired = path
         .as_deref()
         .map(expand_home)
-        .filter(|s| !s.trim().is_empty())
+        .filter(|s| !s.is_empty())
         .or_else(home_dir)
         .ok_or("no path")?;
 
@@ -396,6 +397,7 @@ fn list_directories_sync_with_limits(
     if !dir.is_dir() {
         return Err("not a directory".to_string());
     }
+    let dir_path = path_to_utf8(&dir)?;
 
     let mut entries: Vec<DirectoryEntry> = Vec::new();
     let mut truncated = false;
@@ -421,10 +423,11 @@ fn list_directories_sync_with_limits(
             truncated = true;
             break;
         }
-        let name = item.file_name().to_string_lossy().to_string();
+        let file_name = item.file_name();
+        let name = os_str_to_utf8(&file_name)?.to_owned();
         entries.push(DirectoryEntry {
             name,
-            path: path.to_string_lossy().to_string(),
+            path: path_to_utf8(&path)?,
         });
     }
 
@@ -432,11 +435,12 @@ fn list_directories_sync_with_limits(
 
     let parent = dir
         .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .filter(|p| p != &dir.to_string_lossy());
+        .map(path_to_utf8)
+        .transpose()?
+        .filter(|parent| parent != &dir_path);
 
     Ok(DirectoryListing {
-        path: dir.to_string_lossy().to_string(),
+        path: dir_path,
         parent,
         entries,
         truncated,
@@ -445,7 +449,7 @@ fn list_directories_sync_with_limits(
 
 #[cfg(test)]
 mod tests {
-    use super::{list_directories_sync_with_limits, PersistedStateV1};
+    use super::{list_directories_sync_with_limits, path_to_utf8, PersistedStateV1};
     use serde_json::{json, Value};
 
     fn round_trip(value: Value) -> Value {
@@ -470,13 +474,52 @@ mod tests {
                 .expect("create picker test folder");
         }
 
-        let listing =
-            list_directories_sync_with_limits(Some(root.to_string_lossy().to_string()), 3, 64)
-                .expect("list bounded picker directory");
+        let listing = list_directories_sync_with_limits(
+            Some(path_to_utf8(&root).expect("test root must be UTF-8")),
+            3,
+            64,
+        )
+        .expect("list bounded picker directory");
         assert_eq!(listing.entries.len(), 3);
         assert!(listing.truncated);
 
         std::fs::remove_dir_all(root).expect("remove picker test root");
+    }
+
+    #[test]
+    fn directory_picker_preserves_unicode_and_edge_whitespace() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "agents-ui-picker-unicode-{}-{unique}",
+            std::process::id()
+        ));
+        let exact_name = "  MixedCase-目录-🚀-cafe\u{301}  ";
+        std::fs::create_dir_all(root.join(exact_name)).expect("create exact picker folder");
+
+        let root_path = path_to_utf8(&root).expect("test root must be UTF-8");
+        let listing = list_directories_sync_with_limits(Some(root_path.clone()), 10, 64)
+            .expect("list Unicode picker directory");
+        assert_eq!(listing.path, root_path);
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].name.as_bytes(), exact_name.as_bytes());
+        assert_eq!(
+            listing.entries[0].path,
+            path_to_utf8(&root.join(exact_name)).expect("entry path must be UTF-8")
+        );
+
+        std::fs::remove_dir_all(root).expect("remove picker test root");
+    }
+
+    #[test]
+    fn whitespace_only_path_is_not_reclassified_as_missing() {
+        let error = match list_directories_sync_with_limits(Some("   ".to_string()), 10, 64) {
+            Err(error) => error,
+            Ok(_) => panic!("a literal relative path must not fall back to the home directory"),
+        };
+        assert_eq!(error, "not a directory");
     }
 
     #[test]

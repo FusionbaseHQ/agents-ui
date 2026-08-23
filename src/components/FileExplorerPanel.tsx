@@ -7,6 +7,14 @@ import React from "react";
 import { shortenPathSmart } from "../pathDisplay";
 import { useClampedMenuPosition } from "../hooks/useClampedMenuPosition";
 import { Icon } from "./Icon";
+import {
+  FILESYSTEM_TEXT_INPUT_PROPS,
+  armImeSubmitSuppression,
+  classifyImeEnter,
+  consumeImeSubmitSuppression,
+  isInvalidPosixBasename,
+  isUnsupportedFilenameEncodingError,
+} from "./filesystemInput";
 import { ConfirmActionModal } from "./modals/ConfirmActionModal";
 import { PathPickerModal } from "./modals/PathPickerModal";
 
@@ -122,21 +130,19 @@ type FileTypeBadgeKind =
 type FileTypeBadge = { label: string; kind: FileTypeBadgeKind };
 
 function normalizePath(input: string): string {
-  const trimmed = input.trim();
-  if (!trimmed) return "";
-  if (trimmed === "/") return "/";
-  return trimmed.replace(/\/+$/, "");
+  if (input.length === 0) return "";
+  if (input === "/") return "/";
+  return input.replace(/\/+$/, "");
 }
 
 function normalizeSshRootPath(input: string): string {
-  const trimmed = input.trim();
-  if (!trimmed) return "/";
-  if (trimmed === "~") return "/";
-  if (trimmed.startsWith("~/")) {
-    const normalized = normalizePath(trimmed.slice(1));
+  if (input.length === 0) return "/";
+  if (input === "~") return "/";
+  if (input.startsWith("~/")) {
+    const normalized = normalizePath(input.slice(1));
     return normalized.startsWith("/") ? normalized : "/";
   }
-  const normalized = normalizePath(trimmed);
+  const normalized = normalizePath(input);
   return normalized.startsWith("/") ? normalized : "/";
 }
 
@@ -149,7 +155,9 @@ function dirname(input: string): string {
 }
 
 function basename(input: string): string {
-  const path = normalizePath(input).replace(/\\/g, "/");
+  // Local app paths and SSH paths are POSIX. A backslash is a literal
+  // filename character and must not be silently reinterpreted as a separator.
+  const path = normalizePath(input);
   if (!path) return "";
   if (path === "/") return "/";
   const idx = path.lastIndexOf("/");
@@ -527,18 +535,24 @@ export function FileExplorerPanel({
   const [renameBusy, setRenameBusy] = React.useState(false);
   const [renameError, setRenameError] = React.useState<string | null>(null);
   const renameInputRef = React.useRef<HTMLInputElement | null>(null);
+  const renameCompositionRef = React.useRef(false);
+  const renameSubmitSuppressionRef = React.useRef(0);
 
   const [newFileDir, setNewFileDir] = React.useState<string | null>(null);
   const [newFileName, setNewFileName] = React.useState("");
   const [newFileBusy, setNewFileBusy] = React.useState(false);
   const [newFileError, setNewFileError] = React.useState<string | null>(null);
   const newFileInputRef = React.useRef<HTMLInputElement | null>(null);
+  const newFileCompositionRef = React.useRef(false);
+  const newFileSubmitSuppressionRef = React.useRef(0);
 
   const [newFolderDir, setNewFolderDir] = React.useState<string | null>(null);
   const [newFolderName, setNewFolderName] = React.useState("");
   const [newFolderBusy, setNewFolderBusy] = React.useState(false);
   const [newFolderError, setNewFolderError] = React.useState<string | null>(null);
   const newFolderInputRef = React.useRef<HTMLInputElement | null>(null);
+  const newFolderCompositionRef = React.useRef(false);
+  const newFolderSubmitSuppressionRef = React.useRef(0);
 
   const [deleteTarget, setDeleteTarget] = React.useState<FsEntry | null>(null);
   const [deleteBusy, setDeleteBusy] = React.useState(false);
@@ -746,7 +760,7 @@ export function FileExplorerPanel({
    * Silent background poll for a single directory.
    * - Does NOT set loading state (invisible to user)
    * - Compares with cached entries — skips update if unchanged
-   * - Swallows errors (keeps showing cached data)
+   * - Keeps cached data for transient errors, but surfaces unsupported names
    * - Cleans up expandedDirs/dirStateByPath for removed child directories
    */
   const pollDirectory = React.useCallback(
@@ -823,8 +837,19 @@ export function FileExplorerPanel({
           ...prev,
           [path]: { entries, loading: false, error: null },
         }));
-      } catch {
-        // Silently skip — keep showing cached data, retry next tick
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (isUnsupportedFilenameEncodingError(message)) {
+          setDirStateByPath((prev) => ({
+            ...prev,
+            [path]: {
+              entries: prev[path]?.entries ?? [],
+              loading: false,
+              error: message,
+            },
+          }));
+        }
+        // Transient background failures keep cached data and retry later.
       } finally {
         inFlightPollsRef.current.delete(path);
         if (isSshPoll) globalSshPollsInFlight = Math.max(0, globalSshPollsInFlight - 1);
@@ -1091,6 +1116,7 @@ export function FileExplorerPanel({
   }, [contextMenu]);
 
   React.useEffect(() => {
+    renameCompositionRef.current = false;
     if (!renameTarget) return;
     window.setTimeout(() => {
       renameInputRef.current?.focus();
@@ -1099,6 +1125,7 @@ export function FileExplorerPanel({
   }, [renameTarget]);
 
   React.useEffect(() => {
+    newFileCompositionRef.current = false;
     if (!newFileDir) return;
     window.setTimeout(() => {
       newFileInputRef.current?.focus();
@@ -1106,6 +1133,7 @@ export function FileExplorerPanel({
   }, [newFileDir]);
 
   React.useEffect(() => {
+    newFolderCompositionRef.current = false;
     if (!newFolderDir) return;
     window.setTimeout(() => {
       newFolderInputRef.current?.focus();
@@ -1114,6 +1142,7 @@ export function FileExplorerPanel({
 
   const closeRenameModal = React.useCallback(() => {
     if (renameBusy) return;
+    renameCompositionRef.current = false;
     setRenameTarget(null);
     setRenameValue("");
     setRenameError(null);
@@ -1121,6 +1150,7 @@ export function FileExplorerPanel({
 
   const closeNewFileModal = React.useCallback(() => {
     if (newFileBusy) return;
+    newFileCompositionRef.current = false;
     setNewFileDir(null);
     setNewFileName("");
     setNewFileError(null);
@@ -1128,6 +1158,7 @@ export function FileExplorerPanel({
 
   const closeNewFolderModal = React.useCallback(() => {
     if (newFolderBusy) return;
+    newFolderCompositionRef.current = false;
     setNewFolderDir(null);
     setNewFolderName("");
     setNewFolderError(null);
@@ -1136,10 +1167,11 @@ export function FileExplorerPanel({
   const submitNewFolder = React.useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
+      if (newFolderCompositionRef.current || consumeImeSubmitSuppression(newFolderSubmitSuppressionRef)) return;
       if (!newFolderDir) return;
 
-      const name = newFolderName.trim();
-      if (!name) {
+      const name = newFolderInputRef.current?.value ?? newFolderName;
+      if (name.length === 0) {
         setNewFolderError("Folder name cannot be empty.");
         return;
       }
@@ -1147,8 +1179,8 @@ export function FileExplorerPanel({
         setNewFolderError("That name is not allowed.");
         return;
       }
-      if (/[\\/]/.test(name)) {
-        setNewFolderError("Name must not contain / or \\.");
+      if (isInvalidPosixBasename(name)) {
+        setNewFolderError("Name must not contain / or NUL.");
         return;
       }
 
@@ -1188,10 +1220,11 @@ export function FileExplorerPanel({
   const submitNewFile = React.useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
+      if (newFileCompositionRef.current || consumeImeSubmitSuppression(newFileSubmitSuppressionRef)) return;
       if (!newFileDir) return;
 
-      const name = newFileName.trim();
-      if (!name) {
+      const name = newFileInputRef.current?.value ?? newFileName;
+      if (name.length === 0) {
         setNewFileError("File name cannot be empty.");
         return;
       }
@@ -1199,8 +1232,8 @@ export function FileExplorerPanel({
         setNewFileError("That name is not allowed.");
         return;
       }
-      if (/[\\/]/.test(name)) {
-        setNewFileError("Name must not contain / or \\.");
+      if (isInvalidPosixBasename(name)) {
+        setNewFileError("Name must not contain / or NUL.");
         return;
       }
 
@@ -1295,6 +1328,9 @@ export function FileExplorerPanel({
 
     const walk = (dirPath: string, depth: number) => {
       const state = dirStateByPath[dirPath];
+      if (depth === 0 && state?.error) {
+        out.push({ type: "error", path: dirPath, depth, message: state.error });
+      }
       const entries = state?.entries ?? [];
       for (const entry of entries) {
         out.push({ type: "entry", entry, depth });
@@ -1468,17 +1504,21 @@ export function FileExplorerPanel({
   const submitRename = React.useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
+      if (renameCompositionRef.current || consumeImeSubmitSuppression(renameSubmitSuppressionRef)) return;
       const entry = renameTarget;
       if (!entry) return;
 
-      const name = renameValue.trim();
-      if (!name) return;
+      const name = renameInputRef.current?.value ?? renameValue;
+      if (name.length === 0) {
+        setRenameError("Name cannot be empty.");
+        return;
+      }
       if (name === "." || name === "..") {
         setRenameError("That name is not allowed.");
         return;
       }
-      if (/[\\/]/.test(name)) {
-        setRenameError("Name must not contain / or \\.");
+      if (isInvalidPosixBasename(name)) {
+        setRenameError("Name must not contain / or NUL.");
         return;
       }
 
@@ -1718,7 +1758,7 @@ export function FileExplorerPanel({
     const requestId = downloadPickerRequestRef.current + 1;
     downloadPickerRequestRef.current = requestId;
     const initialDirectory = await invoke<string>("default_download_directory")
-      .then((value) => value.trim() || null)
+      .then((value) => value || null)
       .catch(() => null);
 
     if (!mountedRef.current || downloadPickerRequestRef.current !== requestId) return;
@@ -1871,7 +1911,7 @@ export function FileExplorerPanel({
         let lastName = "";
 
         for (const sourcePathRaw of paths) {
-          const raw = sourcePathRaw.trim();
+          const raw = sourcePathRaw;
           const sourcePath = parseFileUrlPath(raw) ?? raw;
           if (!sourcePath) continue;
 
@@ -2234,14 +2274,18 @@ export function FileExplorerPanel({
                     );
                   }
                   if (item.type === "error") {
+                    const unsupportedEncoding = isUnsupportedFilenameEncodingError(item.message);
                     return (
                       <div
                         key={`error:${item.path}`}
                         className="fileExplorerRow fileExplorerMeta fileExplorerError"
                         style={{ paddingLeft: 12 + item.depth * 14, height: rowHeight }}
                         title={item.message}
+                        role={unsupportedEncoding ? "alert" : undefined}
+                        aria-live={unsupportedEncoding ? "assertive" : undefined}
+                        aria-label={unsupportedEncoding ? `Invalid UTF-8 filename: ${item.message}` : undefined}
                       >
-                        failed to load
+                        {unsupportedEncoding ? "invalid UTF-8 filename" : "failed to load"}
                       </div>
                     );
                   }
@@ -2405,6 +2449,7 @@ export function FileExplorerPanel({
             role="menuitem"
             onClick={() => {
               const targetDir = contextMenu.entry.isDir ? contextMenu.entry.path : dirname(contextMenu.entry.path);
+              newFileCompositionRef.current = false;
               setNewFileDir(targetDir);
               setNewFileName("");
               setNewFileError(null);
@@ -2419,6 +2464,7 @@ export function FileExplorerPanel({
             role="menuitem"
             onClick={() => {
               const targetDir = contextMenu.entry.isDir ? contextMenu.entry.path : dirname(contextMenu.entry.path);
+              newFolderCompositionRef.current = false;
               setNewFolderDir(targetDir);
               setNewFolderName("");
               setNewFolderError(null);
@@ -2432,6 +2478,7 @@ export function FileExplorerPanel({
             className="sidebarActionMenuItem"
             role="menuitem"
             onClick={() => {
+              renameCompositionRef.current = false;
               setRenameTarget(contextMenu.entry);
               setRenameValue(contextMenu.entry.name);
               setRenameError(null);
@@ -2476,11 +2523,27 @@ export function FileExplorerPanel({
               <div className="formRow">
                 <div className="label">New name</div>
                 <input
+                  {...FILESYSTEM_TEXT_INPUT_PROPS}
                   className="input"
                   ref={renameInputRef}
                   value={renameValue}
                   onChange={(e) => setRenameValue(e.target.value)}
+                  onCompositionStart={() => {
+                    renameCompositionRef.current = true;
+                  }}
+                  onCompositionEnd={(event) => {
+                    renameCompositionRef.current = false;
+                    setRenameValue(event.currentTarget.value);
+                  }}
+                  onKeyDown={(event) => {
+                    const disposition = classifyImeEnter(event.nativeEvent, renameCompositionRef.current);
+                    if (disposition === "none") return;
+                    armImeSubmitSuppression(renameSubmitSuppressionRef);
+                    if (disposition === "trailing-enter") event.preventDefault();
+                    event.stopPropagation();
+                  }}
                   placeholder={renameTarget.name}
+                  aria-label="New name"
                   disabled={renameBusy}
                 />
                 <div className="hint" style={{ marginTop: 6 }}>
@@ -2520,11 +2583,27 @@ export function FileExplorerPanel({
             <form onSubmit={(e) => void submitNewFile(e)}>
               <div className="formRow">
                 <input
+                  {...FILESYSTEM_TEXT_INPUT_PROPS}
                   className="input"
                   ref={newFileInputRef}
                   value={newFileName}
                   onChange={(e) => setNewFileName(e.target.value)}
+                  onCompositionStart={() => {
+                    newFileCompositionRef.current = true;
+                  }}
+                  onCompositionEnd={(event) => {
+                    newFileCompositionRef.current = false;
+                    setNewFileName(event.currentTarget.value);
+                  }}
+                  onKeyDown={(event) => {
+                    const disposition = classifyImeEnter(event.nativeEvent, newFileCompositionRef.current);
+                    if (disposition === "none") return;
+                    armImeSubmitSuppression(newFileSubmitSuppressionRef);
+                    if (disposition === "trailing-enter") event.preventDefault();
+                    event.stopPropagation();
+                  }}
                   placeholder="example.txt"
+                  aria-label="New file name"
                   disabled={newFileBusy}
                 />
               </div>
@@ -2561,11 +2640,27 @@ export function FileExplorerPanel({
             <form onSubmit={(e) => void submitNewFolder(e)}>
               <div className="formRow">
                 <input
+                  {...FILESYSTEM_TEXT_INPUT_PROPS}
                   className="input"
                   ref={newFolderInputRef}
                   value={newFolderName}
                   onChange={(e) => setNewFolderName(e.target.value)}
+                  onCompositionStart={() => {
+                    newFolderCompositionRef.current = true;
+                  }}
+                  onCompositionEnd={(event) => {
+                    newFolderCompositionRef.current = false;
+                    setNewFolderName(event.currentTarget.value);
+                  }}
+                  onKeyDown={(event) => {
+                    const disposition = classifyImeEnter(event.nativeEvent, newFolderCompositionRef.current);
+                    if (disposition === "none") return;
+                    armImeSubmitSuppression(newFolderSubmitSuppressionRef);
+                    if (disposition === "trailing-enter") event.preventDefault();
+                    event.stopPropagation();
+                  }}
                   placeholder="my-folder"
+                  aria-label="New folder name"
                   disabled={newFolderBusy}
                 />
               </div>
@@ -2715,7 +2810,7 @@ export function FileExplorerPanel({
                 onClick={() => setTransferStatus(null)}
                 aria-label="Dismiss"
               >
-                \u00d7
+                <Icon name="close" size={12} />
               </button>
             </>
           )}
@@ -2728,7 +2823,7 @@ export function FileExplorerPanel({
                 onClick={() => setTransferStatus(null)}
                 aria-label="Dismiss"
               >
-                \u00d7
+                <Icon name="close" size={12} />
               </button>
             </>
           )}

@@ -1,19 +1,41 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::io::Write;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use tauri::Emitter;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
+const MCP_CONFIG_FILE_NAME: &str = "mcp-config.json";
+static NEXT_MCP_CONFIG_STAGE: AtomicU64 = AtomicU64::new(1);
+
+fn validated_shell_path(shell: &str) -> Option<String> {
+    let path = std::path::Path::new(shell);
+    if !path.is_absolute() {
+        return None;
+    }
+    #[cfg(target_family = "unix")]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+    #[cfg(not(target_family = "unix"))]
+    let executable = path.is_file();
+    executable.then(|| shell.to_string())
+}
 
 /// Get the user's default login shell, same logic as pty.rs.
 fn default_user_shell() -> String {
     if let Ok(shell) = std::env::var("SHELL") {
-        let trimmed = shell.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
+        if let Some(shell) = validated_shell_path(&shell) {
+            return shell;
         }
     }
     #[cfg(target_os = "macos")]
@@ -38,6 +60,15 @@ fn shell_escape(s: &str) -> String {
     }
     // Wrap in single quotes, escaping embedded single quotes
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn append_shell_escaped_args(parts: &mut Vec<String>, args: Vec<String>) {
+    parts.extend(args.into_iter().map(|argument| shell_escape(&argument)));
+}
+
+fn path_to_utf8<'a>(path: &'a std::path::Path, context: &str) -> Result<&'a str, String> {
+    path.to_str()
+        .ok_or_else(|| format!("{context} is not valid UTF-8"))
 }
 
 /// Tracks running agent processes by run_id.
@@ -73,15 +104,288 @@ impl Default for AgentLaunchSettings {
     }
 }
 
-/// Write the MCP config file that agents use to connect to our MCP server.
-#[tauri::command]
-pub async fn write_agent_mcp_config(mcp_port: Option<u16>) -> Result<String, String> {
-    let port = mcp_port.unwrap_or(45557);
-    let token = crate::mcp_server::get_or_init_auth_token();
-    let dir = agents_ui_dir()?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create dir: {e}"))?;
-    let path = dir.join("mcp-config.json");
+#[cfg(target_family = "unix")]
+fn effective_user_id() -> u32 {
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    unsafe { libc::geteuid() }
+}
 
+#[cfg(target_family = "unix")]
+fn ensure_private_agents_ui_directory_for_uid(
+    dir: &std::path::Path,
+    expected_uid: u32,
+) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("create agent data directory failed: {error}")),
+    }
+
+    let metadata = std::fs::symlink_metadata(dir)
+        .map_err(|error| format!("inspect agent data directory failed: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err("agent data directory must not be a symbolic link".to_string());
+    }
+    if !metadata.is_dir() {
+        return Err("agent data path is not a directory".to_string());
+    }
+    if metadata.uid() != expected_uid {
+        return Err("agent data directory is not owned by the effective user".to_string());
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("restrict agent data directory failed: {error}"))?;
+    }
+
+    let metadata = std::fs::symlink_metadata(dir)
+        .map_err(|error| format!("verify agent data directory failed: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("agent data directory changed while it was being secured".to_string());
+    }
+    if metadata.uid() != expected_uid {
+        return Err("agent data directory owner changed while it was being secured".to_string());
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err("agent data directory permissions are not 0700".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+fn ensure_private_agents_ui_directory(dir: &std::path::Path) -> Result<(), String> {
+    ensure_private_agents_ui_directory_for_uid(dir, effective_user_id())
+}
+
+#[cfg(not(target_family = "unix"))]
+fn ensure_private_agents_ui_directory(dir: &std::path::Path) -> Result<(), String> {
+    match std::fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("create agent data directory failed: {error}")),
+    }
+    let metadata = std::fs::symlink_metadata(dir)
+        .map_err(|error| format!("inspect agent data directory failed: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("agent data path is not a real directory".to_string());
+    }
+    Ok(())
+}
+
+struct McpConfigStage {
+    path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl McpConfigStage {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for McpConfigStage {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn mcp_config_stage_path(dir: &std::path::Path, id: u64) -> std::path::PathBuf {
+    dir.join(format!(
+        ".mcp-config.json.stage-{}-{id:x}",
+        std::process::id()
+    ))
+}
+
+fn create_mcp_config_stage_with_ids(
+    dir: &std::path::Path,
+    mut next_id: impl FnMut() -> u64,
+) -> Result<(McpConfigStage, std::fs::File), String> {
+    const MAX_ATTEMPTS: usize = 128;
+    for _ in 0..MAX_ATTEMPTS {
+        let path = mcp_config_stage_path(dir, next_id());
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => {
+                let stage = McpConfigStage { path, armed: true };
+                #[cfg(target_family = "unix")]
+                {
+                    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                    if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    {
+                        drop(file);
+                        drop(stage);
+                        return Err(format!("restrict MCP config stage failed: {error}"));
+                    }
+                    let metadata = match file.metadata() {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            drop(file);
+                            drop(stage);
+                            return Err(format!("inspect MCP config stage failed: {error}"));
+                        }
+                    };
+                    if metadata.uid() != effective_user_id()
+                        || metadata.permissions().mode() & 0o777 != 0o600
+                    {
+                        drop(file);
+                        drop(stage);
+                        return Err("MCP config staging file is not private".to_string());
+                    }
+                }
+                return Ok((stage, file));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create MCP config stage failed: {error}")),
+        }
+    }
+    Err("could not allocate a unique MCP config staging file".to_string())
+}
+
+fn create_mcp_config_stage(
+    dir: &std::path::Path,
+) -> Result<(McpConfigStage, std::fs::File), String> {
+    create_mcp_config_stage_with_ids(dir, || {
+        NEXT_MCP_CONFIG_STAGE.fetch_add(1, Ordering::Relaxed)
+    })
+}
+
+#[cfg(target_family = "windows")]
+fn replace_file_atomically(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_family = "windows"))]
+fn replace_file_atomically(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(target_family = "unix")]
+fn verify_private_mcp_config(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect published MCP config failed: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("published MCP config is not a regular file".to_string());
+    }
+    if metadata.uid() != effective_user_id() {
+        return Err("published MCP config is not owned by the effective user".to_string());
+    }
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        return Err("published MCP config permissions are not 0600".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_family = "unix"))]
+fn verify_private_mcp_config(path: &std::path::Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect published MCP config failed: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("published MCP config is not a regular file".to_string());
+    }
+    Ok(())
+}
+
+fn write_private_mcp_config_with_publish_and_sync(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    contents: &[u8],
+    publish: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+    sync_directory: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let (mut stage, mut file) = create_mcp_config_stage(dir)?;
+    let write_result = file
+        .write_all(contents)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("write MCP config stage failed: {error}"));
+    drop(file);
+    write_result?;
+
+    publish(&stage.path, path).map_err(|error| format!("publish MCP config failed: {error}"))?;
+    stage.disarm();
+    verify_private_mcp_config(path)?;
+    // Publication already committed the private 0600 file. Network, FUSE, and
+    // FileProvider directories may reject directory fsync; reporting failure
+    // here would be false and could trigger retries after a successful rename.
+    let _ = sync_directory(dir);
+    Ok(())
+}
+
+fn write_private_mcp_config_with_publish(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    contents: &[u8],
+    publish: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    write_private_mcp_config_with_publish_and_sync(
+        dir,
+        path,
+        contents,
+        publish,
+        |directory| {
+            #[cfg(target_family = "unix")]
+            {
+                return std::fs::File::open(directory)
+                    .and_then(|handle| handle.sync_all());
+            }
+            #[cfg(not(target_family = "unix"))]
+            {
+                let _ = directory;
+                Ok(())
+            }
+        },
+    )
+}
+
+fn serialize_mcp_config(port: u16, token: &str) -> Result<Vec<u8>, String> {
     let config = serde_json::json!({
         "mcpServers": {
             "agents-ui": {
@@ -93,11 +397,29 @@ pub async fn write_agent_mcp_config(mcp_port: Option<u16>) -> Result<String, Str
             }
         }
     });
+    serde_json::to_vec_pretty(&config).map_err(|error| format!("serialize: {error}"))
+}
 
-    let json = serde_json::to_string_pretty(&config)
-        .map_err(|e| format!("serialize: {e}"))?;
-    std::fs::write(&path, &json).map_err(|e| format!("write: {e}"))?;
-    Ok(path.to_string_lossy().to_string())
+fn write_mcp_config_in_directory(
+    dir: &std::path::Path,
+    port: u16,
+    token: &str,
+) -> Result<std::path::PathBuf, String> {
+    ensure_private_agents_ui_directory(dir)?;
+    let path = dir.join(MCP_CONFIG_FILE_NAME);
+    let json = serialize_mcp_config(port, token)?;
+    write_private_mcp_config_with_publish(dir, &path, &json, replace_file_atomically)?;
+    Ok(path)
+}
+
+/// Write the MCP config file that agents use to connect to our MCP server.
+#[tauri::command]
+pub async fn write_agent_mcp_config(mcp_port: Option<u16>) -> Result<String, String> {
+    let port = mcp_port.unwrap_or(45557);
+    let token = crate::mcp_server::get_or_init_auth_token();
+    let dir = agents_ui_dir()?;
+    let path = write_mcp_config_in_directory(&dir, port, &token)?;
+    Ok(path_to_utf8(&path, "agent MCP path")?.to_string())
 }
 
 /// Build command parts for Claude Code CLI.
@@ -118,7 +440,7 @@ fn build_claude_cmd(
         "--verbose".into(),
         "--include-partial-messages".into(),
         "--mcp-config".into(),
-        shell_escape(&mcp_config_path.to_string_lossy()),
+        shell_escape(path_to_utf8(mcp_config_path, "agent MCP path")?),
     ];
 
     if let Some(sid) = session_id {
@@ -188,7 +510,7 @@ fn build_codex_cmd(
     parts.push("-c".into());
     parts.push(format!(
         "instructions_file={}",
-        shell_escape(&instructions_path.to_string_lossy())
+        shell_escape(path_to_utf8(&instructions_path, "Codex instructions path")?)
     ));
 
     Ok(parts)
@@ -397,11 +719,14 @@ pub async fn get_agent_terminal_command(
         }
     } else {
         parts.push("--mcp-config".into());
-        parts.push(mcp_config_path.to_string_lossy().to_string());
+        parts.push(shell_escape(path_to_utf8(
+            &mcp_config_path,
+            "agent MCP path",
+        )?));
     }
 
     if let Some(args) = extra_args {
-        parts.extend(args);
+        append_shell_escaped_args(&mut parts, args);
     }
 
     Ok(parts.join(" "))
@@ -503,23 +828,7 @@ pub fn do_register_mcp_with_agents(port: u16, token: &str) -> McpRegistrationRes
 
 fn write_mcp_config_sync(port: u16, token: &str) -> Result<(), String> {
     let dir = agents_ui_dir()?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create dir: {e}"))?;
-    let path = dir.join("mcp-config.json");
-
-    let config = serde_json::json!({
-        "mcpServers": {
-            "agents-ui": {
-                "type": "http",
-                "url": format!("http://127.0.0.1:{port}/mcp"),
-                "headers": {
-                    "Authorization": format!("Bearer {token}")
-                }
-            }
-        }
-    });
-
-    let json = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
-    std::fs::write(&path, &json).map_err(|e| format!("write: {e}"))?;
+    write_mcp_config_in_directory(&dir, port, token)?;
     Ok(())
 }
 
@@ -698,7 +1007,7 @@ fn build_claude_task_cmd(
         shell_escape(prompt),
         "--verbose".into(),
         "--mcp-config".into(),
-        shell_escape(&mcp_config_path.to_string_lossy()),
+        shell_escape(path_to_utf8(mcp_config_path, "agent MCP path")?),
     ];
 
     let default_tools = "mcp__agents-ui__*";
@@ -748,7 +1057,7 @@ fn build_codex_task_cmd(
     parts.push("-c".into());
     parts.push(format!(
         "instructions_file={}",
-        shell_escape(&instructions_path.to_string_lossy())
+        shell_escape(path_to_utf8(&instructions_path, "Codex instructions path")?)
     ));
 
     Ok(parts)
@@ -801,4 +1110,272 @@ pub async fn register_mcp_with_agents(port: Option<u16>) -> Result<McpRegistrati
         .await
         .map_err(|e| format!("join error: {e}"))?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        append_shell_escaped_args, shell_escape, validated_shell_path,
+    };
+    #[cfg(target_family = "unix")]
+    use super::{
+        create_mcp_config_stage_with_ids, effective_user_id,
+        ensure_private_agents_ui_directory, ensure_private_agents_ui_directory_for_uid,
+        mcp_config_stage_path, replace_file_atomically, verify_private_mcp_config,
+        write_mcp_config_in_directory, write_private_mcp_config_with_publish,
+        write_private_mcp_config_with_publish_and_sync, MCP_CONFIG_FILE_NAME,
+    };
+    #[cfg(target_family = "unix")]
+    use std::io::Write;
+
+    struct TestDirectory(std::path::PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_directory(label: &str) -> TestDirectory {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "agents-ui-agent-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create agent test directory");
+        TestDirectory(path)
+    }
+
+    #[test]
+    fn shell_validation_preserves_an_exact_executable_path() {
+        let root = test_directory("shell");
+        let shell = root.0.join("  shell runner-目录  ");
+        std::fs::write(&shell, "#!/bin/sh\n").expect("write test shell");
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
+                .expect("make test shell executable");
+        }
+        let exact = shell.to_str().expect("test path is UTF-8").to_string();
+
+        assert_eq!(validated_shell_path(&exact), Some(exact));
+        assert_eq!(validated_shell_path("relative-shell"), None);
+        assert_eq!(validated_shell_path("/definitely/missing/agents-ui-shell"), None);
+        assert_eq!(validated_shell_path(root.0.to_str().unwrap()), None);
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn shell_validation_rejects_a_non_executable_file() {
+        let root = test_directory("non-executable-shell");
+        let shell = root.0.join("shell");
+        std::fs::write(&shell, "#!/bin/sh\n").expect("write test shell");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o644))
+            .expect("set non-executable permissions");
+        assert_eq!(validated_shell_path(shell.to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn terminal_command_dynamic_arguments_are_shell_escaped() {
+        let mut parts = vec!["claude".to_string(), "--mcp-config".to_string()];
+        append_shell_escaped_args(
+            &mut parts,
+            vec![
+                "/tmp/MCP path/config.json".to_string(),
+                "--model".to_string(),
+                "it's-$HOME-`touch owned`; echo bad".to_string(),
+            ],
+        );
+
+        assert_eq!(parts[1], "--mcp-config");
+        assert_eq!(parts[2], "'/tmp/MCP path/config.json'");
+        assert_eq!(parts[3], "--model");
+        assert_eq!(parts[4], "'it'\\''s-$HOME-`touch owned`; echo bad'");
+        assert_eq!(shell_escape("--full-auto"), "--full-auto");
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn mcp_config_and_agent_directory_are_private() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = test_directory("mcp-private");
+        let dir = root.0.join(".agents-ui");
+        std::fs::create_dir(&dir).expect("create agent directory");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("make directory initially permissive");
+        let initial_path = dir.join(MCP_CONFIG_FILE_NAME);
+        std::fs::write(&initial_path, b"old").expect("create old MCP config");
+        std::fs::set_permissions(&initial_path, std::fs::Permissions::from_mode(0o644))
+            .expect("make old MCP config initially permissive");
+
+        let path = write_mcp_config_in_directory(&dir, 45557, "test-bearer-token")
+            .expect("write private MCP config");
+        let dir_metadata = std::fs::symlink_metadata(&dir).expect("inspect agent directory");
+        let file_metadata = std::fs::symlink_metadata(&path).expect("inspect MCP config");
+
+        assert_eq!(path, dir.join(MCP_CONFIG_FILE_NAME));
+        assert_eq!(dir_metadata.uid(), effective_user_id());
+        assert_eq!(dir_metadata.permissions().mode() & 0o777, 0o700);
+        assert!(file_metadata.is_file());
+        assert!(!file_metadata.file_type().is_symlink());
+        assert_eq!(file_metadata.uid(), effective_user_id());
+        assert_eq!(file_metadata.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn existing_mcp_config_symlink_is_replaced_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_directory("mcp-file-symlink");
+        let dir = root.0.join(".agents-ui");
+        ensure_private_agents_ui_directory(&dir).expect("create private agent directory");
+        let victim = root.0.join("victim");
+        std::fs::write(&victim, b"untouched").expect("create victim");
+        let config_path = dir.join(MCP_CONFIG_FILE_NAME);
+        symlink(&victim, &config_path).expect("plant MCP config symlink");
+
+        let published = write_mcp_config_in_directory(&dir, 45557, "private-token")
+            .expect("atomically replace MCP config symlink");
+
+        assert_eq!(published, config_path);
+        let metadata = std::fs::symlink_metadata(&published).expect("inspect published config");
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn symlinked_agent_directory_is_rejected_without_writing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_directory("mcp-dir-symlink");
+        let outside = test_directory("mcp-dir-outside");
+        let dir = root.0.join(".agents-ui");
+        symlink(&outside.0, &dir).expect("plant agent directory symlink");
+
+        let error = write_mcp_config_in_directory(&dir, 45557, "must-not-escape")
+            .expect_err("symlinked agent directory must fail closed");
+
+        assert!(error.contains("symbolic link"), "{error}");
+        assert!(!outside.0.join(MCP_CONFIG_FILE_NAME).exists());
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn agent_directory_with_unexpected_owner_is_rejected_before_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_directory("mcp-dir-owner");
+        let dir = root.0.join(".agents-ui");
+        std::fs::create_dir(&dir).expect("create agent directory");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("set original directory mode");
+
+        let error = ensure_private_agents_ui_directory_for_uid(
+            &dir,
+            effective_user_id().wrapping_add(1),
+        )
+        .expect_err("unexpected owner must fail closed");
+
+        assert!(error.contains("not owned"), "{error}");
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "ownership must be checked before changing permissions"
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn preplanted_mcp_stage_symlink_is_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_directory("mcp-stage-symlink");
+        let dir = root.0.join(".agents-ui");
+        ensure_private_agents_ui_directory(&dir).expect("create private agent directory");
+        let victim = root.0.join("victim");
+        std::fs::write(&victim, b"untouched").expect("create victim");
+        let planted_id = 7;
+        let usable_id = 8;
+        let planted = mcp_config_stage_path(&dir, planted_id);
+        symlink(&victim, &planted).expect("plant staging symlink");
+        let mut ids = [planted_id, usable_id].into_iter();
+
+        let (stage, mut file) = create_mcp_config_stage_with_ids(&dir, || {
+            ids.next().expect("stage allocator retried unexpectedly")
+        })
+        .expect("skip planted staging path");
+        assert_eq!(stage.path, mcp_config_stage_path(&dir, usable_id));
+        file.write_all(b"staged").expect("write staging file");
+        file.sync_all().expect("sync staging file");
+        drop(file);
+        drop(stage);
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert!(std::fs::symlink_metadata(&planted)
+            .expect("inspect planted symlink")
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn failed_publish_preserves_existing_file_and_cleans_stage() {
+        let root = test_directory("mcp-publish-failure");
+        let dir = root.0.join(".agents-ui");
+        ensure_private_agents_ui_directory(&dir).expect("create private agent directory");
+        let destination = dir.join("sentinel");
+        std::fs::write(&destination, b"original").expect("write original destination");
+
+        let error = write_private_mcp_config_with_publish(
+            &dir,
+            &destination,
+            b"replacement",
+            |_stage, _destination| Err(std::io::Error::other("injected publish failure")),
+        )
+        .expect_err("injected publish failure must be reported");
+
+        assert!(error.contains("injected publish failure"), "{error}");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        let stages = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".mcp-config.json.stage-"))
+            })
+            .count();
+        assert_eq!(stages, 0);
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn unsupported_directory_sync_does_not_report_failure_after_publish() {
+        let root = test_directory("mcp-directory-sync-unsupported");
+        let dir = root.0.join(".agents-ui");
+        ensure_private_agents_ui_directory(&dir).expect("create private agent directory");
+        let destination = dir.join(MCP_CONFIG_FILE_NAME);
+
+        write_private_mcp_config_with_publish_and_sync(
+            &dir,
+            &destination,
+            b"private config",
+            replace_file_atomically,
+            |_directory| Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        )
+        .expect("post-commit unsupported directory sync must be best effort");
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"private config");
+        verify_private_mcp_config(&destination).expect("published config remains private");
+    }
 }

@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import Editor, { loader } from "@monaco-editor/react";
 import * as bundledMonaco from "monaco-editor";
 import React from "react";
-import { shortenPathSmart } from "../pathDisplay";
+import { localFileUrlForPath, shortenPathSmart } from "../pathDisplay";
 import { useClampedMenuPosition } from "../hooks/useClampedMenuPosition";
 import { Icon } from "./Icon";
 import { ConfirmActionModal } from "./modals/ConfirmActionModal";
@@ -248,10 +248,7 @@ function normalizeBrowserUrl(input: string): string {
   new URL(candidate);
   return candidate;
 }
-const isHtmlPath = (path: string) => /\.(x?html?|htm)$/i.test(path.trim());
-// file:// URL for a local absolute path (spaces etc. percent-encoded, slashes kept).
-const fileUrlForPath = (path: string) => `file://${encodeURI(path)}`;
-
+const isHtmlPath = (path: string) => /\.(x?html?|htm)$/i.test(path);
 type FileProbe = {
   size: number;
   mtimeMs?: number | null;
@@ -329,17 +326,15 @@ type PendingCloseAction =
 type TabMenuState = { x: number; y: number; path: string };
 
 function basename(path: string): string {
-  const trimmed = path.trim();
-  if (!trimmed || trimmed === "/") return "/";
-  const cleaned = trimmed.replace(/\/+$/, "");
+  if (!path || path === "/") return "/";
+  const cleaned = path.replace(/\/+$/, "");
   const idx = cleaned.lastIndexOf("/");
   return idx >= 0 ? cleaned.slice(idx + 1) : cleaned;
 }
 
 function dirname(path: string): string {
-  const trimmed = path.trim();
-  if (!trimmed || trimmed === "/") return "/";
-  const cleaned = trimmed.replace(/\/+$/, "");
+  if (!path || path === "/") return "/";
+  const cleaned = path.replace(/\/+$/, "");
   const idx = cleaned.lastIndexOf("/");
   if (idx <= 0) return "/";
   return cleaned.slice(0, idx);
@@ -1184,7 +1179,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   }, [provider, rootDir, serializeWorkspaceTab]);
 
   const resolveExistingTabPath = React.useCallback((input?: { tabId?: string | null; path?: string | null }): string | null => {
-    const candidate = ((input?.tabId ?? input?.path ?? "") as string).trim();
+    const candidate = (input?.tabId ?? input?.path ?? "") as string;
     if (!candidate) return activePathRef.current;
     if (openPathsRef.current.has(candidate)) return candidate;
     for (const [path, meta] of browserMetaRef.current.entries()) {
@@ -1408,7 +1403,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
 
   const openFile = React.useCallback(
     async (path: string, mode: CodeEditorOpenMode = "auto") => {
-      const normalized = path.trim();
+      const normalized = path;
       if (!normalized) return;
 
       // Browser tabs have no backing file — just activate them.
@@ -1558,7 +1553,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
         return serializeWorkspaceTab(tab);
       }
 
-      const path = (input.path ?? "").trim();
+      const path = input.path ?? "";
       if (!path) throw new Error("path is required");
       await openFile(path, input.mode ?? "auto");
       const tab = tabsRef.current.find((it) => it.path === path);
@@ -1582,7 +1577,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
             remotePath: path,
           });
         }
-        openBrowserTab(fileUrlForPath(localPath), basename(path));
+        openBrowserTab(localFileUrlForPath(localPath), basename(path));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         setSaveError(message);
@@ -1905,7 +1900,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
 
   const requestCloseTab = React.useCallback(
     (path: string) => {
-      const normalized = path.trim();
+      const normalized = path;
       if (!normalized) return;
       if (dirtyPathsRef.current.has(normalized)) {
         setPendingClose({ kind: "tab", path: normalized });
@@ -2042,16 +2037,15 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     lastFsEventNonceRef.current = fsEvent.nonce;
 
     if (fsEvent.type === "rename") {
-      const from = fsEvent.from.trim();
-      const to = fsEvent.to.trim();
+      const from = fsEvent.from;
+      const to = fsEvent.to;
       if (!from || !to || from === to) return;
       const fromPrefix = `${from}/`;
 
       const transformPath = (path: string): string => {
-        const trimmed = path.trim();
-        if (trimmed === from) return to;
-        if (trimmed.startsWith(fromPrefix)) return `${to}${trimmed.slice(from.length)}`;
-        return trimmed;
+        if (path === from) return to;
+        if (path.startsWith(fromPrefix)) return `${to}${path.slice(from.length)}`;
+        return path;
       };
 
       const activeBefore = activePathRef.current;
@@ -2131,7 +2125,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     }
 
     if (fsEvent.type === "delete") {
-      const base = fsEvent.path.trim();
+      const base = fsEvent.path;
       if (!base) return;
       const basePrefix = `${base}/`;
       const shouldClose = (path: string) => path === base || path.startsWith(basePrefix);

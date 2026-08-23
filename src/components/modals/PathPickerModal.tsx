@@ -1,5 +1,12 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { Modal } from "../../ui";
+import {
+  FILESYSTEM_TEXT_INPUT_PROPS,
+  armImeSubmitSuppression,
+  classifyImeEnter,
+  consumeImeSubmitSuppression,
+  isInvalidPosixBasename,
+} from "../filesystemInput";
 
 type DirectoryEntry = { name: string; path: string };
 type DirectoryListing = {
@@ -38,14 +45,12 @@ export function PathPickerModal({
   const [error, setError] = useState<string | null>(null);
   const [selectionName, setSelectionName] = useState(suggestedName ?? "");
   const loadRequestRef = React.useRef(0);
-  const selectionNameInvalid =
-    suggestedName !== undefined &&
-    (selectionName.length === 0 ||
-      selectionName === "." ||
-      selectionName === ".." ||
-      selectionName.includes("/") ||
-      selectionName.includes("\\") ||
-      selectionName.includes("\0"));
+  const pathInputRef = React.useRef<HTMLInputElement | null>(null);
+  const pathCompositionRef = React.useRef(false);
+  const pathSubmitSuppressionRef = React.useRef(0);
+  const selectionNameInputRef = React.useRef<HTMLInputElement | null>(null);
+  const selectionNameCompositionRef = React.useRef(false);
+  const selectionNameInvalid = suggestedName !== undefined && isInvalidPosixBasename(selectionName);
 
   const load = useCallback(async (path: string | null) => {
     const requestId = loadRequestRef.current + 1;
@@ -87,9 +92,13 @@ export function PathPickerModal({
             className="btn"
             disabled={!listing || loading || input !== listing.path || selectionNameInvalid}
             onClick={() => {
-              if (listing) {
-                onSelect(listing.path, suggestedName === undefined ? undefined : selectionName);
-              }
+              if (!listing || pathCompositionRef.current || selectionNameCompositionRef.current) return;
+              const selectedName =
+                suggestedName === undefined
+                  ? undefined
+                  : (selectionNameInputRef.current?.value ?? selectionName);
+              if (selectedName !== undefined && isInvalidPosixBasename(selectedName)) return;
+              onSelect(listing.path, selectedName);
             }}
           >
             {selectLabel}
@@ -100,7 +109,9 @@ export function PathPickerModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          void load(input.trim() || null);
+          if (pathCompositionRef.current || consumeImeSubmitSuppression(pathSubmitSuppressionRef)) return;
+          const literalPath = pathInputRef.current?.value ?? input;
+          void load(literalPath.length > 0 ? literalPath : null);
         }}
       >
         <div className="pathPickerHeader">
@@ -114,9 +125,25 @@ export function PathPickerModal({
             Up
           </button>
           <input
+            {...FILESYSTEM_TEXT_INPUT_PROPS}
+            ref={pathInputRef}
             className="input"
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onCompositionStart={() => {
+              pathCompositionRef.current = true;
+            }}
+            onCompositionEnd={(event) => {
+              pathCompositionRef.current = false;
+              setInput(event.currentTarget.value);
+            }}
+            onKeyDown={(event) => {
+              const disposition = classifyImeEnter(event.nativeEvent, pathCompositionRef.current);
+              if (disposition === "none") return;
+              armImeSubmitSuppression(pathSubmitSuppressionRef);
+              if (disposition === "trailing-enter") event.preventDefault();
+              event.stopPropagation();
+            }}
             placeholder={placeholder}
             aria-label="Folder path"
           />
@@ -131,16 +158,32 @@ export function PathPickerModal({
           <label className="pathPickerName">
             <span>{nameLabel}</span>
             <input
+              {...FILESYSTEM_TEXT_INPUT_PROPS}
+              ref={selectionNameInputRef}
               className="input"
               value={selectionName}
               onChange={(event) => setSelectionName(event.target.value)}
+              onCompositionStart={() => {
+                selectionNameCompositionRef.current = true;
+              }}
+              onCompositionEnd={(event) => {
+                selectionNameCompositionRef.current = false;
+                setSelectionName(event.currentTarget.value);
+              }}
+              onKeyDown={(event) => {
+                const disposition = classifyImeEnter(event.nativeEvent, selectionNameCompositionRef.current);
+                if (disposition === "none") return;
+                if (disposition === "trailing-enter") event.preventDefault();
+                event.stopPropagation();
+              }}
+              aria-label={nameLabel}
               aria-invalid={selectionNameInvalid}
               aria-describedby={selectionNameInvalid ? "path-picker-name-error" : undefined}
             />
           </label>
           {selectionNameInvalid && (
             <div id="path-picker-name-error" className="pathPickerError" role="alert">
-              Enter a non-empty name other than . or .., without slashes.
+              Enter a non-empty name other than . or .., without / or NUL.
             </div>
           )}
         </>

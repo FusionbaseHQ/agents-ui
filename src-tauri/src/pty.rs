@@ -1,6 +1,7 @@
 use crate::api_bridge::ApiEventBus;
 use crate::api_types::StateChangeNotification;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -985,7 +986,7 @@ fn capture_original_env(cmd: &mut CommandBuilder, name: &str, present_key: &str,
     match std::env::var_os(name) {
         Some(v) => {
             cmd.env(present_key, "1");
-            cmd.env(value_key, v.to_string_lossy().to_string());
+            cmd.env(value_key, v);
         }
         None => {
             cmd.env(present_key, "0");
@@ -994,7 +995,11 @@ fn capture_original_env(cmd: &mut CommandBuilder, name: &str, present_key: &str,
     }
 }
 
-#[cfg(target_family = "unix")]
+fn validated_shell_path(shell: &str) -> Option<String> {
+    let path = Path::new(shell);
+    (path.is_absolute() && is_executable_file(path)).then(|| shell.to_string())
+}
+
 #[cfg(target_family = "unix")]
 fn shell_from_passwd() -> Option<String> {
     let user = std::env::var("USER")
@@ -1006,23 +1011,16 @@ fn shell_from_passwd() -> Option<String> {
         if !line.starts_with(&prefix) {
             continue;
         }
-        let shell = line.split(':').last()?.trim();
-        if shell.is_empty() {
-            return None;
-        }
-        if Path::new(shell).is_file() {
-            return Some(shell.to_string());
-        }
-        return None;
+        let shell = line.split(':').last()?;
+        return validated_shell_path(shell);
     }
     None
 }
 
 fn default_user_shell() -> String {
     if let Ok(shell) = std::env::var("SHELL") {
-        let trimmed = shell.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
+        if let Some(shell) = validated_shell_path(&shell) {
+            return shell;
         }
     }
 
@@ -1046,9 +1044,38 @@ fn default_user_shell() -> String {
 }
 
 fn run_command_output_with_timeout(
+    cmd: Command,
+    timeout: Duration,
+    label: &str,
+) -> Result<std::process::Output, String> {
+    run_command_output_with_timeout_bounded(cmd, timeout, label, 256 * 1024, 256 * 1024)
+}
+
+fn read_pipe_bounded(mut reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
+    let mut output = Vec::with_capacity(limit.min(8192));
+    let mut chunk = [0u8; 8192];
+    let mut exceeded = false;
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                let remaining = limit.saturating_sub(output.len());
+                let keep = read.min(remaining);
+                output.extend_from_slice(&chunk[..keep]);
+                exceeded |= keep < read;
+            }
+            Err(_) => break,
+        }
+    }
+    (output, exceeded)
+}
+
+fn run_command_output_with_timeout_bounded(
     mut cmd: Command,
     timeout: Duration,
     label: &str,
+    stdout_limit: usize,
+    stderr_limit: usize,
 ) -> Result<std::process::Output, String> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -1063,19 +1090,13 @@ fn run_command_output_with_timeout(
         .take()
         .ok_or_else(|| format!("{label} failed: missing stderr pipe"))?;
 
-    let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>();
-    let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>();
+    let (stdout_tx, stdout_rx) = mpsc::channel::<(Vec<u8>, bool)>();
+    let (stderr_tx, stderr_rx) = mpsc::channel::<(Vec<u8>, bool)>();
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut reader = stdout_pipe;
-        let _ = reader.read_to_end(&mut buf);
-        let _ = stdout_tx.send(buf);
+        let _ = stdout_tx.send(read_pipe_bounded(stdout_pipe, stdout_limit));
     });
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut reader = stderr_pipe;
-        let _ = reader.read_to_end(&mut buf);
-        let _ = stderr_tx.send(buf);
+        let _ = stderr_tx.send(read_pipe_bounded(stderr_pipe, stderr_limit));
     });
 
     let started = Instant::now();
@@ -1094,18 +1115,112 @@ fn run_command_output_with_timeout(
         }
     };
 
-    let stdout = stdout_rx
+    let (stdout, stdout_exceeded) = stdout_rx
         .recv_timeout(Duration::from_millis(200))
-        .unwrap_or_default();
-    let stderr = stderr_rx
+        .unwrap_or_else(|_| (Vec::new(), true));
+    let (stderr, stderr_exceeded) = stderr_rx
         .recv_timeout(Duration::from_millis(200))
-        .unwrap_or_default();
+        .unwrap_or_else(|_| (Vec::new(), true));
+    if stdout_exceeded || stderr_exceeded {
+        return Err(format!("{label} exceeded its bounded output limit"));
+    }
 
     Ok(std::process::Output {
         status,
         stdout,
         stderr,
     })
+}
+
+fn unique_nul_marker(output: &[u8], marker: &[u8]) -> Option<usize> {
+    if marker.is_empty() {
+        return None;
+    }
+    let mut found = None;
+    for (index, window) in output.windows(marker.len() + 1).enumerate() {
+        if &window[..marker.len()] == marker && window[marker.len()] == 0 {
+            if found.replace(index).is_some() {
+                return None;
+            }
+        }
+    }
+    found
+}
+
+fn extract_nul_framed_utf8(
+    output: &[u8],
+    magic: &[u8],
+    trailer: &[u8],
+    output_limit: usize,
+    value_limit: usize,
+) -> Option<String> {
+    if output.len() > output_limit || magic.is_empty() || trailer.is_empty() {
+        return None;
+    }
+    let magic_end = unique_nul_marker(output, magic)? + magic.len();
+    let trailer_start = unique_nul_marker(output, trailer)?;
+    let value_start = magic_end + 1;
+    let value_end = output[value_start..]
+        .iter()
+        .position(|byte| *byte == 0)?
+        + value_start;
+    let value = &output[value_start..value_end];
+    if value.is_empty() || value.len() > value_limit {
+        return None;
+    }
+    if value_end + 1 != trailer_start {
+        return None;
+    }
+    std::str::from_utf8(value).ok().map(str::to_owned)
+}
+
+fn has_complete_nul_frame(output: &[u8], magic: &[u8], trailer: &[u8]) -> bool {
+    let Some(magic_end) = unique_nul_marker(output, magic).map(|start| start + magic.len()) else {
+        return false;
+    };
+    let value_start = magic_end + 1;
+    let Some(value_end) = output[value_start..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .map(|offset| value_start + offset)
+    else {
+        return false;
+    };
+    unique_nul_marker(output, trailer).is_some_and(|start| start == value_end + 1)
+}
+
+fn random_frame_token(label: &str) -> Result<String, String> {
+    let mut nonce = [0u8; 16];
+    OsRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|error| format!("generate login-shell PATH frame nonce failed: {error}"))?;
+    let nonce = nonce
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("__AGENTS_UI_{label}_{}__", nonce))
+}
+
+fn path_to_utf8_string(path: &Path, context: &str) -> Result<String, String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{context} is not valid UTF-8"))
+}
+
+#[cfg(target_os = "macos")]
+fn push_exact_absolute_path_entry(path_entries: &mut Vec<String>, value: &str) {
+    // Shell startup scripts can pollute PATH with diagnostic text. Reject
+    // malformed entries, but never turn one path into another by trimming it.
+    if value.is_empty()
+        || !value.starts_with('/')
+        || value.contains('\n')
+        || value.contains('\r')
+    {
+        return;
+    }
+    if !path_entries.iter().any(|path| path == value) {
+        path_entries.push(value.to_string());
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1116,41 +1231,36 @@ fn login_shell_path(shell: &str, base_path: &str) -> Option<String> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    const START: &str = "__AGENTS_UI_PATH_START__";
-    const END: &str = "__AGENTS_UI_PATH_END__";
+    const CAPTURE_MAX_BYTES: usize = 64 * 1024;
+    const PATH_MAX_BYTES: usize = 32 * 1024;
+    let magic = random_frame_token("PATH_V2").ok()?;
+    let trailer = random_frame_token("PATH_DONE_V2").ok()?;
 
     let (script, arg_sets): (String, Vec<Vec<&str>>) =
         if shell_name.contains("zsh") || shell_name.contains("bash") {
             (
-                format!("printf '{START}%s{END}' \"$PATH\""),
+                format!("printf '%s\\0%s\\0%s\\0' '{magic}' \"$PATH\" '{trailer}'"),
                 vec![vec!["-i", "-l", "-c"]],
             )
         } else if shell_name == "fish" {
             (
-                format!("printf '{START}%s{END}' (string join ':' $PATH)"),
+                format!(
+                    "printf '%s\\0%s\\0%s\\0' '{magic}' (string join ':' $PATH) '{trailer}'"
+                ),
                 vec![vec!["-i", "-l", "-c"], vec!["-l", "-c"]],
             )
         } else if shell_name == "nu" || shell_name == "nushell" {
             (
-                format!("print $\"{START}($env.PATH | str join ':'){END}\""),
+                format!(
+                    "print --no-newline $\"{magic}(char --integer 0)($env.PATH | str join ':')(char --integer 0){trailer}(char --integer 0)\""
+                ),
                 vec![vec!["-l", "-c"], vec!["-i", "-l", "-c"]],
             )
         } else {
             return None;
         };
 
-    let extract_path = |stdout: &str| -> Option<String> {
-        let start = stdout.find(START)?;
-        let rest = &stdout[start + START.len()..];
-        let end = rest.find(END)?;
-        let path = rest[..end].trim();
-        if path.is_empty() {
-            return None;
-        }
-        Some(path.to_string())
-    };
-
-    let run_with_pty = |args: &[&str]| -> Option<String> {
+    let run_with_pty = |args: &[&str]| -> Option<Vec<u8>> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -1171,50 +1281,63 @@ fn login_shell_path(shell: &str, base_path: &str) -> Option<String> {
 
         let mut child = pair.slave.spawn_command(cmd).ok()?;
         let mut reader = pair.master.try_clone_reader().ok()?;
-        let (tx, rx) = mpsc::channel::<String>();
+        let reader_magic = magic.as_bytes().to_vec();
+        let reader_trailer = trailer.as_bytes().to_vec();
+        let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
-            let mut utf8_carry: Vec<u8> = Vec::new();
-            let mut output = String::new();
+            let mut output = Vec::new();
+            let mut valid = true;
 
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        output.push_str(&decode_utf8_stream(&mut utf8_carry, &buf[..n]));
-                        if output.contains(START) && output.contains(END) {
+                        let remaining = CAPTURE_MAX_BYTES.saturating_sub(output.len());
+                        let keep = n.min(remaining);
+                        output.extend_from_slice(&buf[..keep]);
+                        if has_complete_nul_frame(
+                            &output,
+                            &reader_magic,
+                            &reader_trailer,
+                        ) {
+                            break;
+                        }
+                        if keep < n {
+                            valid = false;
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        valid = false;
+                        break;
+                    }
                 }
             }
 
-            if !utf8_carry.is_empty() {
-                output.push_str(&String::from_utf8_lossy(&utf8_carry));
-            }
-            let _ = tx.send(output);
+            let _ = tx.send(valid.then_some(output));
         });
 
         let output = match rx.recv_timeout(Duration::from_millis(2000)) {
             Ok(data) => data,
-            Err(RecvTimeoutError::Timeout) => String::new(),
-            Err(RecvTimeoutError::Disconnected) => String::new(),
+            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => None,
         };
 
         let _ = child.kill();
         let _ = child.wait();
 
-        if output.is_empty() {
-            None
-        } else {
-            Some(output)
-        }
+        output
     };
 
     for args in &arg_sets {
         if let Some(stdout) = run_with_pty(args.as_slice()) {
-            if let Some(path) = extract_path(&stdout) {
+            if let Some(path) = extract_nul_framed_utf8(
+                &stdout,
+                magic.as_bytes(),
+                trailer.as_bytes(),
+                CAPTURE_MAX_BYTES,
+                PATH_MAX_BYTES,
+            ) {
                 return Some(path);
             }
         }
@@ -1228,17 +1351,24 @@ fn login_shell_path(shell: &str, base_path: &str) -> Option<String> {
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
             .env("SHELL", shell);
-        let out = match run_command_output_with_timeout(
+        let out = match run_command_output_with_timeout_bounded(
             cmd,
             Duration::from_millis(2000),
             "login shell PATH probe",
+            CAPTURE_MAX_BYTES,
+            CAPTURE_MAX_BYTES,
         ) {
             Ok(out) => out,
             Err(_) => continue,
         };
 
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if let Some(path) = extract_path(&stdout) {
+        if let Some(path) = extract_nul_framed_utf8(
+            &out.stdout,
+            magic.as_bytes(),
+            trailer.as_bytes(),
+            CAPTURE_MAX_BYTES,
+            PATH_MAX_BYTES,
+        ) {
             return Some(path);
         }
     }
@@ -1377,11 +1507,8 @@ fn zellij_list_sessions(
 ) -> Result<Vec<String>, String> {
     let mut cmd = Command::new(zellij);
     cmd.args(["list-sessions", "--short", "--no-formatting"])
-        .env("HOME", zellij_home.to_string_lossy().to_string())
-        .env(
-            "ZELLIJ_SOCKET_DIR",
-            socket_dir.to_string_lossy().to_string(),
-        );
+        .env("HOME", zellij_home)
+        .env("ZELLIJ_SOCKET_DIR", socket_dir);
     let out = run_command_output_with_timeout(
         cmd,
         Duration::from_millis(2000),
@@ -1592,11 +1719,8 @@ pub fn kill_persistent_session(app: AppHandle, persist_id: String) -> Result<(),
         for socket_dir in zellij_socket_dir_candidates(&zellij_paths.socket_dir) {
             let out = Command::new(&zellij)
                 .args(["kill-session", &session_name])
-                .env("HOME", zellij_paths.home_dir.to_string_lossy().to_string())
-                .env(
-                    "ZELLIJ_SOCKET_DIR",
-                    socket_dir.to_string_lossy().to_string(),
-                )
+                .env("HOME", &zellij_paths.home_dir)
+                .env("ZELLIJ_SOCKET_DIR", &socket_dir)
                 .output()
                 .map_err(|e| format!("failed to run bundled zellij: {e}"))?;
             if out.status.success() {
@@ -1605,11 +1729,8 @@ pub fn kill_persistent_session(app: AppHandle, persist_id: String) -> Result<(),
 
             let fallback = Command::new(&zellij)
                 .args(["delete-session", "--force", &session_name])
-                .env("HOME", zellij_paths.home_dir.to_string_lossy().to_string())
-                .env(
-                    "ZELLIJ_SOCKET_DIR",
-                    socket_dir.to_string_lossy().to_string(),
-                )
+                .env("HOME", &zellij_paths.home_dir)
+                .env("ZELLIJ_SOCKET_DIR", &socket_dir)
                 .output()
                 .ok();
             if let Some(out) = fallback {
@@ -1882,35 +2003,35 @@ fn write_zsh_startup_files(temp_dir: &Path, orig_dir: &Path) -> Result<(), Strin
     let orig_zlogin = orig_dir.join(".zlogin");
     let orig_zshrc = orig_dir.join(".zshrc");
 
-    let orig_dir_str = orig_dir.to_string_lossy();
+    let orig_dir_str = path_to_utf8_string(orig_dir, "shell startup directory")?;
 
-    let source_if_exists = |path: &Path| -> String {
-        let path_str = path.to_string_lossy();
-        format!(
+    let source_if_exists = |path: &Path| -> Result<String, String> {
+        let path_str = path_to_utf8_string(path, "shell startup file")?;
+        Ok(format!(
             "if [ -f {q} ]; then source {q}; fi\n",
-            q = sh_single_quote(path_str.as_ref())
-        )
+            q = sh_single_quote(&path_str)
+        ))
     };
 
-    let orig_dir_quoted = sh_single_quote(orig_dir_str.as_ref());
+    let orig_dir_quoted = sh_single_quote(&orig_dir_str);
 
-    let wrap_source = |orig_file: &Path, restore_to_temp: bool| -> String {
+    let wrap_source = |orig_file: &Path, restore_to_temp: bool| -> Result<String, String> {
         let mut out = String::new();
         out.push_str("typeset -g __agents_ui_temp_zdotdir=\"$ZDOTDIR\"\n");
         out.push_str(&format!("export ZDOTDIR={orig_dir_quoted}\n"));
-        out.push_str(&source_if_exists(orig_file));
+        out.push_str(&source_if_exists(orig_file)?);
         if restore_to_temp {
             out.push_str("export ZDOTDIR=\"$__agents_ui_temp_zdotdir\"\n");
         }
         out.push_str("unset __agents_ui_temp_zdotdir\n");
-        out
+        Ok(out)
     };
 
-    fs::write(&zshenv, wrap_source(&orig_zshenv, true)).map_err(|e| e.to_string())?;
-    fs::write(&zprofile, wrap_source(&orig_zprofile, true)).map_err(|e| e.to_string())?;
-    fs::write(&zlogin, wrap_source(&orig_zlogin, false)).map_err(|e| e.to_string())?;
+    fs::write(&zshenv, wrap_source(&orig_zshenv, true)?).map_err(|e| e.to_string())?;
+    fs::write(&zprofile, wrap_source(&orig_zprofile, true)?).map_err(|e| e.to_string())?;
+    fs::write(&zlogin, wrap_source(&orig_zlogin, false)?).map_err(|e| e.to_string())?;
 
-    let mut zshrc_contents = wrap_source(&orig_zshrc, false);
+    let mut zshrc_contents = wrap_source(&orig_zshrc, false)?;
     zshrc_contents.push_str(
         r#"
 __agents_ui_emit_cwd() {
@@ -2054,7 +2175,7 @@ pub struct ShellInfo {
 }
 
 fn shell_family_from_name(name: &str) -> &'static str {
-    let n = name.trim().to_ascii_lowercase();
+    let n = name.to_ascii_lowercase();
     if n == "nu" || n == "nushell" {
         "nu"
     } else if n.contains("agsh") {
@@ -2117,13 +2238,19 @@ fn shell_supports_integration(family: &str) -> bool {
     matches!(family, "nu" | "zsh" | "bash" | "fish")
 }
 
-#[cfg(target_family = "unix")]
 fn is_executable_file(path: &Path) -> bool {
+    #[cfg(target_family = "unix")]
+    {
     use std::os::unix::fs::PermissionsExt;
-    match fs::metadata(path) {
+    return match fs::metadata(path) {
         // `fs::metadata` follows symlinks, so /usr/local/bin/zsh → /bin/zsh works.
         Ok(m) => m.is_file() && (m.permissions().mode() & 0o111 != 0),
         Err(_) => false,
+    };
+    }
+    #[cfg(not(target_family = "unix"))]
+    {
+        path.is_file()
     }
 }
 
@@ -2151,17 +2278,18 @@ fn probe_shell_version(path: &str, family: &str) -> Option<String> {
     }
 }
 
+#[cfg(target_family = "unix")]
+fn push_unique_exact_path(paths: &mut Vec<String>, path: &str) {
+    if !path.is_empty() && !paths.iter().any(|existing| existing == path) {
+        paths.push(path.to_string());
+    }
+}
+
 /// Union of candidate shell paths from several independent sources, so one
 /// failing source can never blank the list.
 #[cfg(target_family = "unix")]
 fn shell_candidate_paths() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let push = |p: &str, out: &mut Vec<String>| {
-        let t = p.trim().to_string();
-        if !t.is_empty() && !out.iter().any(|e| e == &t) {
-            out.push(t);
-        }
-    };
 
     // 1. /etc/shells — canonical login-approved shells on macOS.
     if let Ok(contents) = fs::read_to_string("/etc/shells") {
@@ -2170,18 +2298,20 @@ fn shell_candidate_paths() -> Vec<String> {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            push(line, &mut out);
+            push_unique_exact_path(&mut out, line);
         }
     }
 
     // 2. $SHELL — the user's configured login shell.
     if let Ok(s) = std::env::var("SHELL") {
-        push(&s, &mut out);
+        if let Some(s) = validated_shell_path(&s) {
+            push_unique_exact_path(&mut out, &s);
+        }
     }
 
     // 3. passwd entry.
     if let Some(s) = shell_from_passwd() {
-        push(&s, &mut out);
+        push_unique_exact_path(&mut out, &s);
     }
 
     // 4. Well-known absolute paths.
@@ -2199,7 +2329,7 @@ fn shell_candidate_paths() -> Vec<String> {
         for n in NAMES {
             let p = format!("{d}/{n}");
             if Path::new(&p).exists() {
-                push(&p, &mut out);
+                push_unique_exact_path(&mut out, &p);
             }
         }
     }
@@ -2207,13 +2337,13 @@ fn shell_candidate_paths() -> Vec<String> {
     // 5. PATH lookup — catches nonstandard prefixes (nix, asdf, custom).
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in path_var.split(':') {
-            if dir.trim().is_empty() {
+            if dir.is_empty() {
                 continue;
             }
             for n in NAMES {
                 let p = format!("{dir}/{n}");
                 if Path::new(&p).exists() {
-                    push(&p, &mut out);
+                    push_unique_exact_path(&mut out, &p);
                 }
             }
         }
@@ -2226,10 +2356,9 @@ fn shell_candidate_paths() -> Vec<String> {
 fn detect_shells_uncached() -> Vec<ShellInfo> {
     let login_default = default_user_shell();
     let login_default_canon = fs::canonicalize(&login_default)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| login_default.clone());
+        .unwrap_or_else(|_| PathBuf::from(&login_default));
 
-    let mut seen: Vec<String> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
     let mut shells: Vec<ShellInfo> = Vec::new();
 
     // Bundled shells come first: agsh (the app default), then Nushell. Both
@@ -2267,9 +2396,7 @@ fn detect_shells_uncached() -> Vec<ShellInfo> {
             continue;
         }
         // Dedupe by canonical (symlink-resolved) path.
-        let canon = fs::canonicalize(&cand)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| cand.clone());
+        let canon = fs::canonicalize(&cand).unwrap_or_else(|_| PathBuf::from(&cand));
         if seen.iter().any(|s| s == &canon) {
             continue;
         }
@@ -2279,8 +2406,15 @@ fn detect_shells_uncached() -> Vec<ShellInfo> {
         let family = shell_family_from_name(&fname).to_string();
         let version = probe_shell_version(&cand, &family);
         let is_login_default = canon == login_default_canon;
+        // ShellInfo is serialized as UTF-8. If a canonical symlink target is
+        // not representable, keep the exact user-visible launch path as the ID
+        // instead of substituting replacement characters.
+        let id = canon
+            .to_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| cand.clone());
         shells.push(ShellInfo {
-            id: canon,
+            id,
             kind: "system".to_string(),
             display_name: shell_display_name(&family, &fname),
             supports_integration: shell_supports_integration(&family),
@@ -2355,7 +2489,7 @@ fn resolve_shell(
 
     match choice {
         Some(c) if c.kind == "system" => match c.path.as_deref() {
-            Some(p) if is_executable_file(Path::new(p)) => {
+            Some(p) if validated_shell_path(p).is_some() => {
                 (ResolvedShell::System(p.to_string()), None)
             }
             Some(p) => (
@@ -2626,10 +2760,10 @@ $env.PROMPT_MULTILINE_INDICATOR = {|| "… " }
     }
 
     Some((
-        config_home.to_string_lossy().to_string(),
-        data_home.to_string_lossy().to_string(),
-        cache_home.to_string_lossy().to_string(),
-        runtime_dir.to_string_lossy().to_string(),
+        config_home.to_str()?.to_string(),
+        data_home.to_str()?.to_string(),
+        cache_home.to_str()?.to_string(),
+        runtime_dir.to_str()?.to_string(),
     ))
 }
 
@@ -2640,6 +2774,10 @@ pub fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionInfo>, Str
         .iter()
         .map(|(id, session)| session_info(id, session))
         .collect())
+}
+
+fn exact_existing_directory(path: String) -> Option<String> {
+    (!path.is_empty() && Path::new(&path).is_dir()).then_some(path)
 }
 
 #[tauri::command]
@@ -2750,9 +2888,7 @@ pub fn create_session(
     }
 
     let cwd = cwd
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .filter(|s| Path::new(s).is_dir())
+        .and_then(exact_existing_directory)
         .or_else(|| {
             #[cfg(target_family = "unix")]
             {
@@ -2777,13 +2913,19 @@ pub fn create_session(
             .clone()
             .ok_or("persistId is required for persistent sessions")?;
         let zellij_session = agents_ui_zellij_session_name(&persist_id);
-        let zellij_config = ensure_zellij_config(&app).map(|p| p.to_string_lossy().to_string());
+        let zellij_config = ensure_zellij_config(&app)
+            .map(|path| path_to_utf8_string(&path, "zellij config path"))
+            .transpose()?;
         let zellij_paths =
             ensure_zellij_paths(&app).ok_or("unable to determine app data dir".to_string())?;
 
         let (inner_shell, inner_use_nu) = match &resolved_shell {
-            ResolvedShell::BundledNu(nu) => (nu.to_string_lossy().to_string(), true),
-            ResolvedShell::BundledAgsh(agsh) => (agsh.to_string_lossy().to_string(), false),
+            ResolvedShell::BundledNu(nu) => {
+                (path_to_utf8_string(nu, "bundled Nushell path")?, true)
+            }
+            ResolvedShell::BundledAgsh(agsh) => {
+                (path_to_utf8_string(agsh, "bundled agsh path")?, false)
+            }
             ResolvedShell::System(p) => (p.clone(), false),
         };
 
@@ -2798,8 +2940,8 @@ pub fn create_session(
             }
         }
         persistent_zellij_env = Some((
-            zellij_paths.home_dir.to_string_lossy().to_string(),
-            socket_dir.to_string_lossy().to_string(),
+            path_to_utf8_string(&zellij_paths.home_dir, "zellij home path")?,
+            path_to_utf8_string(&socket_dir, "zellij socket path")?,
         ));
 
         let mut zellij_args: Vec<String> = Vec::new();
@@ -2818,7 +2960,7 @@ pub fn create_session(
         };
 
         (
-            zellij.to_string_lossy().to_string(),
+            path_to_utf8_string(&zellij, "bundled zellij path")?,
             zellij_args,
             shown_command,
             inner_use_nu,
@@ -2827,7 +2969,7 @@ pub fn create_session(
     } else if is_shell {
         match &resolved_shell {
             ResolvedShell::BundledNu(nu) => (
-                nu.to_string_lossy().to_string(),
+                path_to_utf8_string(nu, "bundled Nushell path")?,
                 Vec::new(),
                 "nu".to_string(),
                 true,
@@ -2836,11 +2978,11 @@ pub fn create_session(
             // inner_shell is the agsh path (not $SHELL) so the zsh/bash
             // integration blocks below don't fire for an agsh session.
             ResolvedShell::BundledAgsh(agsh) => (
-                agsh.to_string_lossy().to_string(),
+                path_to_utf8_string(agsh, "bundled agsh path")?,
                 Vec::new(),
                 "agsh".to_string(),
                 false,
-                agsh.to_string_lossy().to_string(),
+                path_to_utf8_string(agsh, "bundled agsh path")?,
             ),
             ResolvedShell::System(p) => {
                 let args = interactive_login_args(p);
@@ -2951,15 +3093,12 @@ pub fn create_session(
             cmd.env("HOME", zellij_home.clone());
             cmd.env("ZELLIJ_SOCKET_DIR", zellij_socket_dir.clone());
         } else if let Some(zellij_paths) = ensure_zellij_paths(&app) {
-            cmd.env("HOME", zellij_paths.home_dir.to_string_lossy().to_string());
-            cmd.env(
-                "ZELLIJ_SOCKET_DIR",
-                zellij_paths.socket_dir.to_string_lossy().to_string(),
-            );
+            cmd.env("HOME", zellij_paths.home_dir);
+            cmd.env("ZELLIJ_SOCKET_DIR", zellij_paths.socket_dir);
         }
 
         if let Some(wrapper) = ensure_zellij_shell_wrapper(&app) {
-            cmd.env("SHELL", wrapper.to_string_lossy().to_string());
+            cmd.env("SHELL", wrapper);
             cmd.env("AGENTS_UI_ZELLIJ_REAL_SHELL", inner_shell.clone());
             // agsh takes no `-l`; the wrapper execs the real shell bare then.
             cmd.env(
@@ -3019,7 +3158,7 @@ pub fn create_session(
             let mut fallback_entries: Vec<String> = std::env::var("PATH")
                 .unwrap_or_default()
                 .split(':')
-                .filter(|s| !s.trim().is_empty())
+                .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
                 .collect();
 
@@ -3075,30 +3214,15 @@ pub fn create_session(
             };
 
             let mut path_entries: Vec<String> = Vec::new();
-            let mut push_unique = |value: &str| {
-                let trimmed = value.trim();
-                // Filter out entries that don't look like valid paths.
-                // Shell startup scripts can pollute PATH with error messages.
-                if trimmed.is_empty()
-                    || !trimmed.starts_with('/')
-                    || trimmed.contains('\n')
-                    || trimmed.contains('\r')
-                {
-                    return;
-                }
-                if !path_entries.iter().any(|p| p == trimmed) {
-                    path_entries.push(trimmed.to_string());
-                }
-            };
 
             if let Some(ref imported) = imported_path {
                 for entry in imported.split(':') {
-                    push_unique(entry);
+                    push_exact_absolute_path_entry(&mut path_entries, entry);
                 }
             }
 
             for entry in &fallback_entries {
-                push_unique(entry);
+                push_exact_absolute_path_entry(&mut path_entries, entry);
             }
 
             if !path_entries.is_empty() {
@@ -3109,9 +3233,8 @@ pub fn create_session(
 
     if cmd.get_env("PATH").is_none() {
         if let Ok(path) = std::env::var("PATH") {
-            let trimmed = path.trim();
-            if !trimmed.is_empty() {
-                cmd.env("PATH", trimmed);
+            if !path.is_empty() {
+                cmd.env("PATH", path);
             }
         }
     }
@@ -3128,19 +3251,10 @@ pub fn create_session(
         }
     } else if persistent {
         if let Some(xdg) = ensure_shell_xdg_paths(&app) {
-            cmd.env(
-                "XDG_CONFIG_HOME",
-                xdg.config_home.to_string_lossy().to_string(),
-            );
-            cmd.env("XDG_DATA_HOME", xdg.data_home.to_string_lossy().to_string());
-            cmd.env(
-                "XDG_CACHE_HOME",
-                xdg.cache_home.to_string_lossy().to_string(),
-            );
-            cmd.env(
-                "XDG_RUNTIME_DIR",
-                xdg.runtime_dir.to_string_lossy().to_string(),
-            );
+            cmd.env("XDG_CONFIG_HOME", xdg.config_home);
+            cmd.env("XDG_DATA_HOME", xdg.data_home);
+            cmd.env("XDG_CACHE_HOME", xdg.cache_home);
+            cmd.env("XDG_RUNTIME_DIR", xdg.runtime_dir);
         }
     }
     if let Some(ref cwd) = cwd {
@@ -3195,7 +3309,7 @@ pub fn create_session(
                     if fs::create_dir_all(&dotdir).is_ok()
                         && write_zsh_startup_files(&dotdir, Path::new(&orig_dotdir)).is_ok()
                     {
-                        cmd.env("ZDOTDIR", dotdir.to_string_lossy().to_string());
+                        cmd.env("ZDOTDIR", dotdir);
                     }
                 }
             }
@@ -3236,6 +3350,8 @@ pub fn create_session(
     let mut sessions = state.inner.sessions.lock().map_err(|_| "state poisoned")?;
 
     let base_name = name.unwrap_or_else(|| (if is_shell { "shell" } else { "agent" }).to_string());
+    // Session names are display labels, not filesystem paths. Keep intentional
+    // blank-label normalization separate from the exact cwd/PATH handling.
     let base_trimmed = base_name.trim();
     let base_trimmed = if base_trimmed.is_empty() {
         "session"
@@ -3839,6 +3955,176 @@ pub fn detach_session(state: State<'_, AppState>, id: String) -> Result<(), Stri
             .map_err(|e| format!("write failed: {e}"))?;
         writer.flush().ok();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod path_identity_tests {
+    use super::{
+        exact_existing_directory, extract_nul_framed_utf8, has_complete_nul_frame,
+        validated_shell_path,
+    };
+
+    struct TestDirectory(std::path::PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_directory(label: &str) -> TestDirectory {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "agents-ui-pty-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create pty test directory");
+        TestDirectory(path)
+    }
+
+    #[test]
+    fn framed_path_value_preserves_edge_whitespace() {
+        let output = "noise<magic>\0 /bin:/tmp/目录/bin \0<trailer>\0noise".as_bytes();
+        assert_eq!(
+            extract_nul_framed_utf8(output, b"<magic>", b"<trailer>", 1024, 512),
+            Some(" /bin:/tmp/目录/bin ".to_string())
+        );
+        assert_eq!(
+            extract_nul_framed_utf8(b"<m>\0\0<t>\0", b"<m>", b"<t>", 32, 16),
+            None
+        );
+    }
+
+    #[test]
+    fn framed_path_rejects_invalid_utf8_without_replacement() {
+        assert_eq!(
+            extract_nul_framed_utf8(
+                b"noise<m>\0/tmp/\xff/bin\0<t>\0",
+                b"<m>",
+                b"<t>",
+                128,
+                64,
+            ),
+            None
+        );
+        assert_eq!(
+            extract_nul_framed_utf8(
+                b"\xff<m>\0/tmp/exact\0<t>\0\xfe",
+                b"<m>",
+                b"<t>",
+                128,
+                64,
+            ),
+            Some("/tmp/exact".to_string())
+        );
+    }
+
+    #[test]
+    fn framed_path_rejects_bad_framing_and_bounds() {
+        assert!(!has_complete_nul_frame(
+            b"<t><m>\0value",
+            b"<m>",
+            b"<t>"
+        ));
+        assert!(has_complete_nul_frame(
+            b"noise<m>\0value\0<t>\0",
+            b"<m>",
+            b"<t>"
+        ));
+        for output in [
+            b"<m>unterminated".as_slice(),
+            b"<m>\0unterminated".as_slice(),
+            b"<t><m>\0value".as_slice(),
+            b"<m>\0value\0wrong-trailer\0".as_slice(),
+        ] {
+            assert_eq!(
+                extract_nul_framed_utf8(output, b"<m>", b"<t>", 128, 64),
+                None
+            );
+        }
+        assert_eq!(
+            extract_nul_framed_utf8(b"<m>\0value\0<t>\0", b"<m>", b"<t>", 10, 64),
+            None
+        );
+        assert_eq!(
+            extract_nul_framed_utf8(b"<m>\0value\0<t>\0", b"<m>", b"<t>", 64, 4),
+            None
+        );
+    }
+
+    #[test]
+    fn textual_trailer_substring_inside_path_is_unambiguous() {
+        let exact = "/tmp/__AGENTS_UI_PATH_DONE_V1_7C9D4E21__/bin";
+        let mut output = b"<m>\0".to_vec();
+        output.extend_from_slice(exact.as_bytes());
+        output.extend_from_slice(b"\0<t>\0");
+        assert_eq!(
+            extract_nul_framed_utf8(&output, b"<m>", b"<t>", 256, 128),
+            Some(exact.to_string())
+        );
+    }
+
+    #[test]
+    fn multiple_complete_path_frames_are_rejected_as_ambiguous() {
+        let output = b"<m>\0/first\0<t>\0noise<m>\0/second\0<t>\0";
+        assert_eq!(
+            extract_nul_framed_utf8(output, b"<m>", b"<t>", 128, 64),
+            None
+        );
+    }
+
+    #[test]
+    fn cwd_validation_preserves_exact_unicode_path() {
+        let parent = test_directory("cwd");
+        let exact = parent.0.join("  lowerCase-目录-🚀  ");
+        std::fs::create_dir_all(&exact).expect("create exact cwd");
+        let exact_string = exact.to_str().expect("test path is UTF-8").to_string();
+
+        assert_eq!(
+            exact_existing_directory(exact_string.clone()),
+            Some(exact_string)
+        );
+    }
+
+    #[test]
+    fn shell_validation_preserves_only_an_absolute_executable_path() {
+        let root = test_directory("shell");
+        let shell = root.0.join("  shell runner-目录  ");
+        std::fs::write(&shell, "#!/bin/sh\n").expect("write test shell");
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
+                .expect("make test shell executable");
+        }
+        let exact = shell.to_str().expect("test path is UTF-8").to_string();
+
+        assert_eq!(validated_shell_path(&exact), Some(exact));
+        assert_eq!(validated_shell_path("relative-shell"), None);
+        assert_eq!(validated_shell_path(root.0.to_str().unwrap()), None);
+        assert_eq!(validated_shell_path("/definitely/missing/agents-ui-shell"), None);
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn shell_candidate_dedup_preserves_literal_path() {
+        let mut paths = Vec::new();
+        super::push_unique_exact_path(&mut paths, " /tmp/lowerCase-目录 ");
+        super::push_unique_exact_path(&mut paths, " /tmp/lowerCase-目录 ");
+        assert_eq!(paths, vec![" /tmp/lowerCase-目录 "]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn imported_path_entries_are_validated_without_trimming() {
+        let mut paths = Vec::new();
+        super::push_exact_absolute_path_entry(&mut paths, "/tmp/lowerCase-目录 ");
+        super::push_exact_absolute_path_entry(&mut paths, " /tmp/would-change-if-trimmed");
+        assert_eq!(paths, vec!["/tmp/lowerCase-目录 "]);
     }
 }
 

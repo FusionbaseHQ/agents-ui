@@ -28,6 +28,14 @@ import { TerminalPane, type TerminalPaneSession } from "./components/TerminalPan
 import { Icon } from "./components/Icon";
 import { ActivityCenter, type ActivityCenterItem } from "./components/ActivityCenter";
 import { FileExplorerPanel, type FileExplorerPersistedState } from "./components/FileExplorerPanel";
+import {
+  FILESYSTEM_TEXT_INPUT_PROPS,
+  armImeSubmitSuppression,
+  classifyImeEnter,
+  consumeImeSubmitSuppression,
+  isImeCompositionKey,
+  isShortcutAllowedWhileEditing,
+} from "./components/filesystemInput";
 import { WorkspaceFileSearch } from "./components/WorkspaceFileSearch";
 import { EDITOR_THEME_BY_UI_THEME } from "./monaco/editorThemes";
 import { TabSymbolIcon, normalizeTabSymbolValue } from "./tabSymbols";
@@ -363,6 +371,27 @@ const MIN_AGENT_PANEL_WIDTH = 320;
 const MAX_AGENT_PANEL_WIDTH = 700;
 const AUTO_RENAME_LOG_ENTRY_LIMIT = 6;
 const AGENTS_UI_MCP_PREFIX = "mcp__agents-ui__";
+function eventTargetElement(event: KeyboardEvent): Element | null {
+  for (const target of event.composedPath()) {
+    if (target instanceof Element) return target;
+  }
+  return event.target instanceof Element ? event.target : null;
+}
+
+function isTextEditingTarget(element: Element | null): boolean {
+  const editable = element?.closest("input, textarea, [contenteditable], [role='textbox']") ?? null;
+  if (!editable || editable.closest(".xterm")) return false;
+
+  if (editable instanceof HTMLInputElement) {
+    if (editable.disabled || editable.readOnly) return false;
+    return !["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"].includes(
+      editable.type,
+    );
+  }
+  if (editable instanceof HTMLTextAreaElement) return !editable.disabled && !editable.readOnly;
+  if (!(editable instanceof HTMLElement)) return false;
+  return editable.isContentEditable || editable.getAttribute("role") === "textbox";
+}
 
 function selectEditableElement(element: Element | null): boolean {
   const editable = element?.closest("input, textarea, [contenteditable]") ?? null;
@@ -606,10 +635,16 @@ function shellEscapePosix(value: string): string {
 }
 
 function basenamePath(input: string): string {
-  const normalized = input.trim().replace(/[\\/]+$/, "");
+  // Backslash is a valid POSIX filename character. Treat it as a separator
+  // only when the value is unambiguously a Windows drive or UNC path, and
+  // never discard valid edge whitespace from the final path component.
+  const normalizedSeparators = /^[A-Za-z]:\\/.test(input) || input.startsWith("\\\\")
+    ? input.replace(/\\/g, "/")
+    : input;
+  const normalized = normalizedSeparators.replace(/\/+$/, "");
   if (!normalized) return "";
   if (normalized === "/") return "/";
-  const parts = normalized.replace(/\\/g, "/").split("/");
+  const parts = normalized.split("/");
   return parts[parts.length - 1] ?? "";
 }
 
@@ -780,7 +815,7 @@ function buildSshCommandAtRemoteDir(input: {
   remoteDir: string;
 }): string {
   const target = input.target.trim();
-  const remoteDir = input.remoteDir.trim();
+  const remoteDir = input.remoteDir;
   const base = input.baseCommandLine?.trim() ?? "";
 
   const parts = base && isSshCommandLine(base) ? base.split(/\s+/).filter(Boolean) : [];
@@ -813,7 +848,7 @@ function buildSshAgentCommandAtRemoteDir(input: {
   agentCommand: string;
 }): string {
   const target = input.target.trim();
-  const remoteDir = input.remoteDir.trim();
+  const remoteDir = input.remoteDir;
   const agentCommand = input.agentCommand.trim();
   // Literal text for the remote shell to expand (NOT interpolated locally).
   const SH = "${SHELL:-sh}";
@@ -1666,9 +1701,11 @@ function coerceFileExplorerPersistedState(
   if (!value || typeof value !== "object") return null;
   const rec = value as Record<string, unknown>;
   const root =
-    (typeof rootOverride === "string" && rootOverride.trim()) ||
-    (typeof rec.root === "string" && rec.root.trim()) ||
-    "";
+    typeof rootOverride === "string" && rootOverride.length > 0
+      ? rootOverride
+      : typeof rec.root === "string" && rec.root.length > 0
+        ? rec.root
+        : "";
   if (!root) return null;
 
   const expandedDirs = Array.isArray(rec.expandedDirs)
@@ -1691,7 +1728,7 @@ function coerceCodeEditorPersistedState(value: unknown): CodeEditorPersistedStat
     .filter((t): t is { path: unknown } => Boolean(t) && typeof t === "object" && "path" in (t as object))
     .map((t) => {
       const rec = t as Record<string, unknown>;
-      const path = typeof rec.path === "string" ? rec.path.trim() : "";
+      const path = typeof rec.path === "string" ? rec.path : "";
       const viewerKind: CodeEditorPersistedState["tabs"][number]["viewerKind"] =
         rec.viewerKind === "largeText" ||
         rec.viewerKind === "image" ||
@@ -1708,7 +1745,7 @@ function coerceCodeEditorPersistedState(value: unknown): CodeEditorPersistedStat
 
   if (tabs.length === 0) return null;
 
-  const desiredActive = typeof rec.activePath === "string" ? rec.activePath.trim() : "";
+  const desiredActive = typeof rec.activePath === "string" ? rec.activePath : "";
   const activePath =
     (desiredActive && tabs.some((t) => t.path === desiredActive) && desiredActive) || tabs[0]?.path || null;
 
@@ -1868,7 +1905,7 @@ async function createSession(input: {
   const sshTarget = isSshSession
     ? (explicitSshTarget || sshTargetFromCommandLine(commandForDetection))
     : null;
-  const sshRootDir = isSshSession ? input.sshRootDir?.trim() || null : null;
+  const sshRootDir = isSshSession ? input.sshRootDir || null : null;
   const sessionName = buildSmartSessionName({
     explicitName: input.name ?? null,
     launchCommand,
@@ -2627,6 +2664,9 @@ export default function App() {
   const promptTitleRef = useRef<HTMLInputElement | null>(null);
   const envNameRef = useRef<HTMLInputElement | null>(null);
   const assetNameRef = useRef<HTMLInputElement | null>(null);
+  const assetPathInputRef = useRef<HTMLInputElement | null>(null);
+  const assetEditorCompositionRef = useRef(false);
+  const assetEditorSubmitSuppressionRef = useRef(0);
   const homeDirRef = useRef<string | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const pendingSaveRef = useRef<PersistedStateV1 | null>(null);
@@ -3326,17 +3366,16 @@ export default function App() {
     if (active && (active.exited || active.closing) && !projectSsh) return;
     if (!activeWorkspaceView.fileExplorerOpen && !activeWorkspaceView.codeEditorOpen) return;
 
-    const currentRoot = (
+    const currentRoot =
       activeWorkspaceView.fileExplorerRootDir ??
       activeWorkspaceView.codeEditorRootDir ??
-      ""
-    ).trim();
+      "";
     if (currentRoot) return;
 
-    const persistedRoot = (active?.sshRootDir ?? curProject?.sshRemotePath ?? "").trim();
+    const persistedRoot = active?.sshRootDir ?? curProject?.sshRemotePath ?? "";
     if (persistedRoot) {
       updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => {
-        const existing = (prev.fileExplorerRootDir ?? prev.codeEditorRootDir ?? "").trim();
+        const existing = prev.fileExplorerRootDir ?? prev.codeEditorRootDir ?? "";
         if (existing) return prev;
         return { ...prev, fileExplorerRootDir: persistedRoot, codeEditorRootDir: persistedRoot };
       });
@@ -3354,7 +3393,7 @@ export default function App() {
         const root = await invoke<string>("ssh_default_root", { target });
         if (cancelled) return;
         updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => {
-          const existing = (prev.fileExplorerRootDir ?? prev.codeEditorRootDir ?? "").trim();
+          const existing = prev.fileExplorerRootDir ?? prev.codeEditorRootDir ?? "";
           if (existing) return prev;
           return { ...prev, fileExplorerRootDir: root, codeEditorRootDir: root };
         });
@@ -3403,14 +3442,12 @@ export default function App() {
     (path: string, mode: CodeEditorOpenFileRequest["mode"] = "auto") => {
       updateActiveWorkspaceView((prev) => {
         const project = projectByIdRef.current.get(activeProjectId) ?? null;
-        const root = (
+        const root =
           prev.codeEditorRootDir ??
           prev.fileExplorerRootDir ??
           (!activeIsSsh ? project?.basePath : null) ??
           (!activeIsSsh ? active?.cwd : null) ??
-          ""
-        )
-          .trim();
+          "";
         if (!root) return prev;
         return {
           ...prev,
@@ -3572,12 +3609,10 @@ export default function App() {
 
   const activeWorkspaceFileRoot = useMemo(
     () =>
-      (
-        activeWorkspaceView.fileExplorerRootDir ??
-        activeWorkspaceView.codeEditorRootDir ??
-        (activeIsSsh ? active?.sshRootDir ?? activeProject?.sshRemotePath : activeProject?.basePath ?? active?.cwd) ??
-        ""
-      ).trim(),
+      activeWorkspaceView.fileExplorerRootDir ??
+      activeWorkspaceView.codeEditorRootDir ??
+      (activeIsSsh ? active?.sshRootDir ?? activeProject?.sshRemotePath : activeProject?.basePath ?? active?.cwd) ??
+      "",
     [
       active?.cwd,
       active?.sshRootDir,
@@ -4326,7 +4361,7 @@ export default function App() {
 
   const handleOpenTerminalAtPath = useCallback(
     async (path: string, provider: "local" | "ssh", sshTarget: string | null) => {
-      const desiredPath = path.trim();
+      const desiredPath = path;
       if (!desiredPath) return;
 
       const projectId = activeProjectId;
@@ -4574,13 +4609,12 @@ export default function App() {
       const project = projectByIdRef.current.get(activeProjectIdRef.current) ?? null;
       const activeSession = sessionsRef.current.find((s) => s.id === activeIdRef.current) ?? null;
       const provider = activeWorkspaceProvider();
-      const root = (
+      const root =
         view.codeEditorRootDir ??
         view.fileExplorerRootDir ??
         (provider === "ssh"
           ? activeSession?.sshRootDir ?? project?.sshRemotePath ?? ""
-          : project?.basePath ?? activeSession?.cwd ?? "")
-      ).trim();
+          : project?.basePath ?? activeSession?.cwd ?? "");
       if (root) return root;
       if (provider === "local") return "/";
       throw new Error("workspace root is not resolved yet");
@@ -4684,7 +4718,7 @@ export default function App() {
         url: typeof p.url === "string" ? p.url : null,
         title: typeof p.title === "string" ? p.title : null,
       };
-      if (kind === "file" && !request.path?.trim()) throw new Error("path is required");
+      if (kind === "file" && !request.path) throw new Error("path is required");
       if (kind === "browser" && request.url?.trim()) request.url = normalizeBrowserApiUrl(request.url);
       const mode = parseEditorMode(p.mode);
       if (mode) request.mode = mode;
@@ -4896,7 +4930,7 @@ export default function App() {
           ? await invoke<string | null>("validate_directory", { path: desiredBasePath }).catch(() => null)
           : null;
         const sshTarget = ((p.sshTarget as string | undefined) ?? "").trim() || null;
-        const sshRemotePath = ((p.sshRemotePath as string | undefined) ?? "").trim() || null;
+        const sshRemotePath = ((p.sshRemotePath as string | undefined) ?? "") || null;
         const id = makeId();
         const project: Project = {
           id,
@@ -4927,7 +4961,7 @@ export default function App() {
             ...(p.symbol !== undefined && { symbol: normalizeTabSymbolValue(p.symbol as string | null) }),
             ...(p.color !== undefined && { color: p.color as string | null }),
             ...(p.sshTarget !== undefined && { sshTarget: (p.sshTarget as string | null)?.trim() || null }),
-            ...(p.sshRemotePath !== undefined && { sshRemotePath: (p.sshRemotePath as string | null)?.trim() || null }),
+            ...(p.sshRemotePath !== undefined && { sshRemotePath: (p.sshRemotePath as string | null) || null }),
           };
         }));
         notifyStateChange("projects.updated", { projectId: id });
@@ -5475,7 +5509,7 @@ export default function App() {
         if (!target) throw new Error("target is required");
         const proj = projectsRef.current.find((pr) => pr.id === projectId);
         if (!proj) throw new Error("project not found");
-        const remoteDir = ((p.remoteDir as string) || "").trim();
+        const remoteDir = (p.remoteDir as string) || "";
         const envVars = envVarsForProjectId(projectId, projectsRef.current, environmentsRef.current);
         const launchCommand = buildSshCommandAtRemoteDir({
           baseCommandLine: null,
@@ -5979,6 +6013,8 @@ export default function App() {
   useEffect(() => {
     const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
     const onKeyDown = (e: KeyboardEvent) => {
+      if (isImeCompositionKey(e)) return;
+
       const ks = keyHandlerStateRef.current;
       const {
         newOpen, sshManagerOpen, agentShortcutsOpen, projectOpen,
@@ -6071,6 +6107,16 @@ export default function App() {
 
       // Match the declarative keymap once; dispatch on the binding id below.
       const binding = matchBinding(e, isMac);
+      const shortcutTarget = eventTargetElement(e);
+      const isEditingText = isTextEditingTarget(shortcutTarget);
+      const isCodeEditorTarget = Boolean(shortcutTarget?.closest(".codeEditorPanel"));
+      if (
+        binding &&
+        isEditingText &&
+        !isShortcutAllowedWhileEditing(binding, isCodeEditorTarget)
+      ) {
+        return;
+      }
 
       // Command palette takes priority - mod+K
       if (binding === "palette.open" && !commandPaletteOpen) {
@@ -7191,6 +7237,7 @@ export default function App() {
   }
 
   function openAssetEditor(asset?: AssetTemplate) {
+    assetEditorCompositionRef.current = false;
     setAssetEditorId(asset?.id ?? null);
     setAssetEditorName(asset?.name ?? "");
     setAssetEditorPath(asset?.relativePath ?? "");
@@ -7201,6 +7248,7 @@ export default function App() {
   }
 
   function closeAssetEditor() {
+    assetEditorCompositionRef.current = false;
     setAssetEditorOpen(false);
     setAssetEditorId(null);
     setAssetEditorName("");
@@ -7210,9 +7258,9 @@ export default function App() {
   }
 
   function saveAssetFromEditor() {
-    const name = assetEditorName.trim();
-    const relativePath = assetEditorPath.trim();
-    if (!name || !relativePath) return;
+    const name = assetNameRef.current?.value ?? assetEditorName;
+    const relativePath = assetPathInputRef.current?.value ?? assetEditorPath;
+    if (name.length === 0 || relativePath.length === 0) return;
     const now = Date.now();
     const id = assetEditorId ?? makeId();
     const next: AssetTemplate = {
@@ -7265,14 +7313,14 @@ export default function App() {
     templates: AssetTemplate[],
     overwrite: boolean,
   ): Promise<string[]> {
-    const dir = baseDir.trim();
+    const dir = baseDir;
     if (!dir) return [];
     const payload = templates
       .map((t) => ({
         relativePath: t.relativePath,
         content: t.content,
       }))
-      .filter((t) => t.relativePath.trim());
+      .filter((t) => t.relativePath.length > 0);
     if (payload.length === 0) return [];
     return invoke<string[]>("apply_text_assets", { baseDir: dir, assets: payload, overwrite });
   }
@@ -7306,8 +7354,10 @@ export default function App() {
   }
 
   function joinPathDisplay(baseDir: string, relativePath: string): string {
-    const base = baseDir.replace(/[\\/]+$/, "");
-    const rel = relativePath.replace(/^[\\/]+/, "");
+    // Asset paths are POSIX-style on the supported desktop target. A
+    // backslash is literal filename data, not a path separator.
+    const base = baseDir.replace(/\/+$/, "");
+    const rel = relativePath.replace(/^\/+/, "");
     if (!base) return rel;
     if (!rel) return base;
     return `${base}/${rel}`;
@@ -7524,8 +7574,7 @@ export default function App() {
   );
 
   const onCwdChange = useCallback((id: string, cwd: string) => {
-    const trimmed = cwd.trim();
-    if (!trimmed) return;
+    if (cwd.length === 0) return;
 
     const hasExplicitCommandLifecycle = commandLifecycleSessionsRef.current.has(id);
     if (!hasExplicitCommandLifecycle) {
@@ -7537,7 +7586,7 @@ export default function App() {
     }
 
     updateSessionById(id, (s) => {
-      const nextCwd = s.cwd !== trimmed ? trimmed : s.cwd;
+      const nextCwd = s.cwd !== cwd ? cwd : s.cwd;
       if (hasExplicitCommandLifecycle) {
         return nextCwd === s.cwd ? s : { ...s, cwd: nextCwd };
       }
@@ -7746,7 +7795,7 @@ export default function App() {
 
   async function createSshSessionForProject(project: Project, allProjects?: Project[]) {
     const target = project.sshTarget!.trim();
-    const remoteDir = project.sshRemotePath?.trim() || "";
+    const remoteDir = project.sshRemotePath || "";
     const launchCommand = remoteDir
       ? buildSshCommandAtRemoteDir({ baseCommandLine: null, target, remoteDir })
       : ensureSshKeepAliveOptions(`ssh ${target}`);
@@ -7767,7 +7816,7 @@ export default function App() {
 
   async function createSshAgentSessionForProject(project: Project, effect: ProcessEffect) {
     const target = project.sshTarget!.trim();
-    const remoteDir = project.sshRemotePath?.trim() || "";
+    const remoteDir = project.sshRemotePath || "";
     const agentCommand = effect.matchCommands[0] ?? effect.label;
     const launchCommand = buildSshAgentCommandAtRemoteDir({ target, remoteDir, agentCommand });
     const localCwd = project.basePath ?? homeDirRef.current ?? "";
@@ -7796,8 +7845,7 @@ export default function App() {
 
     const isSshProject = Boolean(data.sshTarget?.trim());
 
-    const desiredBasePath =
-      data.basePath.trim() || activeProject?.basePath || homeDirRef.current || "";
+    const desiredBasePath = data.basePath || activeProject?.basePath || homeDirRef.current || "";
     const validatedBasePath = isSshProject
       ? (await invoke<string | null>("validate_directory", { path: desiredBasePath }).catch(() => null) ?? homeDirRef.current ?? "")
       : await invoke<string | null>("validate_directory", { path: desiredBasePath }).catch(() => null);
@@ -7821,7 +7869,7 @@ export default function App() {
                 environmentId,
                 assetsEnabled: data.assetsEnabled,
                 sshTarget: isSshProject ? data.sshTarget.trim() : null,
-                sshRemotePath: isSshProject ? data.sshRemotePath.trim() || null : null,
+                sshRemotePath: isSshProject ? data.sshRemotePath || null : null,
                 defaultShell: isSshProject ? null : data.defaultShell,
               }
             : p,
@@ -7839,7 +7887,7 @@ export default function App() {
       environmentId,
       assetsEnabled: data.assetsEnabled,
       sshTarget: isSshProject ? data.sshTarget.trim() : null,
-      sshRemotePath: isSshProject ? data.sshRemotePath.trim() || null : null,
+      sshRemotePath: isSshProject ? data.sshRemotePath || null : null,
       defaultShell: isSshProject ? null : data.defaultShell,
     };
     setProjects((prev) => [...prev, project]);
@@ -8448,8 +8496,8 @@ export default function App() {
         const loaded = (state.assets ?? [])
           .map((a) => ({
             ...a,
-            name: a.name?.trim?.() ? a.name.trim() : a.name,
-            relativePath: a.relativePath?.trim?.() ? a.relativePath.trim() : a.relativePath,
+            name: a.name,
+            relativePath: a.relativePath,
             autoApply: a.autoApply ?? true,
           }))
           .filter((a) => a && a.id && a.relativePath && a.name);
@@ -8785,8 +8833,7 @@ export default function App() {
     try {
       const launchCommand = data.command.trim() || null;
       const usePersistent = data.persistent && !launchCommand;
-      const desiredCwd =
-        data.cwd.trim() || activeProject?.basePath || homeDirRef.current || "";
+      const desiredCwd = data.cwd || activeProject?.basePath || homeDirRef.current || "";
       const validatedCwd = await invoke<string | null>("validate_directory", {
         path: desiredCwd,
       }).catch(() => null);
@@ -9844,7 +9891,7 @@ export default function App() {
         const projectTitle = projectTitleById.get(session.projectId) ?? "—";
         if (projectTitle) details.push(`Project: ${projectTitle}`);
         if (session.disconnectReason?.trim()) details.push(session.disconnectReason.trim());
-        if (session.cwd?.trim()) details.push(shortenPathSmart(session.cwd.trim(), 68));
+        if (session.cwd) details.push(shortenPathSmart(session.cwd, 68));
         if (activity.command) details.push(truncateInlineText(activity.command, 96));
 
         const summaryParts: string[] = [];
@@ -10120,7 +10167,7 @@ export default function App() {
                   <button
                     className="iconBtn iconBtnText"
                     onClick={() => {
-                      const cwd = active.cwd?.trim() ?? "";
+                      const cwd = active.cwd ?? "";
                       if (!cwd) return;
                       void invoke("open_path_in_file_manager", { path: cwd }).catch((err) =>
                         reportError("Failed to open folder in Finder", err),
@@ -10135,7 +10182,7 @@ export default function App() {
                   <button
                     className="iconBtn iconBtnText"
                     onClick={() => {
-                      const cwd = active.cwd?.trim() ?? "";
+                      const cwd = active.cwd ?? "";
                       if (!cwd) return;
                       void invoke("open_path_in_vscode", { path: cwd }).catch((err) =>
                         reportError("Failed to open VS Code", err),
@@ -10160,13 +10207,12 @@ export default function App() {
                   if (activeIsSsh) {
                     return { ...prev, fileExplorerOpen: true };
                   }
-                  const root = (
+                  const root =
                     prev.fileExplorerRootDir ??
                     prev.codeEditorRootDir ??
                     activeProject?.basePath ??
                     active?.cwd ??
-                    ""
-                  ).trim();
+                    "";
                   if (!root) return prev;
                   return {
                     ...prev,
@@ -10185,7 +10231,7 @@ export default function App() {
                       activeProject?.basePath ??
                       active?.cwd ??
                       ""
-                    ).trim()
+                    )
               }
               title={
                 activeWorkspaceView.fileExplorerOpen
@@ -10201,7 +10247,7 @@ export default function App() {
                           activeProject?.basePath ??
                           active?.cwd ??
                           ""
-                        ).trim() || "—"
+                        ) || "—"
                       }`
               }
             >
@@ -10295,7 +10341,7 @@ export default function App() {
           activeWorkspaceView.codeEditorRootDir ??
           activeWorkspaceView.fileExplorerRootDir ??
           (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
-        ).trim() ? (
+        ) ? (
           <>
             <div
               className="workspaceResize"
@@ -10321,7 +10367,7 @@ export default function App() {
                     activeWorkspaceView.codeEditorRootDir ??
                     activeWorkspaceView.fileExplorerRootDir ??
                     (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
-                  ).trim()
+                  )
                 }
                 openFileRequest={activeWorkspaceView.openFileRequest}
                 openWorkspaceTabRequest={activeWorkspaceView.openWorkspaceTabRequest}
@@ -10363,7 +10409,7 @@ export default function App() {
           activeWorkspaceView.fileExplorerRootDir ??
           activeWorkspaceView.codeEditorRootDir ??
           (!(activeIsSsh || isProjectSsh(activeProject)) ? activeProject?.basePath ?? active?.cwd ?? "" : activeProject?.sshRemotePath ?? "")
-        ).trim() ? (
+        ) ? (
           <>
             <div
               className="workspaceResize"
@@ -10382,7 +10428,7 @@ export default function App() {
                   activeWorkspaceView.fileExplorerRootDir ??
                   activeWorkspaceView.codeEditorRootDir ??
                   (!(activeIsSsh || isProjectSsh(activeProject)) ? activeProject?.basePath ?? active?.cwd ?? "" : activeProject?.sshRemotePath ?? "")
-                ).trim()
+                )
               }
               persistedState={activeWorkspaceView.fileExplorerPersistedState}
               activeFilePath={activeWorkspaceView.codeEditorActiveFilePath}
@@ -10581,7 +10627,7 @@ export default function App() {
             initialCwd={activeProject?.basePath ?? homeDirRef.current ?? ""}
             cwdPlaceholder={activeProject?.basePath ?? "~"}
             onBrowseCwd={(currentCwd) =>
-              openPathPicker("session", currentCwd.trim() || activeProject?.basePath || null)
+              openPathPicker("session", currentCwd || activeProject?.basePath || null)
             }
             canUseProjectBase={Boolean(activeProject?.basePath)}
             projectBasePath={activeProject?.basePath ?? null}
@@ -10804,7 +10850,7 @@ export default function App() {
             sshHosts={sshHosts}
             sshHostsLoading={sshHostsLoading}
             onBrowseBasePath={(currentBasePath) =>
-              openPathPicker("project", currentBasePath.trim() || activeProject?.basePath || null)
+              openPathPicker("project", currentBasePath || activeProject?.basePath || null)
             }
             onBrowseRemotePath={(target, currentPath) => {
               sshPathPickerTargetRef.current = target;
@@ -11454,32 +11500,50 @@ export default function App() {
                 <form
                   onSubmit={(e) => {
                     e.preventDefault();
+                    if (
+                      assetEditorCompositionRef.current ||
+                      consumeImeSubmitSuppression(assetEditorSubmitSuppressionRef)
+                    ) {
+                      return;
+                    }
                     saveAssetFromEditor();
+                  }}
+                  onCompositionStart={() => {
+                    assetEditorCompositionRef.current = true;
+                  }}
+                  onCompositionEnd={() => {
+                    assetEditorCompositionRef.current = false;
+                  }}
+                  onKeyDown={(event) => {
+                    const disposition = classifyImeEnter(event.nativeEvent, assetEditorCompositionRef.current);
+                    if (disposition === "none") return;
+                    armImeSubmitSuppression(assetEditorSubmitSuppressionRef);
+                    if (disposition === "trailing-enter") event.preventDefault();
+                    event.stopPropagation();
                   }}
                 >
                   <div className="formRow">
                     <div className="label">Name</div>
                     <input
+                      {...FILESYSTEM_TEXT_INPUT_PROPS}
                       ref={assetNameRef}
                       className="input"
                       value={assetEditorName}
-                      autoCapitalize="off"
-                      autoCorrect="off"
-                      spellCheck={false}
-                      onChange={(e) => setAssetEditorName(normalizeSmartQuotes(e.target.value))}
+                      onChange={(e) => setAssetEditorName(e.target.value)}
                       placeholder="e.g. AGENTS.md"
+                      aria-label="Asset name"
                     />
                   </div>
                   <div className="formRow">
                     <div className="label">Relative path</div>
                     <input
+                      {...FILESYSTEM_TEXT_INPUT_PROPS}
+                      ref={assetPathInputRef}
                       className="input"
                       value={assetEditorPath}
-                      autoCapitalize="off"
-                      autoCorrect="off"
-                      spellCheck={false}
-                      onChange={(e) => setAssetEditorPath(normalizeSmartQuotes(e.target.value))}
+                      onChange={(e) => setAssetEditorPath(e.target.value)}
                       placeholder="e.g. AGENTS.md or .github/ISSUE_TEMPLATE.md"
+                      aria-label="Asset relative path"
                     />
                     <div className="hint" style={{ marginTop: 0 }}>
                       Written relative to the session/project directory.
@@ -11515,7 +11579,7 @@ export default function App() {
                     <button
                       type="submit"
                       className="btn"
-                      disabled={!assetEditorName.trim() || !assetEditorPath.trim()}
+                      disabled={assetEditorName.length === 0 || assetEditorPath.length === 0}
                     >
                       Save
                     </button>

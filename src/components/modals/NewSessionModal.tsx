@@ -1,5 +1,11 @@
 import React, { useState, useRef, useEffect, useImperativeHandle, forwardRef } from "react";
 import { Modal } from "../../ui";
+import {
+  FILESYSTEM_TEXT_INPUT_PROPS,
+  armImeSubmitSuppression,
+  classifyImeEnter,
+  consumeImeSubmitSuppression,
+} from "../filesystemInput";
 
 function normalizeSmartQuotes(input: string): string {
   return input.replace(/[""„‟«»]/g, '"').replace(/[''‚‛‹›]/g, "'");
@@ -43,6 +49,9 @@ export const NewSessionModal = forwardRef<NewSessionModalHandle, NewSessionModal
     const [persistent, setPersistent] = useState(false);
     const [cwd, setCwd] = useState(initialCwd);
     const nameRef = useRef<HTMLInputElement>(null);
+    const cwdInputRef = useRef<HTMLInputElement>(null);
+    const formCompositionRef = useRef(false);
+    const formSubmitSuppressionRef = useRef(0);
     const datalistId = "newSessionCommandSuggestions";
 
     useImperativeHandle(ref, () => ({ setCwd }));
@@ -54,12 +63,28 @@ export const NewSessionModal = forwardRef<NewSessionModalHandle, NewSessionModal
 
     const handleSubmit = (e: React.FormEvent) => {
       e.preventDefault();
-      onSubmit({ name, command, persistent, cwd });
+      if (formCompositionRef.current || consumeImeSubmitSuppression(formSubmitSuppressionRef)) return;
+      onSubmit({ name, command, persistent, cwd: cwdInputRef.current?.value ?? cwd });
     };
 
     return (
       <Modal title={`New terminal${projectTitle ? ` — ${projectTitle}` : ""}`} onClose={onClose}>
-        <form onSubmit={handleSubmit}>
+        <form
+          onSubmit={handleSubmit}
+          onCompositionStart={() => {
+            formCompositionRef.current = true;
+          }}
+          onCompositionEnd={() => {
+            formCompositionRef.current = false;
+          }}
+          onKeyDown={(event) => {
+            const disposition = classifyImeEnter(event.nativeEvent, formCompositionRef.current);
+            if (disposition === "none") return;
+            armImeSubmitSuppression(formSubmitSuppressionRef);
+            if (disposition === "trailing-enter") event.preventDefault();
+            event.stopPropagation();
+          }}
+        >
           <div className="formRow">
             <div className="label">Name (optional)</div>
             <input
@@ -106,10 +131,13 @@ export const NewSessionModal = forwardRef<NewSessionModalHandle, NewSessionModal
             <div className="label">Working directory</div>
             <div className="pathRow">
               <input
+                {...FILESYSTEM_TEXT_INPUT_PROPS}
+                ref={cwdInputRef}
                 className="input"
                 value={cwd}
-                onChange={(e) => setCwd(normalizeSmartQuotes(e.target.value))}
+                onChange={(e) => setCwd(e.target.value)}
                 placeholder={cwdPlaceholder}
+                aria-label="Working directory"
               />
               <button type="button" className="btn" onClick={() => onBrowseCwd(cwd)}>
                 Browse

@@ -48,10 +48,10 @@ export function PlanTaskCard({ task, onViewTerminal, onRetry, onCancel }: Props)
             {assigneeLabel(task.assignee)}
             {task.model ? ` \u00B7 ${task.model}` : ""}
             {task.status === "done" && task.completedAt && (
-              <> \u2713 {formatTimeAgo(task.completedAt)}</>
+              <> {"\u2713"} {formatTimeAgo(task.completedAt)}</>
             )}
             {task.status === "running" && (
-              <> <span className="planTaskRunningIcon">\u21BB</span></>
+              <> <span className="planTaskRunningIcon">{"\u21BB"}</span></>
             )}
             {task.status === "blocked" && task.dependencies.length > 0 && (
               <> needs: {task.dependencies.join(", ")}</>

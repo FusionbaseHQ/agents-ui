@@ -731,7 +731,7 @@ export function OrchestratePanel({ settings, projectBasePath, onCreateTaskSessio
                       {p.goal.length > 60 ? p.goal.slice(0, 60) + "\u2026" : p.goal}
                     </span>
                     <span className="orchestrateHistoryMeta">
-                      {p.tasks.length} tasks \u00B7 {p.status}
+                      {p.tasks.length} tasks {"\u00B7"} {p.status}
                     </span>
                   </button>
                 ))}

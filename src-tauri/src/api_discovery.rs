@@ -50,7 +50,10 @@ pub fn write_discovery_file(token: &str) -> Result<PathBuf, String> {
     let disc = discovery_path()?;
 
     let file = DiscoveryFile {
-        socket: sock.to_string_lossy().to_string(),
+        socket: sock
+            .to_str()
+            .ok_or_else(|| "API socket path is not valid UTF-8".to_string())?
+            .to_string(),
         version: "1".to_string(),
         pid: std::process::id(),
         token: token.to_string(),
