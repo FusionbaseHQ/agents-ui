@@ -14,18 +14,6 @@ import { registerCodeEditorThemes, type CodeEditorThemeId } from "../monaco/edit
 import { closeBrowserNativeView } from "../browser/nativeViewLifecycle";
 
 type MonacoType = typeof import("monaco-editor");
-type MonacoTypeScriptDefaults = {
-  addExtraLib: (content: string, filePath?: string) => { dispose: () => void };
-  getCompilerOptions: () => Record<string, unknown>;
-  getDiagnosticsOptions: () => Record<string, unknown>;
-  setCompilerOptions: (options: Record<string, unknown>) => void;
-  setDiagnosticsOptions: (options: Record<string, unknown>) => void;
-};
-type MonacoTypeScriptApi = {
-  typescriptDefaults: MonacoTypeScriptDefaults;
-  javascriptDefaults: MonacoTypeScriptDefaults;
-  JsxEmit: { ReactJSX: unknown };
-};
 
 const REACT_JSX_EXTRA_LIB = `
 declare namespace JSX {
@@ -649,8 +637,7 @@ let didConfigureTypeScriptDefaults = false;
 function configureTypeScriptDefaults(monaco: MonacoType): void {
   if (didConfigureTypeScriptDefaults) return;
 
-  const ts = (monaco.languages as unknown as { typescript?: MonacoTypeScriptApi }).typescript;
-  if (!ts?.typescriptDefaults || !ts.javascriptDefaults || !ts.JsxEmit?.ReactJSX) return;
+  const ts = monaco.typescript;
 
   didConfigureTypeScriptDefaults = true;
   ts.typescriptDefaults.addExtraLib(REACT_JSX_EXTRA_LIB, "file:///node_modules/@types/react/index.d.ts");
