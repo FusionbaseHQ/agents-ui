@@ -138,9 +138,43 @@ type PersistedWorkspacesV1 = {
 
 type SessionInfo = {
   id: string;
+  persistId?: string | null;
   name: string;
   command: string;
   cwd?: string | null;
+};
+
+type PtyReplayChunk = { sequence: number; data: string };
+type SessionReplaySnapshot = {
+  id: string;
+  persistId?: string | null;
+  replay: PtyReplayChunk[];
+  replayThroughSequence: number;
+  replayTruncated: boolean;
+};
+type SessionAttachResult = SessionInfo & {
+  adopted: boolean;
+  exited: boolean;
+  exitCode?: number | null;
+  replay: PtyReplayChunk[];
+  replayThroughSequence: number;
+  replayTruncated: boolean;
+};
+type BackendSessionAttachment = {
+  adopted: boolean;
+  replay: PtyReplayChunk[];
+  replayThroughSequence: number;
+  replayTruncated: boolean;
+};
+type RendererListenerReady = {
+  rendererId: string;
+  sessions: SessionReplaySnapshot[];
+  exits: Array<SessionReplaySnapshot & SessionInfo & { exitCode?: number | null }>;
+  exitsTruncated: boolean;
+};
+type RendererListenerTicket = {
+  rendererId: string;
+  contentGeneration: number;
 };
 
 type Session = SessionInfo & {
@@ -172,6 +206,8 @@ type Session = SessionInfo & {
   nextReconnectAt?: number | null;
   disconnectReason?: string | null;
   manualReconnectAvailable?: boolean;
+  /** Ephemeral native attachment metadata; persistence serializers ignore it. */
+  backendAttachment?: BackendSessionAttachment;
 };
 
 type WorkspaceView = {
@@ -201,8 +237,22 @@ type SplitView = {
   lastFocusedId: string;
 };
 
-type PtyOutput = { id: string; data: string };
-type PtyExit = { id: string; exit_code?: number | null };
+type PtyOutput = {
+  id: string;
+  persistId?: string | null;
+  sequence: number;
+  data: string;
+};
+type PendingPtySequenceBuffer = {
+  events: PtyOutput[];
+  totalBytes: number;
+  truncated: boolean;
+};
+type PtyExit = {
+  id: string;
+  exit_code?: number | null;
+  renderer_recovery?: boolean;
+};
 type AgentOutputPayload = { runId: string; data: string };
 type AgentDonePayload = { runId: string; exitCode: number | null };
 type AgentStderrPayload = { runId: string; data: string };
@@ -270,6 +320,9 @@ const MAX_SSH_HISTORY = 10;
 const MAX_PENDING_SESSIONS = 32;
 const MAX_PENDING_CHUNKS_PER_SESSION = 200;
 const MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION = 64;
+const MAX_PENDING_SEQUENCED_OUTPUT_BYTES_PER_SESSION = 512 * 1024;
+const PTY_REPLAY_TRUNCATED_NOTICE =
+  "\r\n\x1b[33m[terminal output replay truncated; oldest output was discarded while the renderer was unavailable]\x1b[0m\r\n";
 // Byte cap for output deferred for a hidden session. The terminal keeps 5000
 // lines of scrollback (~1.25 MB of typical text), so anything beyond the
 // newest few MiB could never survive switch-in anyway — dropping the oldest
@@ -1788,6 +1841,10 @@ async function createSession(input: {
   pinned?: boolean;
   sidebarOrder?: number | null;
   shellChoice?: ShellChoice | null;
+  /** Explicit user/health reconnect may replace a retained exit tombstone. */
+  respawn?: boolean;
+  /** Startup restore must never rerun an exit whose bounded metadata overflowed. */
+  restoreExisting?: boolean;
 }): Promise<Session> {
   const persistent = input.persistent ?? false;
   const persistId = input.persistId ?? makeId();
@@ -1820,15 +1877,26 @@ async function createSession(input: {
     command: commandForDetection,
     name: sessionName,
   });
-  const info = await invoke<SessionInfo>("create_session", {
+  const attachment = await invoke<SessionAttachResult>("create_session", {
     name: sessionName,
     command: launchCommand,
     cwd: input.cwd ?? null,
     envVars: input.envVars ?? null,
     persistent,
     persistId,
+    respawn: Boolean(input.respawn),
+    restoreExisting: Boolean(input.restoreExisting),
     shellChoice: shellChoiceToPayload(input.shellChoice),
   });
+  const {
+    adopted,
+    exited,
+    exitCode,
+    replay,
+    replayThroughSequence,
+    replayTruncated,
+    ...info
+  } = attachment;
   return {
     ...info,
     projectId: input.projectId,
@@ -1849,13 +1917,23 @@ async function createSession(input: {
     cwd: info.cwd ?? input.cwd ?? null,
     effectId: effect?.id ?? null,
     processTag,
-    runningCommand: shouldTrackLaunchCommandAsRunning(launchCommand, persistent) ? launchCommand : null,
+    runningCommand:
+      !exited && shouldTrackLaunchCommandAsRunning(launchCommand, persistent) ? launchCommand : null,
     shellChoice: input.shellChoice ?? null,
-    connectionState: "connected",
+    exited,
+    exitCode: exitCode ?? null,
+    connectionState: exited && isSshSession ? "disconnected" : "connected",
     reconnectAttempt: 0,
     nextReconnectAt: null,
-    disconnectReason: null,
-    manualReconnectAvailable: false,
+    disconnectReason:
+      exited && isSshSession ? "Session exited while the renderer was unavailable." : null,
+    manualReconnectAvailable: exited && isSshSession,
+    backendAttachment: {
+      adopted,
+      replay,
+      replayThroughSequence,
+      replayTruncated,
+    },
   };
 }
 
@@ -2505,6 +2583,12 @@ export default function App() {
   }, []);
   const outputQueueRef = useRef<OutputQueueBySession>(new Map());
   const outputFlushRafRef = useRef<number | null>(null);
+  const pendingSequencedOutputRef = useRef<Map<string, PendingPtySequenceBuffer>>(new Map());
+  const attachedPtyIdsRef = useRef<Set<string>>(new Set());
+  const lastPtySequenceRef = useRef<Map<string, number>>(new Map());
+  const rendererReplaySnapshotsRef = useRef<Map<string, SessionReplaySnapshot>>(new Map());
+  const replayTruncationNotifiedRef = useRef<Set<string>>(new Set());
+  const rendererHandshakePendingRef = useRef(true);
   const pendingExitCodes = useRef<Map<string, number | null>>(new Map());
   const closingSessions = useRef<Map<string, number>>(new Map());
   const exitedCleanupTimers = useRef<Map<string, number>>(new Map());
@@ -3022,6 +3106,11 @@ export default function App() {
     lastResizeAtRef.current.delete(id);
     pendingData.current.delete(id);
     outputQueueRef.current.delete(id);
+    pendingSequencedOutputRef.current.delete(id);
+    attachedPtyIdsRef.current.delete(id);
+    lastPtySequenceRef.current.delete(id);
+    rendererReplaySnapshotsRef.current.delete(id);
+    replayTruncationNotifiedRef.current.delete(id);
     pendingExitCodes.current.delete(id);
     clearReconnectTimer(id);
     reconnectInFlightRef.current.delete(id);
@@ -3060,6 +3149,150 @@ export default function App() {
       return next;
     });
   }, []);
+
+  const deliverPtyOutputText = (id: string, rawData: unknown) => {
+    let text = coercePtyDataToString(rawData);
+    if (!text) return;
+    // Strip echoed Cursor Position Report responses (ESC[row;colR). Replay and
+    // live output intentionally share this exact path so adoption cannot alter
+    // the terminal byte stream relative to normal delivery.
+    if (CPR_RESPONSE_RE.test(text)) {
+      text = text.replace(CPR_RESPONSE_RE_GLOBAL, "");
+      if (!text) return;
+    }
+    if (closingSessions.current.has(id)) return;
+
+    markSessionAliveFromOutput(id);
+    markAgentWorkingFromOutput(id, text);
+    const queue = outputQueueRef.current.get(id) ?? [];
+    if (queue.length === 0) {
+      queue.push(text);
+    } else if (queue.length >= MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION) {
+      const last = queue[queue.length - 1];
+      if (last.length >= 64 * 1024) {
+        queue.shift();
+        queue.push(text);
+      } else {
+        queue[queue.length - 1] += text;
+      }
+    } else {
+      queue.push(text);
+    }
+    outputQueueRef.current.set(id, queue);
+    scheduleOutputFlush();
+  };
+
+  const bufferSequencedPtyOutput = (event: PtyOutput) => {
+    const existing = pendingSequencedOutputRef.current.get(event.id) ?? {
+      events: [],
+      totalBytes: 0,
+      truncated: false,
+    };
+    existing.events.push(event);
+    existing.totalBytes += event.data.length;
+    while (
+      existing.totalBytes > MAX_PENDING_SEQUENCED_OUTPUT_BYTES_PER_SESSION
+      && existing.events.length > 0
+    ) {
+      const removed = existing.events.shift();
+      if (!removed) break;
+      existing.totalBytes = Math.max(0, existing.totalBytes - removed.data.length);
+      existing.truncated = true;
+    }
+    pendingSequencedOutputRef.current.set(event.id, existing);
+  };
+
+  const acceptAttachedPtyOutput = (event: PtyOutput) => {
+    if (!Number.isSafeInteger(event.sequence) || event.sequence <= 0) return;
+    const previous = lastPtySequenceRef.current.get(event.id) ?? 0;
+    if (event.sequence <= previous) return;
+    lastPtySequenceRef.current.set(event.id, event.sequence);
+    deliverPtyOutputText(event.id, event.data);
+  };
+
+  const reconcileAttachedPtyAfterRendererReady = (
+    id: string,
+    snapshot: SessionReplaySnapshot | null,
+  ) => {
+    const pending = pendingSequencedOutputRef.current.get(id) ?? null;
+    const events: PtyOutput[] = (snapshot?.replay ?? []).map((chunk) => ({
+      id,
+      persistId: snapshot?.persistId ?? null,
+      sequence: chunk.sequence,
+      data: chunk.data,
+    }));
+    if (pending) events.push(...pending.events);
+    events.sort((a, b) => a.sequence - b.sequence);
+
+    if (
+      (snapshot?.replayTruncated || pending?.truncated)
+      && !replayTruncationNotifiedRef.current.has(id)
+    ) {
+      replayTruncationNotifiedRef.current.add(id);
+      deliverPtyOutputText(id, PTY_REPLAY_TRUNCATED_NOTICE);
+    }
+    for (const event of events) acceptAttachedPtyOutput(event);
+    if (snapshot) {
+      const previous = lastPtySequenceRef.current.get(id) ?? 0;
+      lastPtySequenceRef.current.set(id, Math.max(previous, snapshot.replayThroughSequence));
+    }
+    pendingSequencedOutputRef.current.delete(id);
+  };
+
+  const finalizePtyAttachment = (session: Session) => {
+    if (attachedPtyIdsRef.current.has(session.id)) return;
+    const attachment = session.backendAttachment;
+    if (!attachment) return;
+
+    const readySnapshot = rendererReplaySnapshotsRef.current.get(session.id) ?? null;
+    const pending = pendingSequencedOutputRef.current.get(session.id) ?? null;
+    const events: PtyOutput[] = [];
+    const appendReplay = (chunks: PtyReplayChunk[]) => {
+      for (const chunk of chunks) {
+        events.push({
+          id: session.id,
+          persistId: session.persistId,
+          sequence: chunk.sequence,
+          data: chunk.data,
+        });
+      }
+    };
+    if (readySnapshot) appendReplay(readySnapshot.replay);
+    appendReplay(attachment.replay);
+    if (pending) events.push(...pending.events);
+    events.sort((a, b) => a.sequence - b.sequence);
+
+    const truncated = Boolean(
+      readySnapshot?.replayTruncated
+      || attachment.replayTruncated
+      || pending?.truncated,
+    );
+    if (truncated && !replayTruncationNotifiedRef.current.has(session.id)) {
+      replayTruncationNotifiedRef.current.add(session.id);
+      deliverPtyOutputText(session.id, PTY_REPLAY_TRUNCATED_NOTICE);
+    }
+
+    let lastSequence = lastPtySequenceRef.current.get(session.id) ?? 0;
+    for (const event of events) {
+      if (!Number.isSafeInteger(event.sequence) || event.sequence <= lastSequence) continue;
+      lastSequence = event.sequence;
+      lastPtySequenceRef.current.set(session.id, lastSequence);
+      deliverPtyOutputText(session.id, event.data);
+    }
+    lastSequence = Math.max(
+      lastSequence,
+      readySnapshot?.replayThroughSequence ?? 0,
+      attachment.replayThroughSequence,
+    );
+    lastPtySequenceRef.current.set(session.id, lastSequence);
+    pendingSequencedOutputRef.current.delete(session.id);
+    rendererReplaySnapshotsRef.current.delete(session.id);
+    attachedPtyIdsRef.current.add(session.id);
+  };
+
+  useEffect(() => {
+    for (const session of sessions) finalizePtyAttachment(session);
+  }, [sessions]);
 
   const active = useMemo(
     () => sessions.find((s) => s.id === activeId) ?? null,
@@ -3544,11 +3777,15 @@ export default function App() {
             persistent: current.persistent,
             persistId: current.persistId,
             createdAt: current.createdAt,
+            respawn: true,
           });
           const created = applyPendingExit(createdRaw);
           replacementId = created.id;
 
-          if (current.persistent) {
+          // An idempotent create can return the already-live persistent PTY
+          // (for example when a health check races renderer recovery). Never
+          // inject its bootstrap command a second time into that session.
+          if (current.persistent && !created.backendAttachment?.adopted) {
             const bootstrap = (restoreCommand ?? launchCommand ?? "").trim();
             if (bootstrap) {
               await invoke("write_to_session", {
@@ -3724,7 +3961,14 @@ export default function App() {
                 pinned: s.pinned,
                 sidebarOrder: s.sidebarOrder,
               });
-              setSessionsSync(prev => prev.map(x => x.id === id ? { ...created, connectionState: "connected" as const } : x));
+              setSessionsSync(prev => prev.map(x =>
+                x.id === id
+                  ? {
+                      ...created,
+                      connectionState: created.exited ? created.connectionState : "connected" as const,
+                    }
+                  : x
+              ));
               setActiveId(prev => prev === id ? created.id : prev);
             } catch {
               setSessionsSync(prev => prev.map(x =>
@@ -7688,48 +7932,51 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     const unlisteners: Array<() => void> = [];
+    const rendererId = makeId();
+    rendererHandshakePendingRef.current = true;
 
 	    const setup = async () => {
-	      // Set up event listeners FIRST, before creating any sessions
+      // Await a native generation ticket before listeners are installed. If
+      // this WebContent process terminates at any later point, native lifecycle
+      // handling invalidates the ticket and a queued stale ready cannot enable
+      // delivery to the dead renderer.
+      const rendererTicket = await invoke<RendererListenerTicket>("renderer_listener_ticket", {
+        rendererId,
+      });
+      if (cancelled) {
+        void invoke("renderer_listener_unavailable", { rendererId }).catch(() => {});
+        return;
+      }
+
+      // Set up event listeners FIRST, before creating any sessions
       const unlistenOutput = await listen<PtyOutput>("pty-output", (event) => {
         if (cancelled) return;
-        const { id, data } = event.payload as { id: string; data?: unknown };
-        let text = coercePtyDataToString(data);
-        if (!text) return;
-              // Strip echoed Cursor Position Report responses (ESC[row;colR).
-              // TUI apps send ESC[6n to query cursor position; xterm.js responds
-              // via onData which the PTY kernel may echo back as visible garbage.
-              if (CPR_RESPONSE_RE.test(text)) {
-                text = text.replace(CPR_RESPONSE_RE_GLOBAL, "");
-                if (!text) return;
-              }
-
-		        // Ignore events for sessions being closed
-		        if (closingSessions.current.has(id)) return;
-              markSessionAliveFromOutput(id);
-			        markAgentWorkingFromOutput(id, text);
-              const queue = outputQueueRef.current.get(id) ?? [];
-              if (queue.length === 0) {
-                queue.push(text);
-              } else if (queue.length >= MAX_OUTPUT_QUEUE_CHUNKS_PER_SESSION) {
-                const last = queue[queue.length - 1];
-                if (last.length >= 64 * 1024) {
-                  queue.shift();
-                  queue.push(text);
-                } else {
-                  queue[queue.length - 1] += text;
-                }
-              } else {
-                queue.push(text);
-              }
-              outputQueueRef.current.set(id, queue);
-              scheduleOutputFlush();
+        const payload = event.payload;
+        if (
+          !payload
+          || typeof payload.id !== "string"
+          || typeof payload.data !== "string"
+          || !Number.isSafeInteger(payload.sequence)
+          || payload.sequence <= 0
+        ) return;
+        if (
+          rendererHandshakePendingRef.current
+          || !attachedPtyIdsRef.current.has(payload.id)
+        ) {
+          bufferSequencedPtyOutput(payload);
+          return;
+        }
+        acceptAttachedPtyOutput(payload);
       });
+      if (cancelled) {
+        unlistenOutput();
+        return;
+      }
       unlisteners.push(unlistenOutput);
 
       const unlistenExit = await listen<PtyExit>("pty-exit", (event) => {
         if (cancelled) return;
-        const { id, exit_code } = event.payload;
+        const { id, exit_code, renderer_recovery } = event.payload;
 
         clearAgentIdleTimer(id);
         clearCommandActivityTimer(id);
@@ -7744,9 +7991,13 @@ export default function App() {
         }
 
         const exitedSession = sessionByIdRef.current.get(id) ?? null;
+        // A final exit code can arrive just after listener-ready returned an
+        // exit placeholder. That is recovery state, not a fresh SSH failure;
+        // keep it exited until the user explicitly reconnects.
         if (
           exitedSession &&
           isSshSession(exitedSession) &&
+          !renderer_recovery &&
           !exitedSession.manualReconnectAvailable
         ) {
           reconnectSshSessionRef.current(
@@ -7785,12 +8036,80 @@ export default function App() {
             exitedCleanupTimers.current.delete(id);
             if (activeIdRef.current !== id) {
               removeSessionFromState(id);
+              // The exited tab is no longer restorable, so its bounded native
+              // pending-exit record can now be discarded as well.
+              void closeSession(id).catch(() => {});
             }
           }, 120_000);
           exitedCleanupTimers.current.set(id, timer);
         }
       });
+      if (cancelled) {
+        unlistenExit();
+        return;
+      }
       unlisteners.push(unlistenExit);
+
+      // Native output is disabled after a WebContent termination. Re-enable it
+      // only after both listeners exist, while atomically receiving everything
+      // retained before this point. Listener events that race the command
+      // response remain buffered above and are merged by their sequence number.
+      if (cancelled) return;
+      const rendererReady = await invoke<RendererListenerReady>("renderer_listener_ready", {
+        rendererId,
+        contentGeneration: rendererTicket.contentGeneration,
+      });
+      if (cancelled) {
+        void invoke("renderer_listener_unavailable", { rendererId }).catch(() => {});
+        return;
+      }
+      const readyById = new Map(rendererReady.sessions.map((snapshot) => [snapshot.id, snapshot]));
+      for (const snapshot of rendererReady.sessions) {
+        if (attachedPtyIdsRef.current.has(snapshot.id)) {
+          reconcileAttachedPtyAfterRendererReady(snapshot.id, snapshot);
+        } else {
+          rendererReplaySnapshotsRef.current.set(snapshot.id, snapshot);
+        }
+      }
+      const recoveredExitIds = new Set<string>();
+      const recoveredExits = rendererReady.exits ?? [];
+      for (const exit of recoveredExits) {
+        readyById.set(exit.id, exit);
+        recoveredExitIds.add(exit.id);
+        if (attachedPtyIdsRef.current.has(exit.id)) {
+          reconcileAttachedPtyAfterRendererReady(exit.id, exit);
+        } else {
+          rendererReplaySnapshotsRef.current.set(exit.id, exit);
+        }
+        if (!sessionByIdRef.current.has(exit.id)) {
+          pendingExitCodes.current.set(exit.id, exit.exitCode ?? null);
+        }
+      }
+      if (recoveredExitIds.size > 0) {
+        setSessionsSync((prev) =>
+          prev.map((session) => {
+            if (!recoveredExitIds.has(session.id)) return session;
+            const exit = recoveredExits.find((item) => item.id === session.id);
+            const reconnectable = isSshSession(session);
+            return {
+              ...session,
+              exited: true,
+              exitCode: exit?.exitCode ?? null,
+              runningCommand: null,
+              recordingActive: false,
+              connectionState: reconnectable ? "disconnected" : session.connectionState ?? "connected",
+              manualReconnectAvailable: reconnectable,
+              disconnectReason: reconnectable
+                ? "Session exited while the renderer was unavailable."
+                : session.disconnectReason ?? null,
+            };
+          }),
+        );
+      }
+      for (const id of attachedPtyIdsRef.current) {
+        if (!readyById.has(id)) reconcileAttachedPtyAfterRendererReady(id, null);
+      }
+      rendererHandshakePendingRef.current = false;
 
       const unlistenMenu = await listen<AppMenuEventPayload>("app-menu", (event) => {
         if (cancelled) return;
@@ -8206,6 +8525,7 @@ export default function App() {
               typeof s.sidebarOrder === "number" && Number.isFinite(s.sidebarOrder)
                 ? s.sidebarOrder
                 : s.createdAt,
+            restoreExisting: true,
           });
           const created = applyPendingExit(createdRaw);
           if (s.symbol) created.symbol = s.symbol;
@@ -8214,7 +8534,7 @@ export default function App() {
             (s.persistent
               ? null
               : (s.launchCommand ? null : (s.restoreCommand ?? null))?.trim()) ?? null;
-          if (restoreCmd) {
+          if (restoreCmd && !created.exited && !created.backendAttachment?.adopted) {
             const singleLine = restoreCmd.replace(/\r?\n/g, " ");
             void (async () => {
               try {
@@ -8279,7 +8599,11 @@ export default function App() {
       }
 
       if (cancelled) {
-        await Promise.all(restored.map((s) => closeSession(s.id).catch(() => {})));
+        await Promise.all(
+          restored
+            .filter((session) => !session.backendAttachment?.adopted)
+            .map((session) => closeSession(session.id).catch(() => {})),
+        );
         return;
       }
 
@@ -8302,7 +8626,9 @@ export default function App() {
           return;
         }
         if (cancelled) {
-          await closeSession(first.id).catch(() => {});
+          if (!first.backendAttachment?.adopted) {
+            await closeSession(first.id).catch(() => {});
+          }
           return;
         }
         syncLastActiveByProject([first]);
@@ -8393,6 +8719,8 @@ export default function App() {
 
 	    return () => {
 	      cancelled = true;
+	      rendererHandshakePendingRef.current = true;
+	      void invoke("renderer_listener_unavailable", { rendererId }).catch(() => {});
 	      unlisteners.forEach(fn => fn());
         if (outputFlushRafRef.current !== null) {
           window.cancelAnimationFrame(outputFlushRafRef.current);

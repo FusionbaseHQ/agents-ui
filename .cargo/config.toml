@@ -1,0 +1,4 @@
+[patch.crates-io]
+tauri = { path = "src-tauri/vendor/tauri" }
+tauri-runtime-wry = { path = "src-tauri/vendor/tauri-runtime-wry" }
+wry = { path = "src-tauri/vendor/wry" }

@@ -1,61 +1,79 @@
+#[cfg(all(target_os = "macos", panic = "abort"))]
+compile_error!(
+    "macOS builds require panic=unwind so WebKit/AppKit callback containment remains effective"
+);
+
 mod agent;
 mod api_bridge;
-mod browser;
-mod display_recovery;
 mod api_discovery;
 mod api_handlers;
 mod api_server;
 mod api_types;
-mod app_menu;
 mod app_info;
+mod app_menu;
 mod assets;
-mod server_control;
-mod files;
+mod browser;
+mod display_recovery;
 mod file_manager;
+mod files;
 mod fs_watcher;
 mod mcp_server;
 mod mcp_tools;
+mod persist;
 mod power_assertion;
 mod pty;
-mod persist;
 mod recording;
 mod secure;
+mod server_control;
 mod ssh;
 mod ssh_fs;
 mod startup;
 mod system_stats;
 mod tray;
 
+use agent::{
+    build_agent_task_command, get_agent_terminal_command, orchestrate_ensure_dir,
+    orchestrate_read_file, read_agent_session_output, register_mcp_with_agents, start_agent_prompt,
+    stop_agent, write_agent_mcp_config, AgentState,
+};
+use api_bridge::{api_notify_state_change, api_respond, ApiEventBus, ApiPendingRequests};
 use app_info::get_app_info;
-use assets::apply_text_assets;
 use app_menu::{build_app_menu, handle_app_menu_event};
-use files::{copy_fs_entry, create_directory, create_file, delete_fs_entry, list_fs_entries, probe_file, read_file_range, read_text_file, rename_fs_entry, search_fs_entries, write_text_file};
+use assets::apply_text_assets;
 use file_manager::{open_path_in_file_manager, open_path_in_vscode};
+use files::{
+    copy_fs_entry, create_directory, create_file, delete_fs_entry, list_fs_entries, probe_file,
+    read_file_range, read_text_file, rename_fs_entry, search_fs_entries, write_text_file,
+};
+use fs_watcher::{
+    start_fs_watcher, stop_fs_watcher, unwatch_directory, watch_directory, FsWatcherState,
+};
+use mcp_tools::OutputBuffers;
+use persist::{
+    list_directories, load_persisted_state, load_persisted_state_meta, save_persisted_state,
+    validate_directory,
+};
 use pty::{
     close_session, create_session, detach_session, detect_shells, kill_persistent_session,
-    list_persistent_sessions, list_sessions, rename_session, resize_session,
+    list_persistent_sessions, list_sessions, rename_session, renderer_listener_ready,
+    renderer_listener_ticket, renderer_listener_unavailable, resize_session,
     start_session_recording, stop_session_recording, write_to_session, AppState,
 };
-use persist::{list_directories, load_persisted_state, load_persisted_state_meta, save_persisted_state, validate_directory};
 use recording::{delete_recording, list_recordings, load_recording};
 use secure::{prepare_secure_storage, reset_secure_storage};
+use server_control::{get_server_status, set_api_enabled, set_mcp_enabled, ServerControl};
 use ssh::list_ssh_hosts;
 use ssh_fs::{
-    ssh_create_directory, ssh_create_file, ssh_default_root, ssh_delete_fs_entry, ssh_download_file,
-    ssh_download_to_temp, ssh_effective_user,
-    ssh_list_fs_entries, ssh_probe_file, ssh_read_file_range, ssh_read_text_file, ssh_rename_fs_entry, ssh_search_fs_entries, ssh_upload_file,
-    ssh_write_text_file,
+    ssh_create_directory, ssh_create_file, ssh_default_root, ssh_delete_fs_entry,
+    ssh_download_file, ssh_download_to_temp, ssh_effective_user, ssh_list_fs_entries,
+    ssh_probe_file, ssh_read_file_range, ssh_read_text_file, ssh_rename_fs_entry,
+    ssh_search_fs_entries, ssh_upload_file, ssh_write_text_file,
 };
-use fs_watcher::{start_fs_watcher, stop_fs_watcher, watch_directory, unwatch_directory, FsWatcherState};
 use startup::get_startup_flags;
-use system_stats::{ssh_system_health_stats, system_health_stats};
-use agent::{start_agent_prompt, stop_agent, get_agent_terminal_command, build_agent_task_command, write_agent_mcp_config, register_mcp_with_agents, read_agent_session_output, orchestrate_ensure_dir, orchestrate_read_file, AgentState};
-use api_bridge::{api_respond, api_notify_state_change, ApiPendingRequests, ApiEventBus};
-use mcp_tools::OutputBuffers;
-use server_control::{get_server_status, set_api_enabled, set_mcp_enabled, ServerControl};
-use tray::{build_status_tray, set_tray_agent_count, set_tray_recent_sessions, set_tray_status};
 use std::sync::Arc;
+use system_stats::{ssh_system_health_stats, system_health_stats};
 use tauri::Manager;
+use tray::{build_status_tray, set_tray_agent_count, set_tray_recent_sessions, set_tray_status};
 
 /// Raise the open-file-descriptor soft limit on Unix. The macOS default is only
 /// 256, which a terminal multiplexer exhausts fast: each PTY session holds ~3
@@ -71,7 +89,10 @@ fn raise_fd_limit() {
     // SAFETY: getrlimit/setrlimit are simple syscalls writing into a local
     // rlimit we fully own; no aliasing or lifetime concerns.
     unsafe {
-        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
             eprintln!(
                 "[fd-limit] getrlimit failed: {}",
@@ -92,7 +113,10 @@ fn raise_fd_limit() {
             return; // already high enough
         }
 
-        let new = libc::rlimit { rlim_cur: target, rlim_max: lim.rlim_max };
+        let new = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: lim.rlim_max,
+        };
         if libc::setrlimit(libc::RLIMIT_NOFILE, &new) != 0 {
             eprintln!(
                 "[fd-limit] setrlimit to {target} failed (current soft {}): {}",
@@ -138,7 +162,7 @@ fn main() {
         let _ = fix_path_env::fix();
     }
     startup::init_startup_flags();
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .manage(AppState::default())
         .manage(FsWatcherState::default())
         .manage(ApiPendingRequests::default())
@@ -149,7 +173,34 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_drag::init())
         .menu(|app| build_app_menu(app))
-        .on_menu_event(|app, event| handle_app_menu_event(app, event))
+        .on_menu_event(|app, event| handle_app_menu_event(app, event));
+
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_web_content_process_terminate(|webview| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if webview.label() == "main" {
+                // Stop serializing PTY output into a dead JavaScript event queue.
+                // Output remains available in bounded per-session replay buffers.
+                pty::mark_renderer_unavailable();
+                // Browser child views belong to the dead renderer's ephemeral
+                // React state. Mark them terminal synchronously, then let the
+                // browser worker hide/close them outside this WebKit callback.
+                browser::handle_main_web_content_terminated(webview);
+                display_recovery::handle_main_web_content_terminated(webview);
+            } else {
+                browser::handle_web_content_terminated(webview);
+            }
+        }));
+        if result.is_err() {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "[web-content-recovery] Rust panic contained in process-termination callback"
+            );
+        }
+    });
+
+    builder
         .setup(|app| {
             if let Err(e) = startup::clear_app_data_if_requested(&app.handle()) {
                 eprintln!("Failed to clear app data: {e}");
@@ -198,6 +249,9 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             create_session,
+            renderer_listener_ticket,
+            renderer_listener_ready,
+            renderer_listener_unavailable,
             detect_shells,
             write_to_session,
             resize_session,

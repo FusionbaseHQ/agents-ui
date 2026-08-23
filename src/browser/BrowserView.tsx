@@ -67,8 +67,7 @@ export default function BrowserView({
     let desiredSignature = "";
     let desiredVisible = false;
     let desiredKey = "";
-    let recoveryPhase: "none" | "hiding" | "dwell" = "none";
-    let recoveryTimer = 0;
+    let geometryRefreshGeneration = 0;
     let unlistenRecovery: (() => void) | undefined;
 
     const resetRetry = () => {
@@ -85,26 +84,13 @@ export default function BrowserView({
       }
     };
 
-    const beginRecoveryDwell = () => {
-      if (cancelled || recoveryPhase !== "hiding") return;
-      recoveryPhase = "dwell";
-      if (recoveryTimer !== 0) window.clearTimeout(recoveryTimer);
-      recoveryTimer = window.setTimeout(() => {
-        recoveryTimer = 0;
-        if (cancelled) return;
-        recoveryPhase = "none";
-        // Force a bounds/show call even if layout coordinates did not change.
-        appliedKey = "";
-        resetRetry();
-      }, 60);
-    };
-
     const runNativeOperation = (
       operation: "open" | "hide",
       args: Record<string, unknown>,
       key = "",
     ) => {
       operationInFlight = true;
+      const operationGeometryGeneration = geometryRefreshGeneration;
       const result = enqueueBrowserNativeOperation(label, async (operationId) => {
         if (isBrowserNativeViewClosing(label)) return false;
         // An operation can wait behind another component instance or a previous
@@ -127,11 +113,13 @@ export default function BrowserView({
         resetRetry();
         if (operation === "open") {
           appliedVisible = true;
-          appliedKey = key;
+          // A wake event can arrive while this call is in flight. Its native
+          // result is still safe, but do not let it consume the requested
+          // post-stability geometry refresh.
+          appliedKey = operationGeometryGeneration === geometryRefreshGeneration ? key : "";
         } else {
           appliedVisible = false;
           appliedKey = "";
-          beginRecoveryDwell();
         }
       }, (error) => {
         if (cancelled) return;
@@ -145,19 +133,13 @@ export default function BrowserView({
       });
     };
 
-    // Native child WKWebView bounds are expressed in the current window/display
-    // coordinate space. A display wake can invalidate that mapping even when
-    // the DOM rectangle itself is unchanged. Pulse through the same serialized
-    // state machine as tab/modal visibility so stale completions cannot win.
+    // A wake may preserve both the DOM rectangle and DPR while AppKit changes
+    // the native sibling coordinate space. Invalidate geometry only; the next
+    // ordinary serialized open retries through the native topology gate. There
+    // is deliberately no hide/dwell/show pulse here.
     void listen("system-resumed", () => {
-      if (cancelled || suppressedRef.current || isBrowserNativeViewClosing(label)) return;
-      recoveryPhase = "hiding";
-      desiredVisible = false;
-      desiredKey = "";
-      if (recoveryTimer !== 0) {
-        window.clearTimeout(recoveryTimer);
-        recoveryTimer = 0;
-      }
+      if (cancelled || isBrowserNativeViewClosing(label)) return;
+      geometryRefreshGeneration += 1;
       appliedKey = "";
       resetRetry();
     }).then((unlisten) => {
@@ -180,11 +162,11 @@ export default function BrowserView({
       const key = hasUsableBounds
         ? `${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)},${Math.round(r.height)},${yOffset},${window.devicePixelRatio.toFixed(4)}`
         : "";
-      const wantsHidden = suppressedRef.current || recoveryPhase !== "none" || !hasUsableBounds;
+      const wantsHidden = suppressedRef.current || !hasUsableBounds;
       desiredVisible = !wantsHidden;
       desiredKey = desiredVisible ? key : "";
       const nextSignature = wantsHidden
-        ? `hidden:${suppressedRef.current}:${recoveryPhase}:${hasUsableBounds}`
+        ? `hidden:${suppressedRef.current}:${hasUsableBounds}`
         : `visible:${key}`;
       if (nextSignature !== desiredSignature) {
         desiredSignature = nextSignature;
@@ -195,8 +177,6 @@ export default function BrowserView({
         if (wantsHidden) {
           if (appliedVisible !== false) {
             runNativeOperation("hide", { label });
-          } else {
-            beginRecoveryDwell();
           }
         } else if (appliedVisible !== true || appliedKey !== key) {
           // browser_open creates the webview the first time and repositions +
@@ -259,7 +239,6 @@ export default function BrowserView({
     return () => {
       cancelled = true;
       cancelAnimationFrame(raf);
-      if (recoveryTimer !== 0) window.clearTimeout(recoveryTimer);
       unlistenRecovery?.();
       // Queue the final native hide behind every prior operation for this label.
       // Owner-aware retries prevent an obsolete component from hiding a newer

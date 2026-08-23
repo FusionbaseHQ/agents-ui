@@ -1,19 +1,111 @@
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use crate::api_bridge::ApiEventBus;
+use crate::api_types::StateChangeNotification;
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 pub(crate) const AGENTS_UI_ZELLIJ_PREFIX: &str = "agents-ui-";
+// A fresh renderer can reconstruct the recent terminal stream after WebKit
+// replaces its content process. This is deliberately a byte bound rather than
+// a line bound: VT output need not contain newlines, and a runaway process must
+// never turn renderer recovery into unbounded native memory growth.
+const PTY_REPLAY_MAX_BYTES: usize = 512 * 1024;
+// A renderer can disappear while many PTYs are exiting. Retain at most one
+// terminal-sized tombstone per backend session, with an explicit global cap so
+// API-driven create/exit loops cannot grow native memory without bound.
+const PTY_EXIT_TOMBSTONE_MAX_SESSIONS: usize = 256;
+// Fixed global memory for persist IDs whose full tombstone/replay was evicted.
+// The filter has no false negatives: an evicted command is never rerun by
+// renderer restore. False positives are safety-biased and vanishingly rare at
+// realistic session counts (1 MiB, three independent bit positions).
+const PTY_EVICTED_EXIT_FILTER_BITS: usize = 8 * 1024 * 1024;
+const PTY_EVICTED_EXIT_FILTER_WORDS: usize = PTY_EVICTED_EXIT_FILTER_BITS / u64::BITS as usize;
+const RENDERER_CANCELED_ID_MAX: usize = 128;
+const RENDERER_TICKET_MAX: usize = 128;
 #[cfg(target_family = "unix")]
 const AGENTS_UI_ZELLIJ_LEGACY_SOCKET_BASE: &str = "/tmp/agents-ui-zellij";
+
+#[derive(Default)]
+struct EvictedPersistFilter {
+    words: Vec<u64>,
+}
+
+impl EvictedPersistFilter {
+    fn hash(value: &str, seed: u64) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64 ^ seed;
+        for byte in value.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    fn bit_indexes(value: &str) -> [usize; 3] {
+        let first = Self::hash(value, 0x9e3779b97f4a7c15);
+        let step = Self::hash(value, 0xd6e8feb86659fd93) | 1;
+        [0u64, 1, 2].map(|offset| {
+            first
+                .wrapping_add(step.wrapping_mul(offset))
+                .wrapping_rem(PTY_EVICTED_EXIT_FILTER_BITS as u64) as usize
+        })
+    }
+
+    fn insert(&mut self, persist_id: &str) {
+        if self.words.len() != PTY_EVICTED_EXIT_FILTER_WORDS {
+            self.words.resize(PTY_EVICTED_EXIT_FILTER_WORDS, 0);
+        }
+        for bit in Self::bit_indexes(persist_id) {
+            self.words[bit / u64::BITS as usize] |= 1u64 << (bit % u64::BITS as usize);
+        }
+    }
+
+    fn contains(&self, persist_id: &str) -> bool {
+        self.words.len() == PTY_EVICTED_EXIT_FILTER_WORDS
+            && Self::bit_indexes(persist_id).iter().all(|bit| {
+                self.words[*bit / u64::BITS as usize] & (1u64 << (*bit % u64::BITS as usize)) != 0
+            })
+    }
+}
+
+#[derive(Default)]
+struct RendererDeliveryState {
+    listener_id: Option<String>,
+    // Live exit events stay here until the frontend explicitly discards the
+    // exited tab. A native renderer-termination notification atomically
+    // promotes every retained entry into recovery tombstones.
+    pending_live_exits: VecDeque<SessionExitTombstone>,
+    exit_tombstones: VecDeque<SessionExitTombstone>,
+    exit_tombstones_truncated: bool,
+    evicted_exit_persist_ids: EvictedPersistFilter,
+    canceled_renderer_ids: VecDeque<String>,
+    content_generation: u64,
+    renderer_tickets: VecDeque<(String, u64)>,
+}
+
+// Output emitters and the listener-ready handshake take this mutex before
+// deciding whether to emit. The handshake snapshots every replay buffer while
+// holding it, then enables delivery. Consequently, every output chunk is
+// either present in the returned snapshot or emitted to the installed listener
+// (and may harmlessly be in both; sequence numbers let the frontend dedupe).
+static RENDERER_DELIVERY: Mutex<RendererDeliveryState> = Mutex::new(RendererDeliveryState {
+    listener_id: None,
+    pending_live_exits: VecDeque::new(),
+    exit_tombstones: VecDeque::new(),
+    exit_tombstones_truncated: false,
+    evicted_exit_persist_ids: EvictedPersistFilter { words: Vec::new() },
+    canceled_renderer_ids: VecDeque::new(),
+    content_generation: 0,
+    renderer_tickets: VecDeque::new(),
+});
 
 #[cfg(target_os = "macos")]
 #[derive(Default)]
@@ -27,6 +119,8 @@ struct LoginPathCache {
 struct AppStateInner {
     next_id: AtomicU64,
     sessions: Mutex<HashMap<String, PtySession>>,
+    creating_persist_ids: Mutex<HashSet<String>>,
+    session_created: Condvar,
     #[cfg(target_os = "macos")]
     login_path_cache: Mutex<LoginPathCache>,
     #[cfg(target_family = "unix")]
@@ -46,7 +140,7 @@ impl AppState {
         match self.inner.sessions.lock() {
             Ok(sessions) => sessions
                 .values()
-                .map(|s| (s.command.clone(), s.child.process_id()))
+                .map(|s| (s.command.clone(), s.child_pid))
                 .collect(),
             Err(_) => Vec::new(),
         }
@@ -54,13 +148,23 @@ impl AppState {
 }
 
 struct PtySession {
+    persist_id: Option<String>,
     name: String,
     command: String,
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    child: Box<dyn portable_pty::Child + Send>,
-    recording: Option<SessionRecording>,
-    closing: bool,
+    cwd: Option<String>,
+    io: PtySessionIo,
+    child_pid: Option<u32>,
+    replay: Arc<Mutex<PtyReplayBuffer>>,
+}
+
+#[derive(Clone)]
+struct PtySessionIo {
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
+    killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
+    recording: Arc<Mutex<Option<SessionRecording>>>,
+    closing: Arc<AtomicBool>,
 }
 
 struct SessionRecording {
@@ -74,24 +178,740 @@ struct SessionRecording {
     enc_key: Option<[u8; 32]>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
     pub id: String,
+    pub persist_id: Option<String>,
     pub name: String,
     pub command: String,
     pub cwd: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct PtyOutput {
     id: Arc<str>,
+    persist_id: Option<Arc<str>>,
+    sequence: u64,
     data: String,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PtyReplayChunk {
+    pub sequence: u64,
+    pub data: String,
+}
+
+#[derive(Default)]
+struct PtyReplayBuffer {
+    chunks: VecDeque<PtyReplayChunk>,
+    total_bytes: usize,
+    last_sequence: u64,
+    truncated: bool,
+}
+
+impl PtyReplayBuffer {
+    fn append(&mut self, data: &str) -> u64 {
+        self.append_with_limit(data, PTY_REPLAY_MAX_BYTES)
+    }
+
+    fn append_with_limit(&mut self, data: &str, max_bytes: usize) -> u64 {
+        self.last_sequence = self.last_sequence.wrapping_add(1).max(1);
+        let sequence = self.last_sequence;
+        self.total_bytes = self.total_bytes.saturating_add(data.len());
+        self.chunks.push_back(PtyReplayChunk {
+            sequence,
+            data: data.to_string(),
+        });
+
+        while self.total_bytes > max_bytes {
+            let Some(removed) = self.chunks.pop_front() else {
+                self.total_bytes = 0;
+                break;
+            };
+            self.total_bytes = self.total_bytes.saturating_sub(removed.data.len());
+            self.truncated = true;
+        }
+        sequence
+    }
+
+    fn snapshot(&self) -> (Vec<PtyReplayChunk>, u64, bool) {
+        (
+            self.chunks.iter().cloned().collect(),
+            self.last_sequence,
+            self.truncated,
+        )
+    }
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReplaySnapshot {
+    pub id: String,
+    pub persist_id: Option<String>,
+    pub replay: Vec<PtyReplayChunk>,
+    pub replay_through_sequence: u64,
+    pub replay_truncated: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionAttachResult {
+    #[serde(flatten)]
+    pub session: SessionInfo,
+    pub adopted: bool,
+    pub exited: bool,
+    pub exit_code: Option<u32>,
+    pub replay: Vec<PtyReplayChunk>,
+    pub replay_through_sequence: u64,
+    pub replay_truncated: bool,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionExitTombstone {
+    #[serde(flatten)]
+    pub session: SessionInfo,
+    pub exit_code: Option<u32>,
+    pub replay: Vec<PtyReplayChunk>,
+    pub replay_through_sequence: u64,
+    pub replay_truncated: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RendererListenerReady {
+    pub renderer_id: String,
+    pub sessions: Vec<SessionReplaySnapshot>,
+    pub exits: Vec<SessionExitTombstone>,
+    pub exits_truncated: bool,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RendererListenerTicket {
+    pub renderer_id: String,
+    pub content_generation: u64,
 }
 
 #[derive(Serialize, Clone)]
 struct PtyExit {
     id: String,
     exit_code: Option<u32>,
+    renderer_recovery: bool,
+}
+
+fn session_info(id: &str, session: &PtySession) -> SessionInfo {
+    SessionInfo {
+        id: id.to_string(),
+        persist_id: session.persist_id.clone(),
+        name: session.name.clone(),
+        command: session.command.clone(),
+        cwd: session.cwd.clone(),
+    }
+}
+
+fn session_io(inner: &AppStateInner, id: &str) -> Result<PtySessionIo, String> {
+    let sessions = inner
+        .sessions
+        .lock()
+        .map_err(|_| "state poisoned".to_string())?;
+    sessions
+        .get(id)
+        .map(|session| session.io.clone())
+        .ok_or_else(|| "unknown session".to_string())
+}
+
+fn try_claim_session_closing(closing: &AtomicBool) -> bool {
+    !closing.swap(true, Ordering::AcqRel)
+}
+
+fn replay_snapshot(id: &str, session: &PtySession) -> SessionReplaySnapshot {
+    let replay = session
+        .replay
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (chunks, through_sequence, truncated) = replay.snapshot();
+    SessionReplaySnapshot {
+        id: id.to_string(),
+        persist_id: session.persist_id.clone(),
+        replay: chunks,
+        replay_through_sequence: through_sequence,
+        replay_truncated: truncated,
+    }
+}
+
+fn session_attach_result(id: &str, session: &PtySession, adopted: bool) -> SessionAttachResult {
+    let snapshot = replay_snapshot(id, session);
+    SessionAttachResult {
+        session: session_info(id, session),
+        adopted,
+        exited: false,
+        exit_code: None,
+        replay: snapshot.replay,
+        replay_through_sequence: snapshot.replay_through_sequence,
+        replay_truncated: snapshot.replay_truncated,
+    }
+}
+
+fn session_exit_tombstone(
+    id: &str,
+    session: &PtySession,
+    exit_code: Option<u32>,
+) -> SessionExitTombstone {
+    let snapshot = replay_snapshot(id, session);
+    SessionExitTombstone {
+        session: session_info(id, session),
+        exit_code,
+        replay: snapshot.replay,
+        replay_through_sequence: snapshot.replay_through_sequence,
+        replay_truncated: snapshot.replay_truncated,
+    }
+}
+
+fn tombstone_attach_result(tombstone: &SessionExitTombstone) -> SessionAttachResult {
+    SessionAttachResult {
+        session: tombstone.session.clone(),
+        adopted: true,
+        exited: true,
+        exit_code: tombstone.exit_code,
+        replay: tombstone.replay.clone(),
+        replay_through_sequence: tombstone.replay_through_sequence,
+        replay_truncated: tombstone.replay_truncated,
+    }
+}
+
+fn truncated_exit_attach_result(
+    persist_id: &str,
+    name: Option<&str>,
+    command: Option<&str>,
+    cwd: Option<&str>,
+) -> SessionAttachResult {
+    SessionAttachResult {
+        session: SessionInfo {
+            id: format!("exited-{persist_id}"),
+            persist_id: Some(persist_id.to_string()),
+            name: name.unwrap_or("session").to_string(),
+            command: command.unwrap_or_default().to_string(),
+            cwd: cwd.map(str::to_string),
+        },
+        adopted: true,
+        exited: true,
+        exit_code: None,
+        replay: Vec::new(),
+        replay_through_sequence: 0,
+        replay_truncated: true,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryTarget {
+    RendererAndNativeApi,
+    NativeApiOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainedExitLocation {
+    PendingLive,
+    RecoveryTombstone,
+}
+
+impl RendererDeliveryState {
+    fn push_retained_exit(
+        &mut self,
+        location: RetainedExitLocation,
+        tombstone: SessionExitTombstone,
+    ) {
+        // A session can move from the live-listener queue into the recovery
+        // queue, but it must never consume a slot in both. Keeping this
+        // de-duplication global also makes the bound below a true aggregate
+        // cap rather than two independent per-queue caps.
+        self.pending_live_exits
+            .retain(|existing| existing.session.id != tombstone.session.id);
+        self.exit_tombstones
+            .retain(|existing| existing.session.id != tombstone.session.id);
+        match location {
+            RetainedExitLocation::PendingLive => self.pending_live_exits.push_back(tombstone),
+            RetainedExitLocation::RecoveryTombstone => self.exit_tombstones.push_back(tombstone),
+        }
+
+        while self.pending_live_exits.len() + self.exit_tombstones.len()
+            > PTY_EXIT_TOMBSTONE_MAX_SESSIONS
+        {
+            // Pending entries back direct events that the current renderer may
+            // not yet have consumed. Prefer evicting an older recovery entry;
+            // either kind is still recorded in the fixed-memory persist-ID
+            // filter so restore can never rerun an evicted command.
+            let evicted = self
+                .exit_tombstones
+                .pop_front()
+                .or_else(|| self.pending_live_exits.pop_front());
+            if let Some(evicted) = evicted {
+                self.remember_evicted_exit(evicted);
+            } else {
+                break;
+            }
+        }
+        debug_assert!(
+            self.pending_live_exits.len() + self.exit_tombstones.len()
+                <= PTY_EXIT_TOMBSTONE_MAX_SESSIONS
+        );
+    }
+
+    fn remember_evicted_exit(&mut self, tombstone: SessionExitTombstone) {
+        self.exit_tombstones_truncated = true;
+        if let Some(persist_id) = tombstone.session.persist_id.as_deref() {
+            self.evicted_exit_persist_ids.insert(persist_id);
+        }
+    }
+
+    fn delivery_target(&self) -> DeliveryTarget {
+        if self.listener_id.is_some() {
+            DeliveryTarget::RendererAndNativeApi
+        } else {
+            DeliveryTarget::NativeApiOnly
+        }
+    }
+
+    /// Returns true when the installed renderer must receive the normal direct
+    /// exit event. Such events remain pending until JS acknowledges them, so a
+    /// content-process termination racing event delivery can promote them to
+    /// recovery tombstones without rerunning the command.
+    fn classify_exit(&mut self, tombstone: Option<SessionExitTombstone>) -> bool {
+        let renderer_live = self.listener_id.is_some();
+        if let Some(tombstone) = tombstone {
+            let location = if renderer_live {
+                RetainedExitLocation::PendingLive
+            } else {
+                RetainedExitLocation::RecoveryTombstone
+            };
+            self.push_retained_exit(location, tombstone);
+        }
+        renderer_live
+    }
+
+    fn promote_pending_exits(&mut self) {
+        while let Some(pending) = self.pending_live_exits.pop_front() {
+            self.push_retained_exit(RetainedExitLocation::RecoveryTombstone, pending);
+        }
+    }
+
+    fn mark_unavailable(&mut self) {
+        self.listener_id = None;
+        self.promote_pending_exits();
+    }
+
+    fn mark_unavailable_if_listener(&mut self, renderer_id: &str) -> bool {
+        if self.listener_id.as_deref() != Some(renderer_id) {
+            return false;
+        }
+        self.mark_unavailable();
+        true
+    }
+
+    fn remember_canceled_renderer(&mut self, renderer_id: &str) {
+        self.canceled_renderer_ids
+            .retain(|existing| existing != renderer_id);
+        self.canceled_renderer_ids
+            .push_back(renderer_id.to_string());
+        while self.canceled_renderer_ids.len() > RENDERER_CANCELED_ID_MAX {
+            self.canceled_renderer_ids.pop_front();
+        }
+    }
+
+    fn cancel_renderer(&mut self, renderer_id: &str) {
+        self.remember_canceled_renderer(renderer_id);
+        self.renderer_tickets
+            .retain(|(ticket_id, _)| ticket_id != renderer_id);
+        self.mark_unavailable_if_listener(renderer_id);
+    }
+
+    fn cancel_current_renderer(&mut self) {
+        if let Some(renderer_id) = self.listener_id.clone() {
+            self.remember_canceled_renderer(&renderer_id);
+            self.renderer_tickets
+                .retain(|(ticket_id, _)| ticket_id != &renderer_id);
+        }
+        self.mark_unavailable();
+    }
+
+    fn terminate_content_generation(&mut self) {
+        self.content_generation = self.content_generation.wrapping_add(1);
+        // A ticket is issued only after JavaScript has awaited the native
+        // response. Clearing every ticket therefore invalidates all ready
+        // invokes that an abruptly terminated content process could have
+        // queued, including the no-current-listener window.
+        self.renderer_tickets.clear();
+        self.cancel_current_renderer();
+    }
+
+    fn renderer_was_canceled(&self, renderer_id: &str) -> bool {
+        self.canceled_renderer_ids
+            .iter()
+            .any(|existing| existing == renderer_id)
+    }
+
+    fn issue_renderer_ticket(
+        &mut self,
+        renderer_id: String,
+    ) -> Result<RendererListenerTicket, &'static str> {
+        if self.renderer_was_canceled(&renderer_id) {
+            return Err("renderer listener registration was canceled");
+        }
+        self.renderer_tickets
+            .retain(|(ticket_id, _)| ticket_id != &renderer_id);
+        let content_generation = self.content_generation;
+        self.renderer_tickets
+            .push_back((renderer_id.clone(), content_generation));
+        while self.renderer_tickets.len() > RENDERER_TICKET_MAX {
+            self.renderer_tickets.pop_front();
+        }
+        Ok(RendererListenerTicket {
+            renderer_id,
+            content_generation,
+        })
+    }
+
+    fn validate_renderer_ticket(
+        &self,
+        renderer_id: &str,
+        content_generation: u64,
+    ) -> Result<(), &'static str> {
+        if self.renderer_was_canceled(renderer_id) {
+            return Err("renderer listener registration was canceled");
+        }
+        if content_generation != self.content_generation
+            || !self.renderer_tickets.iter().any(|(ticket_id, generation)| {
+                ticket_id == renderer_id && *generation == content_generation
+            })
+        {
+            return Err("renderer content generation expired");
+        }
+        Ok(())
+    }
+
+    fn try_enable_renderer(
+        &mut self,
+        renderer_id: String,
+        content_generation: u64,
+    ) -> Result<(Vec<SessionExitTombstone>, bool), &'static str> {
+        self.validate_renderer_ticket(&renderer_id, content_generation)?;
+        self.renderer_tickets.retain(|(ticket_id, generation)| {
+            ticket_id != &renderer_id || *generation != content_generation
+        });
+        Ok(self.enable_renderer(renderer_id))
+    }
+
+    /// Completes an already-published exit without creating new retained state.
+    /// A deliberate respawn/close can remove the placeholder while child.wait()
+    /// is in progress; in that case this must remain a no-op.
+    fn update_retained_exit_code(
+        &mut self,
+        id: &str,
+        exit_code: Option<u32>,
+    ) -> Option<RetainedExitLocation> {
+        if let Some(exit) = self
+            .pending_live_exits
+            .iter_mut()
+            .find(|exit| exit.session.id == id)
+        {
+            exit.exit_code = exit_code;
+            return Some(RetainedExitLocation::PendingLive);
+        }
+        if let Some(exit) = self
+            .exit_tombstones
+            .iter_mut()
+            .find(|exit| exit.session.id == id)
+        {
+            exit.exit_code = exit_code;
+            return Some(RetainedExitLocation::RecoveryTombstone);
+        }
+        None
+    }
+
+    fn retained_exit_for_create(
+        &self,
+        persist_id: &str,
+        respawn: bool,
+    ) -> Option<SessionAttachResult> {
+        if respawn {
+            return None;
+        }
+        self.exit_tombstones
+            .iter()
+            .rev()
+            .chain(self.pending_live_exits.iter().rev())
+            .find(|tombstone| tombstone.session.persist_id.as_deref() == Some(persist_id))
+            .map(tombstone_attach_result)
+    }
+
+    fn evicted_exit_for_create(
+        &self,
+        persist_id: &str,
+        restore_existing: bool,
+        name: Option<&str>,
+        command: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Option<SessionAttachResult> {
+        self.evicted_exit_persist_ids.contains(persist_id).then(|| {
+            // Startup restore has authoritative saved metadata. Other
+            // idempotent calls remain suppressed too, but use a neutral label;
+            // only explicit `respawn: true` may rerun the command.
+            truncated_exit_attach_result(
+                persist_id,
+                restore_existing.then_some(name).flatten(),
+                restore_existing.then_some(command).flatten(),
+                restore_existing.then_some(cwd).flatten(),
+            )
+        })
+    }
+
+    fn enable_renderer(&mut self, renderer_id: String) -> (Vec<SessionExitTombstone>, bool) {
+        // A ready handshake from a different content process supersedes the old
+        // listener even if its cleanup/termination callback has not arrived.
+        // Its unacknowledged direct exits now belong in the new renderer's
+        // recovery snapshot, not in an invisible old-listener pending set.
+        if self.listener_id.as_deref() != Some(renderer_id.as_str()) {
+            self.promote_pending_exits();
+        }
+        let exits = self.exit_tombstones.iter().cloned().collect();
+        let exits_truncated = self.exit_tombstones_truncated;
+        self.listener_id = Some(renderer_id);
+        (exits, exits_truncated)
+    }
+
+    fn remove_exit_by_id(&mut self, id: &str) {
+        self.pending_live_exits
+            .retain(|tombstone| tombstone.session.id != id);
+        self.exit_tombstones
+            .retain(|tombstone| tombstone.session.id != id);
+    }
+
+    fn remove_exits_by_persist_id(&mut self, persist_id: &str) {
+        self.pending_live_exits
+            .retain(|tombstone| tombstone.session.persist_id.as_deref() != Some(persist_id));
+        self.exit_tombstones
+            .retain(|tombstone| tombstone.session.persist_id.as_deref() != Some(persist_id));
+    }
+}
+
+struct SessionCreationReservation<'a> {
+    inner: &'a AppStateInner,
+    persist_id: String,
+}
+
+impl Drop for SessionCreationReservation<'_> {
+    fn drop(&mut self) {
+        let mut creating = self
+            .inner
+            .creating_persist_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        creating.remove(&self.persist_id);
+        self.inner.session_created.notify_all();
+    }
+}
+
+enum SessionCreationStart<'a> {
+    Adopted(SessionAttachResult),
+    Reserved(SessionCreationReservation<'a>),
+}
+
+fn reserve_or_adopt_session<'a>(
+    inner: &'a AppStateInner,
+    persist_id: &str,
+) -> Result<SessionCreationStart<'a>, String> {
+    let mut creating = inner
+        .creating_persist_ids
+        .lock()
+        .map_err(|_| "session creation state poisoned".to_string())?;
+
+    loop {
+        let adopted = {
+            let sessions = inner
+                .sessions
+                .lock()
+                .map_err(|_| "state poisoned".to_string())?;
+            sessions
+                .iter()
+                .filter(|(_, session)| {
+                    !session.io.closing.load(Ordering::Acquire)
+                        && session.persist_id.as_deref() == Some(persist_id)
+                })
+                // Prefer the oldest backend ID if an older build already left
+                // duplicate attachments behind. New creation is serialized, so
+                // this compatibility branch is not reached for new sessions.
+                .min_by_key(|(id, _)| id.parse::<u64>().unwrap_or(u64::MAX))
+                .map(|(id, session)| session_attach_result(id, session, true))
+        };
+        if let Some(adopted) = adopted {
+            return Ok(SessionCreationStart::Adopted(adopted));
+        }
+
+        if creating.insert(persist_id.to_string()) {
+            return Ok(SessionCreationStart::Reserved(SessionCreationReservation {
+                inner,
+                persist_id: persist_id.to_string(),
+            }));
+        }
+
+        creating = inner
+            .session_created
+            .wait(creating)
+            .map_err(|_| "session creation state poisoned".to_string())?;
+    }
+}
+
+fn normalized_renderer_id(renderer_id: String) -> Result<String, String> {
+    let renderer_id = renderer_id.trim();
+    if renderer_id.is_empty() {
+        return Err("rendererId is required".to_string());
+    }
+    if renderer_id.len() > 128 {
+        return Err("rendererId is too long".to_string());
+    }
+    Ok(renderer_id.to_string())
+}
+
+fn notify_native_api(app: &AppHandle, event: &str, data: serde_json::Value) {
+    let Some(event_bus) = app.try_state::<ApiEventBus>() else {
+        return;
+    };
+    let _ = event_bus.sender().send(StateChangeNotification {
+        event: event.to_string(),
+        data,
+    });
+}
+
+fn notify_native_api_output(app: &AppHandle, id: &str, data: &str) {
+    notify_native_api(
+        app,
+        "sessions.output",
+        serde_json::json!({
+            "sessionId": id,
+            "output": data,
+        }),
+    );
+}
+
+fn notify_native_api_exit(app: &AppHandle, id: &str, exit_code: Option<u32>) {
+    notify_native_api(
+        app,
+        "sessions.exit",
+        serde_json::json!({
+            "sessionId": id,
+            "exitCode": exit_code,
+        }),
+    );
+}
+
+/// Stops PTY output from being serialized into JavaScript while the main
+/// WebContent process is absent. The native lifecycle hook can call this
+/// directly; output continues to enter each bounded replay buffer.
+pub fn mark_renderer_unavailable() {
+    let mut delivery = RENDERER_DELIVERY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    delivery.terminate_content_generation();
+}
+
+/// Issues a content-generation ticket before JavaScript installs listeners.
+/// The caller must await this response; an abrupt WebContent termination then
+/// invalidates the ticket before any late ready invoke can be queued.
+#[tauri::command]
+pub fn renderer_listener_ticket(renderer_id: String) -> Result<RendererListenerTicket, String> {
+    let renderer_id = normalized_renderer_id(renderer_id)?;
+    let mut delivery = RENDERER_DELIVERY
+        .lock()
+        .map_err(|_| "renderer delivery state poisoned".to_string())?;
+    delivery
+        .issue_renderer_ticket(renderer_id)
+        .map_err(str::to_string)
+}
+
+/// React cleanup uses a renderer-scoped ID so a late cleanup from an older
+/// StrictMode mount cannot disable a newer listener that is already ready.
+#[tauri::command]
+pub fn renderer_listener_unavailable(renderer_id: String) -> Result<(), String> {
+    let renderer_id = normalized_renderer_id(renderer_id)?;
+    let mut delivery = RENDERER_DELIVERY
+        .lock()
+        .map_err(|_| "renderer delivery state poisoned".to_string())?;
+    delivery.cancel_renderer(&renderer_id);
+    Ok(())
+}
+
+/// Atomically snapshots retained output and enables future live events. The JS
+/// caller must install both output and exit listeners before invoking this.
+#[tauri::command]
+pub fn renderer_listener_ready(
+    state: State<'_, AppState>,
+    renderer_id: String,
+    content_generation: u64,
+) -> Result<RendererListenerReady, String> {
+    let renderer_id = normalized_renderer_id(renderer_id)?;
+    let mut delivery = RENDERER_DELIVERY
+        .lock()
+        .map_err(|_| "renderer delivery state poisoned".to_string())?;
+    // Reject stale content before cloning any potentially large replay state.
+    // The same delivery lock remains held until the listener is enabled, so a
+    // native termination cannot invalidate this check between the two steps.
+    delivery
+        .validate_renderer_ticket(&renderer_id, content_generation)
+        .map_err(str::to_string)?;
+    let replay_sources = {
+        let sessions = state
+            .inner
+            .sessions
+            .lock()
+            .map_err(|_| "state poisoned".to_string())?;
+        sessions
+            .iter()
+            .filter(|(_, session)| !session.io.closing.load(Ordering::Acquire))
+            .map(|(id, session)| {
+                (
+                    id.clone(),
+                    session.persist_id.clone(),
+                    session.replay.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut snapshots = Vec::with_capacity(replay_sources.len());
+    for (id, persist_id, replay) in replay_sources {
+        let replay = replay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (chunks, through_sequence, truncated) = replay.snapshot();
+        snapshots.push(SessionReplaySnapshot {
+            id,
+            persist_id,
+            replay: chunks,
+            replay_through_sequence: through_sequence,
+            replay_truncated: truncated,
+        });
+    }
+    snapshots.sort_by(|a, b| a.id.cmp(&b.id));
+    let (mut exits, exits_truncated) = delivery
+        .try_enable_renderer(renderer_id.clone(), content_generation)
+        .map_err(str::to_string)?;
+    exits.sort_by(|a, b| a.session.id.cmp(&b.session.id));
+    // main.rs marks PTY delivery unavailable before it marks display recovery
+    // unavailable. Calling this while still holding the delivery lock preserves
+    // that ordering if WebContent terminates concurrently with a successful
+    // ready command: termination will invalidate delivery and then set the
+    // display flag after this call, never the other way around.
+    crate::display_recovery::renderer_listener_ready();
+    drop(delivery);
+    Ok(RendererListenerReady {
+        renderer_id,
+        sessions: snapshots,
+        exits,
+        exits_truncated,
+    })
 }
 
 /// Emitted when a session's requested shell couldn't be launched and we fell
@@ -232,9 +1052,7 @@ fn run_command_output_with_timeout(
 ) -> Result<std::process::Output, String> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("{label} failed: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("{label} failed: {e}"))?;
 
     let stdout_pipe = child
         .stdout
@@ -268,10 +1086,7 @@ fn run_command_output_with_timeout(
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!(
-                        "{label} timed out after {}ms",
-                        timeout.as_millis()
-                    ));
+                    return Err(format!("{label} timed out after {}ms", timeout.as_millis()));
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -304,21 +1119,25 @@ fn login_shell_path(shell: &str, base_path: &str) -> Option<String> {
     const START: &str = "__AGENTS_UI_PATH_START__";
     const END: &str = "__AGENTS_UI_PATH_END__";
 
-    let (script, arg_sets): (String, Vec<Vec<&str>>) = if shell_name.contains("zsh") || shell_name.contains("bash") {
-        (format!("printf '{START}%s{END}' \"$PATH\""), vec![vec!["-i", "-l", "-c"]])
-    } else if shell_name == "fish" {
-        (
-            format!("printf '{START}%s{END}' (string join ':' $PATH)"),
-            vec![vec!["-i", "-l", "-c"], vec!["-l", "-c"]],
-        )
-    } else if shell_name == "nu" || shell_name == "nushell" {
-        (
-            format!("print $\"{START}($env.PATH | str join ':'){END}\""),
-            vec![vec!["-l", "-c"], vec!["-i", "-l", "-c"]],
-        )
-    } else {
-        return None;
-    };
+    let (script, arg_sets): (String, Vec<Vec<&str>>) =
+        if shell_name.contains("zsh") || shell_name.contains("bash") {
+            (
+                format!("printf '{START}%s{END}' \"$PATH\""),
+                vec![vec!["-i", "-l", "-c"]],
+            )
+        } else if shell_name == "fish" {
+            (
+                format!("printf '{START}%s{END}' (string join ':' $PATH)"),
+                vec![vec!["-i", "-l", "-c"], vec!["-l", "-c"]],
+            )
+        } else if shell_name == "nu" || shell_name == "nushell" {
+            (
+                format!("print $\"{START}($env.PATH | str join ':'){END}\""),
+                vec![vec!["-l", "-c"], vec!["-i", "-l", "-c"]],
+            )
+        } else {
+            return None;
+        };
 
     let extract_path = |stdout: &str| -> Option<String> {
         let start = stdout.find(START)?;
@@ -559,7 +1378,10 @@ fn zellij_list_sessions(
     let mut cmd = Command::new(zellij);
     cmd.args(["list-sessions", "--short", "--no-formatting"])
         .env("HOME", zellij_home.to_string_lossy().to_string())
-        .env("ZELLIJ_SOCKET_DIR", socket_dir.to_string_lossy().to_string());
+        .env(
+            "ZELLIJ_SOCKET_DIR",
+            socket_dir.to_string_lossy().to_string(),
+        );
     let out = run_command_output_with_timeout(
         cmd,
         Duration::from_millis(2000),
@@ -704,8 +1526,10 @@ pub fn list_persistent_sessions(app: AppHandle) -> Result<Vec<PersistentSessionI
 
     #[cfg(target_family = "unix")]
     {
-        let zellij = find_bundled_zellij().ok_or("bundled zellij missing in this build".to_string())?;
-        let zellij_paths = ensure_zellij_paths(&app).ok_or("unable to determine app data dir".to_string())?;
+        let zellij =
+            find_bundled_zellij().ok_or("bundled zellij missing in this build".to_string())?;
+        let zellij_paths =
+            ensure_zellij_paths(&app).ok_or("unable to determine app data dir".to_string())?;
         let mut sessions: Vec<PersistentSessionInfo> = Vec::new();
         let mut list_errors: Vec<String> = Vec::new();
 
@@ -750,8 +1574,10 @@ pub fn kill_persistent_session(app: AppHandle, persist_id: String) -> Result<(),
 
     #[cfg(target_family = "unix")]
     {
-        let zellij = find_bundled_zellij().ok_or("bundled zellij missing in this build".to_string())?;
-        let zellij_paths = ensure_zellij_paths(&app).ok_or("unable to determine app data dir".to_string())?;
+        let zellij =
+            find_bundled_zellij().ok_or("bundled zellij missing in this build".to_string())?;
+        let zellij_paths =
+            ensure_zellij_paths(&app).ok_or("unable to determine app data dir".to_string())?;
         let trimmed = persist_id.trim();
         if trimmed.is_empty() {
             return Err("missing persist id".to_string());
@@ -767,7 +1593,10 @@ pub fn kill_persistent_session(app: AppHandle, persist_id: String) -> Result<(),
             let out = Command::new(&zellij)
                 .args(["kill-session", &session_name])
                 .env("HOME", zellij_paths.home_dir.to_string_lossy().to_string())
-                .env("ZELLIJ_SOCKET_DIR", socket_dir.to_string_lossy().to_string())
+                .env(
+                    "ZELLIJ_SOCKET_DIR",
+                    socket_dir.to_string_lossy().to_string(),
+                )
                 .output()
                 .map_err(|e| format!("failed to run bundled zellij: {e}"))?;
             if out.status.success() {
@@ -777,7 +1606,10 @@ pub fn kill_persistent_session(app: AppHandle, persist_id: String) -> Result<(),
             let fallback = Command::new(&zellij)
                 .args(["delete-session", "--force", &session_name])
                 .env("HOME", zellij_paths.home_dir.to_string_lossy().to_string())
-                .env("ZELLIJ_SOCKET_DIR", socket_dir.to_string_lossy().to_string())
+                .env(
+                    "ZELLIJ_SOCKET_DIR",
+                    socket_dir.to_string_lossy().to_string(),
+                )
                 .output()
                 .ok();
             if let Some(out) = fallback {
@@ -809,10 +1641,8 @@ fn write_recording_event(rec: &mut SessionRecording, t: u64, data: &str) -> Resu
         )?,
         None => data.to_string(),
     };
-    let line = crate::recording::RecordingLineV1::Input(crate::recording::RecordingEventV1 {
-        t,
-        data,
-    });
+    let line =
+        crate::recording::RecordingLineV1::Input(crate::recording::RecordingEventV1 { t, data });
     rec.json_buf.clear();
     serde_json::to_writer(&mut rec.json_buf, &line)
         .map_err(|e| format!("serialize failed: {e}"))?;
@@ -932,7 +1762,8 @@ fn record_user_input(rec: &mut SessionRecording, data: &str) -> Result<(), Strin
 }
 
 fn unique_name(existing: &HashMap<String, PtySession>, base: &str) -> String {
-    let taken: std::collections::HashSet<&str> = existing.values().map(|s| s.name.as_str()).collect();
+    let taken: std::collections::HashSet<&str> =
+        existing.values().map(|s| s.name.as_str()).collect();
     if !taken.contains(base) {
         return base.to_string();
     }
@@ -1139,7 +1970,11 @@ fn dev_sidecar_path(name: &str) -> Option<PathBuf> {
     } else {
         return None;
     };
-    Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin").join(format!("{name}-{triple}")))
+    Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("bin")
+            .join(format!("{name}-{triple}")),
+    )
 }
 
 #[cfg(target_family = "unix")]
@@ -1304,12 +2139,9 @@ fn probe_shell_version(path: &str, family: &str) -> Option<String> {
     cmd.arg("--version");
     cmd.stdin(Stdio::null());
     cmd.env("TERM", "dumb");
-    let out = run_command_output_with_timeout(
-        cmd,
-        Duration::from_millis(1500),
-        "shell version probe",
-    )
-    .ok()?;
+    let out =
+        run_command_output_with_timeout(cmd, Duration::from_millis(1500), "shell version probe")
+            .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let line = text.lines().find(|l| !l.trim().is_empty())?.trim();
     if line.is_empty() {
@@ -1523,7 +2355,9 @@ fn resolve_shell(
 
     match choice {
         Some(c) if c.kind == "system" => match c.path.as_deref() {
-            Some(p) if is_executable_file(Path::new(p)) => (ResolvedShell::System(p.to_string()), None),
+            Some(p) if is_executable_file(Path::new(p)) => {
+                (ResolvedShell::System(p.to_string()), None)
+            }
             Some(p) => (
                 default_resolved(),
                 Some(format!(
@@ -1565,7 +2399,10 @@ fn shell_accepts_login_flag(path: &str) -> bool {
 }
 
 #[cfg(target_family = "unix")]
-fn ensure_nu_config(app: &AppHandle, env_keys: &[String]) -> Option<(String, String, String, String)> {
+fn ensure_nu_config(
+    app: &AppHandle,
+    env_keys: &[String],
+) -> Option<(String, String, String, String)> {
     let xdg = ensure_shell_xdg_paths(app)?;
     let config_home = xdg.config_home;
     let data_home = xdg.data_home;
@@ -1798,19 +2635,10 @@ $env.PROMPT_MULTILINE_INDICATOR = {|| "… " }
 
 #[tauri::command]
 pub fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionInfo>, String> {
-    let sessions = state
-        .inner
-        .sessions
-        .lock()
-        .map_err(|_| "state poisoned")?;
+    let sessions = state.inner.sessions.lock().map_err(|_| "state poisoned")?;
     Ok(sessions
         .iter()
-        .map(|(id, s)| SessionInfo {
-            id: id.clone(),
-            name: s.name.clone(),
-            command: s.command.clone(),
-            cwd: None,
-        })
+        .map(|(id, session)| session_info(id, session))
         .collect())
 }
 
@@ -1826,8 +2654,54 @@ pub fn create_session(
     env_vars: Option<HashMap<String, String>>,
     persistent: Option<bool>,
     persist_id: Option<String>,
+    respawn: Option<bool>,
+    restore_existing: Option<bool>,
     shell_choice: Option<ShellChoice>,
-) -> Result<SessionInfo, String> {
+) -> Result<SessionAttachResult, String> {
+    let persist_id = persist_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let respawn = respawn.unwrap_or(false);
+    let restore_existing = restore_existing.unwrap_or(false);
+    if let Some(persist_id) = persist_id.as_deref() {
+        let delivery = RENDERER_DELIVERY
+            .lock()
+            .map_err(|_| "renderer delivery state poisoned".to_string())?;
+        if let Some(tombstone) = delivery.retained_exit_for_create(persist_id, respawn) {
+            return Ok(tombstone);
+        }
+    }
+    let creation_reservation = if let Some(persist_id) = persist_id.as_deref() {
+        match reserve_or_adopt_session(state.inner.as_ref(), persist_id)? {
+            SessionCreationStart::Adopted(session) => return Ok(session),
+            SessionCreationStart::Reserved(reservation) => Some(reservation),
+        }
+    } else {
+        None
+    };
+    if !respawn {
+        if let Some(persist_id) = persist_id.as_deref() {
+            // An exit can remove the live session and publish its tombstone
+            // between the optimistic lookup above and the creation reservation.
+            // Recheck under the delivery lock before any spawn side effect.
+            let delivery = RENDERER_DELIVERY
+                .lock()
+                .map_err(|_| "renderer delivery state poisoned".to_string())?;
+            if let Some(tombstone) = delivery.retained_exit_for_create(persist_id, false) {
+                return Ok(tombstone);
+            }
+            if let Some(evicted) = delivery.evicted_exit_for_create(
+                persist_id,
+                restore_existing,
+                name.as_deref(),
+                command.as_deref(),
+                cwd.as_deref(),
+            ) {
+                return Ok(evicted);
+            }
+        }
+    }
+
     #[cfg(not(target_family = "unix"))]
     let _ = &shell_choice;
 
@@ -1886,7 +2760,9 @@ pub fn create_session(
             }
             #[cfg(not(target_family = "unix"))]
             {
-                std::env::var("USERPROFILE").ok().filter(|s| Path::new(s).is_dir())
+                std::env::var("USERPROFILE")
+                    .ok()
+                    .filter(|s| Path::new(s).is_dir())
             }
         });
 
@@ -1895,11 +2771,15 @@ pub fn create_session(
 
     #[cfg(target_family = "unix")]
     let (program, args, shown_command, use_nu, inner_shell) = if persistent {
-        let zellij = find_bundled_zellij().ok_or("bundled zellij missing in this build".to_string())?;
-        let persist_id = persist_id.clone().ok_or("persistId is required for persistent sessions")?;
+        let zellij =
+            find_bundled_zellij().ok_or("bundled zellij missing in this build".to_string())?;
+        let persist_id = persist_id
+            .clone()
+            .ok_or("persistId is required for persistent sessions")?;
         let zellij_session = agents_ui_zellij_session_name(&persist_id);
         let zellij_config = ensure_zellij_config(&app).map(|p| p.to_string_lossy().to_string());
-        let zellij_paths = ensure_zellij_paths(&app).ok_or("unable to determine app data dir".to_string())?;
+        let zellij_paths =
+            ensure_zellij_paths(&app).ok_or("unable to determine app data dir".to_string())?;
 
         let (inner_shell, inner_use_nu) = match &resolved_shell {
             ResolvedShell::BundledNu(nu) => (nu.to_string_lossy().to_string(), true),
@@ -1909,7 +2789,8 @@ pub fn create_session(
 
         let mut socket_dir = zellij_paths.socket_dir.clone();
         for candidate in zellij_socket_dir_candidates(&zellij_paths.socket_dir) {
-            if let Ok(existing) = zellij_list_sessions(&zellij, &zellij_paths.home_dir, &candidate) {
+            if let Ok(existing) = zellij_list_sessions(&zellij, &zellij_paths.home_dir, &candidate)
+            {
                 if existing.iter().any(|s| s == &zellij_session) {
                     socket_dir = candidate;
                     break;
@@ -1980,7 +2861,14 @@ pub fn create_session(
                 }
                 args.push("-c".to_string());
                 args.push(command.clone());
-                let shown = format!("{p} {} {command}", if shell_accepts_login_flag(p) { "-l -c" } else { "-c" });
+                let shown = format!(
+                    "{p} {} {command}",
+                    if shell_accepts_login_flag(p) {
+                        "-l -c"
+                    } else {
+                        "-c"
+                    }
+                );
                 (p.clone(), args, shown, false, p.clone())
             }
             ResolvedShell::BundledNu(_) | ResolvedShell::BundledAgsh(_) => (
@@ -2019,7 +2907,11 @@ pub fn create_session(
         .openpty(size)
         .map_err(|e| format!("openpty failed: {e}"))?;
 
-    let id = state.inner.next_id.fetch_add(1, Ordering::Relaxed).to_string();
+    let id = state
+        .inner
+        .next_id
+        .fetch_add(1, Ordering::Relaxed)
+        .to_string();
 
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
@@ -2060,7 +2952,10 @@ pub fn create_session(
             cmd.env("ZELLIJ_SOCKET_DIR", zellij_socket_dir.clone());
         } else if let Some(zellij_paths) = ensure_zellij_paths(&app) {
             cmd.env("HOME", zellij_paths.home_dir.to_string_lossy().to_string());
-            cmd.env("ZELLIJ_SOCKET_DIR", zellij_paths.socket_dir.to_string_lossy().to_string());
+            cmd.env(
+                "ZELLIJ_SOCKET_DIR",
+                zellij_paths.socket_dir.to_string_lossy().to_string(),
+            );
         }
 
         if let Some(wrapper) = ensure_zellij_shell_wrapper(&app) {
@@ -2069,11 +2964,23 @@ pub fn create_session(
             // agsh takes no `-l`; the wrapper execs the real shell bare then.
             cmd.env(
                 "AGENTS_UI_ZELLIJ_LOGIN",
-                if shell_accepts_login_flag(&inner_shell) { "1" } else { "0" },
+                if shell_accepts_login_flag(&inner_shell) {
+                    "1"
+                } else {
+                    "0"
+                },
             );
-            cmd.env("AGENTS_UI_ZELLIJ_RESTORE_XDG", if use_nu { "0" } else { "1" });
+            cmd.env(
+                "AGENTS_UI_ZELLIJ_RESTORE_XDG",
+                if use_nu { "0" } else { "1" },
+            );
 
-            capture_original_env(&mut cmd, "HOME", "AGENTS_UI_ORIG_HOME_PRESENT", "AGENTS_UI_ORIG_HOME");
+            capture_original_env(
+                &mut cmd,
+                "HOME",
+                "AGENTS_UI_ORIG_HOME_PRESENT",
+                "AGENTS_UI_ORIG_HOME",
+            );
             capture_original_env(
                 &mut cmd,
                 "XDG_CONFIG_HOME",
@@ -2117,8 +3024,14 @@ pub fn create_session(
                 .collect();
 
             if let Ok(home) = std::env::var("HOME") {
-                for candidate in [format!("{home}/.cargo/bin"), format!("{home}/.local/bin"), format!("{home}/bin")] {
-                    if Path::new(&candidate).is_dir() && !fallback_entries.iter().any(|p| p == &candidate) {
+                for candidate in [
+                    format!("{home}/.cargo/bin"),
+                    format!("{home}/.local/bin"),
+                    format!("{home}/bin"),
+                ] {
+                    if Path::new(&candidate).is_dir()
+                        && !fallback_entries.iter().any(|p| p == &candidate)
+                    {
                         fallback_entries.insert(0, candidate);
                     }
                 }
@@ -2130,13 +3043,15 @@ pub fn create_session(
                 "/usr/local/bin",
                 "/usr/local/sbin",
             ] {
-                if Path::new(candidate).is_dir() && !fallback_entries.iter().any(|p| p == candidate) {
+                if Path::new(candidate).is_dir() && !fallback_entries.iter().any(|p| p == candidate)
+                {
                     fallback_entries.insert(0, candidate.to_string());
                 }
             }
 
             for candidate in ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
-                if Path::new(candidate).is_dir() && !fallback_entries.iter().any(|p| p == candidate) {
+                if Path::new(candidate).is_dir() && !fallback_entries.iter().any(|p| p == candidate)
+                {
                     fallback_entries.push(candidate.to_string());
                 }
             }
@@ -2213,10 +3128,19 @@ pub fn create_session(
         }
     } else if persistent {
         if let Some(xdg) = ensure_shell_xdg_paths(&app) {
-            cmd.env("XDG_CONFIG_HOME", xdg.config_home.to_string_lossy().to_string());
+            cmd.env(
+                "XDG_CONFIG_HOME",
+                xdg.config_home.to_string_lossy().to_string(),
+            );
             cmd.env("XDG_DATA_HOME", xdg.data_home.to_string_lossy().to_string());
-            cmd.env("XDG_CACHE_HOME", xdg.cache_home.to_string_lossy().to_string());
-            cmd.env("XDG_RUNTIME_DIR", xdg.runtime_dir.to_string_lossy().to_string());
+            cmd.env(
+                "XDG_CACHE_HOME",
+                xdg.cache_home.to_string_lossy().to_string(),
+            );
+            cmd.env(
+                "XDG_RUNTIME_DIR",
+                xdg.runtime_dir.to_string_lossy().to_string(),
+            );
         }
     }
     if let Some(ref cwd) = cwd {
@@ -2292,31 +3216,58 @@ pub fn create_session(
         .master
         .take_writer()
         .map_err(|e| format!("take writer failed: {e}"))?;
+    let child_pid = child.process_id();
+    let killer = child.clone_killer();
+    let io = PtySessionIo {
+        master: Arc::new(Mutex::new(pair.master)),
+        writer: Arc::new(Mutex::new(writer)),
+        child: Arc::new(Mutex::new(child)),
+        killer: Arc::new(Mutex::new(killer)),
+        recording: Arc::new(Mutex::new(None)),
+        closing: Arc::new(AtomicBool::new(false)),
+    };
 
-    let mut sessions = state
-        .inner
-        .sessions
+    // Publish a deliberate tombstone replacement atomically with removing the
+    // retained exit. renderer_listener_ready takes the same delivery→sessions
+    // lock order, so it can never observe neither (or both) as authoritative.
+    let mut delivery = RENDERER_DELIVERY
         .lock()
-        .map_err(|_| "state poisoned")?;
+        .map_err(|_| "renderer delivery state poisoned")?;
+    let mut sessions = state.inner.sessions.lock().map_err(|_| "state poisoned")?;
 
     let base_name = name.unwrap_or_else(|| (if is_shell { "shell" } else { "agent" }).to_string());
     let base_trimmed = base_name.trim();
-    let base_trimmed = if base_trimmed.is_empty() { "session" } else { base_trimmed };
+    let base_trimmed = if base_trimmed.is_empty() {
+        "session"
+    } else {
+        base_trimmed
+    };
     let final_name = unique_name(&sessions, base_trimmed);
+    let replay = Arc::new(Mutex::new(PtyReplayBuffer::default()));
 
     sessions.insert(
         id.clone(),
         PtySession {
+            persist_id: persist_id.clone(),
             name: final_name.clone(),
             command: shown_command.clone(),
-            master: pair.master,
-            writer,
-            child,
-            recording: None,
-            closing: false,
+            cwd: cwd.clone(),
+            io,
+            child_pid,
+            replay: replay.clone(),
         },
     );
+    if respawn {
+        if let Some(persist_id) = persist_id.as_deref() {
+            delivery.remove_exits_by_persist_id(persist_id);
+        }
+    }
     drop(sessions);
+    drop(delivery);
+    // Publish the fully constructed session before waking another concurrent
+    // create_session call for the same logical ID. That caller will atomically
+    // adopt this backend entry instead of spawning a second PTY.
+    drop(creation_reservation);
 
     // Re-evaluate promptly so the sleep assertion engages as soon as an SSH
     // session opens. Deliberately no poke on exit/close: release goes through
@@ -2338,6 +3289,8 @@ pub fn create_session(
 
     let id_for_reader = id.clone();
     let id_for_emitter: Arc<str> = Arc::from(id.as_str());
+    let persist_id_for_emitter = persist_id.as_deref().map(Arc::<str>::from);
+    let replay_for_emitter = replay.clone();
     let state_for_emitter = state.inner().clone();
     let app_for_emitter = app.clone();
     // Bounded channel so a flooding child can't grow the queue without limit:
@@ -2401,14 +3354,34 @@ pub fn create_session(
                 return;
             }
             let data = std::mem::take(buffer);
-            let _ = app_for_emitter.emit_to(
-                "main",
-                "pty-output",
-                PtyOutput {
-                    id: id_for_emitter.clone(),
-                    data,
-                },
-            );
+            let delivery = RENDERER_DELIVERY
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let sequence = replay_for_emitter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .append(&data);
+            match delivery.delivery_target() {
+                DeliveryTarget::RendererAndNativeApi => {
+                    // api_server's native Tauri listener forwards this same
+                    // event to ApiEventBus while the renderer is healthy.
+                    let _ = app_for_emitter.emit_to(
+                        "main",
+                        "pty-output",
+                        PtyOutput {
+                            id: id_for_emitter.clone(),
+                            persist_id: persist_id_for_emitter.clone(),
+                            sequence,
+                            data,
+                        },
+                    );
+                }
+                DeliveryTarget::NativeApiOnly => {
+                    // Never enqueue into a dead WKWebView. Native API/MCP
+                    // subscribers still receive the live stream exactly once.
+                    notify_native_api_output(&app_for_emitter, &id_for_emitter, &data);
+                }
+            }
         };
 
         // Pull everything already waiting in the channel into the buffer without
@@ -2455,29 +3428,91 @@ pub fn create_session(
             }
         }
 
-        let session = match state_for_emitter.inner.sessions.lock() {
-            Ok(mut sessions) => sessions.remove(&id_for_reader),
-            Err(_) => None,
+        // Publish exit presence in the same delivery→sessions critical section
+        // that removes the live entry. renderer_listener_ready and create_session
+        // therefore cannot observe an absent live session and absent tombstone.
+        // Child wait may take arbitrarily long, so publish with an unknown code
+        // first and fill it in afterward.
+        let mut session = {
+            let mut delivery = RENDERER_DELIVERY
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut sessions = state_for_emitter
+                .inner
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let session = sessions.remove(&id_for_reader);
+            let placeholder = session.as_ref().and_then(|session| {
+                // Removal is the lifecycle boundary for every cloned I/O
+                // handle. Publish it before releasing the registry so a
+                // command that was waiting on a per-session lock cannot start
+                // new work against an already-exited backend.
+                let claimed_exit = try_claim_session_closing(&session.io.closing);
+                (claimed_exit && session.persist_id.is_some())
+                    .then(|| session_exit_tombstone(&id_for_reader, session, None))
+            });
+            delivery.classify_exit(placeholder);
+            session
         };
 
-        let exit_code = session
-            .and_then(|mut s| s.child.wait().ok().map(|status| status.exit_code()));
+        let exit_code = session.as_mut().and_then(|session| {
+            session
+                .io
+                .child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .wait()
+                .ok()
+                .map(|status| status.exit_code())
+        });
 
-        let _ = app_for_emitter.emit_to(
-            "main",
-            "pty-exit",
-            PtyExit {
-                id: id_for_reader,
-                exit_code,
-            },
+        let mut delivery = RENDERER_DELIVERY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Update only if the placeholder still exists. Explicit respawn/close
+        // removes it and must not be undone by this late child status.
+        let retained_location = delivery.update_retained_exit_code(&id_for_reader, exit_code);
+        let renderer_recovery = matches!(
+            retained_location,
+            Some(RetainedExitLocation::RecoveryTombstone)
         );
+        match delivery.delivery_target() {
+            DeliveryTarget::RendererAndNativeApi => {
+                let _ = app_for_emitter.emit_to(
+                    "main",
+                    "pty-exit",
+                    PtyExit {
+                        id: id_for_reader,
+                        exit_code,
+                        renderer_recovery,
+                    },
+                );
+            }
+            DeliveryTarget::NativeApiOnly => {
+                notify_native_api_exit(&app_for_emitter, &id_for_reader, exit_code);
+            }
+        }
     });
 
-    Ok(SessionInfo {
-        id,
-        name: final_name,
-        command: shown_command,
-        cwd,
+    let (replay, replay_through_sequence, replay_truncated) = replay
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .snapshot();
+    Ok(SessionAttachResult {
+        session: SessionInfo {
+            id,
+            persist_id,
+            name: final_name,
+            command: shown_command,
+            cwd,
+        },
+        adopted: false,
+        exited: false,
+        exit_code: None,
+        replay,
+        replay_through_sequence,
+        replay_truncated,
     })
 }
 
@@ -2503,14 +3538,18 @@ pub fn start_session_recording(
         None
     };
 
-    let mut sessions = state
-        .inner
-        .sessions
+    let io = session_io(state.inner.as_ref(), &id)?;
+    if io.closing.load(Ordering::Acquire) {
+        return Err("session is closing".to_string());
+    }
+    let mut recording = io
+        .recording
         .lock()
-        .map_err(|_| "state poisoned")?;
-    let s = sessions.get_mut(&id).ok_or("unknown session")?;
-
-    if s.recording.is_some() {
+        .map_err(|_| "recording state poisoned")?;
+    if io.closing.load(Ordering::Acquire) {
+        return Err("session is closing".to_string());
+    }
+    if recording.is_some() {
         return Err("already recording".to_string());
     }
 
@@ -2552,10 +3591,12 @@ pub fn start_session_recording(
     writer
         .write_all(json.as_bytes())
         .map_err(|e| format!("write failed: {e}"))?;
-    writer.write_all(b"\n").map_err(|e| format!("write failed: {e}"))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|e| format!("write failed: {e}"))?;
     writer.flush().map_err(|e| format!("flush failed: {e}"))?;
 
-    s.recording = Some(SessionRecording {
+    *recording = Some(SessionRecording {
         id: safe_id.clone(),
         writer,
         started_at: Instant::now(),
@@ -2570,19 +3611,23 @@ pub fn start_session_recording(
 }
 
 #[tauri::command]
-pub fn stop_session_recording(state: State<'_, AppState>, id: String) -> Result<Option<String>, String> {
-    let mut sessions = state
-        .inner
-        .sessions
+pub fn stop_session_recording(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Option<String>, String> {
+    let io = session_io(state.inner.as_ref(), &id)?;
+    let mut rec = match io
+        .recording
         .lock()
-        .map_err(|_| "state poisoned")?;
-    let s = sessions.get_mut(&id).ok_or("unknown session")?;
-
-    let mut rec = match s.recording.take() {
+        .map_err(|_| "recording state poisoned")?
+        .take()
+    {
         Some(r) => r,
         None => return Ok(None),
     };
-    rec.writer.flush().map_err(|e| format!("flush failed: {e}"))?;
+    rec.writer
+        .flush()
+        .map_err(|e| format!("flush failed: {e}"))?;
     Ok(Some(rec.id))
 }
 
@@ -2593,13 +3638,8 @@ pub fn write_to_session(
     data: String,
     source: Option<String>,
 ) -> Result<(), String> {
-    let mut sessions = state
-        .inner
-        .sessions
-        .lock()
-        .map_err(|_| "state poisoned")?;
-    let s = sessions.get_mut(&id).ok_or("unknown session")?;
-    if s.closing {
+    let io = session_io(state.inner.as_ref(), &id)?;
+    if io.closing.load(Ordering::Acquire) {
         return Ok(());
     }
 
@@ -2607,22 +3647,33 @@ pub fn write_to_session(
     // MCP tool callers send as literal backslash-letter pairs.
     let data = unescape_terminal_sequences(&data);
 
-    s.writer
+    let mut writer = io.writer.lock().map_err(|_| "session writer poisoned")?;
+    if io.closing.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    writer
         .write_all(data.as_bytes())
         .map_err(|e| format!("write failed: {e}"))?;
-    s.writer.flush().ok();
+    writer.flush().ok();
 
+    // Keep the per-session writer guard through recording so concurrent input
+    // is recorded in exactly the same order in which it reached the PTY. This
+    // lock is deliberately session-local; no registry/delivery lock is held.
     let is_user = source.as_deref() == Some("user");
     if is_user {
+        let mut recording = io
+            .recording
+            .lock()
+            .map_err(|_| "recording state poisoned")?;
         let mut rec_err: Option<String> = None;
-        if let Some(rec) = s.recording.as_mut() {
+        if let Some(rec) = recording.as_mut() {
             if let Err(e) = record_user_input(rec, &data) {
                 rec_err = Some(e);
             }
         }
         if let Some(err) = rec_err {
             eprintln!("Failed to write recording event: {err}");
-            s.recording = None;
+            *recording = None;
         }
     }
     Ok(())
@@ -2671,16 +3722,15 @@ pub fn resize_session(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let sessions = state
-        .inner
-        .sessions
-        .lock()
-        .map_err(|_| "state poisoned")?;
-    let s = sessions.get(&id).ok_or("unknown session")?;
-    if s.closing {
+    let io = session_io(state.inner.as_ref(), &id)?;
+    if io.closing.load(Ordering::Acquire) {
         return Ok(());
     }
-    s.master
+    let master = io.master.lock().map_err(|_| "session PTY state poisoned")?;
+    if io.closing.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    master
         .resize(PtySize {
             rows,
             cols,
@@ -2693,11 +3743,7 @@ pub fn resize_session(
 
 #[tauri::command]
 pub fn rename_session(state: State<'_, AppState>, id: String, name: String) -> Result<(), String> {
-    let mut sessions = state
-        .inner
-        .sessions
-        .lock()
-        .map_err(|_| "state poisoned")?;
+    let mut sessions = state.inner.sessions.lock().map_err(|_| "state poisoned")?;
     let session = sessions
         .get_mut(&id)
         .ok_or_else(|| "Session not found".to_string())?;
@@ -2707,25 +3753,35 @@ pub fn rename_session(state: State<'_, AppState>, id: String, name: String) -> R
 
 #[tauri::command]
 pub fn close_session(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let mut sessions = state
-        .inner
-        .sessions
-        .lock()
-        .map_err(|_| "state poisoned")?;
-    let Some(session) = sessions.get_mut(&id) else {
+    // Claim the lifecycle while the entry is still protected by the registry.
+    // The exit path holds delivery→sessions while removing that same entry and
+    // publishing its placeholder. Consequently close either wins here (and
+    // exit observes `closing`) or observes the entry missing and waits for the
+    // already-in-progress publication before removing it below.
+    let io = {
+        let sessions = state.inner.sessions.lock().map_err(|_| "state poisoned")?;
+        sessions.get(&id).and_then(|session| {
+            try_claim_session_closing(&session.io.closing).then(|| session.io.clone())
+        })
+    };
+    let Some(io) = io else {
+        let mut delivery = RENDERER_DELIVERY
+            .lock()
+            .map_err(|_| "renderer delivery state poisoned")?;
+        delivery.remove_exit_by_id(&id);
         return Ok(());
     };
 
-    if session.closing {
-        return Ok(());
-    }
     // Flush any buffered recording tail now rather than relying on BufWriter's
     // silent Drop flush when the emitter thread removes the session.
-    if let Some(rec) = session.recording.as_mut() {
-        let _ = rec.writer.flush();
+    if let Ok(mut recording) = io.recording.lock() {
+        if let Some(rec) = recording.as_mut() {
+            let _ = rec.writer.flush();
+        }
     }
-    session.closing = true;
-    let _ = session.child.kill();
+    if let Ok(mut killer) = io.killer.lock() {
+        let _ = killer.kill();
+    }
     Ok(())
 }
 
@@ -2733,15 +3789,24 @@ pub fn close_session(state: State<'_, AppState>, id: String) -> Result<(), Strin
 /// managed state, so buffered recording tails would be lost and children would
 /// only learn of the exit via PTY EOF. Flush every recording and kill children.
 pub fn shutdown_flush_all(state: &AppState) {
-    let Ok(mut sessions) = state.inner.sessions.lock() else {
+    let Ok(sessions) = state.inner.sessions.lock() else {
         return;
     };
-    for session in sessions.values_mut() {
-        if let Some(rec) = session.recording.as_mut() {
-            let _ = rec.writer.flush();
+    let handles = sessions
+        .values()
+        .map(|session| session.io.clone())
+        .collect::<Vec<_>>();
+    drop(sessions);
+    for io in handles {
+        io.closing.store(true, Ordering::Release);
+        if let Ok(mut recording) = io.recording.lock() {
+            if let Some(rec) = recording.as_mut() {
+                let _ = rec.writer.flush();
+            }
         }
-        session.closing = true;
-        let _ = session.child.kill();
+        if let Ok(mut killer) = io.killer.lock() {
+            let _ = killer.kill();
+        }
     }
 }
 
@@ -2756,20 +3821,636 @@ pub fn detach_session(state: State<'_, AppState>, id: String) -> Result<(), Stri
 
     #[cfg(target_family = "unix")]
     {
-        let mut sessions = state
-            .inner
-            .sessions
-            .lock()
-            .map_err(|_| "state poisoned")?;
-        let Some(s) = sessions.get_mut(&id) else {
-            return Ok(());
+        let io = match session_io(state.inner.as_ref(), &id) {
+            Ok(io) => io,
+            Err(_) => return Ok(()),
         };
+        if io.closing.load(Ordering::Acquire) {
+            return Ok(());
+        }
 
         // Default zellij detach: Ctrl+o then d.
-        s.writer
+        let mut writer = io.writer.lock().map_err(|_| "session writer poisoned")?;
+        if io.closing.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        writer
             .write_all(&[0x0f, b'd'])
             .map_err(|e| format!("write failed: {e}"))?;
-        s.writer.flush().ok();
+        writer.flush().ok();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod renderer_recovery_tests {
+    use super::{
+        normalized_renderer_id, try_claim_session_closing, DeliveryTarget, PtyReplayBuffer,
+        PtyReplayChunk, RendererDeliveryState, RetainedExitLocation, SessionExitTombstone,
+        SessionInfo, PTY_EXIT_TOMBSTONE_MAX_SESSIONS, PTY_REPLAY_MAX_BYTES,
+        RENDERER_CANCELED_ID_MAX, RENDERER_TICKET_MAX,
+    };
+
+    fn exit_tombstone(id: &str, persist_id: &str) -> SessionExitTombstone {
+        SessionExitTombstone {
+            session: SessionInfo {
+                id: id.to_string(),
+                persist_id: Some(persist_id.to_string()),
+                name: "saved".to_string(),
+                command: "agent --dangerous-to-repeat".to_string(),
+                cwd: Some("/tmp/project".to_string()),
+            },
+            exit_code: Some(23),
+            replay: vec![PtyReplayChunk {
+                sequence: 1,
+                data: "retained output".to_string(),
+            }],
+            replay_through_sequence: 1,
+            replay_truncated: false,
+        }
+    }
+
+    #[test]
+    fn replay_buffer_preserves_order_and_monotonic_sequences() {
+        let mut replay = PtyReplayBuffer::default();
+        assert_eq!(replay.append_with_limit("one", 64), 1);
+        assert_eq!(replay.append_with_limit("two", 64), 2);
+        assert_eq!(replay.append_with_limit("three", 64), 3);
+
+        let (chunks, through, truncated) = replay.snapshot();
+        assert_eq!(through, 3);
+        assert!(!truncated);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| (chunk.sequence, chunk.data.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "one"), (2, "two"), (3, "three")]
+        );
+    }
+
+    #[test]
+    fn replay_buffer_evicts_oldest_chunks_and_reports_truncation() {
+        let mut replay = PtyReplayBuffer::default();
+        replay.append_with_limit("1234", 8);
+        replay.append_with_limit("5678", 8);
+        replay.append_with_limit("90", 8);
+
+        let (chunks, through, truncated) = replay.snapshot();
+        assert_eq!(through, 3);
+        assert!(truncated);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| (chunk.sequence, chunk.data.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "5678"), (3, "90")]
+        );
+        assert!(chunks.iter().map(|chunk| chunk.data.len()).sum::<usize>() <= 8);
+    }
+
+    #[test]
+    fn oversized_chunk_stays_bounded_and_advances_watermark() {
+        let mut replay = PtyReplayBuffer::default();
+        replay.append_with_limit("larger-than-limit", 4);
+        let (chunks, through, truncated) = replay.snapshot();
+        assert!(chunks.is_empty());
+        assert_eq!(through, 1);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn production_replay_cap_is_512_kib_per_session() {
+        assert_eq!(PTY_REPLAY_MAX_BYTES, 512 * 1024);
+        let mut replay = PtyReplayBuffer::default();
+        for _ in 0..513 {
+            replay.append(&"x".repeat(1024));
+        }
+
+        let (chunks, through, truncated) = replay.snapshot();
+        assert_eq!(through, 513);
+        assert!(truncated);
+        assert_eq!(chunks.len(), 512);
+        assert_eq!(chunks.first().map(|chunk| chunk.sequence), Some(2));
+        assert!(chunks.iter().map(|chunk| chunk.data.len()).sum::<usize>() <= PTY_REPLAY_MAX_BYTES);
+    }
+
+    #[test]
+    fn renderer_ids_are_nonempty_and_bounded() {
+        assert_eq!(
+            normalized_renderer_id(" renderer-1 ".into()).unwrap(),
+            "renderer-1"
+        );
+        assert!(normalized_renderer_id("  ".into()).is_err());
+        assert!(normalized_renderer_id("x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn listener_ready_and_exit_classification_have_no_delivery_gap() {
+        let mut delivery = RendererDeliveryState::default();
+        assert_eq!(delivery.delivery_target(), DeliveryTarget::NativeApiOnly);
+
+        // Exit wins the mutex race: it is retained, and the same critical
+        // section that enables the renderer returns it to the listener.
+        assert!(!delivery.classify_exit(Some(exit_tombstone("1", "persist-1"))));
+        let (exits, truncated) = delivery.enable_renderer("renderer-1".to_string());
+        assert!(!truncated);
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].session.id, "1");
+
+        // Listener-ready wins the race: the exit takes the normal event path
+        // and cannot also become a tombstone/API duplicate.
+        assert_eq!(
+            delivery.delivery_target(),
+            DeliveryTarget::RendererAndNativeApi
+        );
+        assert!(delivery.classify_exit(Some(exit_tombstone("2", "persist-2"))));
+        assert_eq!(delivery.exit_tombstones.len(), 1);
+        assert_eq!(delivery.pending_live_exits.len(), 1);
+        assert_eq!(
+            delivery.update_retained_exit_code("2", Some(24)),
+            Some(RetainedExitLocation::PendingLive)
+        );
+
+        // If WebContent terminates before JS acknowledges that direct event,
+        // mark_renderer_unavailable takes the same lock and promotes it. A new
+        // ready handshake therefore cannot miss the exit even if emit_to won
+        // the original race.
+        delivery.terminate_content_generation();
+        assert!(delivery.pending_live_exits.is_empty());
+        let (exits, truncated) = delivery.enable_renderer("renderer-2".to_string());
+        assert!(!truncated);
+        assert_eq!(exits.len(), 2);
+        assert!(exits.iter().any(|exit| exit.session.id == "2"));
+
+        // Explicit tab close (or a successful respawn by persistId) removes
+        // either pending or promoted state. Merely rendering the exit does not:
+        // a later WebContent crash must still be able to recover it.
+        delivery.remove_exit_by_id("2");
+        assert!(delivery
+            .exit_tombstones
+            .iter()
+            .all(|exit| exit.session.id != "2"));
+    }
+
+    #[test]
+    fn live_removal_publishes_placeholder_before_ready_can_observe_state() {
+        use std::collections::HashSet;
+
+        let id = "atomic-exit";
+        let mut live_ids = HashSet::from([id.to_string()]);
+        let mut delivery = RendererDeliveryState::default();
+        let (initial_exits, _) = delivery.enable_renderer("renderer-before-exit".to_string());
+        assert!(initial_exits.is_empty());
+        let is_observably_present = |live: &HashSet<String>, state: &RendererDeliveryState| {
+            live.contains(id)
+                || state
+                    .pending_live_exits
+                    .iter()
+                    .chain(state.exit_tombstones.iter())
+                    .any(|exit| exit.session.id == id)
+        };
+        assert!(is_observably_present(&live_ids, &delivery));
+
+        // Production performs these mutations while holding delivery→sessions;
+        // an observer can see only the state before or after this model step.
+        assert!(live_ids.remove(id));
+        let mut placeholder = exit_tombstone(id, "persist-atomic");
+        placeholder.exit_code = None;
+        assert!(delivery.classify_exit(Some(placeholder)));
+        assert!(is_observably_present(&live_ids, &delivery));
+        let create_view = delivery
+            .retained_exit_for_create("persist-atomic", false)
+            .expect("create must observe the pending placeholder");
+        assert!(create_view.exited);
+        assert_eq!(create_view.exit_code, None);
+
+        // Ready may win before child.wait() supplies the final status. It gets
+        // the placeholder immediately, and the retained copy is updated later.
+        let (ready_before_code, truncated) = delivery.enable_renderer("renderer-ready".to_string());
+        assert!(!truncated);
+        assert_eq!(ready_before_code.len(), 1);
+        assert_eq!(ready_before_code[0].exit_code, None);
+        assert_eq!(
+            delivery.update_retained_exit_code(id, Some(41)),
+            Some(RetainedExitLocation::RecoveryTombstone)
+        );
+        assert_eq!(delivery.exit_tombstones[0].exit_code, Some(41));
+
+        // A deliberate respawn can remove the placeholder while wait is still
+        // running; the late code update is update-only and cannot resurrect it.
+        delivery.remove_exits_by_persist_id("persist-atomic");
+        assert_eq!(delivery.update_retained_exit_code(id, Some(42)), None);
+        assert!(delivery.exit_tombstones.is_empty());
+    }
+
+    #[test]
+    fn replacement_renderer_adopts_old_listener_pending_exits_atomically() {
+        let mut delivery = RendererDeliveryState::default();
+        let (initial, _) = delivery.enable_renderer("renderer-old".to_string());
+        assert!(initial.is_empty());
+        let mut pending = exit_tombstone("old-pending", "persist-old-pending");
+        pending.exit_code = None;
+        assert!(delivery.classify_exit(Some(pending)));
+        assert_eq!(delivery.pending_live_exits.len(), 1);
+
+        // No unavailable callback is required: a distinct ready ID promotes
+        // old-listener pending state before taking ownership.
+        let (replacement_exits, truncated) = delivery.enable_renderer("renderer-new".to_string());
+        assert!(!truncated);
+        assert!(delivery.pending_live_exits.is_empty());
+        assert_eq!(replacement_exits.len(), 1);
+        assert_eq!(replacement_exits[0].exit_code, None);
+        assert_eq!(delivery.listener_id.as_deref(), Some("renderer-new"));
+
+        // Late StrictMode cleanup from the superseded renderer is harmless.
+        delivery.cancel_renderer("renderer-old");
+        assert!(delivery.renderer_was_canceled("renderer-old"));
+        assert_eq!(delivery.listener_id.as_deref(), Some("renderer-new"));
+        assert_eq!(
+            delivery.update_retained_exit_code("old-pending", Some(9)),
+            Some(RetainedExitLocation::RecoveryTombstone)
+        );
+        assert_eq!(delivery.exit_tombstones[0].exit_code, Some(9));
+        assert_eq!(
+            delivery.delivery_target(),
+            DeliveryTarget::RendererAndNativeApi
+        );
+    }
+
+    #[test]
+    fn canceled_stale_ready_cannot_supersede_new_renderer() {
+        let mut delivery = RendererDeliveryState::default();
+
+        // StrictMode can unmount the first async setup before its ready invoke
+        // reaches Rust. Remembering the ID makes that eventual invoke inert.
+        let stale_ticket = delivery
+            .issue_renderer_ticket("renderer-stale".to_string())
+            .expect("initial ticket");
+        delivery.cancel_renderer("renderer-stale");
+        assert!(delivery.renderer_was_canceled("renderer-stale"));
+
+        let current_ticket = delivery
+            .issue_renderer_ticket("renderer-current".to_string())
+            .expect("replacement ticket");
+        let (exits, truncated) = delivery
+            .try_enable_renderer(
+                "renderer-current".to_string(),
+                current_ticket.content_generation,
+            )
+            .expect("the replacement listener should become current");
+        assert!(exits.is_empty());
+        assert!(!truncated);
+        assert_eq!(delivery.listener_id.as_deref(), Some("renderer-current"));
+
+        assert!(delivery
+            .try_enable_renderer(
+                "renderer-stale".to_string(),
+                stale_ticket.content_generation,
+            )
+            .is_err());
+        assert_eq!(delivery.listener_id.as_deref(), Some("renderer-current"));
+
+        // A duplicate late cleanup is also ID-guarded and cannot turn off the
+        // listener that won the ready handshake.
+        delivery.cancel_renderer("renderer-stale");
+        assert_eq!(delivery.listener_id.as_deref(), Some("renderer-current"));
+    }
+
+    #[test]
+    fn abrupt_termination_invalidates_no_listener_late_ready() {
+        let mut delivery = RendererDeliveryState::default();
+        let stale_ticket = delivery
+            .issue_renderer_ticket("terminated-content".to_string())
+            .expect("old content ticket");
+        assert!(delivery.listener_id.is_none());
+
+        // Exact critical race: native termination fires before the queued old
+        // ready acquires delivery, while no listener ID exists to cancel.
+        delivery.terminate_content_generation();
+        assert!(delivery.listener_id.is_none());
+        assert!(delivery
+            .try_enable_renderer(stale_ticket.renderer_id, stale_ticket.content_generation,)
+            .is_err());
+        assert!(delivery.listener_id.is_none());
+
+        let replacement_ticket = delivery
+            .issue_renderer_ticket("replacement-content".to_string())
+            .expect("replacement content ticket");
+        let (exits, truncated) = delivery
+            .try_enable_renderer(
+                replacement_ticket.renderer_id.clone(),
+                replacement_ticket.content_generation,
+            )
+            .expect("current-generation ready must succeed");
+        assert!(exits.is_empty());
+        assert!(!truncated);
+        assert_eq!(
+            delivery.listener_id.as_deref(),
+            Some(replacement_ticket.renderer_id.as_str())
+        );
+    }
+
+    #[test]
+    fn canceled_renderer_memory_is_bounded_and_deduplicated() {
+        let mut delivery = RendererDeliveryState::default();
+        for index in 0..=RENDERER_CANCELED_ID_MAX {
+            delivery.cancel_renderer(&format!("renderer-{index}"));
+        }
+        assert_eq!(
+            delivery.canceled_renderer_ids.len(),
+            RENDERER_CANCELED_ID_MAX
+        );
+        assert!(!delivery.renderer_was_canceled("renderer-0"));
+        assert!(delivery.renderer_was_canceled(&format!("renderer-{RENDERER_CANCELED_ID_MAX}")));
+
+        delivery.cancel_renderer("renderer-1");
+        assert_eq!(
+            delivery
+                .canceled_renderer_ids
+                .iter()
+                .filter(|id| id.as_str() == "renderer-1")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn renderer_ticket_memory_is_bounded() {
+        let mut delivery = RendererDeliveryState::default();
+        for index in 0..=RENDERER_TICKET_MAX {
+            delivery
+                .issue_renderer_ticket(format!("ticket-{index}"))
+                .expect("ticket registration");
+        }
+        assert_eq!(delivery.renderer_tickets.len(), RENDERER_TICKET_MAX);
+        assert!(delivery
+            .validate_renderer_ticket("ticket-0", delivery.content_generation)
+            .is_err());
+        assert!(delivery
+            .validate_renderer_ticket(
+                &format!("ticket-{RENDERER_TICKET_MAX}"),
+                delivery.content_generation,
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn blocked_session_io_cannot_block_delivery_registry_snapshot() {
+        use std::collections::HashMap;
+        use std::sync::{mpsc, Arc, Mutex};
+        use std::thread;
+        use std::time::Duration;
+
+        // This models the production ownership split: a command clones its
+        // per-session handle while briefly holding the registry, drops the
+        // registry, and only then enters potentially blocking PTY/file I/O.
+        // Listener-ready takes delivery -> registry but never the I/O lock.
+        for iteration in 0..32 {
+            let io_lock = Arc::new(Mutex::new(()));
+            let registry = Arc::new(Mutex::new(HashMap::from([(
+                "session".to_string(),
+                io_lock,
+            )])));
+            let delivery = Arc::new(Mutex::new(()));
+            let (io_locked_tx, io_locked_rx) = mpsc::channel();
+            let (release_io_tx, release_io_rx) = mpsc::channel();
+
+            let writer_registry = Arc::clone(&registry);
+            let writer = thread::spawn(move || {
+                let io = writer_registry
+                    .lock()
+                    .expect("registry lock")
+                    .get("session")
+                    .expect("session handle")
+                    .clone();
+                let _io_guard = io.lock().expect("I/O lock");
+                io_locked_tx.send(()).expect("announce blocked I/O");
+                release_io_rx.recv().expect("release blocked I/O");
+            });
+            io_locked_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("writer should hold only the per-session I/O lock");
+
+            let ready_registry = Arc::clone(&registry);
+            let ready_delivery = Arc::clone(&delivery);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let ready = thread::spawn(move || {
+                let _delivery_guard = ready_delivery.lock().expect("delivery lock");
+                let session_count = ready_registry.lock().expect("registry lock").len();
+                ready_tx.send(session_count).expect("ready snapshot result");
+            });
+
+            let snapshot = ready_rx.recv_timeout(Duration::from_secs(1));
+            release_io_tx.send(()).expect("release writer");
+            writer.join().expect("writer thread");
+            ready.join().expect("ready thread");
+            assert_eq!(
+                snapshot.unwrap_or_else(|_| panic!(
+                    "listener-ready blocked behind session I/O in iteration {iteration}"
+                )),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn close_losing_atomic_exit_removal_clears_the_published_tombstone() {
+        use std::collections::HashMap;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Barrier, Mutex};
+        use std::thread;
+        use std::time::Duration;
+
+        // Deterministically model the production locks and lifecycle flag. The
+        // emitter owns delivery→sessions, removes the live entry, claims exit,
+        // and publishes a placeholder. Close then observes the missing entry,
+        // releases sessions, waits for delivery, and removes that placeholder.
+        let sessions = Arc::new(Mutex::new(HashMap::from([(
+            "race".to_string(),
+            Arc::new(AtomicBool::new(false)),
+        )])));
+        let delivery = Arc::new(Mutex::new(RendererDeliveryState::default()));
+        let published = Arc::new(Barrier::new(2));
+        let release_emitter = Arc::new(Barrier::new(2));
+        let (missing_tx, missing_rx) = mpsc::channel();
+
+        let emitter_sessions = Arc::clone(&sessions);
+        let emitter_delivery = Arc::clone(&delivery);
+        let emitter_published = Arc::clone(&published);
+        let emitter_release = Arc::clone(&release_emitter);
+        let emitter = thread::spawn(move || {
+            let mut delivery = emitter_delivery.lock().expect("delivery lock");
+            let closing = emitter_sessions
+                .lock()
+                .expect("sessions lock")
+                .remove("race")
+                .expect("live session");
+            assert!(try_claim_session_closing(&closing));
+            let mut placeholder = exit_tombstone("race", "persist-race");
+            placeholder.exit_code = None;
+            assert!(!delivery.classify_exit(Some(placeholder)));
+            emitter_published.wait();
+            emitter_release.wait();
+        });
+
+        let close_sessions = Arc::clone(&sessions);
+        let close_delivery = Arc::clone(&delivery);
+        let close_published = Arc::clone(&published);
+        let close = thread::spawn(move || {
+            close_published.wait();
+            let claimed = {
+                let sessions = close_sessions.lock().expect("sessions lock");
+                sessions.get("race").and_then(|closing| {
+                    try_claim_session_closing(closing).then(|| Arc::clone(closing))
+                })
+            };
+            assert!(claimed.is_none());
+            missing_tx.send(()).expect("close observed missing entry");
+
+            // Production takes delivery only after releasing sessions. This
+            // blocks until the emitter's placeholder publication is complete.
+            close_delivery
+                .lock()
+                .expect("delivery lock")
+                .remove_exit_by_id("race");
+        });
+
+        let observed_missing = missing_rx.recv_timeout(Duration::from_secs(1));
+        // Always release the emitter before asserting so a failed test cannot
+        // leave a blocked helper thread behind.
+        release_emitter.wait();
+        observed_missing.expect("close should observe the atomic exit removal");
+        emitter.join().expect("emitter thread");
+        close.join().expect("close thread");
+
+        let delivery = delivery.lock().expect("delivery lock");
+        assert!(delivery.pending_live_exits.is_empty());
+        assert!(delivery.exit_tombstones.is_empty());
+    }
+
+    #[test]
+    fn retained_exit_blocks_restore_respawn_until_explicit_reconnect() {
+        let mut delivery = RendererDeliveryState::default();
+        assert!(!delivery.classify_exit(Some(exit_tombstone("7", "persist-7"))));
+
+        let restored = delivery
+            .retained_exit_for_create("persist-7", false)
+            .expect("normal restore must adopt the exit tombstone");
+        assert!(restored.adopted);
+        assert!(restored.exited);
+        assert_eq!(restored.exit_code, Some(23));
+        assert_eq!(restored.replay[0].data, "retained output");
+
+        // Only the explicit reconnect/respawn input may proceed to PTY spawn.
+        assert!(delivery
+            .retained_exit_for_create("persist-7", true)
+            .is_none());
+    }
+
+    #[test]
+    fn exit_tombstones_are_one_per_session_and_globally_bounded() {
+        let mut delivery = RendererDeliveryState::default();
+        assert!(!delivery.classify_exit(Some(exit_tombstone("same", "persist-old"))));
+        assert!(!delivery.classify_exit(Some(exit_tombstone("same", "persist-new"))));
+        assert_eq!(delivery.exit_tombstones.len(), 1);
+        assert_eq!(
+            delivery.exit_tombstones[0].session.persist_id.as_deref(),
+            Some("persist-new")
+        );
+
+        for index in 0..=PTY_EXIT_TOMBSTONE_MAX_SESSIONS {
+            let id = format!("bounded-{index}");
+            assert!(!delivery.classify_exit(Some(exit_tombstone(&id, &id))));
+        }
+        assert_eq!(
+            delivery.exit_tombstones.len(),
+            PTY_EXIT_TOMBSTONE_MAX_SESSIONS
+        );
+        assert!(delivery.exit_tombstones_truncated);
+
+        // The oldest full tombstone was evicted into a fixed-memory, scoped
+        // persist-ID filter. It remains non-runnable, including through a
+        // later renderer reload, without poisoning unrelated restore IDs.
+        let overflow_restore = delivery
+            .evicted_exit_for_create(
+                "persist-new",
+                true,
+                Some("saved command"),
+                Some("must-not-run"),
+                Some("/tmp/project"),
+            )
+            .expect("the evicted persist ID must never rerun");
+        assert!(overflow_restore.adopted);
+        assert!(overflow_restore.exited);
+        assert!(overflow_restore.replay_truncated);
+        assert_eq!(overflow_restore.replay_through_sequence, 0);
+
+        // Normal tombstone cleanup does not turn the historical global
+        // overflow bit into a permanent poison for unrelated sessions.
+        delivery.remove_exits_by_persist_id("bounded-256");
+        assert!(delivery
+            .evicted_exit_for_create(
+                "unrelated-after-cleanup",
+                true,
+                Some("safe to restore"),
+                Some("new-command"),
+                Some("/tmp/other"),
+            )
+            .is_none());
+        assert!(delivery
+            .evicted_exit_for_create("persist-new", false, None, None, None)
+            .is_some());
+    }
+
+    #[test]
+    fn pending_and_recovery_exits_share_one_global_cap_without_false_negatives() {
+        let mut delivery = RendererDeliveryState::default();
+        let recovery_count = PTY_EXIT_TOMBSTONE_MAX_SESSIONS / 2;
+        for index in 0..recovery_count {
+            let id = format!("recovery-{index}");
+            assert!(!delivery.classify_exit(Some(exit_tombstone(&id, &id))));
+        }
+
+        let (initial_recovery, truncated) = delivery.enable_renderer("renderer-live".to_string());
+        assert_eq!(initial_recovery.len(), recovery_count);
+        assert!(!truncated);
+
+        // More than one queue's worth of live exits forces eviction first from
+        // older recovery entries and eventually from the oldest pending entry.
+        for index in 0..=PTY_EXIT_TOMBSTONE_MAX_SESSIONS {
+            let id = format!("pending-{index}");
+            assert!(delivery.classify_exit(Some(exit_tombstone(&id, &id))));
+        }
+        assert_eq!(
+            delivery.pending_live_exits.len() + delivery.exit_tombstones.len(),
+            PTY_EXIT_TOMBSTONE_MAX_SESSIONS
+        );
+        assert!(delivery.exit_tombstones.is_empty());
+        assert_eq!(
+            delivery.pending_live_exits.len(),
+            PTY_EXIT_TOMBSTONE_MAX_SESSIONS
+        );
+        assert!(delivery.exit_tombstones_truncated);
+
+        // Both an evicted recovery entry and an evicted pending entry remain
+        // authoritative through the fixed-memory filter, so neither command
+        // can be rerun implicitly after its full replay is discarded.
+        assert!(delivery
+            .evicted_exit_for_create("recovery-0", true, None, None, None)
+            .is_some());
+        assert!(delivery
+            .evicted_exit_for_create("pending-0", true, None, None, None)
+            .is_some());
+        assert!(delivery
+            .retained_exit_for_create("pending-256", false)
+            .is_some());
+
+        delivery.terminate_content_generation();
+        assert!(delivery.pending_live_exits.is_empty());
+        assert_eq!(
+            delivery.exit_tombstones.len(),
+            PTY_EXIT_TOMBSTONE_MAX_SESSIONS
+        );
     }
 }
