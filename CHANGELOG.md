@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 This project aims to follow Semantic Versioning.
 
+## 0.12.0
+
+- **SSH file browser reliability**: the remote file tree and viewer no longer intermittently show nothing.
+  - Fixed a race that could leave the remote tree blank after connecting; failures now show in the tree with a **Retry** button and retry automatically on reconnect.
+  - Remote paths like `~` and `~/project` are expanded on the server (they were previously misread as `/` and `/project`).
+  - Unreadable or missing folders now say "permission denied" / "folder not found" instead of looking empty; files deleted mid-listing no longer fail the whole folder.
+  - Works with remote login shells that print output (e.g. a `.bashrc` echo) and with csh/tcsh login shells.
+  - Recovers the shared SSH connection after sleep, network changes, or a reconnect; opening folders and files is prioritized over background refreshes.
+  - Sessions started as `ssh -p <port> host` or `ssh host <command>` now browse the right server and port.
+  - Clearer messages for SSH authentication and host-key problems.
+
 ## 0.11.0
 
 - **Bundled agsh 0.2.0** (session journaling/resume, `agshd` PTY broker, hardened release gates) and automatic sidecar sync from the local checkout on dev/build.
