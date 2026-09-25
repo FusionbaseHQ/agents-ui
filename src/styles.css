@@ -9690,3 +9690,35 @@ select.input {
 }
 
 .sessionBannerBtn { flex-shrink: 0; }
+
+.fileExplorerRetry {
+  margin-left: auto;
+  flex: none;
+  border: 1px solid rgba(var(--danger-rgb), 0.45);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 10px;
+  padding: 0 6px;
+  line-height: 16px;
+  cursor: pointer;
+}
+
+.fileExplorerRetry:hover {
+  background: rgba(var(--danger-rgb), 0.12);
+}
+
+.fileExplorerRootError {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: auto;
+  white-space: normal;
+  color: rgba(var(--danger-rgb), 0.95);
+}
+
+.fileExplorerRootErrorText {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}

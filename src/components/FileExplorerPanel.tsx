@@ -104,7 +104,8 @@ type FileExplorerPersistedTreeSnapshot = Omit<FileExplorerPersistedState, "scrol
 type VisibleItem =
   | { type: "entry"; entry: FsEntry; depth: number }
   | { type: "loading"; path: string; depth: number }
-  | { type: "error"; path: string; depth: number; message: string };
+  | { type: "error"; path: string; depth: number; message: string }
+  | { type: "status"; path: string; depth: number; message: string };
 
 type ScrollAnchor = {
   path: string;
@@ -135,15 +136,30 @@ function normalizePath(input: string): string {
   return input.replace(/\/+$/, "");
 }
 
+/**
+ * SSH roots arrive already resolved to an absolute path. Anything else ("~",
+ * "~/code", a relative path) is *unresolved* and yields "" so the panel waits,
+ * instead of silently listing a different directory ("~/code" used to become
+ * "/code", and "~" the filesystem root).
+ */
 function normalizeSshRootPath(input: string): string {
-  if (input.length === 0) return "/";
-  if (input === "~") return "/";
-  if (input.startsWith("~/")) {
-    const normalized = normalizePath(input.slice(1));
-    return normalized.startsWith("/") ? normalized : "/";
-  }
-  const normalized = normalizePath(input);
-  return normalized.startsWith("/") ? normalized : "/";
+  if (!input.startsWith("/")) return "";
+  return normalizePath(input);
+}
+
+/** Short, row-sized reason for a failed directory load (full text in the tooltip). */
+function directoryErrorLabel(message: string): string {
+  const lower = message.toLowerCase();
+  if (lower.startsWith("permission denied")) return "permission denied";
+  if (lower.startsWith("no such directory")) return "folder not found";
+  if (lower.startsWith("not a directory")) return "not a folder";
+  if (lower.includes("entry safety limit")) return "too many entries to list";
+  if (lower.includes("batchmode") || lower.includes("permission denied (")) return "SSH authentication failed";
+  if (lower.includes("known_hosts") || lower.includes("host key")) return "SSH host key not trusted";
+  if (lower.includes("ssh is busy")) return "SSH busy";
+  if (lower.includes("safety deadline") || lower.includes("timed out")) return "timed out";
+  if (lower.includes("incomplete response") || lower.includes("connection")) return "connection problem";
+  return "failed to load";
 }
 
 function dirname(input: string): string {
@@ -339,6 +355,9 @@ const POLL_INTERVAL_MS = 5_000;
 const POLL_MAX_PER_TICK = 5;
 const MAX_GLOBAL_SSH_POLLS_IN_FLIGHT = 5;
 const MUTATION_COOLDOWN_MS = 8_000;
+// A poll tick (or hidden period) this many intervals late means the machine
+// slept or the app idled long enough for the shared SSH connection to die.
+const STALE_CONNECTION_GAP_FACTOR = 6;
 const FILE_EXPLORER_ROW_HEIGHT = 28;
 
 // A timed-out frontend Promise cannot cancel a Tauri command. Keep the permit
@@ -725,6 +744,8 @@ export function FileExplorerPanel({
   const loadDirectory = React.useCallback(
     async (path: string) => {
       const dirPath = normalizePath(path);
+      if (!root || !dirPath) return;
+      const requestRoot = root;
       setDirStateByPath((prev) => ({
         ...prev,
         [dirPath]: {
@@ -741,11 +762,15 @@ export function FileExplorerPanel({
           provider === "ssh"
             ? await invoke<FsEntry[]>("ssh_list_fs_entries", { target: sshTargetValue, root, path: dirPath })
             : await invoke<FsEntry[]>("list_fs_entries", { root, path: dirPath });
+        // The root changed while this request was in flight: its result
+        // describes a directory of the previous tree.
+        if (rootRef.current !== requestRoot) return;
         setDirStateByPath((prev) => ({
           ...prev,
           [dirPath]: { entries, loading: false, error: null },
         }));
       } catch (err) {
+        if (rootRef.current !== requestRoot) return;
         const message = err instanceof Error ? err.message : String(err);
         setDirStateByPath((prev) => ({
           ...prev,
@@ -767,6 +792,8 @@ export function FileExplorerPanel({
     async (dirPath: string): Promise<void> => {
       const path = normalizePath(dirPath);
       const isSshPoll = provider === "ssh";
+      if (!root) return;
+      const requestRoot = root;
       if (isSshPoll && (downloadBusy || downloadSingleFlightRef.current)) return;
       if (inFlightPollsRef.current.has(path)) return;
       if (isSshPoll && globalSshPollsInFlight >= MAX_GLOBAL_SSH_POLLS_IN_FLIGHT) return;
@@ -777,10 +804,13 @@ export function FileExplorerPanel({
         // Do not race the native invoke against a frontend timer. Losing that
         // race does not cancel the native SSH child and used to release the
         // per-path guard, allowing another poll to pile on every five seconds.
+        // Background priority: polls never queue for, or take, the SSH slots
+        // reserved for opening folders and files.
         const entries = isSshPoll
-          ? await invoke<FsEntry[]>("ssh_list_fs_entries", { target: sshTargetValue, root, path })
+          ? await invoke<FsEntry[]>("ssh_list_fs_entries", { target: sshTargetValue, root, path, background: true })
           : await invoke<FsEntry[]>("list_fs_entries", { root, path });
 
+        if (rootRef.current !== requestRoot) return;
         // Guard: discard result if dir was collapsed/renamed/removed while polling
         if (!expandedDirsRef.current.has(path) && path !== rootRef.current) return;
 
@@ -913,6 +943,7 @@ export function FileExplorerPanel({
 
   React.useEffect(() => {
     if (!isOpen) return;
+    if (!root) return;
     if (restoredRef.current) return;
     setContextMenu(null);
     setRenameTarget(null);
@@ -1003,6 +1034,51 @@ export function FileExplorerPanel({
     await Promise.allSettled(batch.map((dir) => pollDirectory(dir)));
   }, [downloadBusy, provider, sshTargetValue, pollDirectory]);
 
+  // After sleep, a network change, or an SSH reconnect the shared SSH master
+  // may be sitting on a dead TCP connection. Ask the backend to verify (and if
+  // needed recycle) it, then retry folders that are showing an error and
+  // refresh the rest, instead of waiting for keepalives to time out.
+  const revalidateAndRefresh = React.useCallback(async () => {
+    if (provider !== "ssh" || !sshTargetValue || !rootRef.current) return;
+    try {
+      await invoke("ssh_revalidate_connection", { target: sshTargetValue });
+    } catch {
+      // Best effort: the listings below report their own errors.
+    }
+    if (!mountedRef.current) return;
+    const currentRoot = rootRef.current;
+    for (const [path, state] of Object.entries(dirStateByPathRef.current)) {
+      if (!state?.error || state.loading) continue;
+      if (isUnsupportedFilenameEncodingError(state.error)) continue;
+      if (path === currentRoot || expandedDirsRef.current.has(path)) void loadDirectory(path);
+    }
+    void pollExpandedDirs();
+  }, [loadDirectory, pollExpandedDirs, provider, sshTargetValue]);
+
+  const revalidateAndRefreshRef = React.useRef(revalidateAndRefresh);
+  React.useEffect(() => {
+    revalidateAndRefreshRef.current = revalidateAndRefresh;
+  }, [revalidateAndRefresh]);
+
+  // SSH session came back (reconnecting/disconnected -> connected).
+  const previousConnectionStateRef = React.useRef(sshConnectionState);
+  React.useEffect(() => {
+    const previous = previousConnectionStateRef.current;
+    previousConnectionStateRef.current = sshConnectionState;
+    if (!isOpen || provider !== "ssh") return;
+    if (sshConnectionState === "connected" && previous && previous !== "connected") {
+      void revalidateAndRefreshRef.current();
+    }
+  }, [isOpen, provider, sshConnectionState]);
+
+  // Network came back.
+  React.useEffect(() => {
+    if (!isOpen || provider !== "ssh") return;
+    const handleOnline = () => void revalidateAndRefreshRef.current();
+    window.addEventListener("online", handleOnline);
+    return () => window.removeEventListener("online", handleOnline);
+  }, [isOpen, provider]);
+
   // Own the polling interval in one effect. Sharing the ref between separate
   // timer and visibility effects allowed visibility restore to create a timer
   // that neither effect later owned, so it survived downloads and unmounts.
@@ -1010,6 +1086,21 @@ export function FileExplorerPanel({
     if (!isOpen || provider !== "ssh" || downloadBusy) return;
     if (sshConnectionState === "reconnecting" || sshConnectionState === "disconnected") return;
 
+    // A tick arriving much later than scheduled, or a return from a long
+    // hidden period, means the machine slept or the app was idle: the shared
+    // connection is suspect, so revalidate before polling.
+    let lastTickAt = Date.now();
+    let hiddenAt: number | null = document.hidden ? Date.now() : null;
+    const tick = () => {
+      const now = Date.now();
+      const gap = now - lastTickAt;
+      lastTickAt = now;
+      if (gap > POLL_INTERVAL_MS * STALE_CONNECTION_GAP_FACTOR) {
+        void revalidateAndRefreshRef.current();
+      } else {
+        void pollExpandedDirs();
+      }
+    };
     const stopPolling = () => {
       if (pollIntervalRef.current === null) return;
       window.clearInterval(pollIntervalRef.current);
@@ -1017,14 +1108,22 @@ export function FileExplorerPanel({
     };
     const startPolling = () => {
       if (document.hidden || pollIntervalRef.current !== null) return;
+      lastTickAt = Date.now();
       void pollExpandedDirs();
-      pollIntervalRef.current = window.setInterval(() => {
-        void pollExpandedDirs();
-      }, POLL_INTERVAL_MS);
+      pollIntervalRef.current = window.setInterval(tick, POLL_INTERVAL_MS);
     };
     const handleVisibilityChange = () => {
-      if (document.hidden) stopPolling();
-      else startPolling();
+      if (document.hidden) {
+        hiddenAt = Date.now();
+        stopPolling();
+        return;
+      }
+      const hiddenFor = hiddenAt === null ? 0 : Date.now() - hiddenAt;
+      hiddenAt = null;
+      if (hiddenFor > POLL_INTERVAL_MS * STALE_CONNECTION_GAP_FACTOR) {
+        void revalidateAndRefreshRef.current();
+      }
+      startPolling();
     };
 
     startPolling();
@@ -1326,10 +1425,20 @@ export function FileExplorerPanel({
     const out: VisibleItem[] = [];
     if (!isOpen) return out;
 
+    if (!root) {
+      out.push({ type: "status", path: "", depth: 0, message: "resolving remote folder…" });
+      return out;
+    }
+
     const walk = (dirPath: string, depth: number) => {
       const state = dirStateByPath[dirPath];
       if (depth === 0 && state?.error) {
         out.push({ type: "error", path: dirPath, depth, message: state.error });
+      }
+      // Show progress for the root itself instead of "No files." while the
+      // first listing is still in flight.
+      if (depth === 0 && !state?.error && (!state || (state.loading && state.entries.length === 0))) {
+        out.push({ type: "loading", path: dirPath, depth });
       }
       const entries = state?.entries ?? [];
       for (const entry of entries) {
@@ -2273,8 +2382,20 @@ export function FileExplorerPanel({
                       </div>
                     );
                   }
+                  if (item.type === "status") {
+                    return (
+                      <div
+                        key={`status:${item.path}`}
+                        className="fileExplorerRow fileExplorerMeta"
+                        style={{ paddingLeft: 12 + item.depth * 14, height: rowHeight }}
+                      >
+                        {item.message}
+                      </div>
+                    );
+                  }
                   if (item.type === "error") {
                     const unsupportedEncoding = isUnsupportedFilenameEncodingError(item.message);
+                    const errorPath = item.path;
                     return (
                       <div
                         key={`error:${item.path}`}
@@ -2283,9 +2404,27 @@ export function FileExplorerPanel({
                         title={item.message}
                         role={unsupportedEncoding ? "alert" : undefined}
                         aria-live={unsupportedEncoding ? "assertive" : undefined}
-                        aria-label={unsupportedEncoding ? `Invalid UTF-8 filename: ${item.message}` : undefined}
+                        aria-label={
+                          unsupportedEncoding
+                            ? `Invalid UTF-8 filename: ${item.message}`
+                            : `Failed to load: ${item.message}`
+                        }
                       >
-                        {unsupportedEncoding ? "invalid UTF-8 filename" : "failed to load"}
+                        <span className="fileExplorerName">
+                          {unsupportedEncoding ? "invalid UTF-8 filename" : directoryErrorLabel(item.message)}
+                        </span>
+                        {unsupportedEncoding ? null : (
+                          <button
+                            type="button"
+                            className="fileExplorerRetry"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void loadDirectory(errorPath);
+                            }}
+                          >
+                            retry
+                          </button>
+                        )}
                       </div>
                     );
                   }

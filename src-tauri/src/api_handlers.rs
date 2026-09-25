@@ -324,7 +324,7 @@ fn handle_files_open_in_finder(params: Value) -> Result<Value, JsonRpcError> {
 
 async fn handle_ssh_files_default_root(params: Value) -> Result<Value, JsonRpcError> {
     let host = require_str(&params, "host")?;
-    let path = crate::ssh_fs::ssh_default_root(host).await
+    let path = crate::ssh_fs::ssh_default_root(host, None).await
         .map_err(|e| op_failed(&e))?;
     Ok(json!({ "path": path }))
 }
@@ -333,7 +333,7 @@ async fn handle_ssh_files_list(params: Value) -> Result<Value, JsonRpcError> {
     let host = require_str(&params, "host")?;
     let root = require_str(&params, "root")?;
     let path = require_str(&params, "path")?;
-    let result = crate::ssh_fs::ssh_list_fs_entries(host, root, path).await
+    let result = crate::ssh_fs::ssh_list_fs_entries(host, root, path, None).await
         .map_err(|e| op_failed(&e))?;
     serde_json::to_value(result).map_err(|e| internal(&e.to_string()))
 }

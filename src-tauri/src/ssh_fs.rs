@@ -22,7 +22,16 @@ const MAX_REMOTE_FILE_SEARCH_RESULTS: usize = 1_000;
 /// How many times an ssh/sftp op (or master-establish) is retried when it hits a
 /// transient transport error before giving up.
 const SSH_OP_ATTEMPTS: usize = 3;
-const MAX_ACTIVE_SSH_SHORT_OPS: usize = 8;
+const MAX_ACTIVE_SSH_SHORT_OPS: usize = 10;
+/// Slots background refreshes may never occupy, so user actions always have
+/// headroom even while every expanded folder is being polled.
+const SSH_FOREGROUND_RESERVED_SLOTS: usize = 4;
+/// How long a user-visible operation waits in line for a free slot before
+/// reporting that SSH is busy (it used to fail instantly).
+const SSH_FOREGROUND_PERMIT_WAIT: Duration = Duration::from_secs(20);
+/// Upper bound for the "is the shared connection actually usable?" probe that
+/// decides whether a failing master must be recycled.
+const SSH_MASTER_PROBE_LIMIT: Duration = Duration::from_secs(8);
 const MAX_DEFERRED_SSH_CHILDREN: usize = 8;
 const SSH_COMMAND_STDOUT_LIMIT: usize = 16 * 1024 * 1024;
 const SFTP_LIST_STDOUT_LIMIT: usize = 8 * 1024 * 1024;
@@ -556,35 +565,225 @@ fn invalidate_master_verified(target: &str) {
     }
 }
 
+/// Generation of the shared master per target. Every recycle bumps it, so an
+/// operation that failed on an *older* master never tears down the fresh one
+/// another operation already rebuilt.
+fn master_epochs() -> &'static Mutex<HashMap<String, u64>> {
+    static EPOCHS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    EPOCHS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn master_epoch(target: &str) -> u64 {
+    master_epochs()
+        .lock()
+        .map(|map| map.get(target).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+fn bump_master_epoch(target: &str) {
+    if let Ok(mut map) = master_epochs().lock() {
+        *map.entry(target.to_string()).or_insert(0) += 1;
+    }
+}
+
+/// Run a trivial command through the existing master (never creating a new
+/// one) with a short deadline. `-O check` only proves the master *process*
+/// exists; after sleep or a network change that process can sit on a dead TCP
+/// connection until keepalives expire, and every multiplexed command hangs.
+fn master_round_trip_ok(target: &str, renderer_generation: Option<u64>) -> bool {
+    let (Ok(ssh), Ok(common)) = (program_path("ssh"), ssh_common_args()) else {
+        return false;
+    };
+    let mut command = Command::new(ssh);
+    // ssh keeps the FIRST value of a repeated -o, so this must precede the
+    // common ControlMaster=auto.
+    command
+        .args(["-o", "ControlMaster=no"])
+        .args(&common)
+        .arg(target)
+        .arg("true");
+    run_command_bounded(
+        command,
+        None,
+        SCP_DIAGNOSTIC_TAIL_BYTES,
+        renderer_generation,
+        Some(SSH_MASTER_PROBE_LIMIT),
+        "ssh connection probe",
+    )
+    .map(|output| output.status.success())
+    .unwrap_or(false)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MasterHealth {
+    /// The master answered a real round trip; the failure was not the
+    /// connection's fault.
+    Healthy,
+    /// The master was dead, wedged, or already replaced; a retry will run on a
+    /// fresh connection.
+    Replaced,
+}
+
+/// Serialized per target: decide whether the shared master that an operation
+/// failed on must be recycled. Only one caller probes; callers that observed an
+/// older epoch learn that the master was already replaced and simply retry.
+/// A healthy master is never closed because of one operation's failure.
+fn recover_master(
+    target: &str,
+    observed_epoch: u64,
+    renderer_generation: Option<u64>,
+) -> MasterHealth {
+    let Ok(target) = validate_ssh_target(target) else {
+        return MasterHealth::Healthy;
+    };
+    let lock = ssh_master_lock(target);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if master_epoch(target) != observed_epoch {
+        return MasterHealth::Replaced;
+    }
+    invalidate_master_verified(target);
+    if !master_is_alive(target, renderer_generation) {
+        bump_master_epoch(target);
+        return MasterHealth::Replaced;
+    }
+    if master_round_trip_ok(target, renderer_generation) {
+        mark_master_verified(target);
+        return MasterHealth::Healthy;
+    }
+    eprintln!("[ssh] shared connection to {target} is unresponsive; recycling it");
+    close_master(target, renderer_generation);
+    bump_master_epoch(target);
+    MasterHealth::Replaced
+}
+
+/// Re-check the shared connection after the app was idle, asleep, or the
+/// network changed, so the next file operation doesn't hang on a dead master.
+#[tauri::command]
+pub async fn ssh_revalidate_connection(target: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = validate_ssh_target(&target)?.to_string();
+        let epoch = master_epoch(&target);
+        recover_master(&target, epoch, None);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+/// Turn raw OpenSSH connection failures into actionable messages. The file
+/// browser connects non-interactively, so failures that the interactive
+/// terminal session masks (password prompts, unknown host keys) need to say so.
+fn describe_ssh_connect_failure(stderr: &str) -> String {
+    let lower = stderr.to_ascii_lowercase();
+    let hint = if (lower.contains("permission denied") && lower.contains("publickey"))
+        || lower.contains("too many authentication failures")
+        || lower.contains("no more authentication methods")
+    {
+        Some("the file browser connects without prompting (BatchMode), so it needs key- or agent-based authentication; passwords, keyboard-interactive/2FA, or key passphrases not loaded into ssh-agent only work in the terminal")
+    } else if lower.contains("host key verification failed")
+        || (lower.contains("no ") && lower.contains("host key is known"))
+    {
+        Some("the host key is not in known_hosts (or has changed); connect once from a terminal with plain `ssh` to verify and accept it")
+    } else if lower.contains("remote host identification has changed") {
+        Some("the host key changed; verify it and update known_hosts")
+    } else if lower.contains("could not resolve hostname") {
+        Some("the host name could not be resolved; check the SSH target / ~/.ssh/config Host entry")
+    } else {
+        None
+    };
+    let detail = if stderr.is_empty() {
+        "connection failed"
+    } else {
+        stderr
+    };
+    match hint {
+        Some(hint) => format!("{detail} ({hint})"),
+        None => detail.to_string(),
+    }
+}
+
+/// Who is waiting for an SSH slot. User-visible work (opening a folder or a
+/// file, saving) waits in line for a slot; background refreshes (file-tree
+/// polls, health stats) never queue and never take the slots reserved for
+/// user-visible work, so a burst of polls can't starve a click.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SshOpPriority {
+    Foreground,
+    Background,
+}
+
+impl SshOpPriority {
+    fn from_background_flag(background: Option<bool>) -> Self {
+        if background.unwrap_or(false) {
+            Self::Background
+        } else {
+            Self::Foreground
+        }
+    }
+}
+
 struct SshShortOpPermit;
 
 impl Drop for SshShortOpPermit {
     fn drop(&mut self) {
-        active_ssh_short_ops().fetch_sub(1, Ordering::AcqRel);
+        let (active, available) = ssh_short_op_slots();
+        let mut count = active.lock().unwrap_or_else(|e| e.into_inner());
+        *count = count.saturating_sub(1);
+        available.notify_all();
     }
 }
 
-fn active_ssh_short_ops() -> &'static AtomicUsize {
-    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-    &ACTIVE
+fn ssh_short_op_slots() -> &'static (Mutex<usize>, std::sync::Condvar) {
+    static SLOTS: OnceLock<(Mutex<usize>, std::sync::Condvar)> = OnceLock::new();
+    SLOTS.get_or_init(|| (Mutex::new(0), std::sync::Condvar::new()))
 }
 
-fn acquire_ssh_short_op_permit() -> Result<SshShortOpPermit, String> {
+fn ssh_short_op_slot_limit(priority: SshOpPriority) -> usize {
+    match priority {
+        SshOpPriority::Foreground => MAX_ACTIVE_SSH_SHORT_OPS,
+        SshOpPriority::Background => MAX_ACTIVE_SSH_SHORT_OPS - SSH_FOREGROUND_RESERVED_SLOTS,
+    }
+}
+
+fn try_take_ssh_short_op_slot(
+    priority: SshOpPriority,
+    wait: Duration,
+) -> Result<SshShortOpPermit, String> {
+    let limit = ssh_short_op_slot_limit(priority);
+    let (active, available) = ssh_short_op_slots();
+    let deadline = Instant::now() + wait;
+    let mut count = active.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if *count < limit {
+            *count += 1;
+            return Ok(SshShortOpPermit);
+        }
+        let now = Instant::now();
+        if priority == SshOpPriority::Background || now >= deadline {
+            return Err(match priority {
+                SshOpPriority::Background => {
+                    "SSH is busy with other file operations; background refresh skipped".to_string()
+                }
+                SshOpPriority::Foreground => format!(
+                    "SSH is busy: {MAX_ACTIVE_SSH_SHORT_OPS} file operations are still running after waiting {}s; try again shortly",
+                    wait.as_secs()
+                ),
+            });
+        }
+        count = available
+            .wait_timeout(count, deadline - now)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+}
+
+fn acquire_ssh_short_op_permit(priority: SshOpPriority) -> Result<SshShortOpPermit, String> {
     poll_deferred_ssh_fallback();
     let _ = deferred_ssh_child_sender()?;
     if deferred_ssh_child_count().load(Ordering::Acquire) >= MAX_DEFERRED_SSH_CHILDREN {
         return Err("SSH process cleanup is still pending; try again shortly".to_string());
     }
-    active_ssh_short_ops()
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-            (active < MAX_ACTIVE_SSH_SHORT_OPS).then_some(active + 1)
-        })
-        .map(|_| SshShortOpPermit)
-        .map_err(|_| {
-            format!(
-                "too many active SSH filesystem operations (maximum {MAX_ACTIVE_SSH_SHORT_OPS})"
-            )
-        })
+    try_take_ssh_short_op_slot(priority, SSH_FOREGROUND_PERMIT_WAIT)
 }
 
 fn run_command_bounded(
@@ -834,11 +1033,21 @@ fn close_master(target: &str, renderer_generation: Option<u64>) {
     );
 }
 
+/// Prefix of a connection failure that retrying cannot fix (authentication,
+/// host key, DNS). Retrying those only multiplies failed logins, which can
+/// trip fail2ban-style lockouts on the server.
+const SSH_CONNECT_FAILED_PREFIX: &str = "ssh connect failed: ";
+
 fn supervisor_error_is_retryable(error: &str) -> bool {
     !error.contains("terminated renderer")
         && !error.contains("output exceeded")
         && !error.contains("not found")
         && !error.contains("invalid SSH")
+        && !error.starts_with(SSH_CONNECT_FAILED_PREFIX)
+}
+
+fn is_safety_deadline_error(error: &str) -> bool {
+    error.contains("safety deadline")
 }
 
 /// Ensure the multiplexing master for `target` is up. Serialized per target so
@@ -894,13 +1103,18 @@ fn ensure_master(target: &str, renderer_generation: Option<u64>) -> Result<(), S
             Err(error) => return Err(error),
         };
         if output.status.success() {
+            // A new master replaces whatever an in-flight operation was using.
+            bump_master_epoch(target);
             mark_master_verified(target);
             return Ok(());
         }
         last_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if !is_transient_ssh_error(&last_err) {
             // Auth / host-key / DNS failures won't be fixed by retrying.
-            return Err(format!("ssh connect failed: {last_err}"));
+            return Err(format!(
+                "{SSH_CONNECT_FAILED_PREFIX}{}",
+                describe_ssh_connect_failure(&last_err)
+            ));
         }
     }
     Err(format!(
@@ -962,7 +1176,7 @@ fn run_ssh_mutation(
     label: &str,
 ) -> Result<Output, String> {
     let target = validate_ssh_target(target)?;
-    let _permit = acquire_ssh_short_op_permit()?;
+    let _permit = acquire_ssh_short_op_permit(SshOpPriority::Foreground)?;
     ensure_master(target, renderer_generation)?;
     let result = execute_single_mutation_attempt(label, || {
         run_ssh_once(target, remote_args, stdin, renderer_generation)
@@ -979,6 +1193,8 @@ fn run_ssh_mutation(
     result
 }
 
+/// Run a small read-only shell script on the remote host (script on stdin).
+/// Used by background status polling, so it never queues behind user actions.
 pub(crate) fn run_ssh_script(target: &str, script: &str) -> Result<Output, String> {
     let args = vec!["sh".to_string()];
     run_ssh_read_only_with_stdin(
@@ -987,6 +1203,7 @@ pub(crate) fn run_ssh_script(target: &str, script: &str) -> Result<Output, Strin
         Some(script.as_bytes()),
         None,
         SSH_COMMAND_STDOUT_LIMIT,
+        SshOpPriority::Background,
         "ssh system query",
     )
 }
@@ -1014,19 +1231,41 @@ fn run_ssh_read_only_once(
     )
 }
 
+/// Retry policy for idempotent queries.
+///
+/// * success, or a genuine command failure (non-transport stderr), returns
+///   immediately;
+/// * a transient transport failure asks `recover` to repair the shared
+///   connection and retries, bounded by `SSH_OP_ATTEMPTS`;
+/// * a safety-deadline hang is retried at most once, and only when `recover`
+///   reports that the connection really was dead/wedged. A healthy connection
+///   means the command itself is slow, so repeating it would only double the
+///   wait.
 fn run_retry_safe_query_attempts(
     label: &str,
     mut attempt: impl FnMut(usize) -> Result<Output, String>,
+    mut recover: impl FnMut() -> MasterHealth,
 ) -> Result<Output, String> {
     let mut last_output: Option<Output> = None;
     let mut last_error: Option<String> = None;
+    let mut deadline_retried = false;
     for attempt_index in 0..SSH_OP_ATTEMPTS {
+        let is_last_attempt = attempt_index + 1 == SSH_OP_ATTEMPTS;
         let output = match attempt(attempt_index) {
             Ok(output) => output,
-            Err(error)
-                if supervisor_error_is_retryable(&error) && !error.contains("safety deadline") =>
-            {
+            Err(error) if is_safety_deadline_error(&error) => {
+                if deadline_retried || is_last_attempt || recover() == MasterHealth::Healthy {
+                    return Err(error);
+                }
+                deadline_retried = true;
                 last_error = Some(error);
+                continue;
+            }
+            Err(error) if supervisor_error_is_retryable(&error) => {
+                last_error = Some(error);
+                if !is_last_attempt {
+                    recover();
+                }
                 continue;
             }
             Err(error) => return Err(error),
@@ -1038,6 +1277,9 @@ fn run_retry_safe_query_attempts(
             return Ok(output);
         }
         last_output = Some(output);
+        if !is_last_attempt {
+            recover();
+        }
     }
     match last_output {
         Some(output) => Ok(output),
@@ -1050,6 +1292,7 @@ fn run_retry_safe_query_attempts(
 /// Run an idempotent filesystem query with the same bounded process supervision
 /// as transfers. Unlike mutation commands, read-only queries are safe to retry
 /// after a transient connection failure.
+#[cfg(test)]
 fn run_ssh_read_only(
     target: &str,
     remote_args: &[String],
@@ -1063,6 +1306,7 @@ fn run_ssh_read_only(
         None,
         renderer_generation,
         stdout_limit,
+        SshOpPriority::Foreground,
         label,
     )
 }
@@ -1073,25 +1317,73 @@ fn run_ssh_read_only_with_stdin(
     stdin: Option<&[u8]>,
     renderer_generation: Option<u64>,
     stdout_limit: usize,
+    priority: SshOpPriority,
     label: &str,
 ) -> Result<Output, String> {
     let target = validate_ssh_target(target)?;
-    let _permit = acquire_ssh_short_op_permit()?;
-    run_retry_safe_query_attempts(label, |attempt| {
-        if attempt > 0 {
-            close_master(target, renderer_generation);
-            std::thread::sleep(Duration::from_millis(250 * attempt as u64));
-        }
-        ensure_master(target, renderer_generation)?;
-        run_ssh_read_only_once(
-            target,
-            remote_args,
-            stdin,
-            renderer_generation,
-            stdout_limit,
-            label,
-        )
-    })
+    let _permit = acquire_ssh_short_op_permit(priority)?;
+    let observed_epoch = std::cell::Cell::new(master_epoch(target));
+    let result = run_retry_safe_query_attempts(
+        label,
+        |attempt| {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+            }
+            ensure_master(target, renderer_generation)?;
+            observed_epoch.set(master_epoch(target));
+            run_ssh_read_only_once(
+                target,
+                remote_args,
+                stdin,
+                renderer_generation,
+                stdout_limit,
+                label,
+            )
+        },
+        || recover_master(target, observed_epoch.get(), renderer_generation),
+    );
+    if let Err(error) = &result {
+        eprintln!("[ssh] {label} on {target} failed: {error}");
+    }
+    result
+}
+
+/// Read-only query whose multi-line script is sent on stdin to `sh -s`, so the
+/// remote *login* shell only has to parse `sh -s -- 'arg' ...`. Passing the
+/// script itself through `sh -c '<script>'` breaks under csh/tcsh (newlines in
+/// quotes) and other non-POSIX login shells.
+///
+/// The script is wrapped in a brace group reading from /dev/null: `sh` parses
+/// the whole group before running it, so no command inside can consume the
+/// rest of the script from stdin.
+fn run_ssh_read_only_script(
+    target: &str,
+    script: &str,
+    args: &[String],
+    renderer_generation: Option<u64>,
+    stdout_limit: usize,
+    priority: SshOpPriority,
+    label: &str,
+) -> Result<Output, String> {
+    let mut command = String::from("sh -s --");
+    for arg in args {
+        command.push(' ');
+        command.push_str(&shell_escape_posix(arg));
+    }
+    let wrapped = stdin_script(script);
+    run_ssh_read_only_with_stdin(
+        target,
+        &[command],
+        Some(wrapped.as_bytes()),
+        renderer_generation,
+        stdout_limit,
+        priority,
+        label,
+    )
+}
+
+fn stdin_script(script: &str) -> String {
+    format!("{{\n{script}\n}} </dev/null\n")
 }
 
 fn decode_remote_path_output<'a>(bytes: &'a [u8], operation: &str) -> Result<&'a str, String> {
@@ -1249,7 +1541,8 @@ fn parse_remote_directory_frame_with_tokens(
             b"d" => 'd',
             b"f" => 'f',
             b"l" => 'l',
-            b"o" => 'o',
+            // GNU find %y: FIFO, socket, char/block device, door, unknown.
+            b"o" | b"p" | b"s" | b"c" | b"b" | b"D" | b"U" | b"?" => 'o',
             _ => return Err("ssh directory listing returned an invalid entry type".to_string()),
         };
         let size = decode_remote_path_output(size_field, "ssh directory listing size")?
@@ -1289,8 +1582,30 @@ dir=$1
 limit=$2
 magic=${3:-AGENTS_UI_FS_V1}
 trailer=${4:-Z}
+# Fail loudly instead of returning an empty listing: an unreadable or missing
+# directory used to look exactly like an empty folder.
+if [ ! -e "$dir" ]; then
+  echo "No such directory: $dir" >&2
+  exit 70
+fi
+if [ ! -d "$dir" ]; then
+  echo "Not a directory: $dir" >&2
+  exit 70
+fi
+if [ ! -r "$dir" ] || [ ! -x "$dir" ]; then
+  echo "Permission denied: cannot list $dir as $(id -un 2>/dev/null || echo 'this user')" >&2
+  exit 71
+fi
 prefix=$dir
 if [ "$prefix" = "/" ]; then prefix=""; fi
+# GNU find emits every record in one process; -H follows a symlinked root.
+# Entries that vanish mid-listing are simply omitted by find.
+if find -H "$dir" -maxdepth 0 -printf '' >/dev/null 2>&1; then
+  printf '%s\000' "$magic"
+  find -H "$dir" -mindepth 1 -maxdepth 1 -printf 'E\000%y\000%s\000%f\000' 2>/dev/null || :
+  printf '%s\000' "$trailer"
+  exit 0
+fi
 if stat -c %s / >/dev/null 2>&1; then
   stat_style=gnu
 elif stat -f %z / >/dev/null 2>&1; then
@@ -1321,9 +1636,11 @@ for entry in "$prefix"/* "$prefix"/.[!.]* "$prefix"/..?*; do
   if [ "$kind" = d ]; then
     size=0
   elif [ "$stat_style" = gnu ]; then
-    size=$(stat -c %s "$entry") || exit 74
+    # A file deleted between the glob and stat (temp/lock files) is skipped
+    # rather than failing the whole directory.
+    size=$(stat -c %s "$entry" 2>/dev/null) || continue
   else
-    size=$(stat -f %z "$entry") || exit 74
+    size=$(stat -f %z "$entry" 2>/dev/null) || continue
   fi
   printf 'E\000%s\000%s\000%s\000' "$kind" "$size" "$name"
 done
@@ -1331,8 +1648,8 @@ printf '%s\000' "$trailer"
 "#;
 
 #[tauri::command]
-pub async fn ssh_default_root(target: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || ssh_default_root_sync(target))
+pub async fn ssh_default_root(target: String, path: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || ssh_default_root_sync(target, path))
         .await
         .map_err(|e| format!("ssh task join failed: {e:?}"))?
 }
@@ -1344,65 +1661,137 @@ pub async fn ssh_effective_user(target: String) -> Result<String, String> {
         .map_err(|e| format!("ssh task join failed: {e:?}"))?
 }
 
-fn ssh_effective_user_sync(target: String) -> Result<String, String> {
+/// Locate the payload between a nonce-tagged start marker and trailer. Output
+/// that a remote login shell prints before our script runs (rc-file echoes,
+/// banners) lands before the start marker and is discarded; a missing trailer
+/// means the stream was cut short and is an error rather than a silently
+/// truncated result (a short range read would otherwise look like EOF).
+fn extract_framed_payload<'a>(
+    stdout: &'a [u8],
+    magic: &str,
+    trailer: &str,
+    operation: &str,
+) -> Result<&'a [u8], String> {
+    let start_marker = [magic.as_bytes(), b"\0"].concat();
+    let end_marker = [b"\0".as_slice(), trailer.as_bytes(), b"\0"].concat();
+    let start = stdout
+        .windows(start_marker.len())
+        .position(|window| window == start_marker.as_slice())
+        .map(|index| index + start_marker.len())
+        .ok_or_else(|| format!("{operation} returned no framed response"))?;
+    let end = stdout
+        .windows(end_marker.len())
+        .rposition(|window| window == end_marker.as_slice())
+        .filter(|end| *end >= start)
+        .ok_or_else(|| format!("{operation} returned an incomplete response (connection interrupted?)"))?;
+    Ok(&stdout[start..end])
+}
+
+const REMOTE_IDENTITY_SCRIPT: &str = r#"set -e
+magic=$1
+trailer=$2
+uid=$(id -u 2>/dev/null || echo "")
+user=$(id -un 2>/dev/null || whoami 2>/dev/null || echo "")
+home=${HOME:-}
+printf '%s\000' "$magic"
+printf '%s\000%s\000%s\000%s' "$uid" "$user" "$home" "${PWD:-}"
+printf '\000%s\000' "$trailer"
+"#;
+
+struct RemoteIdentity {
+    uid: String,
+    user: String,
+    home: String,
+    pwd: String,
+}
+
+fn remote_identity(target: &str) -> Result<RemoteIdentity, String> {
     let target = target.trim();
     if target.is_empty() {
         return Err("missing ssh target".to_string());
     }
-
-    // Single-line command to avoid shell parsing differences across hosts.
-    let script = r#"id -un 2>/dev/null || whoami 2>/dev/null"#;
-    let command = build_sh_c_command(script, None, &[]);
-    let args = vec![command];
-    let output = run_ssh_read_only(
+    let (magic, trailer) = remote_frame_tokens("ID")?;
+    let output = run_ssh_read_only_script(
         target,
-        &args,
+        REMOTE_IDENTITY_SCRIPT,
+        &[magic.clone(), trailer.clone()],
         None,
         SSH_COMMAND_STDOUT_LIMIT,
-        "ssh user lookup",
+        SshOpPriority::Foreground,
+        "ssh identity lookup",
     )?;
     if !output.status.success() {
-        return Err(output_to_error("ssh failed", &output));
+        return Err(remote_script_error("ssh failed", &output));
     }
-    let user = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let payload = extract_framed_payload(&output.stdout, &magic, &trailer, "ssh identity lookup")?;
+    let fields: Vec<&[u8]> = payload.split(|byte| *byte == 0).collect();
+    if fields.len() != 4 {
+        return Err("ssh identity lookup returned a malformed response".to_string());
+    }
+    let field = |index: usize| -> Result<String, String> {
+        decode_remote_path_output(fields[index], "ssh identity lookup").map(str::to_string)
+    };
+    Ok(RemoteIdentity {
+        uid: field(0)?,
+        user: field(1)?,
+        home: field(2)?,
+        pwd: field(3)?,
+    })
+}
+
+fn ssh_effective_user_sync(target: String) -> Result<String, String> {
+    let identity = remote_identity(&target)?;
+    let user = identity.user.trim().to_string();
     if user.is_empty() {
         return Err("ssh returned empty user".to_string());
     }
     Ok(user)
 }
 
-fn ssh_default_root_sync(target: String) -> Result<String, String> {
-    let target = target.trim();
-    if target.is_empty() {
-        return Err("missing ssh target".to_string());
+/// Resolve a user-supplied remote directory (as typed into a project, e.g.
+/// `~`, `~/code`, `code`, `/srv/app`) against the remote home directory.
+fn resolve_remote_path(raw: &str, home: &str) -> Result<String, String> {
+    if raw.contains('\0') {
+        return Err("path contains a NUL byte".to_string());
     }
+    if raw.starts_with('/') {
+        return normalize_posix_path(raw);
+    }
+    let require_home = || -> Result<&str, String> {
+        if home.starts_with('/') {
+            Ok(home)
+        } else {
+            Err("the remote home directory is unknown ($HOME is not set); use an absolute path".to_string())
+        }
+    };
+    if raw == "~" {
+        return normalize_posix_path(require_home()?);
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return normalize_posix_path(&format!("{}/{rest}", require_home()?));
+    }
+    if raw.starts_with('~') {
+        return Err(format!(
+            "'{raw}': ~user paths are not supported; use an absolute path"
+        ));
+    }
+    normalize_posix_path(&format!("{}/{raw}", require_home()?))
+}
 
-    // Print without a line delimiter so whitespace in HOME/PWD remains part of
-    // the path rather than being confused with command formatting.
-    let script = r#"uid="$(id -u 2>/dev/null || echo 1000)"; if [ "$uid" = "0" ]; then printf "/"; exit 0; fi; if [ -n "${HOME:-}" ]; then printf "%s" "$HOME"; exit 0; fi; if [ -n "${PWD:-}" ]; then printf "%s" "$PWD"; exit 0; fi; echo "ssh returned no root" >&2; exit 1"#;
-
-    let command = build_sh_c_command(script, None, &[]);
-    let args = vec![command];
-    let output = run_ssh_read_only(
-        target,
-        &args,
-        None,
-        SSH_COMMAND_STDOUT_LIMIT,
-        "ssh root lookup",
-    )?;
-    if !output.status.success() {
-        return Err(output_to_error("ssh failed", &output));
+fn ssh_default_root_sync(target: String, path: Option<String>) -> Result<String, String> {
+    let identity = remote_identity(&target)?;
+    if let Some(path) = path.filter(|path| !path.trim().is_empty()) {
+        return resolve_remote_path(&path, &identity.home);
     }
-    let stdout = decode_remote_path_output(&output.stdout, "ssh root lookup")?.to_string();
-    if stdout.is_empty() {
-        return Err("ssh returned empty root".to_string());
+    if identity.uid == "0" {
+        return Ok("/".to_string());
     }
-    normalize_posix_path(&stdout)
+    for candidate in [&identity.home, &identity.pwd] {
+        if candidate.starts_with('/') {
+            return normalize_posix_path(candidate);
+        }
+    }
+    Err("ssh returned no usable home directory".to_string())
 }
 
 #[tauri::command]
@@ -1410,10 +1799,12 @@ pub async fn ssh_list_fs_entries(
     target: String,
     root: String,
     path: String,
+    background: Option<bool>,
 ) -> Result<Vec<FsEntry>, String> {
     let renderer_generation = current_ssh_transfer_generation();
+    let priority = SshOpPriority::from_background_flag(background);
     tauri::async_runtime::spawn_blocking(move || {
-        ssh_list_fs_entries_sync(target, root, path, renderer_generation)
+        ssh_list_fs_entries_sync(target, root, path, renderer_generation, priority)
     })
     .await
     .map_err(|e| format!("ssh task join failed: {e:?}"))?
@@ -1424,6 +1815,7 @@ fn ssh_list_fs_entries_sync(
     root: String,
     path: String,
     renderer_generation: u64,
+    priority: SshOpPriority,
 ) -> Result<Vec<FsEntry>, String> {
     let target = target.trim();
     if target.is_empty() {
@@ -1432,25 +1824,31 @@ fn ssh_list_fs_entries_sync(
     let (_root, path) = ensure_within_root(&root, &path)?;
     let (frame_magic, frame_trailer) = remote_frame_tokens("FS")?;
 
-    let command = build_sh_c_command(
+    let output = run_ssh_read_only_script(
+        target,
         REMOTE_DIRECTORY_LIST_SCRIPT,
-        Some("--"),
         &[
             path.clone(),
             MAX_REMOTE_DIRECTORY_ENTRIES.to_string(),
             frame_magic.clone(),
             frame_trailer.clone(),
         ],
-    );
-    let output = run_ssh_read_only(
-        target,
-        &[command],
         Some(renderer_generation),
         SFTP_LIST_STDOUT_LIMIT,
+        priority,
         "ssh directory listing",
-    )?;
+    )
+    .map_err(|error| {
+        if error.contains("output exceeded") {
+            format!(
+                "remote directory exceeds the {MAX_REMOTE_DIRECTORY_ENTRIES}-entry safety limit"
+            )
+        } else {
+            error
+        }
+    })?;
     if !output.status.success() {
-        return Err(output_to_error("ssh directory listing failed", &output));
+        return Err(remote_script_error("ssh directory listing failed", &output));
     }
     parse_remote_directory_frame_with_tokens(
         &path,
@@ -1458,6 +1856,36 @@ fn ssh_list_fs_entries_sync(
         frame_magic.as_bytes(),
         frame_trailer.as_bytes(),
     )
+}
+
+/// Error for a remote script that ran but failed. Our scripts report their own
+/// explicit, user-facing reasons ("Permission denied: …", "No such directory:
+/// …") as the last stderr line; anything a login-shell rc file printed before
+/// that is noise. Transport errors keep the whole stderr.
+fn remote_script_error(prefix: &str, output: &Output) -> String {
+    const EXPLICIT_PREFIXES: [&str; 5] = [
+        "Permission denied: ",
+        "No such directory: ",
+        "Not a directory: ",
+        "No such file: ",
+        "Not a regular file: ",
+    ];
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if let Some(line) = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| EXPLICIT_PREFIXES.iter().any(|p| line.starts_with(p)))
+    {
+        return line.to_string();
+    }
+    if output.status.code() == Some(255) {
+        return format!(
+            "{prefix}: {}",
+            describe_ssh_connect_failure(stderr.trim())
+        );
+    }
+    output_to_error(prefix, output)
 }
 
 #[tauri::command]
@@ -1678,16 +2106,17 @@ fn ssh_search_pass(
         frame_magic.clone(),
         frame_trailer.clone(),
     ];
-    let command = build_sh_c_command(REMOTE_FILE_SEARCH_SCRIPT, Some("--"), &args);
-    let output = run_ssh_read_only(
+    let output = run_ssh_read_only_script(
         target,
-        &[command],
+        REMOTE_FILE_SEARCH_SCRIPT,
+        &args,
         Some(renderer_generation),
         SSH_COMMAND_STDOUT_LIMIT,
+        SshOpPriority::Foreground,
         "ssh file search",
     )?;
     if !output.status.success() {
-        return Err(output_to_error("ssh search failed", &output));
+        return Err(remote_script_error("ssh search failed", &output));
     }
     parse_remote_search_frame_with_tokens(
         root,
@@ -1712,6 +2141,40 @@ pub async fn ssh_read_text_file(
         .map_err(|e| format!("ssh task join failed: {e:?}"))?
 }
 
+/// Shared preamble for scripts that read one remote file: explicit, user-facing
+/// reasons instead of an empty or truncated result.
+const REMOTE_READABLE_FILE_CHECK: &str = r#"if [ ! -e "$file" ]; then
+  echo "No such file: $file" >&2
+  exit 70
+fi
+if [ ! -f "$file" ]; then
+  echo "Not a regular file: $file" >&2
+  exit 70
+fi
+if [ ! -r "$file" ]; then
+  echo "Permission denied: cannot read $file as $(id -un 2>/dev/null || echo 'this user')" >&2
+  exit 71
+fi"#;
+
+fn text_read_script() -> String {
+    format!(
+        r#"set -e
+file=$1
+limit=$2
+magic=$3
+trailer=$4
+{REMOTE_READABLE_FILE_CHECK}
+printf '%s\000' "$magic"
+if command -v head >/dev/null 2>&1; then
+  head -c "$limit" "$file"
+else
+  dd if="$file" bs=1 count="$limit" 2>/dev/null
+fi
+printf '\000%s\000' "$trailer"
+"#
+    )
+}
+
 fn ssh_read_text_file_sync(target: String, root: String, path: String) -> Result<String, String> {
     let target = target.trim();
     if target.is_empty() {
@@ -1721,24 +2184,22 @@ fn ssh_read_text_file_sync(target: String, root: String, path: String) -> Result
     ensure_not_root(&root, &path, "read")?;
 
     let limit = MAX_TEXT_FILE_BYTES + 1;
-    let script = format!(
-        r#"set -e; file="$1"; [ -f "$file" ] || {{ echo "not a file" >&2; exit 1; }}; if command -v head >/dev/null 2>&1; then head -c {limit} "$file"; else dd if="$file" bs=1 count={limit}; fi"#
-    );
-
-    let command = build_sh_c_command(&script, Some("--"), &[path.clone()]);
-    let args = vec![command];
-    let output = run_ssh_read_only(
+    let (magic, trailer) = remote_frame_tokens("READ")?;
+    let script = text_read_script();
+    let output = run_ssh_read_only_script(
         target,
-        &args,
+        &script,
+        &[path.clone(), limit.to_string(), magic.clone(), trailer.clone()],
         None,
         SSH_COMMAND_STDOUT_LIMIT,
+        SshOpPriority::Foreground,
         "ssh text read",
     )?;
     if !output.status.success() {
-        return Err(output_to_error("ssh failed", &output));
+        return Err(remote_script_error("ssh failed", &output));
     }
 
-    let bytes = output.stdout;
+    let bytes = extract_framed_payload(&output.stdout, &magic, &trailer, "ssh text read")?;
     if bytes.len() > MAX_TEXT_FILE_BYTES {
         return Err(format!(
             "file too large (>{MAX_TEXT_FILE_BYTES} bytes); open smaller files only"
@@ -1750,7 +2211,7 @@ fn ssh_read_text_file_sync(target: String, root: String, path: String) -> Result
     {
         return Err("binary files are not supported".to_string());
     }
-    String::from_utf8(bytes).map_err(|_| "file is not valid UTF-8".to_string())
+    String::from_utf8(bytes.to_vec()).map_err(|_| "file is not valid UTF-8".to_string())
 }
 
 #[tauri::command]
@@ -1764,6 +2225,33 @@ pub async fn ssh_probe_file(
         .map_err(|e| format!("ssh task join failed: {e:?}"))?
 }
 
+fn probe_script() -> String {
+    format!(
+        r#"set -e
+file=$1
+count=$2
+magic=$3
+trailer=$4
+{REMOTE_READABLE_FILE_CHECK}
+size="$(wc -c < "$file" | tr -d '[:space:]')"
+mtime=""
+if stat -c %Y "$file" >/dev/null 2>&1; then
+  mtime="$(stat -c %Y "$file" 2>/dev/null || true)"
+elif stat -f %m "$file" >/dev/null 2>&1; then
+  mtime="$(stat -f %m "$file" 2>/dev/null || true)"
+fi
+printf 'AGENTS_UI_PROBE size=%s mtime=%s\n' "$size" "$mtime" >&2
+printf '%s\000' "$magic"
+if command -v head >/dev/null 2>&1; then
+  head -c "$count" "$file"
+else
+  dd if="$file" bs=1 count="$count" 2>/dev/null
+fi
+printf '\000%s\000' "$trailer"
+"#
+    )
+}
+
 fn ssh_probe_file_sync(target: String, root: String, path: String) -> Result<FileProbe, String> {
     let target = target.trim();
     if target.is_empty() {
@@ -1773,41 +2261,26 @@ fn ssh_probe_file_sync(target: String, root: String, path: String) -> Result<Fil
     ensure_not_root(&root, &path, "read")?;
 
     let probe_bytes = PROBE_BYTES.to_string();
-    let script = r#"set -e
-file="$1"
-count="$2"
-[ -f "$file" ] || { echo "not a file" >&2; exit 1; }
-size="$(wc -c < "$file" | tr -d '[:space:]')"
-mtime=""
-if stat -c %Y "$file" >/dev/null 2>&1; then
-  mtime="$(stat -c %Y "$file" 2>/dev/null || true)"
-elif stat -f %m "$file" >/dev/null 2>&1; then
-  mtime="$(stat -f %m "$file" 2>/dev/null || true)"
-fi
-printf 'AGENTS_UI_PROBE size=%s mtime=%s\n' "$size" "$mtime" >&2
-if command -v head >/dev/null 2>&1; then
-  head -c "$count" "$file"
-else
-  dd if="$file" bs=1 count="$count" 2>/dev/null
-fi"#;
-
-    let command = build_sh_c_command(&script, Some("--"), &[path.clone(), probe_bytes]);
-    let args = vec![command];
-    let output = run_ssh_read_only(
+    let (magic, trailer) = remote_frame_tokens("PROBE")?;
+    let script = probe_script();
+    let output = run_ssh_read_only_script(
         target,
-        &args,
+        &script,
+        &[path.clone(), probe_bytes, magic.clone(), trailer.clone()],
         None,
         SSH_COMMAND_STDOUT_LIMIT,
+        SshOpPriority::Foreground,
         "ssh file probe",
     )?;
     if !output.status.success() {
-        return Err(output_to_error("ssh failed", &output));
+        return Err(remote_script_error("ssh failed", &output));
     }
     let (size, mtime_ms) = parse_remote_file_meta(&output.stderr, "AGENTS_UI_PROBE ")?;
+    let sample = extract_framed_payload(&output.stdout, &magic, &trailer, "ssh file probe")?;
     Ok(probe_from_sample(
         size,
         mtime_ms,
-        &output.stdout,
+        sample,
         Some(Path::new(&path)),
     ))
 }
@@ -1826,6 +2299,40 @@ pub async fn ssh_read_file_range(
     .await
     .map_err(|e| format!("ssh task join failed: {e:?}"))??;
     Ok(tauri::ipc::Response::new(bytes))
+}
+
+fn range_read_script() -> String {
+    format!(
+        r#"set -e
+file=$1
+offset=$2
+count=$3
+magic=$4
+trailer=$5
+{REMOTE_READABLE_FILE_CHECK}
+if dd if=/dev/null of=/dev/null iflag=skip_bytes,count_bytes count=0 status=none 2>/dev/null; then
+  reader=gnudd
+elif command -v tail >/dev/null 2>&1 && command -v head >/dev/null 2>&1; then
+  reader=tailhead
+else
+  reader=dd
+fi
+printf '%s\000' "$magic"
+case "$reader" in
+  gnudd)
+    dd if="$file" bs=65536 skip="$offset" count="$count" iflag=skip_bytes,count_bytes status=none
+    ;;
+  tailhead)
+    start=$((offset + 1))
+    tail -c +"$start" "$file" | head -c "$count"
+    ;;
+  *)
+    dd if="$file" bs=1 skip="$offset" count="$count" 2>/dev/null
+    ;;
+esac
+printf '\000%s\000' "$trailer"
+"#
+    )
 }
 
 fn ssh_read_file_range_sync(
@@ -1848,36 +2355,32 @@ fn ssh_read_file_range_sync(
     let (root, path) = ensure_within_root(&root, &path)?;
     ensure_not_root(&root, &path, "read")?;
 
-    let script = r#"set -e
-file="$1"
-offset="$2"
-count="$3"
-[ -f "$file" ] || { echo "not a file" >&2; exit 1; }
-start=$((offset + 1))
-if command -v tail >/dev/null 2>&1 && command -v head >/dev/null 2>&1; then
-  tail -c +"$start" "$file" 2>/dev/null | head -c "$count"
-else
-  dd if="$file" bs=1 skip="$offset" count="$count" 2>/dev/null
-fi"#;
-
-    let command = build_sh_c_command(
-        &script,
-        Some("--"),
-        &[path, offset.to_string(), length.to_string()],
-    );
-    let args = vec![command];
-    let output = run_ssh_read_only(
+    let (magic, trailer) = remote_frame_tokens("RANGE")?;
+    // GNU dd with byte-granular skip/count is one fast process whose exit
+    // status is meaningful; the tail|head fallback can't report a tail error
+    // (its exit status is lost in the pipe), which is why readability is
+    // checked up front and the trailer must be present.
+    let script = range_read_script();
+    let output = run_ssh_read_only_script(
         target,
-        &args,
+        &script,
+        &[
+            path,
+            offset.to_string(),
+            length.to_string(),
+            magic.clone(),
+            trailer.clone(),
+        ],
         None,
         SSH_COMMAND_STDOUT_LIMIT,
+        SshOpPriority::Foreground,
         "ssh range read",
     )?;
     if !output.status.success() {
-        return Err(output_to_error("ssh failed", &output));
+        return Err(remote_script_error("ssh failed", &output));
     }
     // Raw bytes; the frontend derives offset/eof from the request + known size.
-    Ok(output.stdout)
+    Ok(extract_framed_payload(&output.stdout, &magic, &trailer, "ssh range read")?.to_vec())
 }
 
 #[tauri::command]
@@ -2336,6 +2839,77 @@ fn validate_ssh_target(target: &str) -> Result<&str, String> {
         return Err("invalid ssh target".to_string());
     }
     Ok(target)
+}
+
+/// Split an `ssh://[user@]host[:port]` target (what the frontend derives for a
+/// session started as `ssh -p 2222 host`) into scp's `[user@]host` form and a
+/// port. ssh itself accepts the URI directly; scp's `host:path` syntax does
+/// not, so transfers pass the port with `-P` instead.
+fn split_ssh_uri_target(target: &str) -> Result<(String, Option<u16>), String> {
+    let Some(rest) = target
+        .get(..6)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("ssh://"))
+        .map(|_| &target[6..])
+    else {
+        return Ok((target.to_string(), None));
+    };
+    let authority = rest.strip_suffix('/').unwrap_or(rest);
+    if authority.is_empty() || authority.contains('/') {
+        return Err("invalid ssh:// target".to_string());
+    }
+    let (user, host_port) = match authority.rfind('@') {
+        Some(index) => (Some(&authority[..index]), &authority[index + 1..]),
+        None => (None, authority),
+    };
+    let (host, port) = if let Some(bracketed) = host_port.strip_prefix('[') {
+        let close = bracketed
+            .find(']')
+            .ok_or_else(|| "invalid ssh:// target".to_string())?;
+        let after = &bracketed[close + 1..];
+        let port = match after {
+            "" => None,
+            _ => Some(
+                after
+                    .strip_prefix(':')
+                    .ok_or_else(|| "invalid ssh:// target".to_string())?,
+            ),
+        };
+        (&host_port[..close + 2], port)
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (host_port, None),
+        }
+    };
+    if host.is_empty() || user.is_some_and(str::is_empty) {
+        return Err("invalid ssh:// target".to_string());
+    }
+    let port = port
+        .map(|port| {
+            port.parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0)
+                .ok_or_else(|| "invalid port in ssh:// target".to_string())
+        })
+        .transpose()?;
+    let destination = match user {
+        Some(user) => format!("{user}@{host}"),
+        None => host.to_string(),
+    };
+    Ok((destination, port))
+}
+
+/// `[user@]host:path` for scp, from any supported target form.
+fn scp_remote_spec(target: &str, escaped_remote_path: &str) -> Result<String, String> {
+    let (destination, _) = split_ssh_uri_target(target)?;
+    Ok(format!("{destination}:{escaped_remote_path}"))
+}
+
+fn scp_port_args(target: &str) -> Result<Vec<String>, String> {
+    Ok(match split_ssh_uri_target(target)?.1 {
+        Some(port) => vec!["-P".to_string(), port.to_string()],
+        None => Vec::new(),
+    })
 }
 
 fn push_bounded_tail(out: &mut Vec<u8>, bytes: &[u8], limit: usize) {
@@ -2897,6 +3471,7 @@ fn scp_control_cancelled(control: ScpControl<'_>) -> bool {
 fn run_scp_once_controlled<F>(
     scp_program: &Path,
     scp_flags: &[&str],
+    port_args: &[String],
     paths: &[String],
     control: ScpControl<'_>,
     attempt: usize,
@@ -2907,6 +3482,7 @@ where
 {
     let mut cmd = Command::new(scp_program);
     cmd.args(scp_flags);
+    cmd.args(port_args);
     cmd.args(ssh_transfer_args());
     // End option parsing before source/destination strings. In particular, an
     // option-shaped target must never be interpreted as an scp flag.
@@ -3107,6 +3683,7 @@ where
     F: FnMut(ScpProgressEvent),
 {
     validate_ssh_target(target)?;
+    let port_args = scp_port_args(target)?;
     if scp_control_cancelled(control) {
         return Err("file transfer cancelled".to_string());
     }
@@ -3142,6 +3719,7 @@ where
         let output = run_scp_once_controlled(
             &scp_program,
             scp_flags,
+            &port_args,
             paths,
             control,
             attempt,
@@ -3827,7 +4405,7 @@ fn ssh_download_file_with_progress_sync(
         },
     );
 
-    let source = format!("{target}:{escaped_remote_path}");
+    let source = scp_remote_spec(target, &escaped_remote_path)?;
     let stage_path = local_path_to_utf8(&stage, "download staging path")?;
     let paths = vec![source, stage_path];
     let mut last_attempt = 1usize;
@@ -3941,7 +4519,7 @@ fn ssh_download_file_sync(
     // Format: scp -r user@host:/remote/path /local/path
     // Remote path must be escaped (remote shell in legacy mode, client-side
     // glob in sftp mode); the local path is passed verbatim.
-    let source = format!("{target}:{escaped_remote_path}");
+    let source = scp_remote_spec(target, &escaped_remote_path)?;
     let paths = vec![source, local.to_string()];
     let output = run_scp_controlled(
         target,
@@ -4000,7 +4578,7 @@ fn ssh_upload_file_sync(
     // Format: scp -r /local/path user@host:/remote/path
     // Remote path must be escaped (remote shell in legacy mode, client-side
     // glob in sftp mode); the local path is passed verbatim.
-    let dest = format!("{target}:{escaped_remote_path}");
+    let dest = scp_remote_spec(target, &escaped_remote_path)?;
     let paths = vec![local.to_string(), dest];
     // Uploads write directly to the remote destination and cannot yet be
     // atomically rolled back. Do not kill one on renderer restart: interruption
@@ -4099,7 +4677,7 @@ fn ssh_download_to_temp_sync(
     };
 
     // Download using scp (remote path escaped for both scp protocol modes)
-    let source = format!("{target}:{escaped_remote_path}");
+    let source = scp_remote_spec(target, &escaped_remote_path)?;
     let paths = vec![source, local_path_str.clone()];
     let cancelled = AtomicBool::new(false);
     let transfer = run_scp_controlled(
@@ -4196,23 +4774,31 @@ mod download_safety_tests {
     #[test]
     fn read_only_policy_retries_transient_failure_but_is_bounded() {
         let mut recovering_calls = 0;
-        let recovered = run_retry_safe_query_attempts("test query", |_| {
-            recovering_calls += 1;
-            Ok(if recovering_calls == 1 {
-                policy_test_output(false, "broken pipe")
-            } else {
-                policy_test_output(true, "")
-            })
-        })
+        let recovered = run_retry_safe_query_attempts(
+            "test query",
+            |_| {
+                recovering_calls += 1;
+                Ok(if recovering_calls == 1 {
+                    policy_test_output(false, "broken pipe")
+                } else {
+                    policy_test_output(true, "")
+                })
+            },
+            || MasterHealth::Replaced,
+        )
         .expect("read-only query should recover");
         assert!(recovered.status.success());
         assert_eq!(recovering_calls, 2);
 
         let mut bounded_calls = 0;
-        let exhausted = run_retry_safe_query_attempts("test query", |_| {
-            bounded_calls += 1;
-            Ok(policy_test_output(false, "connection timed out"))
-        })
+        let exhausted = run_retry_safe_query_attempts(
+            "test query",
+            |_| {
+                bounded_calls += 1;
+                Ok(policy_test_output(false, "connection timed out"))
+            },
+            || MasterHealth::Replaced,
+        )
         .expect("final bounded transport result is returned");
         assert!(!exhausted.status.success());
         assert_eq!(bounded_calls, SSH_OP_ATTEMPTS);
@@ -4869,6 +5455,7 @@ mod download_safety_tests {
             &program,
             &[],
             &[],
+            &[],
             ScpControl {
                 cancelled: &cancelled,
                 renderer_generation: None,
@@ -4900,6 +5487,7 @@ mod download_safety_tests {
         let mut samples = Vec::new();
         let output = run_scp_once_controlled(
             &program,
+            &[],
             &[],
             &[destination.to_string_lossy().to_string()],
             ScpControl {
@@ -5571,6 +6159,7 @@ mod download_safety_tests {
             let _ = run_scp_once_controlled(
                 &program,
                 &[],
+                &[],
                 &[
                     sentinel.to_string_lossy().to_string(),
                     progress.to_string_lossy().to_string(),
@@ -5593,5 +6182,588 @@ mod download_safety_tests {
         assert!(!sentinel.exists(), "panicking callback leaked its child");
         let _ = std::fs::remove_file(progress);
         std::fs::remove_file(program).expect("remove panic supervision program");
+    }
+
+    /// Run one of the remote scripts locally exactly as the SSH transport does:
+    /// `sh -s -- args` with the brace-wrapped script on stdin.
+    #[cfg(target_family = "unix")]
+    fn run_stdin_script(script: &str, args: &[String], path_prefix: Option<&Path>) -> Output {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-s").arg("--").args(args);
+        if let Some(prefix) = path_prefix {
+            let path = std::env::var("PATH").unwrap_or_default();
+            command.env("PATH", format!("{}:{path}", prefix.display()));
+        }
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn local sh");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin_script(script).as_bytes())
+            .expect("write script");
+        child.wait_with_output().expect("wait local sh")
+    }
+
+    #[cfg(target_family = "unix")]
+    fn list_locally(directory: &Path, path_prefix: Option<&Path>) -> (Output, Result<Vec<FsEntry>, String>) {
+        let (magic, trailer) = remote_frame_tokens("FS").unwrap();
+        let directory_utf8 = directory.to_str().expect("UTF-8 test directory").to_string();
+        let output = run_stdin_script(
+            REMOTE_DIRECTORY_LIST_SCRIPT,
+            &[
+                directory_utf8.clone(),
+                MAX_REMOTE_DIRECTORY_ENTRIES.to_string(),
+                magic.clone(),
+                trailer.clone(),
+            ],
+            path_prefix,
+        );
+        let parsed = if output.status.success() {
+            parse_remote_directory_frame_with_tokens(
+                &directory_utf8,
+                &output.stdout,
+                magic.as_bytes(),
+                trailer.as_bytes(),
+            )
+        } else {
+            Err(remote_script_error("ssh directory listing failed", &output))
+        };
+        (output, parsed)
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn listing_reports_missing_and_unreadable_directories_instead_of_empty() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let missing = unique_test_path("listing-missing");
+        let (_, missing_result) = list_locally(&missing, None);
+        let Err(missing_error) = missing_result else { panic!("missing directory must be an error") };
+        assert!(missing_error.starts_with("No such directory: "), "{missing_error}");
+
+        let file = unique_test_path("listing-not-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let (_, file_result) = list_locally(&file, None);
+        let Err(file_error) = file_result else { panic!("a file is not a directory") };
+        assert!(file_error.starts_with("Not a directory: "), "{file_error}");
+        std::fs::remove_file(&file).unwrap();
+
+        // root ignores permission bits, so this assertion only holds for a
+        // regular user (the normal case for the test suite).
+        if effective_user_id() != 0 {
+            let locked = unique_test_path("listing-locked");
+            std::fs::create_dir(&locked).unwrap();
+            std::fs::write(locked.join("inside"), b"x").unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let (_, locked_result) = list_locally(&locked, None);
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let Err(locked_error) = locked_result else { panic!("unreadable directory must be an error") };
+            assert!(locked_error.starts_with("Permission denied: "), "{locked_error}");
+            std::fs::remove_dir_all(&locked).unwrap();
+        }
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn listing_skips_entries_that_vanish_mid_listing() {
+        let directory = unique_test_path("listing-vanish");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("keep"), b"abc").unwrap();
+        std::fs::write(directory.join("gone"), b"x").unwrap();
+        // A `stat` shim that deletes "gone" right before stating it, i.e. the
+        // file disappears between the glob and the size lookup.
+        let shim_dir = unique_test_path("listing-vanish-shim");
+        std::fs::create_dir(&shim_dir).unwrap();
+        let real_stat = ["/usr/bin/stat", "/bin/stat"]
+            .into_iter()
+            .find(|candidate| Path::new(candidate).exists())
+            .expect("system stat");
+        let shim = format!(
+            "#!/bin/sh\nfor last; do :; done\ncase \"$last\" in */gone) rm -f \"$last\";; esac\nexec {real_stat} \"$@\"\n"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let shim_path = shim_dir.join("stat");
+            std::fs::write(&shim_path, shim).unwrap();
+            std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let (output, result) = list_locally(&directory, Some(&shim_dir));
+        let entries = result.unwrap_or_else(|error| {
+            panic!("{error}; stderr={}", String::from_utf8_lossy(&output.stderr))
+        });
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["keep"]);
+        assert_eq!(entries[0].size, 3);
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::remove_dir_all(&shim_dir).unwrap();
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn listing_over_stdin_transport_round_trips_names_and_symlinked_root() {
+        use std::os::unix::fs::symlink;
+
+        let directory = unique_test_path("listing-stdin");
+        std::fs::create_dir(&directory).unwrap();
+        for name in ["plain", "with 'quote'", "line\nbreak", ".hidden", "$(touch nope)"] {
+            std::fs::write(directory.join(name), b"xy").unwrap();
+        }
+        std::fs::create_dir(directory.join("sub")).unwrap();
+        let (_, result) = list_locally(&directory, None);
+        let entries = result.expect("list over stdin transport");
+        assert_eq!(entries.len(), 6);
+        assert!(entries[0].is_dir && entries[0].name == "sub");
+        assert!(entries.iter().any(|e| e.name == "line\nbreak" && e.size == 2));
+        assert!(entries.iter().any(|e| e.name == "$(touch nope)"));
+
+        let link = unique_test_path("listing-stdin-link");
+        symlink(&directory, &link).unwrap();
+        let (_, linked) = list_locally(&link, None);
+        assert_eq!(linked.expect("symlinked root lists its target").len(), 6);
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn directory_parser_maps_gnu_find_special_types_to_other() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"M\0");
+        for (kind, name) in [("p", "fifo"), ("s", "sock"), ("d", "dir"), ("f", "file")] {
+            frame.extend_from_slice(format!("E\0{kind}\0{}\0{name}\0", 4).as_bytes());
+        }
+        frame.extend_from_slice(b"T\0");
+        let entries = parse_remote_directory_frame_with_tokens("/x", &frame, b"M", b"T").unwrap();
+        assert_eq!(entries.len(), 4);
+        assert!(entries[0].is_dir);
+        assert!(entries.iter().filter(|e| !e.is_dir).all(|e| e.size == 4));
+        let mut bad = b"M\0E\0Q\x000\0n\0T\0".to_vec();
+        bad.shrink_to_fit();
+        assert!(parse_remote_directory_frame_with_tokens("/x", &bad, b"M", b"T").is_err());
+    }
+
+    #[test]
+    fn framed_payload_ignores_login_shell_noise_and_detects_truncation() {
+        let payload = b"bin\0ary\ndata\0";
+        let mut stdout = b"Welcome! conda activated\n".to_vec();
+        stdout.extend_from_slice(b"MAGIC\0");
+        stdout.extend_from_slice(payload);
+        stdout.extend_from_slice(b"\0TRAIL\0");
+        stdout.extend_from_slice(b"bye\n");
+        assert_eq!(
+            extract_framed_payload(&stdout, "MAGIC", "TRAIL", "t").unwrap(),
+            payload
+        );
+        // Empty payload (empty file / EOF read) is valid.
+        assert_eq!(
+            extract_framed_payload(b"MAGIC\0\0TRAIL\0", "MAGIC", "TRAIL", "t").unwrap(),
+            b""
+        );
+        // Cut-off stream: no trailer, so no silent short read.
+        let error = extract_framed_payload(b"MAGIC\0partial", "MAGIC", "TRAIL", "t").unwrap_err();
+        assert!(error.contains("incomplete"), "{error}");
+        assert!(extract_framed_payload(b"no frame", "MAGIC", "TRAIL", "t").is_err());
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn file_read_scripts_return_exact_bytes_and_explicit_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let file = unique_test_path("read-scripts");
+        let content: Vec<u8> = (0..=255u8).cycle().take(5000).collect();
+        std::fs::write(&file, &content).unwrap();
+        let file_arg = file.to_str().unwrap().to_string();
+        let (magic, trailer) = remote_frame_tokens("T").unwrap();
+
+        let range = |offset: u64, count: u64| -> Vec<u8> {
+            let output = run_stdin_script(
+                &range_read_script(),
+                &[
+                    file_arg.clone(),
+                    offset.to_string(),
+                    count.to_string(),
+                    magic.clone(),
+                    trailer.clone(),
+                ],
+                None,
+            );
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            extract_framed_payload(&output.stdout, &magic, &trailer, "range")
+                .unwrap()
+                .to_vec()
+        };
+        assert_eq!(range(0, 100), content[..100]);
+        assert_eq!(range(4990, 100), content[4990..]);
+        assert_eq!(range(5000, 100), b"");
+        assert_eq!(range(1234, 1), content[1234..1235]);
+
+        let text = unique_test_path("read-scripts-text");
+        std::fs::write(&text, "héllo\nworld").unwrap();
+        let output = run_stdin_script(
+            &text_read_script(),
+            &[text.to_str().unwrap().to_string(), "100".to_string(), magic.clone(), trailer.clone()],
+            None,
+        );
+        assert_eq!(
+            extract_framed_payload(&output.stdout, &magic, &trailer, "text").unwrap(),
+            "héllo\nworld".as_bytes()
+        );
+
+        let output = run_stdin_script(
+            &probe_script(),
+            &[file_arg.clone(), "16".to_string(), magic.clone(), trailer.clone()],
+            None,
+        );
+        assert!(output.status.success());
+        let (size, _) = parse_remote_file_meta(&output.stderr, "AGENTS_UI_PROBE ").unwrap();
+        assert_eq!(size, 5000);
+        assert_eq!(
+            extract_framed_payload(&output.stdout, &magic, &trailer, "probe").unwrap(),
+            &content[..16]
+        );
+
+        let missing = run_stdin_script(
+            &range_read_script(),
+            &["/definitely/missing".to_string(), "0".to_string(), "1".to_string(), magic.clone(), trailer.clone()],
+            None,
+        );
+        assert!(!missing.status.success());
+        assert_eq!(
+            remote_script_error("ssh failed", &missing),
+            "No such file: /definitely/missing"
+        );
+
+        if effective_user_id() != 0 {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let denied = run_stdin_script(
+                &range_read_script(),
+                &[file_arg.clone(), "0".to_string(), "1".to_string(), magic.clone(), trailer.clone()],
+                None,
+            );
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(!denied.status.success(), "unreadable file must not read as empty");
+            assert!(remote_script_error("ssh failed", &denied).starts_with("Permission denied: "));
+        }
+        std::fs::remove_file(&file).unwrap();
+        std::fs::remove_file(&text).unwrap();
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn identity_script_reports_home_and_user_framed() {
+        let (magic, trailer) = remote_frame_tokens("ID").unwrap();
+        let output = run_stdin_script(REMOTE_IDENTITY_SCRIPT, &[magic.clone(), trailer.clone()], None);
+        assert!(output.status.success());
+        let payload = extract_framed_payload(&output.stdout, &magic, &trailer, "id").unwrap();
+        let fields: Vec<&[u8]> = payload.split(|b| *b == 0).collect();
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields[0], effective_user_id().to_string().as_bytes());
+        assert_eq!(
+            fields[2],
+            std::env::var("HOME").unwrap_or_default().as_bytes()
+        );
+    }
+
+    #[test]
+    fn remote_paths_resolve_tilde_and_relative_against_home() {
+        let home = "/home/alice";
+        assert_eq!(resolve_remote_path("~", home).unwrap(), "/home/alice");
+        assert_eq!(resolve_remote_path("~/", home).unwrap(), "/home/alice");
+        assert_eq!(resolve_remote_path("~/code/app/", home).unwrap(), "/home/alice/code/app");
+        assert_eq!(resolve_remote_path("code", home).unwrap(), "/home/alice/code");
+        assert_eq!(resolve_remote_path("/srv//app/", home).unwrap(), "/srv/app");
+        assert_eq!(resolve_remote_path("/", home).unwrap(), "/");
+        assert!(resolve_remote_path("~bob/x", home).is_err());
+        assert!(resolve_remote_path("~", "").is_err());
+        assert_eq!(resolve_remote_path("/abs", "").unwrap(), "/abs");
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn read_only_policy_retries_a_hang_only_when_the_connection_was_replaced() {
+        let deadline = || Err::<Output, String>("ssh directory listing exceeded the 30 second safety deadline".to_string());
+
+        // Healthy master: the command itself is slow; don't double the wait.
+        let mut calls = 0;
+        let mut probes = 0;
+        let error = run_retry_safe_query_attempts(
+            "q",
+            |_| {
+                calls += 1;
+                deadline()
+            },
+            || {
+                probes += 1;
+                MasterHealth::Healthy
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("safety deadline"));
+        assert_eq!((calls, probes), (1, 1));
+
+        // Wedged master was recycled: retry once, and succeed on the new one.
+        let mut calls = 0;
+        let output = run_retry_safe_query_attempts(
+            "q",
+            |_| {
+                calls += 1;
+                if calls == 1 {
+                    deadline()
+                } else {
+                    Ok(policy_test_output(true, ""))
+                }
+            },
+            || MasterHealth::Replaced,
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(calls, 2);
+
+        // Never more than one hang retry.
+        let mut calls = 0;
+        run_retry_safe_query_attempts(
+            "q",
+            |_| {
+                calls += 1;
+                deadline()
+            },
+            || MasterHealth::Replaced,
+        )
+        .unwrap_err();
+        assert_eq!(calls, 2);
+
+        // Authentication failures are never retried (lockout risk).
+        let mut calls = 0;
+        let error = run_retry_safe_query_attempts(
+            "q",
+            |_| {
+                calls += 1;
+                Err(format!("{SSH_CONNECT_FAILED_PREFIX}Permission denied (publickey)."))
+            },
+            || MasterHealth::Replaced,
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(error.contains("Permission denied"));
+
+        // A genuine command failure is returned as-is without probing.
+        let mut probes = 0;
+        let output = run_retry_safe_query_attempts(
+            "q",
+            |_| Ok(policy_test_output(false, "No such directory: /x")),
+            || {
+                probes += 1;
+                MasterHealth::Replaced
+            },
+        )
+        .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(probes, 0);
+    }
+
+    #[test]
+    fn connection_failures_explain_non_interactive_auth_and_host_keys() {
+        let auth = describe_ssh_connect_failure("user@host: Permission denied (publickey,password).");
+        assert!(auth.contains("BatchMode"), "{auth}");
+        let host_key = describe_ssh_connect_failure("Host key verification failed.");
+        assert!(host_key.contains("known_hosts"), "{host_key}");
+        assert_eq!(describe_ssh_connect_failure("weird"), "weird");
+    }
+
+    #[test]
+    fn ssh_op_slots_reserve_headroom_for_user_actions_and_queue_fairly() {
+        let _lock = registry_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let background_limit = ssh_short_op_slot_limit(SshOpPriority::Background);
+        assert!(background_limit < MAX_ACTIVE_SSH_SHORT_OPS);
+
+        let mut held = Vec::new();
+        while let Ok(permit) = try_take_ssh_short_op_slot(SshOpPriority::Background, Duration::ZERO) {
+            held.push(permit);
+        }
+        assert_eq!(held.len(), background_limit, "background must stop at its share");
+        // User actions still get the reserved slots.
+        for _ in background_limit..MAX_ACTIVE_SSH_SHORT_OPS {
+            held.push(
+                try_take_ssh_short_op_slot(SshOpPriority::Foreground, Duration::ZERO)
+                    .expect("reserved foreground slot"),
+            );
+        }
+        assert!(try_take_ssh_short_op_slot(SshOpPriority::Foreground, Duration::ZERO).is_err());
+
+        // A queued user action is admitted as soon as a slot frees up.
+        let waiter = std::thread::spawn(|| {
+            try_take_ssh_short_op_slot(SshOpPriority::Foreground, Duration::from_secs(5)).is_ok()
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        held.pop();
+        assert!(waiter.join().unwrap(), "waiting foreground op should get the freed slot");
+        drop(held);
+        assert_eq!(*ssh_short_op_slots().0.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn ssh_uri_targets_split_into_scp_destination_and_port() {
+        assert_eq!(split_ssh_uri_target("host").unwrap(), ("host".to_string(), None));
+        assert_eq!(split_ssh_uri_target("me@host").unwrap(), ("me@host".to_string(), None));
+        assert_eq!(
+            split_ssh_uri_target("ssh://me@host:2222").unwrap(),
+            ("me@host".to_string(), Some(2222))
+        );
+        assert_eq!(
+            split_ssh_uri_target("SSH://host:2200/").unwrap(),
+            ("host".to_string(), Some(2200))
+        );
+        assert_eq!(
+            split_ssh_uri_target("ssh://me@[fe80::1]:2222").unwrap(),
+            ("me@[fe80::1]".to_string(), Some(2222))
+        );
+        assert_eq!(split_ssh_uri_target("ssh://[::1]").unwrap(), ("[::1]".to_string(), None));
+        for bad in ["ssh://", "ssh://host:abc", "ssh://host:0", "ssh://@host", "ssh://host/path", "ssh://[::1"] {
+            assert!(split_ssh_uri_target(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            scp_remote_spec("ssh://me@host:2222", "/srv/a\\ b").unwrap(),
+            "me@host:/srv/a\\ b"
+        );
+        assert_eq!(scp_port_args("ssh://h:2222").unwrap(), vec!["-P", "2222"]);
+        assert!(scp_port_args("h").unwrap().is_empty());
+    }
+
+    /// End-to-end against a real sshd in Docker (users with a tcsh login shell,
+    /// a noisy .bashrc, and a quiet account, reachable as 127.0.0.1:2222).
+    /// Run via `scripts/ssh-e2e/run.sh`, which builds the container and points
+    /// HOME at a throwaway ~/.ssh.
+    #[cfg(target_family = "unix")]
+    #[test]
+    #[ignore = "needs the dockerized sshd harness"]
+    fn e2e_file_browser_against_real_sshd() {
+        assert!(std::env::var("AGENTS_UI_SSH_E2E").is_ok(), "set AGENTS_UI_SSH_E2E=1");
+        let generation = current_ssh_transfer_generation();
+        for user in ["bashuser", "tcshuser"] {
+            let target = format!("ssh://{user}@127.0.0.1:2222");
+            let home = ssh_default_root_sync(target.clone(), None).expect("default root");
+            assert_eq!(home, format!("/home/{user}"), "login-shell noise must not leak into the root");
+            assert_eq!(
+                ssh_default_root_sync(target.clone(), Some("~/proj".into())).unwrap(),
+                format!("/home/{user}/proj")
+            );
+            assert_eq!(
+                ssh_default_root_sync(target.clone(), Some("proj/".into())).unwrap(),
+                format!("/home/{user}/proj")
+            );
+            assert_eq!(ssh_effective_user_sync(target.clone()).unwrap(), user);
+
+            let entries = ssh_list_fs_entries_sync(
+                target.clone(),
+                home.clone(),
+                home.clone(),
+                generation,
+                SshOpPriority::Foreground,
+            )
+            .expect("list home");
+            assert!(entries.iter().any(|e| e.name == "proj" && e.is_dir), "{user}");
+
+            let missing = ssh_list_fs_entries_sync(
+                target.clone(),
+                home.clone(),
+                format!("{home}/nope"),
+                generation,
+                SshOpPriority::Background,
+            );
+            let Err(missing) = missing else { panic!("missing dir must fail") };
+            assert!(missing.starts_with("No such directory: "), "{missing}");
+            let denied = ssh_list_fs_entries_sync(
+                target.clone(),
+                "/".into(),
+                "/root".into(),
+                generation,
+                SshOpPriority::Foreground,
+            );
+            let Err(denied) = denied else { panic!("/root must be denied") };
+            assert!(denied.starts_with("Permission denied: "), "{denied}");
+
+            let (file, content): (String, &[u8]) = if user == "bashuser" {
+                (format!("{home}/proj/src/a.txt"), b"hello\n")
+            } else {
+                (format!("{home}/proj/t.txt"), b"tc\n")
+            };
+            assert_eq!(
+                ssh_read_text_file_sync(target.clone(), home.clone(), file.clone()).unwrap().as_bytes(),
+                content
+            );
+            let probe = ssh_probe_file_sync(target.clone(), home.clone(), file.clone()).unwrap();
+            assert_eq!(probe.size, content.len() as u64);
+            assert_eq!(
+                ssh_read_file_range_sync(target.clone(), home.clone(), file.clone(), 1, 2).unwrap(),
+                &content[1..3]
+            );
+            let found = ssh_search_fs_entries_sync(target.clone(), home.clone(), "a.txt".into(), None, generation);
+            if user == "bashuser" {
+                assert_eq!(found.unwrap().len(), 1);
+            }
+
+            // scp (SFTP protocol) cannot tolerate rc-file output; it must fail
+            // with scp's explicit explanation rather than hang or corrupt data.
+            let local = unique_test_path("e2e-download");
+            let error = ssh_download_file_sync(
+                target.clone(),
+                home.clone(),
+                file.clone(),
+                local.to_str().unwrap().to_string(),
+            )
+            .expect_err("noisy login shell breaks the SFTP protocol");
+            assert!(error.contains("produces no output"), "{error}");
+        }
+
+        // scp with an ssh:// (non-default port) target on a quiet account.
+        let quiet = "ssh://quietuser@127.0.0.1:2222".to_string();
+        let local = unique_test_path("e2e-download");
+        ssh_download_file_sync(
+            quiet.clone(),
+            "/home/quietuser".into(),
+            "/home/quietuser/proj/q.txt".into(),
+            local.to_str().unwrap().to_string(),
+        )
+        .expect("scp download over ssh:// target");
+        assert_eq!(std::fs::read(&local).unwrap(), b"quiet\n");
+        let _ = std::fs::remove_file(local);
+
+        // A healthy master survives a recovery check; a wedged one is recycled
+        // quickly and the next operation succeeds on a fresh connection.
+        let target = "ssh://bashuser@127.0.0.1:2222";
+        ensure_master(target, None).unwrap();
+        let epoch = master_epoch(target);
+        assert_eq!(recover_master(target, epoch, None), MasterHealth::Healthy);
+        assert!(master_is_alive(target, None), "healthy master must not be closed");
+        assert_eq!(master_epoch(target), epoch);
+
+        let docker = |verb: &str| {
+            assert!(Command::new("docker")
+                .args([verb, "agentsui-sshd"])
+                .status()
+                .unwrap()
+                .success());
+        };
+        docker("pause");
+        let started = Instant::now();
+        let health = recover_master(target, epoch, None);
+        let elapsed = started.elapsed();
+        docker("unpause");
+        assert_eq!(health, MasterHealth::Replaced);
+        assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
+        assert!(master_epoch(target) > epoch);
+        // A caller holding the old epoch must not tear down the new master.
+        let entries = ssh_list_fs_entries_sync(
+            target.to_string(),
+            "/home/bashuser".into(),
+            "/home/bashuser".into(),
+            generation,
+            SshOpPriority::Foreground,
+        )
+        .expect("listing works again on a fresh master");
+        assert!(!entries.is_empty());
+        assert_eq!(recover_master(target, epoch, None), MasterHealth::Replaced);
+        assert!(master_is_alive(target, None), "stale epoch must not close the fresh master");
     }
 }

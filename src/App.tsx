@@ -704,7 +704,7 @@ function buildSmartSessionName(input: {
     sshTargetFromCommandLine(commandLine || null) ||
     null;
 
-  if (sshTarget) return `SSH ${sshTarget}`;
+  if (sshTarget) return `SSH ${sshTarget.replace(/^ssh:\/\//i, "")}`;
 
   if (effect) {
     const effectLabel = formatCommandTokenLabel(effect.id);
@@ -943,13 +943,95 @@ function ensureSshKeepAliveOptions(commandLine: string | null | undefined): stri
   return [parts[0], ...inject, ...parts.slice(1)].join(" ");
 }
 
+// ssh(1) options that consume an argument (`-p 22` or `-p22`).
+const SSH_OPTIONS_WITH_ARGUMENT = new Set("BbcDEeFIiJLlmOoPpQRSWw".split(""));
+
+/**
+ * Derive the file-browser target from an `ssh ...` command line: the first
+ * non-option token is the destination (everything after it is the remote
+ * command, e.g. `ssh host tmux attach`). A port or login name given as an
+ * option is folded into an `ssh://user@host:port` destination so the file
+ * browser reaches the same server as the terminal.
+ */
 function sshTargetFromCommandLine(commandLine: string | null | undefined): string | null {
   const trimmed = commandLine?.trim() ?? "";
   if (!trimmed) return null;
   if (!isSshCommandLine(trimmed)) return null;
   const parts = trimmed.split(/\s+/);
-  const target = parts[parts.length - 1]?.trim() ?? "";
-  return target ? target : null;
+  let destination: string | null = null;
+  const options: { port: string | null; user: string | null } = { port: null, user: null };
+  for (let i = 1; i < parts.length; i += 1) {
+    const token = parts[i];
+    if (token === "--") {
+      destination = parts[i + 1] ?? null;
+      break;
+    }
+    if (token.startsWith("-") && token.length > 1) {
+      for (let j = 1; j < token.length; j += 1) {
+        const flag = token[j];
+        if (!SSH_OPTIONS_WITH_ARGUMENT.has(flag)) continue;
+        const inline = token.slice(j + 1);
+        const value = inline || parts[i + 1] || "";
+        if (!inline) i += 1;
+        if (flag === "p") options.port = value;
+        else if (flag === "l") options.user = value;
+        else if (flag === "o") {
+          const match = /^(\w+)\s*=?\s*(.*)$/.exec(value);
+          const key = match?.[1]?.toLowerCase();
+          if (key === "port" && match?.[2]) options.port = match[2];
+          else if (key === "user" && match?.[2]) options.user = match[2];
+        }
+        break;
+      }
+      continue;
+    }
+    destination = token;
+    break;
+  }
+  if (!destination) return null;
+  if (/^ssh:\/\//i.test(destination)) return destination;
+  const at = destination.lastIndexOf("@");
+  const host = at >= 0 ? destination.slice(at + 1) : destination;
+  const login = at >= 0 ? destination.slice(0, at) : options.user;
+  const port = options.port;
+  if (!host) return null;
+  if (port && /^\d+$/.test(port) && port !== "22") {
+    const bracketedHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+    return `ssh://${login ? `${login}@` : ""}${bracketedHost}:${port}`;
+  }
+  return login ? `${login}@${host}` : host;
+}
+
+/**
+ * Sessions created before the command-line parser above stored the *last*
+ * token of the ssh command as their target (e.g. "attach" for
+ * `ssh host tmux attach`, "host" for `ssh -p 2222 host`). Upgrade exactly those
+ * stored values; explicit targets never equal the legacy guess and are kept.
+ */
+function migrateLegacySshTarget(
+  stored: string | null | undefined,
+  commandLine: string | null | undefined,
+): { target: string | null; migrated: boolean } {
+  const trimmedStored = stored?.trim() || null;
+  const trimmedCommand = commandLine?.trim() ?? "";
+  if (!trimmedStored || !isSshCommandLine(trimmedCommand)) return { target: trimmedStored, migrated: false };
+  const parts = trimmedCommand.split(/\s+/);
+  const legacy = parts[parts.length - 1]?.trim() || null;
+  const current = sshTargetFromCommandLine(trimmedCommand);
+  if (legacy && current && trimmedStored === legacy && current !== legacy) {
+    return { target: current, migrated: true };
+  }
+  return { target: trimmedStored, migrated: false };
+}
+
+/** Remote roots must be absolute; "~", "~/x" and relative paths need resolving. */
+function isAbsoluteSshPath(path: string | null | undefined): path is string {
+  return typeof path === "string" && path.startsWith("/");
+}
+
+function normalizeAbsoluteSshPath(path: string): string {
+  const collapsed = path.replace(/\/+/g, "/");
+  return collapsed.length > 1 ? collapsed.replace(/\/$/, "") : collapsed;
 }
 
 function sshTargetFromSessionName(name: string | null | undefined): string | null {
@@ -3358,74 +3440,110 @@ export default function App() {
   const activeHealthSessionId = active?.id ?? null;
   const activeHealthConnectionState = active?.connectionState ?? "connected";
 
+  // Resolve the remote root for the active SSH workspace. Deliberately keyed on
+  // stable primitives, not the `active` session object: that object changes on
+  // every session update while a connection comes up, and re-running (and
+  // cancelling) this effect used to discard the in-flight result while the
+  // in-flight guard blocked a new request, leaving the tree blank forever.
   const sshRootResolveInFlightRef = useRef<Set<string>>(new Set());
+  const [sshRootErrors, setSshRootErrors] = useState<Record<string, string>>({});
+  const activeRootSessionId = active?.id ?? null;
+  const activeRootSessionUnavailable = Boolean(active && (active.exited || active.closing));
+  const activeRootSessionSshRootDir = active?.sshRootDir ?? null;
+  const activeRootConnectionState = active?.connectionState ?? "connected";
+  const activeSshRootError = sshRootErrors[activeWorkspaceKey] ?? null;
+  const retryActiveSshRoot = useCallback(() => {
+    setSshRootErrors((prev) => {
+      if (!(activeWorkspaceKey in prev)) return prev;
+      const next = { ...prev };
+      delete next[activeWorkspaceKey];
+      return next;
+    });
+  }, [activeWorkspaceKey]);
+  // A reconnect is a natural retry point for a failed resolution.
+  useEffect(() => {
+    if (activeRootConnectionState === "connected") retryActiveSshRoot();
+  }, [activeRootConnectionState, retryActiveSshRoot]);
   useEffect(() => {
     const curProject = projectByIdRef.current.get(activeProjectId) ?? null;
     const projectSsh = isProjectSsh(curProject);
     if (!activeIsSsh && !projectSsh) return;
-    if (active && (active.exited || active.closing) && !projectSsh) return;
+    if (activeRootSessionUnavailable && !projectSsh) return;
     if (!activeWorkspaceView.fileExplorerOpen && !activeWorkspaceView.codeEditorOpen) return;
 
     const currentRoot =
       activeWorkspaceView.fileExplorerRootDir ??
       activeWorkspaceView.codeEditorRootDir ??
       "";
-    if (currentRoot) return;
+    // Earlier versions stored unexpanded paths such as "~/code" here; those
+    // are resolved again below instead of being treated as a usable root.
+    if (isAbsoluteSshPath(currentRoot)) return;
 
-    const persistedRoot = active?.sshRootDir ?? curProject?.sshRemotePath ?? "";
-    if (persistedRoot) {
-      updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => {
+    const workspaceKey = activeWorkspaceKey;
+    const projectId = activeProjectId;
+    const requested = currentRoot || activeRootSessionSshRootDir || curProject?.sshRemotePath || "";
+    const applyRoot = (root: string) => {
+      updateWorkspaceViewForKey(workspaceKey, projectId, (prev) => {
         const existing = prev.fileExplorerRootDir ?? prev.codeEditorRootDir ?? "";
-        if (existing) return prev;
-        return { ...prev, fileExplorerRootDir: persistedRoot, codeEditorRootDir: persistedRoot };
+        if (isAbsoluteSshPath(existing)) return prev;
+        return { ...prev, fileExplorerRootDir: root, codeEditorRootDir: root };
       });
+    };
+    if (isAbsoluteSshPath(requested)) {
+      applyRoot(normalizeAbsoluteSshPath(requested));
       return;
     }
 
     const target = activeSshTarget ?? curProject?.sshTarget?.trim() ?? null;
     if (!target) return;
-    if (sshRootResolveInFlightRef.current.has(activeWorkspaceKey)) return;
+    if (activeIsSsh && activeRootConnectionState !== "connected") return;
+    if (sshRootErrors[workspaceKey]) return;
+    if (sshRootResolveInFlightRef.current.has(workspaceKey)) return;
 
-    let cancelled = false;
-    sshRootResolveInFlightRef.current.add(activeWorkspaceKey);
+    const sessionId = activeRootSessionId;
+    sshRootResolveInFlightRef.current.add(workspaceKey);
     void (async () => {
       try {
-        const root = await invoke<string>("ssh_default_root", { target });
-        if (cancelled) return;
-        updateWorkspaceViewForKey(activeWorkspaceKey, activeProjectId, (prev) => {
-          const existing = prev.fileExplorerRootDir ?? prev.codeEditorRootDir ?? "";
-          if (existing) return prev;
-          return { ...prev, fileExplorerRootDir: root, codeEditorRootDir: root };
-        });
-        if (active) {
+        // `path` expands "~", "~/x" and relative project paths on the remote.
+        const root = await invoke<string>("ssh_default_root", { target, path: requested || null });
+        applyRoot(root);
+        if (sessionId) {
           setSessionsSync((prev) =>
             prev.map((s) =>
-              s.id === active.id
+              s.id === sessionId
                 ? { ...s, sshTarget: s.sshTarget ?? target, sshRootDir: root }
                 : s,
             ),
           );
         }
       } catch (err) {
-        if (!cancelled) reportError(`Failed to load remote files for ${target}`, err);
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn(`[ssh] failed to resolve remote root for ${target}:`, message);
+        setSshRootErrors((prev) => ({ ...prev, [workspaceKey]: message }));
+        // The open file tree shows this error with a Retry button; without it
+        // (editor-only layout) surface it as a notification instead.
+        const view = activeWorkspaceViewRef.current;
+        if (activeWorkspaceKeyRef.current !== workspaceKey || !view.fileExplorerOpen) {
+          reportError(`Failed to load remote files for ${target}`, err);
+        }
       } finally {
-        sshRootResolveInFlightRef.current.delete(activeWorkspaceKey);
+        sshRootResolveInFlightRef.current.delete(workspaceKey);
       }
     })();
-
-    return () => {
-      cancelled = true;
-    };
   }, [
-    active,
     activeIsSsh,
     activeProjectId,
+    activeRootConnectionState,
+    activeRootSessionId,
+    activeRootSessionSshRootDir,
+    activeRootSessionUnavailable,
     activeSshTarget,
     activeWorkspaceKey,
     activeWorkspaceView.codeEditorOpen,
     activeWorkspaceView.codeEditorRootDir,
     activeWorkspaceView.fileExplorerOpen,
     activeWorkspaceView.fileExplorerRootDir,
+    sshRootErrors,
     updateWorkspaceViewForKey,
   ]);
 
@@ -3442,11 +3560,12 @@ export default function App() {
     (path: string, mode: CodeEditorOpenFileRequest["mode"] = "auto") => {
       updateActiveWorkspaceView((prev) => {
         const project = projectByIdRef.current.get(activeProjectId) ?? null;
+        const isSshWorkspace = activeIsSsh || isProjectSsh(project);
         const root =
           prev.codeEditorRootDir ??
           prev.fileExplorerRootDir ??
-          (!activeIsSsh ? project?.basePath : null) ??
-          (!activeIsSsh ? active?.cwd : null) ??
+          (!isSshWorkspace ? project?.basePath : null) ??
+          (!isSshWorkspace ? active?.cwd : null) ??
           "";
         if (!root) return prev;
         return {
@@ -3607,22 +3726,49 @@ export default function App() {
     [projects, activeProjectId],
   );
 
+  // The file tree, editor and file search must agree on where files live: an
+  // SSH project browses the remote host even while a local session is active.
+  const activeWorkspaceIsSsh = activeIsSsh || isProjectSsh(activeProject);
+  const activeWorkspaceSshTarget = activeWorkspaceIsSsh
+    ? activeSshTarget ?? activeProject?.sshTarget?.trim() ?? null
+    : null;
+  // Only an absolute, resolved remote path is usable as an SSH root; "~/x" and
+  // relative project paths are expanded by the root-resolution effect first.
+  const activeSshWorkspaceRoot = useMemo(() => {
+    const candidate =
+      activeWorkspaceView.codeEditorRootDir ??
+      activeWorkspaceView.fileExplorerRootDir ??
+      (activeIsSsh ? active?.sshRootDir : null) ??
+      activeProject?.sshRemotePath ??
+      "";
+    return isAbsoluteSshPath(candidate) ? candidate : "";
+  }, [
+    active?.sshRootDir,
+    activeIsSsh,
+    activeProject?.sshRemotePath,
+    activeWorkspaceView.codeEditorRootDir,
+    activeWorkspaceView.fileExplorerRootDir,
+  ]);
+
   const activeWorkspaceFileRoot = useMemo(
     () =>
-      activeWorkspaceView.fileExplorerRootDir ??
-      activeWorkspaceView.codeEditorRootDir ??
-      (activeIsSsh ? active?.sshRootDir ?? activeProject?.sshRemotePath : activeProject?.basePath ?? active?.cwd) ??
-      "",
+      activeWorkspaceIsSsh
+        ? activeSshWorkspaceRoot
+        : activeWorkspaceView.fileExplorerRootDir ??
+          activeWorkspaceView.codeEditorRootDir ??
+          activeProject?.basePath ??
+          active?.cwd ??
+          "",
     [
       active?.cwd,
-      active?.sshRootDir,
-      activeIsSsh,
       activeProject?.basePath,
-      activeProject?.sshRemotePath,
+      activeSshWorkspaceRoot,
+      activeWorkspaceIsSsh,
       activeWorkspaceView.codeEditorRootDir,
       activeWorkspaceView.fileExplorerRootDir,
     ],
   );
+
 
   const projectSessions = useMemo(
     () => sortProjectSessionsForSidebar(sessions, activeProjectId),
@@ -4615,6 +4761,9 @@ export default function App() {
         (provider === "ssh"
           ? activeSession?.sshRootDir ?? project?.sshRemotePath ?? ""
           : project?.basePath ?? activeSession?.cwd ?? "");
+      if (provider === "ssh" && !isAbsoluteSshPath(root)) {
+        throw new Error("workspace root is not resolved yet");
+      }
       if (root) return root;
       if (provider === "local") return "/";
       throw new Error("workspace root is not resolved yet");
@@ -7499,7 +7648,11 @@ export default function App() {
     async (path: string | null): Promise<DirectoryListing> => {
       const target = sshPathPickerTargetRef.current;
       if (!target) throw new Error("No SSH target");
-      const resolvedPath = path ?? await invoke<string>("ssh_default_root", { target });
+      // "~", "~/x" and relative paths (as typed in the project form) are
+      // expanded on the remote host; only absolute paths can be listed.
+      const resolvedPath = isAbsoluteSshPath(path)
+        ? path
+        : await invoke<string>("ssh_default_root", { target, path: path || null });
       type FsEntry = { name: string; path: string; isDir: boolean; size: number };
       const entries = await invoke<FsEntry[]>("ssh_list_fs_entries", {
         target,
@@ -8557,16 +8710,21 @@ export default function App() {
 
       const restorePersistedSession = async (s: PersistedSession): Promise<Session | null> => {
         try {
+          const restoredSshTarget = migrateLegacySshTarget(
+            s.sshTarget,
+            s.launchCommand ?? s.restoreCommand ?? null,
+          );
           const createdRaw = await createSession({
             projectId: s.projectId,
             name: s.name,
             launchCommand: s.launchCommand,
             restoreCommand: s.restoreCommand ?? null,
             sshTarget:
-              s.sshTarget ??
+              restoredSshTarget.target ??
               sshTargetFromCommandLine(s.launchCommand ?? s.restoreCommand ?? null) ??
               sshTargetFromSessionName(s.name),
-            sshRootDir: s.sshRootDir ?? null,
+            // A root resolved against a mis-derived target belongs to another host.
+            sshRootDir: restoredSshTarget.migrated ? null : s.sshRootDir ?? null,
             lastRecordingId: s.lastRecordingId ?? null,
             cwd: s.cwd ?? projectById.get(s.projectId)?.basePath ?? resolvedHome ?? null,
             envVars: envVarsForProject(s.projectId),
@@ -10204,7 +10362,7 @@ export default function App() {
                   if (prev.fileExplorerOpen) {
                     return { ...prev, fileExplorerOpen: false };
                   }
-                  if (activeIsSsh) {
+                  if (activeWorkspaceIsSsh) {
                     return { ...prev, fileExplorerOpen: true };
                   }
                   const root =
@@ -10222,8 +10380,8 @@ export default function App() {
                 });
               }}
               disabled={
-                activeIsSsh
-                  ? !activeWorkspaceView.fileExplorerOpen && !activeSshTarget
+                activeWorkspaceIsSsh
+                  ? !activeWorkspaceView.fileExplorerOpen && !activeWorkspaceSshTarget
                   : !activeWorkspaceView.fileExplorerOpen &&
                     !(
                       activeWorkspaceView.fileExplorerRootDir ??
@@ -10235,11 +10393,11 @@ export default function App() {
               }
               title={
                 activeWorkspaceView.fileExplorerOpen
-                  ? activeIsSsh
+                  ? activeWorkspaceIsSsh
                     ? "Close remote file tree"
                     : "Close file tree"
-                  : activeIsSsh
-                    ? `Open remote file tree — ${activeSshTarget ?? "ssh"}`
+                  : activeWorkspaceIsSsh
+                    ? `Open remote file tree — ${activeWorkspaceSshTarget ?? "ssh"}`
                     : `Open file tree — ${
                         (
                           activeWorkspaceView.fileExplorerRootDir ??
@@ -10294,6 +10452,7 @@ export default function App() {
     </div>
   ), [
     active, activeProject, activeIsSsh, activeSshTarget, activeWorkspaceView, hydrated,
+    activeWorkspaceIsSsh, activeWorkspaceSshTarget,
     activityCenterOpen, activityItems, slidePanelOpen, agentPanelOpen, dialogs.settings,
     uiTheme, autoCaffeinate, keepAwakeActive, showShortcutHint,
     handleToggleActivityCenter, handleOpenSettings, reportError,
@@ -10338,9 +10497,13 @@ export default function App() {
 
         {activeWorkspaceView.codeEditorOpen &&
         (
-          activeWorkspaceView.codeEditorRootDir ??
-          activeWorkspaceView.fileExplorerRootDir ??
-          (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
+          activeWorkspaceIsSsh
+            ? activeSshWorkspaceRoot
+            : activeWorkspaceView.codeEditorRootDir ??
+              activeWorkspaceView.fileExplorerRootDir ??
+              activeProject?.basePath ??
+              active?.cwd ??
+              ""
         ) ? (
           <>
             <div
@@ -10359,15 +10522,17 @@ export default function App() {
               <LazyCodeEditorPanel
                 key={`code-editor:${activeWorkspaceKey}`}
                 ref={codeEditorPanelRef}
-                provider={activeIsSsh ? "ssh" : "local"}
+                provider={activeWorkspaceIsSsh ? "ssh" : "local"}
                 editorTheme={EDITOR_THEME_BY_UI_THEME[uiTheme]}
-                sshTarget={activeIsSsh ? activeSshTarget : null}
+                sshTarget={activeWorkspaceSshTarget}
                 rootDir={
-                  (
-                    activeWorkspaceView.codeEditorRootDir ??
-                    activeWorkspaceView.fileExplorerRootDir ??
-                    (!activeIsSsh ? activeProject?.basePath ?? active?.cwd ?? "" : "")
-                  )
+                  activeWorkspaceIsSsh
+                    ? activeSshWorkspaceRoot
+                    : activeWorkspaceView.codeEditorRootDir ??
+                      activeWorkspaceView.fileExplorerRootDir ??
+                      activeProject?.basePath ??
+                      active?.cwd ??
+                      ""
                 }
                 openFileRequest={activeWorkspaceView.openFileRequest}
                 openWorkspaceTabRequest={activeWorkspaceView.openWorkspaceTabRequest}
@@ -10406,9 +10571,13 @@ export default function App() {
 
         {activeWorkspaceView.fileExplorerOpen &&
         (
-          activeWorkspaceView.fileExplorerRootDir ??
-          activeWorkspaceView.codeEditorRootDir ??
-          (!(activeIsSsh || isProjectSsh(activeProject)) ? activeProject?.basePath ?? active?.cwd ?? "" : activeProject?.sshRemotePath ?? "")
+          activeWorkspaceIsSsh
+            ? activeSshWorkspaceRoot
+            : activeWorkspaceView.fileExplorerRootDir ??
+              activeWorkspaceView.codeEditorRootDir ??
+              activeProject?.basePath ??
+              active?.cwd ??
+              ""
         ) ? (
           <>
             <div
@@ -10420,15 +10589,17 @@ export default function App() {
             <FileExplorerPanel
               key={`file-tree:${activeWorkspaceKey}`}
               isOpen
-              provider={(activeIsSsh || isProjectSsh(activeProject)) ? "ssh" : "local"}
-              sshTarget={(activeIsSsh || isProjectSsh(activeProject)) ? (activeSshTarget ?? activeProject?.sshTarget ?? null) : null}
-              sshConnectionState={(activeIsSsh || isProjectSsh(activeProject)) ? (active?.connectionState ?? "connected") : undefined}
+              provider={activeWorkspaceIsSsh ? "ssh" : "local"}
+              sshTarget={activeWorkspaceSshTarget}
+              sshConnectionState={activeWorkspaceIsSsh ? (active?.connectionState ?? "connected") : undefined}
               rootDir={
-                (
-                  activeWorkspaceView.fileExplorerRootDir ??
-                  activeWorkspaceView.codeEditorRootDir ??
-                  (!(activeIsSsh || isProjectSsh(activeProject)) ? activeProject?.basePath ?? active?.cwd ?? "" : activeProject?.sshRemotePath ?? "")
-                )
+                activeWorkspaceIsSsh
+                  ? activeSshWorkspaceRoot
+                  : activeWorkspaceView.fileExplorerRootDir ??
+                    activeWorkspaceView.codeEditorRootDir ??
+                    activeProject?.basePath ??
+                    active?.cwd ??
+                    ""
               }
               persistedState={activeWorkspaceView.fileExplorerPersistedState}
               activeFilePath={activeWorkspaceView.codeEditorActiveFilePath}
@@ -10451,7 +10622,7 @@ export default function App() {
             />
             </PanelErrorBoundary>
           </>
-        ) : activeWorkspaceView.fileExplorerOpen && activeIsSsh ? (
+        ) : activeWorkspaceView.fileExplorerOpen && activeWorkspaceIsSsh ? (
           <>
             <div
               className="workspaceResize"
@@ -10481,9 +10652,22 @@ export default function App() {
                 </div>
               </div>
               <div className="fileExplorerList" role="tree">
-                <div className="fileExplorerRow fileExplorerMeta">
-                  {activeSshTarget ? "Loading remote files…" : "Missing SSH target."}
-                </div>
+                {!activeWorkspaceSshTarget ? (
+                  <div className="fileExplorerRow fileExplorerMeta">Missing SSH target.</div>
+                ) : activeSshRootError ? (
+                  <div className="fileExplorerRow fileExplorerMeta fileExplorerRootError" role="alert">
+                    <span className="fileExplorerRootErrorText" title={activeSshRootError}>
+                      Could not open remote files: {activeSshRootError}
+                    </span>
+                    <button type="button" className="btnSmall" onClick={retryActiveSshRoot}>
+                      Retry
+                    </button>
+                  </div>
+                ) : active && activeIsSsh && active.connectionState !== "connected" ? (
+                  <div className="fileExplorerRow fileExplorerMeta">Waiting for the SSH connection…</div>
+                ) : (
+                  <div className="fileExplorerRow fileExplorerMeta">Loading remote files…</div>
+                )}
               </div>
             </aside>
           </>
@@ -10552,6 +10736,8 @@ export default function App() {
 	    terminalSearchSessions, handleTerminalRegistryChanged, handleSearchClose,
 	    activeWorkspaceView, activeWorkspaceKey,
 	    activeIsSsh, activeSshTarget, activeProject, active,
+	    activeWorkspaceIsSsh, activeWorkspaceSshTarget, activeSshWorkspaceRoot,
+	    activeSshRootError, retryActiveSshRoot,
 	    workspaceResizeMode, activeProjectId, agentPanelOpen, agentPanelWidth,
 	    uiTheme,
 	    onCwdChange, onCommandChange, onSessionResize, onSessionTransportError,
@@ -12354,9 +12540,9 @@ export default function App() {
       />}
       <WorkspaceFileSearch
         isOpen={workspaceFileSearchOpen}
-        provider={activeIsSsh ? "ssh" : "local"}
+        provider={activeWorkspaceIsSsh ? "ssh" : "local"}
         rootDir={activeWorkspaceFileRoot}
-        sshTarget={activeIsSsh ? activeSshTarget : null}
+        sshTarget={activeWorkspaceSshTarget}
         onOpenFile={(path) => handleSelectWorkspaceFile(path, "auto")}
         onClose={() => setWorkspaceFileSearchOpen(false)}
       />
