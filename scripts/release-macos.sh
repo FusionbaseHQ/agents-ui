@@ -19,6 +19,9 @@
 #   bash scripts/release-macos.sh                # build + notarize dmg + verify
 #   bash scripts/release-macos.sh --skip-build   # notarize/staple an existing dmg only
 #
+# Optional: BUILD_NUMBER=<n> stamps the build number into CFBundleVersion (the
+# About panel shows "Version 0.12.0 (n)"); used for internal builds.
+#
 set -euo pipefail
 
 # Put the system tools first so the real /usr/bin/xattr is used during bundling.
@@ -44,8 +47,16 @@ DMG_DIR="$ROOT/src-tauri/target/release/bundle/dmg"
 
 # --- 1) build (Tauri signs + notarizes + staples the app, signs the dmg) -----
 if [ "$SKIP_BUILD" -eq 0 ]; then
-  echo "> npm run tauri build  (v$VERSION)"
-  npm run tauri build
+  if [ -n "${BUILD_NUMBER:-}" ]; then
+    case "$BUILD_NUMBER" in
+      ''|*[!0-9]*) echo "x BUILD_NUMBER must be a positive integer" >&2; exit 1 ;;
+    esac
+    echo "> npm run tauri build  (v$VERSION, build $BUILD_NUMBER)"
+    npm run tauri build -- --config "{\"bundle\":{\"macOS\":{\"bundleVersion\":\"$BUILD_NUMBER\"}}}"
+  else
+    echo "> npm run tauri build  (v$VERSION)"
+    npm run tauri build
+  fi
 else
   echo "> --skip-build: notarizing the existing dmg"
 fi

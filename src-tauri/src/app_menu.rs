@@ -45,6 +45,9 @@ pub fn build_app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
             let about_metadata = AboutMetadata {
                 name: Some(pkg_info.name.clone()),
                 version: Some(pkg_info.version.to_string()),
+                // Build number (CFBundleVersion) of internal builds, shown by
+                // the About panel as "Version 0.12.0 (3)".
+                short_version: config.bundle.macos.bundle_version.clone(),
                 copyright: config.bundle.copyright.clone(),
                 authors: config.bundle.publisher.clone().map(|p| vec![p]),
                 ..Default::default()
