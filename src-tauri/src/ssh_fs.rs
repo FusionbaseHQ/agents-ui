@@ -2841,6 +2841,39 @@ fn validate_ssh_target(target: &str) -> Result<&str, String> {
     Ok(target)
 }
 
+/// Whether the local `scp` defaults to the SFTP protocol (OpenSSH 9.0+; macOS
+/// 13+). The two modes treat an upload *destination* differently: legacy scp
+/// hands it to the remote shell (so it must be escaped), while SFTP mode uses
+/// it literally (escaping would become part of the file name, e.g. a dropped
+/// "shot 1.png" arriving as "shot\ 1.png"). Remote *sources* are escaped in
+/// both modes (SFTP mode globs them).
+fn scp_defaults_to_sftp() -> bool {
+    static SFTP: OnceLock<bool> = OnceLock::new();
+    *SFTP.get_or_init(|| {
+        let Ok(ssh) = program_path("ssh") else {
+            return true;
+        };
+        Command::new(ssh)
+            .arg("-V")
+            .stdin(Stdio::null())
+            .output()
+            .ok()
+            .and_then(|output| openssh_major_version(&String::from_utf8_lossy(&output.stderr)))
+            .map_or(true, |major| major >= 9)
+    })
+}
+
+fn openssh_major_version(version_banner: &str) -> Option<u32> {
+    let rest = version_banner.split("OpenSSH_").nth(1)?;
+    rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+}
+
+/// Remote path spelling for an scp upload destination (see `scp_defaults_to_sftp`).
+fn scp_remote_destination(path: &str) -> Result<String, String> {
+    let escaped = scp_escape_remote_path(path)?;
+    Ok(if scp_defaults_to_sftp() { path.to_string() } else { escaped })
+}
+
 /// Split an `ssh://[user@]host[:port]` target (what the frontend derives for a
 /// session started as `ssh -p 2222 host`) into scp's `[user@]host` form and a
 /// port. ssh itself accepts the URI directly; scp's `host:path` syntax does
@@ -4567,7 +4600,7 @@ fn ssh_upload_file_sync(
         return Err("missing ssh target".to_string());
     }
     let (_root, remote_path) = ensure_within_root(&root, &remote_path)?;
-    let escaped_remote_path = scp_escape_remote_path(&remote_path)?;
+    let remote_destination = scp_remote_destination(&remote_path)?;
 
     let local = validate_local_path_input(&local_path, "missing local path")?;
     if !Path::new(local).exists() {
@@ -4578,7 +4611,7 @@ fn ssh_upload_file_sync(
     // Format: scp -r /local/path user@host:/remote/path
     // Remote path must be escaped (remote shell in legacy mode, client-side
     // glob in sftp mode); the local path is passed verbatim.
-    let dest = scp_remote_spec(target, &escaped_remote_path)?;
+    let dest = scp_remote_spec(target, &remote_destination)?;
     let paths = vec![local.to_string(), dest];
     // Uploads write directly to the remote destination and cannot yet be
     // atomically rolled back. Do not kill one on renderer restart: interruption
@@ -4588,6 +4621,107 @@ fn ssh_upload_file_sync(
         return Err(output_to_error("scp upload failed", &output));
     }
     Ok(())
+}
+
+/// Creates a private, unique folder for one drop under the remote user's
+/// `~/.cache/agents-ui/drops` (owned by them, so no shared-/tmp races) and
+/// prunes drops older than a week. Prints the folder, framed.
+const REMOTE_DROP_STAGE_SCRIPT: &str = r#"set -e
+magic=$1
+trailer=$2
+umask 077
+if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then
+  echo "remote HOME is not set; cannot stage dropped files" >&2
+  exit 70
+fi
+base="$HOME/.cache/agents-ui/drops"
+mkdir -p "$base"
+chmod 700 "$base" 2>/dev/null || :
+find "$base" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || :
+dir=$(mktemp -d "$base/drop.XXXXXXXX")
+printf '%s\000%s\000%s\000' "$magic" "$dir" "$trailer"
+"#;
+
+/// Remote file names for a drop: each local basename, made unique within the
+/// drop ("shot.png", "shot (2).png") so same-named files don't overwrite.
+fn unique_drop_names(local_paths: &[String]) -> Result<Vec<String>, String> {
+    let mut used: HashSet<String> = HashSet::new();
+    let mut names = Vec::with_capacity(local_paths.len());
+    for local in local_paths {
+        let base = Path::new(local.trim_end_matches('/'))
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("cannot determine a file name for {local}"))?
+            .to_string();
+        let (stem, extension) = match base.rfind('.') {
+            Some(index) if index > 0 => (&base[..index], &base[index..]),
+            _ => (base.as_str(), ""),
+        };
+        let mut candidate = base.clone();
+        let mut counter = 2;
+        while !used.insert(candidate.clone()) {
+            candidate = format!("{stem} ({counter}){extension}");
+            counter += 1;
+        }
+        names.push(candidate);
+    }
+    Ok(names)
+}
+
+/// Copy files dropped onto an SSH terminal to the remote host and return their
+/// remote paths, so the remote program (e.g. Claude Code) can read them the
+/// same way a local program reads a dropped local path.
+#[tauri::command]
+pub async fn ssh_stage_dropped_files(
+    target: String,
+    local_paths: Vec<String>,
+) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || ssh_stage_dropped_files_sync(target, local_paths))
+        .await
+        .map_err(|e| format!("ssh task join failed: {e:?}"))?
+}
+
+fn ssh_stage_dropped_files_sync(target: String, local_paths: Vec<String>) -> Result<Vec<String>, String> {
+    let target = validate_ssh_target(&target)?.to_string();
+    if local_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    for local in &local_paths {
+        validate_local_path_input(local, "missing local path")?;
+        if !Path::new(local).exists() {
+            return Err(format!("dropped file no longer exists: {local}"));
+        }
+    }
+    let names = unique_drop_names(&local_paths)?;
+
+    let (magic, trailer) = remote_frame_tokens("DROP")?;
+    let output = run_ssh_read_only_script(
+        &target,
+        REMOTE_DROP_STAGE_SCRIPT,
+        &[magic.clone(), trailer.clone()],
+        None,
+        SSH_COMMAND_STDOUT_LIMIT,
+        SshOpPriority::Foreground,
+        "ssh drop staging",
+    )?;
+    if !output.status.success() {
+        return Err(remote_script_error("staging dropped files failed", &output));
+    }
+    let payload = extract_framed_payload(&output.stdout, &magic, &trailer, "ssh drop staging")?;
+    let remote_dir = normalize_posix_path(decode_remote_path_output(payload, "ssh drop staging")?)?;
+
+    let mut remote_paths = Vec::with_capacity(local_paths.len());
+    for (local, name) in local_paths.iter().zip(&names) {
+        let remote_path = join_posix_path(&remote_dir, name);
+        let dest = scp_remote_spec(&target, &scp_remote_destination(&remote_path)?)?;
+        let output = run_scp(&target, &["-r"], &[local.clone(), dest], None)?;
+        if !output.status.success() {
+            return Err(output_to_error("uploading dropped file failed", &output));
+        }
+        remote_paths.push(remote_path);
+    }
+    Ok(remote_paths)
 }
 
 #[tauri::command]
@@ -6729,6 +6863,51 @@ mod download_safety_tests {
         assert_eq!(std::fs::read(&local).unwrap(), b"quiet\n");
         let _ = std::fs::remove_file(local);
 
+        // Uploads keep names with spaces/specials exactly (SFTP-mode scp takes
+        // the destination literally; escaping it used to leak into the name).
+        let upload_src = unique_test_path("e2e-upload");
+        std::fs::write(&upload_src, b"up").unwrap();
+        for name in ["my file (1).txt", "it's & $x.txt"] {
+            let remote = format!("/home/quietuser/proj/{name}");
+            ssh_upload_file_sync(
+                quiet.clone(),
+                "/home/quietuser".into(),
+                upload_src.to_str().unwrap().into(),
+                remote.clone(),
+            )
+            .expect("upload");
+            assert_eq!(
+                ssh_read_text_file_sync(quiet.clone(), "/home/quietuser".into(), remote).unwrap(),
+                "up",
+                "{name}"
+            );
+        }
+        let _ = std::fs::remove_file(upload_src);
+
+        // Files dropped onto an SSH terminal are staged on the remote host.
+        let drop_dir = unique_test_path("e2e-drop");
+        std::fs::create_dir_all(drop_dir.join("a")).unwrap();
+        std::fs::create_dir_all(drop_dir.join("b")).unwrap();
+        let first = drop_dir.join("a/shot 1.png");
+        let second = drop_dir.join("b/shot 1.png");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let staged = ssh_stage_dropped_files_sync(
+            quiet.clone(),
+            vec![first.to_str().unwrap().into(), second.to_str().unwrap().into()],
+        )
+        .expect("stage dropped files over ssh:// target");
+        assert_eq!(staged.len(), 2);
+        assert!(staged[0].starts_with("/home/quietuser/.cache/agents-ui/drops/drop."), "{staged:?}");
+        assert!(staged[0].ends_with("/shot 1.png") && staged[1].ends_with("/shot 1 (2).png"), "{staged:?}");
+        for (remote, content) in staged.iter().zip(["first", "second"]) {
+            assert_eq!(
+                ssh_read_text_file_sync(quiet.clone(), "/home/quietuser".into(), remote.clone()).unwrap(),
+                content
+            );
+        }
+        let _ = std::fs::remove_dir_all(drop_dir);
+
         // A healthy master survives a recovery check; a wedged one is recycled
         // quickly and the next operation succeeds on a fresh connection.
         let target = "ssh://bashuser@127.0.0.1:2222";
@@ -6765,5 +6944,62 @@ mod download_safety_tests {
         assert!(!entries.is_empty());
         assert_eq!(recover_master(target, epoch, None), MasterHealth::Replaced);
         assert!(master_is_alive(target, None), "stale epoch must not close the fresh master");
+    }
+
+    #[test]
+    fn dropped_file_names_are_unique_within_a_drop() {
+        let names = unique_drop_names(&[
+            "/a/shot.png".into(),
+            "/b/shot.png".into(),
+            "/c/shot.png".into(),
+            "/d/Makefile".into(),
+            "/e/Makefile".into(),
+            "/f/folder/".into(),
+            "/g/.env".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            names,
+            ["shot.png", "shot (2).png", "shot (3).png", "Makefile", "Makefile (2)", "folder", ".env"]
+        );
+        assert!(unique_drop_names(&["/".into()]).is_err());
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn drop_stage_script_creates_private_unique_folders() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = unique_test_path("drop-home");
+        std::fs::create_dir(&home).unwrap();
+        let (magic, trailer) = remote_frame_tokens("DROP").unwrap();
+        let run = || {
+            let mut command = Command::new("/bin/sh");
+            command.env("HOME", &home).arg("-s").arg("--").arg(&magic).arg(&trailer);
+            command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            let mut child = command.spawn().unwrap();
+            child.stdin.take().unwrap().write_all(stdin_script(REMOTE_DROP_STAGE_SCRIPT).as_bytes()).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let payload = extract_framed_payload(&output.stdout, &magic, &trailer, "t").unwrap().to_vec();
+            String::from_utf8(payload).unwrap()
+        };
+        let first = run();
+        let second = run();
+        assert_ne!(first, second);
+        let base = home.join(".cache/agents-ui/drops");
+        assert!(first.starts_with(base.to_str().unwrap()), "{first}");
+        for path in [base.as_path(), Path::new(&first)] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", path.display());
+        }
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn openssh_version_banner_parses_major_version() {
+        assert_eq!(openssh_major_version("OpenSSH_9.9p2, LibreSSL 3.3.6"), Some(9));
+        assert_eq!(openssh_major_version("OpenSSH_8.6p1, LibreSSL 3.3.6"), Some(8));
+        assert_eq!(openssh_major_version("OpenSSH_for_Windows_9.5p1"), None);
+        assert_eq!(openssh_major_version("garbage"), None);
     }
 }

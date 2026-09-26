@@ -6,6 +6,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { initBridge, registerHandlers, destroyBridge, notifyStateChange } from "./apiBridge";
 import React, { useEffect, useMemo, useRef, useState, useCallback, useLayoutEffect } from "react";
 import { type PendingDataBuffer, type TerminalRegistry } from "./SessionTerminal";
+import { openUrlInDefaultBrowser, setTerminalUrlOpener } from "./terminalLinks";
+import { droppedPathsText, useTerminalFileDrop } from "./terminalFileDrop";
 import {
   commandTagFromCommandLine,
   detectProcessEffect,
@@ -6856,6 +6858,80 @@ export default function App() {
     },
     [reportError],
   );
+
+  // URLs clicked in a terminal (see terminalLinks.ts): ⌘-click opens a browser
+  // tab in the active workspace's file viewer, ⌘⇧-click the default browser.
+  useEffect(
+    () =>
+      setTerminalUrlOpener((url, target) => {
+        const openInDefaultBrowser = () =>
+          void openUrlInDefaultBrowser(url).catch((err) => reportError("Failed to open link", err));
+        if (target === "external") {
+          openInDefaultBrowser();
+          return;
+        }
+        const view = activeWorkspaceViewRef.current;
+        const projectId = activeProjectIdRef.current;
+        const project = projectByIdRef.current.get(projectId) ?? null;
+        const session = sessionsRef.current.find((s) => s.id === activeIdRef.current) ?? null;
+        const isSshWorkspace = isSshSession(session) || isProjectSsh(project);
+        const candidate =
+          view.codeEditorRootDir ??
+          view.fileExplorerRootDir ??
+          (isSshWorkspace ? session?.sshRootDir ?? project?.sshRemotePath : project?.basePath ?? session?.cwd) ??
+          "";
+        const root = isSshWorkspace ? (isAbsoluteSshPath(candidate) ? candidate : "") : candidate;
+        // The browser tab lives in the file-viewer panel, which needs a
+        // workspace root; without one, fall back to the default browser.
+        if (!root) {
+          openInDefaultBrowser();
+          return;
+        }
+        updateWorkspaceViewForKey(activeWorkspaceKeyRef.current, projectId, (prev) => ({
+          ...prev,
+          codeEditorOpen: true,
+          codeEditorRootDir: prev.codeEditorRootDir ?? root,
+          fileExplorerRootDir: prev.fileExplorerRootDir ?? root,
+          openWorkspaceTabRequest: { kind: "browser", url, nonce: Date.now() },
+        }));
+      }),
+    [reportError, updateWorkspaceViewForKey],
+  );
+
+  // Files dropped onto a terminal type their paths (Terminal.app behavior), so
+  // e.g. Claude Code attaches a dropped screenshot. SSH sessions get the files
+  // uploaded first and receive the remote paths.
+  const handleFilesDroppedOnTerminal = useCallback(
+    async (sessionId: string, paths: string[]) => {
+      const session = sessionsRef.current.find((s) => s.id === sessionId) ?? null;
+      const entry = registry.current.get(sessionId);
+      if (!session || !entry || entry.term.options.disableStdin || session.exited) return;
+      let pastePaths = paths;
+      if (isSshSession(session)) {
+        const target =
+          session.sshTarget?.trim() ||
+          sshTargetFromCommandLine(session.launchCommand ?? session.restoreCommand ?? null);
+        if (!target) {
+          reportError("Cannot drop files here", new Error("this SSH session has no known target"));
+          return;
+        }
+        const count = paths.length === 1 ? "file" : `${paths.length} files`;
+        showNotice(`Uploading ${count} to ${target.replace(/^ssh:\/\//i, "")}…`);
+        try {
+          pastePaths = await invoke<string[]>("ssh_stage_dropped_files", { target, localPaths: paths });
+        } catch (err) {
+          reportError("Failed to upload dropped files", err);
+          return;
+        }
+      }
+      const current = registry.current.get(sessionId);
+      if (!current) return;
+      current.term.paste(droppedPathsText(pastePaths));
+      current.term.focus();
+    },
+    [reportError],
+  );
+  useTerminalFileDrop(handleFilesDroppedOnTerminal);
 
   function sanitizeRecordedInputForReplay(input: string): string {
     // Remove common ANSI/terminal control sequences; recordings should be replayable as plain input.

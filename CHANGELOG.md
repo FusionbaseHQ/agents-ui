@@ -6,6 +6,9 @@ This project aims to follow Semantic Versioning.
 
 ## 0.12.0
 
+- **Clickable links in terminals**: URLs printed in a terminal (including ones coding agents wrap across lines) are underlined on hover. **⌘-click** opens them in the app's browser tab, **⌘⇧-click** in your default browser. Explicit terminal hyperlinks (OSC 8) work the same way.
+- **Drag & drop files into terminals**: dropping files onto a terminal now types their paths, like Terminal.app and iTerm2, so dragging a screenshot into Claude Code attaches it. In SSH sessions the files are uploaded to the server first (`~/.cache/agents-ui/drops`, cleaned up after 7 days) and the remote paths are inserted.
+- Fixed uploads to SSH hosts (dragging files into the remote file tree) creating wrongly named files when the name contained spaces or special characters.
 - **SSH file browser reliability**: the remote file tree and viewer no longer intermittently show nothing.
   - Fixed a race that could leave the remote tree blank after connecting; failures now show in the tree with a **Retry** button and retry automatically on reconnect.
   - Remote paths like `~` and `~/project` are expanded on the server (they were previously misread as `/` and `/project`).

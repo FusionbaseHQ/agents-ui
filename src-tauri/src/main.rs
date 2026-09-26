@@ -68,7 +68,7 @@ use ssh_fs::{
     shutdown_ssh_transfers, ssh_cancel_download, ssh_create_directory, ssh_create_file,
     ssh_default_root, ssh_delete_fs_entry, ssh_download_file, ssh_download_file_with_progress,
     ssh_download_to_temp, ssh_effective_user, ssh_list_fs_entries, ssh_probe_file,
-    ssh_revalidate_connection,
+    ssh_revalidate_connection, ssh_stage_dropped_files,
     ssh_read_file_range, ssh_read_text_file, ssh_rename_fs_entry, ssh_search_fs_entries,
     ssh_upload_file, ssh_write_text_file,
 };
@@ -292,6 +292,7 @@ fn main() {
             ssh_create_directory,
             ssh_list_fs_entries,
             ssh_revalidate_connection,
+            ssh_stage_dropped_files,
             ssh_search_fs_entries,
             ssh_read_text_file,
             ssh_probe_file,

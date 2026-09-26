@@ -6,6 +6,7 @@ import { FitAddon } from "xterm-addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { SessionShellIntegration, type CommandBlock } from "./shellIntegration";
 import { notifyStateChange } from "./apiBridge";
+import { createTerminalUrlLinkProvider, terminalOsc8LinkHandler } from "./terminalLinks";
 
 export type CanvasRecoveryGeneration = string | number;
 export type CanvasRecoveryOptions = {
@@ -405,6 +406,9 @@ function SessionTerminal(props: SessionTerminalProps) {
       fontSize: 13,
       theme: terminalThemeForUiTheme(props.uiTheme),
       scrollback: 5000,
+      // OSC 8 hyperlinks; xterm's default handler (confirm + window.open)
+      // does not work inside the app's webview.
+      linkHandler: terminalOsc8LinkHandler,
     });
     const fit = new FitAddon();
     const searchAddon = new SearchAddon();
@@ -414,6 +418,8 @@ function SessionTerminal(props: SessionTerminalProps) {
     canvasAddonRef.current = canvasAddon;
     term.loadAddon(canvasAddon);
     term.loadAddon(searchAddon);
+    // Plain-text URLs: ⌘-click opens the app browser, ⌘⇧-click the default one.
+    term.registerLinkProvider(createTerminalUrlLinkProvider(term));
     patchXtermRenderServiceDimensions(term);
     patchXtermPausedResizeTask(term);
 
