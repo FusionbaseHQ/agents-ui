@@ -4,6 +4,7 @@ import { detectProcessEffect, getProcessEffectById, type ProcessEffect } from ".
 import { shortenPathSmart } from "../pathDisplay";
 import { useClampedMenuPosition } from "../hooks/useClampedMenuPosition";
 import { Icon } from "./Icon";
+import type { ProjectModalFocus } from "./modals/ProjectModal";
 import { EmptyState, Menu, type MenuEntry } from "../ui";
 import { TAB_SYMBOLS, TabSymbolIcon, normalizeTabSymbolValue } from "../tabSymbols";
 
@@ -35,6 +36,7 @@ export type SidebarProject = {
   sshTarget?: string | null;
   sshRemotePath?: string | null;
   branch?: string | null;
+  previewUrl?: string | null;
 };
 
 export type SidebarSession = {
@@ -388,7 +390,7 @@ export type WorkspaceSidebarProps = {
 
   onSelectProject: (id: string) => void;
   onNewProject: () => void;
-  onOpenProjectSettings: (id: string) => void;
+  onOpenProjectSettings: (id: string, focus?: ProjectModalFocus) => void;
   onRequestDeleteProject: (id: string) => void;
   onRenameProjectInline: (id: string, name: string) => void;
   onMoveProject: (sourceId: string, targetId: string, position: "before" | "after") => void;
@@ -1615,6 +1617,10 @@ export const WorkspaceSidebar = React.memo(function WorkspaceSidebar(props: Work
                 ]
               : []),
             { type: "separator" },
+            {
+              label: contextProject.previewUrl ? "Edit preview URL…" : "Set preview URL…",
+              onSelect: () => onOpenProjectSettings(contextProject.id, "previewUrl"),
+            },
             {
               label: "Project settings",
               onSelect: () => onOpenProjectSettings(contextProject.id),

@@ -7,6 +7,7 @@ import {
   classifyImeEnter,
   consumeImeSubmitSuppression,
 } from "../filesystemInput";
+import { normalizePreviewUrl } from "../../previewUrl";
 
 function normalizeSmartQuotes(input: string): string {
   return input.replace(/[""„‟«»]/g, '"').replace(/[''‚‛‹›]/g, "'");
@@ -54,7 +55,12 @@ export type ProjectSubmitData = {
   sshTarget: string;
   sshRemotePath: string;
   defaultShell: ShellChoice | null;
+  /** Normalized http(s) URL, or null when the field is blank. */
+  previewUrl: string | null;
 };
+
+/** Which field to focus when the modal opens (default: the title). */
+export type ProjectModalFocus = "title" | "previewUrl";
 
 export type ProjectModalHandle = {
   setBasePath: (basePath: string) => void;
@@ -71,6 +77,8 @@ type ProjectModalProps = {
   initialSshTarget: string;
   initialSshRemotePath: string;
   initialDefaultShell: ShellChoice | null;
+  initialPreviewUrl: string;
+  initialFocus?: ProjectModalFocus;
   shells: ShellInfo[];
   shellsLoading: boolean;
   onLoadShells: () => void;
@@ -106,7 +114,8 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
       mode, initialTitle, initialBasePath, basePathPlaceholder,
       initialEnvironmentId, initialAssetsEnabled,
       initialSshTarget, initialSshRemotePath,
-      initialDefaultShell, shells, shellsLoading, onLoadShells,
+      initialDefaultShell, initialPreviewUrl, initialFocus = "title",
+      shells, shellsLoading, onLoadShells,
       sshHosts, sshHostsLoading,
       canUseCurrentTab, currentTabCwd, canUseHome, homeDir,
       environments, onOpenEnvironments, onBrowseBasePath, onBrowseRemotePath, onClose, onSubmit,
@@ -120,7 +129,10 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
     const [sshTarget, setSshTarget] = useState(initialSshTarget);
     const [sshRemotePath, setSshRemotePath] = useState(initialSshRemotePath);
     const [defaultShellKey, setDefaultShellKey] = useState(choiceToKey(initialDefaultShell));
+    const [previewUrl, setPreviewUrl] = useState(initialPreviewUrl);
+    const [previewUrlError, setPreviewUrlError] = useState<string | null>(null);
     const titleRef = useRef<HTMLInputElement>(null);
+    const previewUrlInputRef = useRef<HTMLInputElement>(null);
     const basePathInputRef = useRef<HTMLInputElement>(null);
     const sshRemotePathInputRef = useRef<HTMLInputElement>(null);
     const formCompositionRef = useRef(false);
@@ -129,8 +141,12 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
     useImperativeHandle(ref, () => ({ setBasePath, setSshRemotePath }));
 
     useEffect(() => {
-      const t = window.setTimeout(() => titleRef.current?.focus(), 0);
+      const t = window.setTimeout(() => {
+        const target = initialFocus === "previewUrl" ? previewUrlInputRef.current : titleRef.current;
+        target?.focus();
+      }, 0);
       return () => clearTimeout(t);
+      // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     // Detect installed shells when the modal opens so the picker is populated.
@@ -198,6 +214,12 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
     const handleSubmit = (e: React.FormEvent) => {
       e.preventDefault();
       if (formCompositionRef.current || consumeImeSubmitSuppression(formSubmitSuppressionRef)) return;
+      const normalizedPreviewUrl = previewUrl.trim() ? normalizePreviewUrl(previewUrl) : null;
+      if (previewUrl.trim() && !normalizedPreviewUrl) {
+        setPreviewUrlError("Enter an http(s) address, e.g. localhost:3000.");
+        previewUrlInputRef.current?.focus();
+        return;
+      }
       onSubmit({
         title,
         basePath: basePathInputRef.current?.value ?? basePath,
@@ -207,6 +229,7 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
         sshRemotePath: isSsh ? (sshRemotePathInputRef.current?.value ?? sshRemotePath) : "",
         // Shell choice applies to local projects only.
         defaultShell: isSsh ? null : keyToChoice(defaultShellKey, shells, initialDefaultShell),
+        previewUrl: normalizedPreviewUrl,
       });
     };
 
@@ -428,6 +451,34 @@ export const ProjectModal = forwardRef<ProjectModalHandle, ProjectModalProps>(
               </div>
             </div>
           )}
+          <div className="formRow">
+            <div className="label">Preview URL</div>
+            <input
+              ref={previewUrlInputRef}
+              className="input"
+              value={previewUrl}
+              onChange={(e) => {
+                setPreviewUrl(e.target.value);
+                setPreviewUrlError(null);
+              }}
+              placeholder="http://localhost:3000"
+              aria-label="Preview URL"
+              aria-invalid={previewUrlError ? true : undefined}
+              autoComplete="off"
+              autoCapitalize="off"
+              autoCorrect="off"
+              spellCheck={false}
+            />
+            {previewUrlError ? (
+              <div className="hint hintError" role="alert">{previewUrlError}</div>
+            ) : (
+              <div className="hint">
+                {isSsh
+                  ? "Optional. Adds an “Open in Browser” button to the toolbar. The address is opened from this Mac: for a server on the SSH host, forward its port or use the host’s address."
+                  : "Optional. Your app’s address, e.g. its dev server. Adds an “Open in Browser” button to the toolbar."}
+              </div>
+            )}
+          </div>
           <div className="formRow">
             <div className="label">Assets</div>
             <label className="checkRow">

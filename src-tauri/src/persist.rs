@@ -45,6 +45,10 @@ pub struct PersistedProjectV1 {
     /// Per-project default shell. Absent ⇒ bundled Nushell (the app default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_shell: Option<PersistedShellChoiceV1>,
+    /// URL of the project's running app (e.g. a dev server), opened by the
+    /// topbar "Open in Browser" button.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_url: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -535,7 +539,8 @@ mod tests {
                 "symbol": "rocket",
                 "color": "80, 120, 240",
                 "sshTarget": "dev@example.test",
-                "sshRemotePath": "/srv/project"
+                "sshRemotePath": "/srv/project",
+                "previewUrl": "http://localhost:5173/"
             }],
             "activeProjectId": "project-1",
             "sessions": [{
@@ -573,6 +578,7 @@ mod tests {
         assert_eq!(output["projects"][0]["color"], "80, 120, 240");
         assert_eq!(output["projects"][0]["sshTarget"], "dev@example.test");
         assert_eq!(output["projects"][0]["sshRemotePath"], "/srv/project");
+        assert_eq!(output["projects"][0]["previewUrl"], "http://localhost:5173/");
         assert_eq!(output["sessions"][0]["pinned"], true);
         assert_eq!(output["sessions"][0]["sidebarOrder"], 3);
         assert_eq!(output["sessions"][0]["symbol"], "terminal");
@@ -614,6 +620,7 @@ mod tests {
         }));
 
         assert!(output["projects"][0].get("color").is_none());
+        assert!(output["projects"][0].get("previewUrl").is_none());
         assert!(output["sessions"][0].get("color").is_none());
         assert!(output["sessions"][0].get("sidebarOrder").is_none());
     }

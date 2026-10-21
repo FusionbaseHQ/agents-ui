@@ -140,6 +140,9 @@ export type CodeEditorOpenWorkspaceTabInput = {
   url?: string | null;
   title?: string | null;
   mode?: CodeEditorOpenMode;
+  // Browser only: switch to an open browser tab on the same origin instead of
+  // opening another one (the topbar's "Open in Browser" for a preview URL).
+  reuse?: boolean;
 };
 
 export type CodeEditorOpenWorkspaceTabRequest = CodeEditorOpenWorkspaceTabInput & {
@@ -237,6 +240,14 @@ function urlHost(url: string): string {
     return new URL(url.includes("://") ? url : `https://${url}`).host || "Browser";
   } catch {
     return "Browser";
+  }
+}
+function urlOrigin(url: string): string | null {
+  try {
+    const origin = new URL(url).origin;
+    return origin === "null" ? null : origin;
+  } catch {
+    return null;
   }
 }
 function normalizeBrowserUrl(input: string): string {
@@ -1548,6 +1559,22 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       const kind = input.kind ?? (input.url ? "browser" : "file");
       if (kind === "browser") {
         const url = normalizeBrowserUrl(input.url ?? BROWSER_START_URL);
+        if (input.reuse) {
+          const origin = urlOrigin(url);
+          const candidates = origin
+            ? tabsRef.current.filter((tab) => {
+                const meta = browserMetaRef.current.get(tab.path);
+                return Boolean(meta && urlOrigin(meta.url) === origin);
+              })
+            : [];
+          const existing = candidates.find((tab) => tab.path === activePathRef.current) ?? candidates[0];
+          if (existing) {
+            setActivePath(existing.path);
+            activePathRef.current = existing.path;
+            setEditorModel(null);
+            return serializeWorkspaceTab(existing);
+          }
+        }
         const title = (input.title ?? "").trim() || urlHost(url);
         const tab = openBrowserTab(url, title);
         return serializeWorkspaceTab(tab);
@@ -1560,7 +1587,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       if (!tab) throw new Error("file tab did not open");
       return serializeWorkspaceTab(tab);
     },
-    [openBrowserTab, openFile, serializeWorkspaceTab],
+    [openBrowserTab, openFile, serializeWorkspaceTab, setEditorModel],
   );
 
   // "Open in browser" for an HTML file: render it in a browser tab. Local files

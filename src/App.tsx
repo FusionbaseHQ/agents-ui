@@ -6,7 +6,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { initBridge, registerHandlers, destroyBridge, notifyStateChange } from "./apiBridge";
 import React, { useEffect, useMemo, useRef, useState, useCallback, useLayoutEffect } from "react";
 import { type PendingDataBuffer, type TerminalRegistry } from "./SessionTerminal";
-import { openUrlInDefaultBrowser, setTerminalUrlOpener } from "./terminalLinks";
+import { openUrlInDefaultBrowser, setTerminalUrlOpener, type UrlOpenTarget } from "./terminalLinks";
+import { normalizePreviewUrl } from "./previewUrl";
 import { droppedPathsText, useTerminalFileDrop } from "./terminalFileDrop";
 import {
   commandTagFromCommandLine,
@@ -89,7 +90,12 @@ import {
   PersistentSessionsModal,
   type PersistentSessionsModalItem,
 } from "./components/modals/PersistentSessionsModal";
-import { ProjectModal, type ProjectModalHandle, type ProjectSubmitData } from "./components/modals/ProjectModal";
+import {
+  ProjectModal,
+  type ProjectModalFocus,
+  type ProjectModalHandle,
+  type ProjectSubmitData,
+} from "./components/modals/ProjectModal";
 import { ApplyAssetModal } from "./components/modals/ApplyAssetModal";
 import { ConfirmActionModal } from "./components/modals/ConfirmActionModal";
 import { ShortcutsModal } from "./components/modals/ShortcutsModal";
@@ -125,6 +131,9 @@ type Project = {
   sshRemotePath?: string | null;
   // Per-project default shell. Absent ⇒ bundled Nushell (the app default).
   defaultShell?: ShellChoice | null;
+  // URL of the project's running app (e.g. a dev server). When set, the
+  // topbar shows an "Open in Browser" button for it.
+  previewUrl?: string | null;
 };
 
 // A Workspace groups projects (Workspace → Project → Session). Workspaces are a
@@ -1301,6 +1310,17 @@ function getSessionActivityState(
   };
 }
 
+// A project's preview URL as passed to the MCP/API bridge: null or blank
+// clears it; anything that isn't an http(s) URL is rejected.
+function previewUrlFromApiParam(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string") throw new Error("previewUrl must be a string or null");
+  if (!value.trim()) return null;
+  const url = normalizePreviewUrl(value);
+  if (!url) throw new Error("previewUrl must be an http(s) URL");
+  return url;
+}
+
 function reconnectDelayMsForAttempt(attempt: number): number {
   const bounded = Math.max(1, attempt);
   const exp = bounded - 1;
@@ -1729,6 +1749,7 @@ function loadLegacyProjectState(): { projects: Project[]; activeProjectId: strin
             color: (p as { color?: string | null }).color ?? null,
             sshTarget: (p as { sshTarget?: string | null }).sshTarget ?? null,
             sshRemotePath: (p as { sshRemotePath?: string | null }).sshRemotePath ?? null,
+            previewUrl: (p as { previewUrl?: string | null }).previewUrl ?? null,
           }));
       }
     }
@@ -2741,7 +2762,20 @@ export default function App() {
   const lastActiveByProject = useRef<Map<string, string>>(new Map());
   const newSessionModalRef = useRef<NewSessionModalHandle>(null);
   const projectModalRef = useRef<ProjectModalHandle>(null);
-  const projectModalInitialRef = useRef({ mode: "new" as "new" | "rename", title: "", basePath: "", environmentId: "", assetsEnabled: true, sshTarget: "", sshRemotePath: "", defaultShell: null as ShellChoice | null });
+  const projectModalInitialRef = useRef({
+    mode: "new" as "new" | "rename",
+    // The project being edited in "rename" mode (not necessarily the active one).
+    projectId: null as string | null,
+    title: "",
+    basePath: "",
+    environmentId: "",
+    assetsEnabled: true,
+    sshTarget: "",
+    sshRemotePath: "",
+    defaultShell: null as ShellChoice | null,
+    previewUrl: "",
+    focus: "title" as ProjectModalFocus,
+  });
   const pathPickerInitialPathRef = useRef<string | null>(null);
   const sshPathPickerTargetRef = useRef<string | null>(null);
   const recordNameRef = useRef<HTMLInputElement | null>(null);
@@ -3793,6 +3827,7 @@ export default function App() {
           sshTarget: p.sshTarget ?? null,
           sshRemotePath: p.sshRemotePath ?? null,
           branch: null,
+          previewUrl: p.previewUrl ?? null,
         })),
     [projects, projectWorkspace, activeWorkspaceId],
   );
@@ -5082,6 +5117,7 @@ export default function App() {
           : null;
         const sshTarget = ((p.sshTarget as string | undefined) ?? "").trim() || null;
         const sshRemotePath = ((p.sshRemotePath as string | undefined) ?? "") || null;
+        const previewUrl = previewUrlFromApiParam(p.previewUrl);
         const id = makeId();
         const project: Project = {
           id,
@@ -5091,6 +5127,7 @@ export default function App() {
           assetsEnabled: p.assetsEnabled !== false,
           sshTarget,
           sshRemotePath,
+          previewUrl,
         };
         setProjects((prev) => [...prev, project]);
         notifyStateChange("projects.created", { projectId: id });
@@ -5098,25 +5135,32 @@ export default function App() {
       },
       "projects.update": (p) => {
         const id = p.id as string;
-        setProjects((prev) => prev.map((proj) => {
-          if (proj.id !== id) return proj;
-          if (p.symbol !== undefined || p.color !== undefined) {
-            urgentPersistenceRef.current = true;
-          }
-          return {
-            ...proj,
-            ...(p.title !== undefined && { title: (p.title as string).trim() }),
-            ...(p.basePath !== undefined && { basePath: p.basePath as string | null }),
-            ...(p.environmentId !== undefined && { environmentId: p.environmentId as string | null }),
-            ...(p.assetsEnabled !== undefined && { assetsEnabled: p.assetsEnabled as boolean }),
-            ...(p.symbol !== undefined && { symbol: normalizeTabSymbolValue(p.symbol as string | null) }),
-            ...(p.color !== undefined && { color: p.color as string | null }),
-            ...(p.sshTarget !== undefined && { sshTarget: (p.sshTarget as string | null)?.trim() || null }),
-            ...(p.sshRemotePath !== undefined && { sshRemotePath: (p.sshRemotePath as string | null) || null }),
-          };
-        }));
+        const current = projectsRef.current.find((pr) => pr.id === id);
+        if (!current) throw new Error("project not found");
+        // Validate before the state update so a bad URL fails the call.
+        const previewUrl = p.previewUrl !== undefined ? previewUrlFromApiParam(p.previewUrl) : undefined;
+        const patch: Partial<Project> = {
+          ...(p.title !== undefined && { title: (p.title as string).trim() }),
+          ...(p.basePath !== undefined && { basePath: p.basePath as string | null }),
+          ...(p.environmentId !== undefined && { environmentId: p.environmentId as string | null }),
+          ...(p.assetsEnabled !== undefined && { assetsEnabled: p.assetsEnabled as boolean }),
+          ...(p.symbol !== undefined && { symbol: normalizeTabSymbolValue(p.symbol as string | null) }),
+          ...(p.color !== undefined && { color: p.color as string | null }),
+          ...(p.sshTarget !== undefined && { sshTarget: (p.sshTarget as string | null)?.trim() || null }),
+          ...(p.sshRemotePath !== undefined && { sshRemotePath: (p.sshRemotePath as string | null) || null }),
+          ...(previewUrl !== undefined && { previewUrl }),
+        };
+        if (p.symbol !== undefined || p.color !== undefined) {
+          urgentPersistenceRef.current = true;
+        }
+        setProjects((prev) => prev.map((proj) => (proj.id === id ? { ...proj, ...patch } : proj)));
+        // The refs only re-sync after the re-render. Update them now so this
+        // call's result, and reads prompted by the notification, see the change.
+        const updated: Project = { ...current, ...patch };
+        projectsRef.current = projectsRef.current.map((pr) => (pr.id === id ? updated : pr));
+        projectByIdRef.current.set(id, updated);
         notifyStateChange("projects.updated", { projectId: id });
-        return projectsRef.current.find((pr) => pr.id === id) ?? null;
+        return updated;
       },
       "projects.delete": async (p) => {
         const id = p.id as string;
@@ -5949,7 +5993,7 @@ export default function App() {
     try {
       localStorage.setItem(
         STORAGE_PROJECTS_KEY,
-        JSON.stringify(projects.map((p) => ({ id: p.id, title: p.title, symbol: p.symbol ?? null, color: p.color ?? null, sshTarget: p.sshTarget ?? null, sshRemotePath: p.sshRemotePath ?? null }))),
+        JSON.stringify(projects.map((p) => ({ id: p.id, title: p.title, symbol: p.symbol ?? null, color: p.color ?? null, sshTarget: p.sshTarget ?? null, sshRemotePath: p.sshRemotePath ?? null, previewUrl: p.previewUrl ?? null }))),
       );
       localStorage.setItem(STORAGE_ACTIVE_PROJECT_KEY, activeProjectId);
     } catch {
@@ -6859,44 +6903,48 @@ export default function App() {
     [reportError],
   );
 
-  // URLs clicked in a terminal (see terminalLinks.ts): ⌘-click opens a browser
-  // tab in the active workspace's file viewer, ⌘⇧-click the default browser.
-  useEffect(
-    () =>
-      setTerminalUrlOpener((url, target) => {
-        const openInDefaultBrowser = () =>
-          void openUrlInDefaultBrowser(url).catch((err) => reportError("Failed to open link", err));
-        if (target === "external") {
-          openInDefaultBrowser();
-          return;
-        }
-        const view = activeWorkspaceViewRef.current;
-        const projectId = activeProjectIdRef.current;
-        const project = projectByIdRef.current.get(projectId) ?? null;
-        const session = sessionsRef.current.find((s) => s.id === activeIdRef.current) ?? null;
-        const isSshWorkspace = isSshSession(session) || isProjectSsh(project);
-        const candidate =
-          view.codeEditorRootDir ??
-          view.fileExplorerRootDir ??
-          (isSshWorkspace ? session?.sshRootDir ?? project?.sshRemotePath : project?.basePath ?? session?.cwd) ??
-          "";
-        const root = isSshWorkspace ? (isAbsoluteSshPath(candidate) ? candidate : "") : candidate;
-        // The browser tab lives in the file-viewer panel, which needs a
-        // workspace root; without one, fall back to the default browser.
-        if (!root) {
-          openInDefaultBrowser();
-          return;
-        }
-        updateWorkspaceViewForKey(activeWorkspaceKeyRef.current, projectId, (prev) => ({
-          ...prev,
-          codeEditorOpen: true,
-          codeEditorRootDir: prev.codeEditorRootDir ?? root,
-          fileExplorerRootDir: prev.fileExplorerRootDir ?? root,
-          openWorkspaceTabRequest: { kind: "browser", url, nonce: Date.now() },
-        }));
-      }),
+  // Opens a URL in a browser tab in the active workspace's file viewer
+  // ("internal") or in the default browser ("external"). Shared by terminal
+  // links (⌘-click / ⌘⇧-click, see terminalLinks.ts) and the topbar
+  // "Open in Browser" button for a project's preview URL, which passes
+  // `reuse` to switch to an open tab on the same origin instead.
+  const openUrlInWorkspaceBrowser = useCallback(
+    (url: string, target: UrlOpenTarget, options: { reuse?: boolean } = {}) => {
+      const openInDefaultBrowser = () =>
+        void openUrlInDefaultBrowser(url).catch((err) => reportError("Failed to open link", err));
+      if (target === "external") {
+        openInDefaultBrowser();
+        return;
+      }
+      const view = activeWorkspaceViewRef.current;
+      const projectId = activeProjectIdRef.current;
+      const project = projectByIdRef.current.get(projectId) ?? null;
+      const session = sessionsRef.current.find((s) => s.id === activeIdRef.current) ?? null;
+      const isSshWorkspace = isSshSession(session) || isProjectSsh(project);
+      const candidate =
+        view.codeEditorRootDir ??
+        view.fileExplorerRootDir ??
+        (isSshWorkspace ? session?.sshRootDir ?? project?.sshRemotePath : project?.basePath ?? session?.cwd) ??
+        "";
+      const root = isSshWorkspace ? (isAbsoluteSshPath(candidate) ? candidate : "") : candidate;
+      // The browser tab lives in the file-viewer panel, which needs a
+      // workspace root; without one, fall back to the default browser.
+      if (!root) {
+        openInDefaultBrowser();
+        return;
+      }
+      updateWorkspaceViewForKey(activeWorkspaceKeyRef.current, projectId, (prev) => ({
+        ...prev,
+        codeEditorOpen: true,
+        codeEditorRootDir: prev.codeEditorRootDir ?? root,
+        fileExplorerRootDir: prev.fileExplorerRootDir ?? root,
+        openWorkspaceTabRequest: { kind: "browser", url, reuse: options.reuse, nonce: Date.now() },
+      }));
+    },
     [reportError, updateWorkspaceViewForKey],
   );
+
+  useEffect(() => setTerminalUrlOpener(openUrlInWorkspaceBrowser), [openUrlInWorkspaceBrowser]);
 
   // Files dropped onto a terminal type their paths (Terminal.app behavior), so
   // e.g. Claude Code attaches a dropped screenshot. SSH sessions get the files
@@ -7991,6 +8039,7 @@ export default function App() {
     setNewOpen(false);
     projectModalInitialRef.current = {
       mode: "new",
+      projectId: null,
       title: "",
       basePath: activeSession?.cwd ?? curProject?.basePath ?? homeDirRef.current ?? "",
       environmentId: curProject?.environmentId ?? "",
@@ -7998,18 +8047,21 @@ export default function App() {
       sshTarget: "",
       sshRemotePath: "",
       defaultShell: null,
+      previewUrl: "",
+      focus: "title",
     };
     setProjectOpen(true);
     void refreshSshHosts();
   }, []);
 
-  const openProjectSettings = useCallback((projectId: string) => {
+  const openProjectSettings = useCallback((projectId: string, focus: ProjectModalFocus = "title") => {
     const project = projectByIdRef.current.get(projectId);
     if (!project) return;
 
     setNewOpen(false);
     projectModalInitialRef.current = {
       mode: "rename",
+      projectId,
       title: project.title,
       basePath: project.basePath ?? "",
       environmentId: project.environmentId ?? "",
@@ -8017,6 +8069,8 @@ export default function App() {
       sshTarget: project.sshTarget ?? "",
       sshRemotePath: project.sshRemotePath ?? "",
       defaultShell: project.defaultShell ?? null,
+      previewUrl: project.previewUrl ?? "",
+      focus,
     };
     setProjectOpen(true);
     void refreshSshHosts();
@@ -8073,8 +8127,14 @@ export default function App() {
     if (!title) return;
 
     const isSshProject = Boolean(data.sshTarget?.trim());
+    // Settings can be opened for any project from the sidebar, so edits go to
+    // the project the modal was opened for, not the active one.
+    const isEdit = projectModalInitialRef.current.mode === "rename";
+    const editingProjectId = isEdit ? projectModalInitialRef.current.projectId : null;
+    const editingProject = editingProjectId ? projectByIdRef.current.get(editingProjectId) ?? null : null;
 
-    const desiredBasePath = data.basePath || activeProject?.basePath || homeDirRef.current || "";
+    const desiredBasePath =
+      data.basePath || (isEdit ? editingProject : activeProject)?.basePath || homeDirRef.current || "";
     const validatedBasePath = isSshProject
       ? (await invoke<string | null>("validate_directory", { path: desiredBasePath }).catch(() => null) ?? homeDirRef.current ?? "")
       : await invoke<string | null>("validate_directory", { path: desiredBasePath }).catch(() => null);
@@ -8087,10 +8147,10 @@ export default function App() {
       ? data.environmentId
       : null;
 
-    if (projectModalInitialRef.current.mode === "rename") {
+    if (isEdit) {
       setProjects((prev) =>
         prev.map((p) =>
-          p.id === activeProjectId
+          p.id === editingProjectId
             ? {
                 ...p,
                 title,
@@ -8100,6 +8160,7 @@ export default function App() {
                 sshTarget: isSshProject ? data.sshTarget.trim() : null,
                 sshRemotePath: isSshProject ? data.sshRemotePath || null : null,
                 defaultShell: isSshProject ? null : data.defaultShell,
+                previewUrl: data.previewUrl,
               }
             : p,
         ),
@@ -8118,6 +8179,7 @@ export default function App() {
       sshTarget: isSshProject ? data.sshTarget.trim() : null,
       sshRemotePath: isSshProject ? data.sshRemotePath || null : null,
       defaultShell: isSshProject ? null : data.defaultShell,
+      previewUrl: data.previewUrl,
     };
     setProjects((prev) => [...prev, project]);
     setProjectOpen(false);
@@ -10349,6 +10411,7 @@ export default function App() {
     handleSendPromptToActive, openPromptEditor, handleOpenPromptsPanel,
   ]);
 
+  const activePreviewUrl = activeProject?.previewUrl ?? null;
   const topbarJsx = useMemo(() => (
     <div className="topbar">
       <div className="activeTitle">
@@ -10393,44 +10456,57 @@ export default function App() {
           </div>
         )}
 
-        {active && (
-          <>
-            {!activeIsSsh ? (
+        {(active && !activeIsSsh) || activePreviewUrl ? (
+          <div className="topbarExternalActions">
+            {active && !activeIsSsh ? (
               <>
-                <div className="topbarExternalActions">
-                  <button
-                    className="iconBtn iconBtnText"
-                    onClick={() => {
-                      const cwd = active.cwd ?? "";
-                      if (!cwd) return;
-                      void invoke("open_path_in_file_manager", { path: cwd }).catch((err) =>
-                        reportError("Failed to open folder in Finder", err),
-                      );
-                    }}
-                    disabled={!active.cwd}
-                    title={active.cwd ? `Open in Finder — ${active.cwd}` : "Open in Finder"}
-                  >
-                    Open in Finder
-                  </button>
+                <button
+                  className="iconBtn iconBtnText"
+                  onClick={() => {
+                    const cwd = active.cwd ?? "";
+                    if (!cwd) return;
+                    void invoke("open_path_in_file_manager", { path: cwd }).catch((err) =>
+                      reportError("Failed to open folder in Finder", err),
+                    );
+                  }}
+                  disabled={!active.cwd}
+                  title={active.cwd ? `Open in Finder — ${active.cwd}` : "Open in Finder"}
+                >
+                  Open in Finder
+                </button>
 
-                  <button
-                    className="iconBtn iconBtnText"
-                    onClick={() => {
-                      const cwd = active.cwd ?? "";
-                      if (!cwd) return;
-                      void invoke("open_path_in_vscode", { path: cwd }).catch((err) =>
-                        reportError("Failed to open VS Code", err),
-                      );
-                    }}
-                    disabled={!active.cwd}
-                    title={active.cwd ? `Open in VS Code — ${active.cwd}` : "Open in VS Code"}
-                  >
-                    Open in VS Code
-                  </button>
-                </div>
+                <button
+                  className="iconBtn iconBtnText"
+                  onClick={() => {
+                    const cwd = active.cwd ?? "";
+                    if (!cwd) return;
+                    void invoke("open_path_in_vscode", { path: cwd }).catch((err) =>
+                      reportError("Failed to open VS Code", err),
+                    );
+                  }}
+                  disabled={!active.cwd}
+                  title={active.cwd ? `Open in VS Code — ${active.cwd}` : "Open in VS Code"}
+                >
+                  Open in VS Code
+                </button>
               </>
             ) : null}
+            {activePreviewUrl ? (
+              <button
+                className="iconBtn iconBtnText"
+                onClick={(e) =>
+                  openUrlInWorkspaceBrowser(activePreviewUrl, e.shiftKey ? "external" : "internal", { reuse: true })
+                }
+                title={`Open ${activePreviewUrl} in a browser tab (⇧-click: default browser)`}
+              >
+                Open in Browser
+              </button>
+            ) : null}
+          </div>
+        ) : null}
 
+        {active && (
+          <>
             <button
               className={`iconBtn ${activeWorkspaceView.fileExplorerOpen ? "iconBtnActive" : ""}`}
               onClick={() => {
@@ -10532,7 +10608,7 @@ export default function App() {
     activityCenterOpen, activityItems, slidePanelOpen, agentPanelOpen, dialogs.settings,
     uiTheme, autoCaffeinate, keepAwakeActive, showShortcutHint,
     handleToggleActivityCenter, handleOpenSettings, reportError,
-    updateActiveWorkspaceView, refreshRecordings,
+    updateActiveWorkspaceView, refreshRecordings, activePreviewUrl, openUrlInWorkspaceBrowser,
   ]);
 
   const workspaceRowJsx = useMemo(() => (
@@ -11106,6 +11182,8 @@ export default function App() {
             initialSshTarget={projectModalInitialRef.current.sshTarget}
             initialSshRemotePath={projectModalInitialRef.current.sshRemotePath}
             initialDefaultShell={projectModalInitialRef.current.defaultShell}
+            initialPreviewUrl={projectModalInitialRef.current.previewUrl}
+            initialFocus={projectModalInitialRef.current.focus}
             shells={detectedShells}
             shellsLoading={shellsLoading}
             onLoadShells={() => void loadShells()}

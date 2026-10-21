@@ -4944,6 +4944,9 @@ select.input {
   color: var(--muted);
   margin-top: 4px;
 }
+.hint.hintError {
+  color: rgb(var(--danger-rgb));
+}
 
 /* Shell picker (bring-your-own-shell) — uses shared .modal chrome */
 .shellList {
