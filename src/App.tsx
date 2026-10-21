@@ -1831,6 +1831,9 @@ function coerceCodeEditorPersistedState(value: unknown): CodeEditorPersistedStat
 
   const tabs = rawTabs
     .filter((t): t is { path: unknown } => Boolean(t) && typeof t === "object" && "path" in (t as object))
+    // Browser tabs survive project switches in memory but are session-only:
+    // never stored or restored from localStorage.
+    .filter((t) => (t as Record<string, unknown>).viewerKind !== "browser")
     .map((t) => {
       const rec = t as Record<string, unknown>;
       const path = typeof rec.path === "string" ? rec.path : "";
@@ -4819,11 +4822,14 @@ export default function App() {
       const activeTabId = view.codeEditorActiveFilePath ?? view.codeEditorPersistedState?.activePath ?? null;
       const tabs: CodeEditorWorkspaceTab[] = (view.codeEditorPersistedState?.tabs ?? []).map((tab) => ({
         id: tab.path,
-        kind: "file",
-        title: tab.path.split("/").filter(Boolean).slice(-1)[0] ?? tab.path,
+        kind: tab.viewerKind === "browser" ? "browser" : "file",
+        title:
+          tab.viewerKind === "browser"
+            ? tab.title ?? tab.url ?? "Browser"
+            : tab.path.split("/").filter(Boolean).slice(-1)[0] ?? tab.path,
         active: tab.path === activeTabId,
-        path: tab.path,
-        url: null,
+        path: tab.viewerKind === "browser" ? null : tab.path,
+        url: tab.viewerKind === "browser" ? tab.url ?? null : null,
         label: null,
         viewerKind: tab.viewerKind ?? null,
         requestedMode: "auto",

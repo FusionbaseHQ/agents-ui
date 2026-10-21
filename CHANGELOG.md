@@ -8,6 +8,7 @@ This project aims to follow Semantic Versioning.
 
 - **Clickable links in terminals**: URLs printed in a terminal (including ones coding agents wrap across lines) are underlined on hover. **⌘-click** opens them in the app's browser tab, **⌘⇧-click** in your default browser. Explicit terminal hyperlinks (OSC 8) work the same way.
 - **Project preview URL**: give a project its app's address (e.g. its dev server) in Project settings, or with **Set preview URL…** in the project's right-click menu, and an **Open in Browser** button appears in the toolbar. Click opens it in the app's browser tab, **⇧-click** in your default browser. Agents can set it with the MCP `create_project` / `update_project` tools.
+- Browser tabs in the file viewer now survive switching projects: they reopen at their last page when you come back (for the current app session). **Open in Browser** switches to an already open tab for the preview instead of opening another one.
 - Fixed Project settings opened from the sidebar for a project other than the active one saving the changes to the active project.
 - Fixed the MCP `update_project` tool returning the project's previous values instead of the updated ones.
 - **Drag & drop files into terminals**: dropping files onto a terminal now types their paths, like Terminal.app and iTerm2, so dragging a screenshot into Claude Code attaches it. In SSH sessions the files are uploaded to the server first (`~/.cache/agents-ui/drops`, cleaned up after 7 days) and the remote paths are inserted.

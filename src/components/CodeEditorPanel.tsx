@@ -305,6 +305,9 @@ export type CodeEditorPersistedTab = {
   content: string | null;
   viewerKind?: ViewerKind | null;
   locked?: boolean;
+  // Browser tabs only: reopened at this URL when the panel remounts.
+  title?: string;
+  url?: string;
 };
 
 export type CodeEditorPersistedState = {
@@ -1043,15 +1046,20 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
   }, [modelUriForPath]);
 
   const serializeState = React.useCallback((): CodeEditorPersistedState => {
-    // Browser tabs are session-only (no URL persistence), so they're excluded.
-    const currentTabs = tabsRef.current.filter((tab) => !isBrowserPath(tab.path));
-    const outTabs: CodeEditorPersistedTab[] = currentTabs.map((tab) => {
+    const outTabs: CodeEditorPersistedTab[] = tabsRef.current.flatMap((tab): CodeEditorPersistedTab[] => {
+      if (isBrowserPath(tab.path)) {
+        // Browser tabs keep their title and current URL so they reopen when the
+        // panel remounts (e.g. after switching projects). They're session-only:
+        // the app drops them before the state reaches localStorage.
+        const meta = browserMetaRef.current.get(tab.path);
+        if (!meta) return [];
+        return [{ path: tab.path, dirty: false, content: null, viewerKind: "browser", title: tab.title, url: meta.url }];
+      }
       const dirty = dirtyPathsRef.current.has(tab.path) || tab.dirty;
       const content = dirty && tab.viewerKind === "text" ? readModelValue(tab.path) ?? "" : null;
-      return { path: tab.path, dirty: tab.viewerKind === "text" ? dirty : false, content, viewerKind: tab.viewerKind, locked: tab.locked };
+      return [{ path: tab.path, dirty: tab.viewerKind === "text" ? dirty : false, content, viewerKind: tab.viewerKind, locked: tab.locked }];
     });
-    const active = activePathRef.current;
-    return { tabs: outTabs, activePath: active && !isBrowserPath(active) ? active : null };
+    return { tabs: outTabs, activePath: activePathRef.current };
   }, [readModelValue]);
 
   React.useEffect(() => {
@@ -1067,6 +1075,9 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
         void closeBrowserNativeView(meta.label).catch(() => {});
       }
       browserMetaRef.current.clear();
+      // Browser meta and models are gone now, so if the mount effects run again
+      // (React StrictMode does this in dev), the tabs must be restored again.
+      restoredRef.current = false;
       editorRef.current?.setModel(null);
       for (const model of modelsRef.current.values()) model.dispose();
       modelsRef.current.clear();
@@ -1618,50 +1629,71 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     if (restoredRef.current) return;
     restoredRef.current = true;
     if (!persistedState) return;
-    if (!persistedState.tabs.length) return;
 
-    const nextTabs: Tab[] = persistedState.tabs.map((it) => ({
-      path: it.path,
-      title: basename(it.path),
-      viewerKind: it.dirty && it.content != null ? "text" : null,
-      requestedMode:
-        it.viewerKind === "bytes"
-          ? "bytes"
-          : it.viewerKind === "image"
-            ? "image"
-            : it.viewerKind === "xlsx"
-              ? "xlsx"
-              : it.viewerKind === "largeText"
-                ? "stream"
-                : "auto",
-      dirty: it.dirty && it.content != null,
-      loading: it.content == null,
-      error: null,
-      size: null,
-      mime: null,
-      imageType: null,
-      locked: Boolean(it.locked),
-    }));
+    // Browser tabs come back as fresh tabs (new path and webview label) at their
+    // last URL; their old webviews were closed when the panel unmounted.
+    const restoredBrowserPaths = new Map<string, string>();
+    for (const it of persistedState.tabs) {
+      if (!isBrowserPath(it.path) || !it.url) continue;
+      const path = `${BROWSER_PREFIX}${++browserSeqRef.current}`;
+      browserMetaRef.current.set(path, { label: nextBrowserLabel(), url: it.url });
+      restoredBrowserPaths.set(it.path, path);
+    }
+    const persistedTabs = persistedState.tabs.filter((it) => !isBrowserPath(it.path) || restoredBrowserPaths.has(it.path));
+    if (!persistedTabs.length) return;
+
+    const nextTabs: Tab[] = persistedTabs.map((it): Tab => {
+      const browserPath = restoredBrowserPaths.get(it.path);
+      if (browserPath) {
+        return { ...emptyTab(browserPath), title: it.title || urlHost(it.url ?? ""), viewerKind: "browser", loading: false };
+      }
+      return {
+        path: it.path,
+        title: basename(it.path),
+        viewerKind: it.dirty && it.content != null ? "text" : null,
+        requestedMode:
+          it.viewerKind === "bytes"
+            ? "bytes"
+            : it.viewerKind === "image"
+              ? "image"
+              : it.viewerKind === "xlsx"
+                ? "xlsx"
+                : it.viewerKind === "largeText"
+                  ? "stream"
+                  : "auto",
+        dirty: it.dirty && it.content != null,
+        loading: it.content == null,
+        error: null,
+        size: null,
+        mime: null,
+        imageType: null,
+        locked: Boolean(it.locked),
+      };
+    });
+    // Set the ref now, not just via the layout effect: a workspace-tab request
+    // handled right after mount must append to the restored tabs.
+    tabsRef.current = nextTabs;
     setTabs(nextTabs);
-    openPathsRef.current = new Set(persistedState.tabs.map((t) => t.path));
-    dirtyPathsRef.current = new Set(persistedState.tabs.filter((t) => t.dirty && t.content != null).map((t) => t.path));
+    openPathsRef.current = new Set(nextTabs.map((t) => t.path));
+    dirtyPathsRef.current = new Set(persistedTabs.filter((t) => t.dirty && t.content != null).map((t) => t.path));
 
-    for (const tab of persistedState.tabs) {
+    for (const tab of persistedTabs) {
       if (!tab.dirty) continue;
       if (tab.content == null) continue;
       ensureModel(tab.path, tab.content);
     }
 
+    const persistedActive = persistedState.activePath
+      ? restoredBrowserPaths.get(persistedState.activePath) ?? persistedState.activePath
+      : null;
     const desiredActive =
-      (persistedState.activePath &&
-        persistedState.tabs.some((t) => t.path === persistedState.activePath) &&
-        persistedState.activePath) ||
-      persistedState.tabs[0]?.path ||
+      (persistedActive && nextTabs.some((t) => t.path === persistedActive) && persistedActive) ||
+      nextTabs[0]?.path ||
       null;
 
     setActivePath(desiredActive);
     activePathRef.current = desiredActive;
-    if (desiredActive) void openFile(desiredActive);
+    if (desiredActive && !isBrowserPath(desiredActive)) void openFile(desiredActive);
   }, [ensureModel, openFile, persistedState]);
 
   React.useEffect(() => {
