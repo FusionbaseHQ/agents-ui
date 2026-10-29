@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 This project aims to follow Semantic Versioning.
 
-## Unreleased
+## 0.12.1
 
 - **⌘W no longer closes the window** (macOS). It closes what has focus: the active session, or the file viewer's tab (including browser tabs) when the file viewer has focus. In a text field or with a dialog open it does nothing. Closing the window moved to **⇧⌘W**, like Terminal.app.
 - **Closing the window keeps your sessions running** (macOS): the red close button and ⇧⌘W hide the window, and the Dock icon or the tray's **Open Agents UI** brings it back. Quit with ⌘Q.
