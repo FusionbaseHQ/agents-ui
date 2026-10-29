@@ -22,6 +22,7 @@ mod mcp_tools;
 mod persist;
 mod power_assertion;
 mod pty;
+mod quit;
 mod recording;
 mod secure;
 mod server_control;
@@ -377,8 +378,26 @@ fn main() {
                     // minimized. Consume it only once the window is presentable.
                     display_recovery::recover_if_pending(app, "main-window-focused");
                 }
+                tauri::RunEvent::ExitRequested { code, api, .. } => {
+                    quit::on_exit_requested(app, code, &api);
+                }
+                tauri::RunEvent::WindowEvent {
+                    label,
+                    event: tauri::WindowEvent::CloseRequested { api, .. },
+                    ..
+                } if label == "main" => {
+                    api.prevent_close();
+                    quit::on_main_window_close(app);
+                }
                 #[cfg(target_os = "macos")]
-                tauri::RunEvent::Reopen { .. } => {
+                tauri::RunEvent::Reopen {
+                    has_visible_windows,
+                    ..
+                } => {
+                    // Dock click after the window was closed (hidden).
+                    if !has_visible_windows {
+                        tray::show_main_window(app);
+                    }
                     display_recovery::recover_if_pending(app, "application-reopened");
                 }
                 _ => {}

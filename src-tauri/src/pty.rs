@@ -150,6 +150,8 @@ impl AppState {
 
 struct PtySession {
     persist_id: Option<String>,
+    // Runs in a zellij session that outlives the app (survives quit).
+    persistent: bool,
     name: String,
     command: String,
     cwd: Option<String>,
@@ -3365,6 +3367,7 @@ pub fn create_session(
         id.clone(),
         PtySession {
             persist_id: persist_id.clone(),
+            persistent,
             name: final_name.clone(),
             command: shown_command.clone(),
             cwd: cwd.clone(),
@@ -3904,6 +3907,19 @@ pub fn close_session(state: State<'_, AppState>, id: String) -> Result<(), Strin
 /// Best-effort cleanup at app exit: process exit does not run destructors for
 /// managed state, so buffered recording tails would be lost and children would
 /// only learn of the exit via PTY EOF. Flush every recording and kill children.
+/// Live sessions as (ended by quitting, persistent ones that keep running).
+/// Sessions already closing aren't counted.
+pub fn quit_session_counts(state: &AppState) -> (usize, usize) {
+    let Ok(sessions) = state.inner.sessions.lock() else {
+        return (0, 0);
+    };
+    let live = sessions
+        .values()
+        .filter(|session| !session.io.closing.load(Ordering::Acquire));
+    let (persistent, ended): (Vec<_>, Vec<_>) = live.partition(|session| session.persistent);
+    (ended.len(), persistent.len())
+}
+
 pub fn shutdown_flush_all(state: &AppState) {
     let Ok(sessions) = state.inner.sessions.lock() else {
         return;

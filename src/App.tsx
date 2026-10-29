@@ -2727,6 +2727,8 @@ export default function App() {
   const terminalSearchSessionsRef = useRef(terminalSearchSessions);
   terminalSearchSessionsRef.current = terminalSearchSessions;
   const terminalSearchTriggerAtRef = useRef(0);
+  // When the page last handled ⌘W, so File › Close Tab doesn't repeat it.
+  const closeTabTriggerAtRef = useRef(0);
   const codeEditorPanelRef = useRef<CodeEditorPanelHandle | null>(null);
   const handleTerminalRegistryChanged = useCallback(() => {
     setTerminalSearchSessions((prev) => (prev.size === 0 ? prev : new Set(prev)));
@@ -6211,6 +6213,54 @@ export default function App() {
     setSecureStorageSettingsOpen(true);
   }, [hydrated, secureStorageMode]);
 
+  // An app dialog is open (the command palette is tracked separately).
+  const isModalOpen = useCallback((): boolean => {
+    const ks = keyHandlerStateRef.current;
+    return (
+      anyDialogOpen() ||
+      ks.newOpen ||
+      ks.sshManagerOpen ||
+      ks.agentShortcutsOpen ||
+      ks.projectOpen ||
+      ks.pathPickerOpen ||
+      ks.confirmDeleteProjectOpen ||
+      Boolean(ks.confirmDeleteRecordingId) ||
+      Boolean(ks.confirmDeletePromptId) ||
+      Boolean(ks.confirmDeleteEnvironmentId) ||
+      Boolean(ks.confirmDeleteAssetId) ||
+      Boolean(ks.applyAssetRequest) ||
+      ks.replayOpen ||
+      ks.recordPromptOpen ||
+      ks.recordingsOpen ||
+      ks.secureStorageSettingsOpen ||
+      ks.promptsOpen ||
+      ks.promptEditorOpen ||
+      ks.environmentsOpen ||
+      ks.environmentEditorOpen ||
+      ks.assetEditorOpen
+    );
+  }, []);
+
+  // What ⌘W and File › Close Tab close: the file viewer's active tab when the
+  // file viewer has focus, otherwise the active session. Nothing while a dialog
+  // is open or a text field has focus, and never the window (see app_menu.rs).
+  const closeFocusedTab = useCallback(
+    (target: Element | null) => {
+      const ks = keyHandlerStateRef.current;
+      if (ks.commandPaletteOpen || isModalOpen()) return;
+      if (target?.closest(".codeEditorPanel")) {
+        codeEditorPanelRef.current?.closeActiveTab();
+        return;
+      }
+      if (isTextEditingTarget(target)) return;
+      const activeId = activeIdRef.current;
+      if (activeId) void onClose(activeId);
+    },
+    // onClose reads from refs/state setters internally; safe with []
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [isModalOpen],
+  );
+
   useEffect(() => {
     const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
     const onKeyDown = (e: KeyboardEvent) => {
@@ -6227,28 +6277,7 @@ export default function App() {
         commandPaletteOpen, slidePanelOpen, slidePanelTab, prompts,
         applyAssetApplying,
       } = ks;
-      const modalOpen =
-        anyDialogOpen() ||
-        newOpen ||
-        sshManagerOpen ||
-        agentShortcutsOpen ||
-        projectOpen ||
-        pathPickerOpen ||
-        confirmDeleteProjectOpen ||
-        Boolean(confirmDeleteRecordingId) ||
-        Boolean(confirmDeletePromptId) ||
-        Boolean(confirmDeleteEnvironmentId) ||
-        Boolean(confirmDeleteAssetId) ||
-        Boolean(applyAssetRequest) ||
-        replayOpen ||
-        recordPromptOpen ||
-        recordingsOpen ||
-        secureStorageSettingsOpen ||
-        promptsOpen ||
-        promptEditorOpen ||
-        environmentsOpen ||
-        environmentEditorOpen ||
-        assetEditorOpen;
+      const modalOpen = isModalOpen();
 
       const resolveVisibleTerminalSearchTargets = (): string[] => {
         const activeProjectId = activeProjectIdRef.current;
@@ -6311,6 +6340,17 @@ export default function App() {
       const shortcutTarget = eventTargetElement(e);
       const isEditingText = isTextEditingTarget(shortcutTarget);
       const isCodeEditorTarget = Boolean(shortcutTarget?.closest(".codeEditorPanel"));
+
+      // ⌘W is always consumed: a key the page leaves unhandled goes to the
+      // native menu. Monaco binds it itself (close file tab, CodeEditorPanel).
+      if (binding === "session.close") {
+        closeTabTriggerAtRef.current = Date.now();
+        if (shortcutTarget?.closest(".monaco-editor")) return;
+        e.preventDefault();
+        closeFocusedTab(shortcutTarget);
+        return;
+      }
+
       if (
         binding &&
         isEditingText &&
@@ -6518,11 +6558,6 @@ export default function App() {
         case "session.new":
           e.preventDefault();
           handleOpenNewSessionFlow();
-          return;
-        case "session.close":
-          if (!activeId) return;
-          e.preventDefault();
-          void onClose(activeId);
           return;
         case "session.next":
           e.preventDefault();
@@ -8487,6 +8522,18 @@ export default function App() {
           selectDocumentContents();
           return;
         }
+        if (event.payload.id === "window-close-tab") {
+          // Fires for a click on the menu item, or for ⌘W the page didn't see:
+          // focus is then in a browser tab's native webview, so the main page
+          // has no focus and that browser tab is the one to close.
+          if (Date.now() - closeTabTriggerAtRef.current < 180) return;
+          if (!document.hasFocus()) {
+            codeEditorPanelRef.current?.closeActiveTab({ browserOnly: true });
+            return;
+          }
+          closeFocusedTab(document.activeElement);
+          return;
+        }
         if (event.payload.id === "window-toggle-terminal-search") {
           const now = Date.now();
           if (now - terminalSearchTriggerAtRef.current < 180) return;
@@ -8551,33 +8598,6 @@ export default function App() {
         setPendingTrayAction(event.payload);
       });
       unlisteners.push(unlistenTray);
-
-      // Intercept window close to flush pending state before shutdown
-      const unlistenClose = await getCurrentWindow().onCloseRequested(async (event) => {
-        event.preventDefault();
-        // Flush pending save immediately
-        if (saveTimerRef.current !== null) {
-          window.clearTimeout(saveTimerRef.current);
-          saveTimerRef.current = null;
-        }
-        const state = pendingSaveRef.current;
-        if (state) {
-          await invoke("save_persisted_state", { state }).catch(() => {});
-          pendingSaveRef.current = null;
-        }
-        // Detach persistent sessions (keep alive), close others
-        const promises: Promise<void>[] = [];
-        for (const s of sessionsRef.current) {
-          if (s.persistent && !s.exited) {
-            promises.push(detachSession(s.id).catch(() => {}));
-          } else if (!s.exited) {
-            promises.push(closeSession(s.id).catch(() => {}));
-          }
-        }
-        await Promise.allSettled(promises);
-        await getCurrentWindow().destroy();
-      });
-      unlisteners.push(unlistenClose);
 
       // Check if we were cancelled during async setup
       if (cancelled) {

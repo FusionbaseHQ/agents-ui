@@ -124,6 +124,9 @@ export type CodeEditorPanelHandle = {
   openWorkspaceTab: (input: CodeEditorOpenWorkspaceTabInput) => Promise<CodeEditorWorkspaceTab>;
   focusWorkspaceTab: (input: { tabId?: string | null; path?: string | null }) => CodeEditorWorkspaceTab;
   closeWorkspaceTab: (input: { tabId?: string | null; path?: string | null; force?: boolean }) => CodeEditorWorkspaceTab;
+  // ⌘W: closes the active tab (asking first if it has unsaved changes);
+  // `browserOnly` limits that to a browser tab. Returns whether one closed.
+  closeActiveTab: (options?: { browserOnly?: boolean }) => boolean;
   browserNavigate: (input: { tabId?: string | null; url: string; activate?: boolean }) => Promise<CodeEditorWorkspaceTab>;
   browserAction: (input: { tabId?: string | null; action: "back" | "forward" | "reload" }) => Promise<CodeEditorWorkspaceTab>;
   browserSnapshot: (input?: { tabId?: string | null }) => CodeEditorBrowserSnapshot;
@@ -2339,6 +2342,17 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
     [resolveBrowserPath, serializeWorkspaceTab],
   );
 
+  const closeActiveTab = React.useCallback(
+    (options: { browserOnly?: boolean } = {}) => {
+      const path = activePathRef.current;
+      if (!path) return false;
+      if (options.browserOnly && !isBrowserPath(path)) return false;
+      requestCloseTab(path);
+      return true;
+    },
+    [requestCloseTab],
+  );
+
   React.useImperativeHandle(
     ref,
     () => ({
@@ -2348,6 +2362,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       openWorkspaceTab,
       focusWorkspaceTab,
       closeWorkspaceTab,
+      closeActiveTab,
       browserNavigate,
       browserAction,
       browserSnapshot,
@@ -2359,6 +2374,7 @@ export const CodeEditorPanel = React.forwardRef<CodeEditorPanelHandle, CodeEdito
       browserNavigate,
       browserSnapshot,
       captureScreenshot,
+      closeActiveTab,
       closeWorkspaceTab,
       fileViewerSnapshot,
       focusWorkspaceTab,

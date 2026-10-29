@@ -42,7 +42,7 @@ struct TrayMenuEventPayload {
     persist_id: Option<String>,
 }
 
-fn show_main_window(app: &AppHandle) {
+pub(crate) fn show_main_window(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     {
         let _ = app.show();

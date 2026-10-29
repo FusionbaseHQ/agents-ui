@@ -47,7 +47,7 @@ export const KEY_BINDINGS: KeyBinding[] = [
   { id: "terminal.search", title: "Find in terminal", section: "General", mac: "mod+f", other: "ctrl+shift+f" },
   { id: "shortcuts.show", title: "Show keyboard shortcuts", section: "General", mac: "mod+/", other: "mod+/" },
   { id: "session.new", title: "New terminal", section: "Sessions", mac: "mod+t", other: "ctrl+shift+t" },
-  { id: "session.close", title: "Close session", section: "Sessions", mac: "mod+w", other: "ctrl+shift+w" },
+  { id: "session.close", title: "Close tab or session", section: "Sessions", mac: "mod+w", other: "ctrl+shift+w" },
   { id: "session.next", title: "Next session", section: "Sessions", mac: "ctrl+tab", other: "ctrl+tab" },
   { id: "session.prev", title: "Previous session", section: "Sessions", mac: "ctrl+shift+tab", other: "ctrl+shift+tab" },
   { id: "panel.prompts", title: "Toggle Prompts panel", section: "Panels", mac: "mod+shift+p", other: "mod+shift+p" },
